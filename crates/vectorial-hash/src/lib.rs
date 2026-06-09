@@ -29,9 +29,11 @@
 //! ```
 
 pub mod geom;
+pub mod template;
 pub mod tree;
 pub mod culling;
 
 pub use geom::{Point, Rect};
+pub use template::{CellState, TemplateGrid};
 pub use tree::{Node, NodeId, Positioned, Tree};
 pub use culling::Shape;

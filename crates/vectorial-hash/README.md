@@ -2,11 +2,11 @@
 
 Core index and hash algorithms for vectorial spaces, designed with modern CPU architecture in mind.
 
-Part of the [`vectorial-hash-kit`](https://github.com/<your-user>/vectorial-hash-kit) workspace.
+Part of the [`vectorial-hash-kit`](https://github.com/OrlandoLuque/vectorial-hash-kit) workspace.
 
 ## Status
 
-First port of the runtime tree from the [`Multidimensional vector index`](../../Multidimensional%20vector%20index.pdf) paper landed. The bbox-fallback culling path is wired up; template-driven culling will follow in the next iteration alongside `remove` / `move` and 3D support.
+Runtime tree and template-driven culling from the [`Multidimensional vector index`](../../Multidimensional%20vector%20index.pdf) paper are wired up. `remove` / `move` and 3D support are next.
 
 ## What it does
 
@@ -15,15 +15,16 @@ A binary-split spatial tree where items live in leaf cells. When a cell exceeds 
 - Rectangles split along the long axis so children are closer to square.
 - Squares pick the axis that distributes their items most evenly.
 
-Queries (`Tree::cull`) walk the tree against a [`Shape`]: cells whose bbox doesn't touch the shape are pruned; leaf items get a final per-point check. A future template-aware path will short-circuit the per-point step for cells fully covered by the shape.
+Queries (`Tree::cull`) walk the tree against a [`Shape`]. If the shape carries a [`TemplateGrid`], each node's bbox is classified as **green** (fully inside the shape — take every item without per-point checks), **white** (fully outside — skip the subtree) or **yellow** (recurse). Without a template, the path falls back to bbox-intersect + per-point check.
 
 ## Public surface
 
 | Module | Type | Purpose |
 | --- | --- | --- |
 | `geom` | `Point`, `Rect` | 2D primitives (half-open `Rect`). |
+| `template` | `CellState`, `TemplateGrid` | Runtime cull template: classify a region as In/Out/Maybe. |
 | `tree` | `Tree<T>`, `Node<T>`, `NodeId`, `Positioned` | Arena-backed binary-split tree. |
-| `culling` | `Shape`, `Tree::cull` | Query items inside a shape. |
+| `culling` | `Shape`, `Tree::cull` | Query items inside a shape, with optional template short-circuit. |
 
 ## Example
 
@@ -60,6 +61,6 @@ assert_eq!(hits.len(), 2);
 ## Roadmap
 
 - `Tree::remove` + `Tree::move_item` with the merge-up rule from the paper.
-- Optional template lookup in `cull` to recover the green/yellow/white short-circuit.
+- Adapter in `vectorial-hash-templates` that decodes its binary templates into `TemplateGrid` for runtime use.
 - 3D variant (probably feature-gated or via a generic dimension parameter once the 2D shape settles).
 - SIMD-friendly cell layout where it pays off.

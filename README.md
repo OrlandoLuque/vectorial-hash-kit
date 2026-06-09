@@ -52,7 +52,14 @@ cargo run -p vectorial-hash-cli --features redis-store -- generate-redis \
 
 **Redis on this machine:** Redis 3.0.504 is installed at `C:\Program Files\Redis\` and runs as a Windows service. `redis-cli ping` should return `PONG`. No manual start needed.
 
-## Algorithm internals (templates crate)
+## Algorithm internals
+
+### Runtime culling (`vectorial-hash`)
+
+- **Binary-split tree**: items live in leaf cells. Rectangles split along the long axis; squares pick the axis that distributes items most evenly.
+- **Green / yellow / white short-circuit**: a `Shape` may expose a `TemplateGrid` classifying its coverage cell-by-cell. During `cull`, each tree-node bbox is classified — *green* takes the whole subtree without per-point checks, *white* skips it, *yellow* recurses. Without a template the path falls back to bbox-intersect + per-point.
+
+### Template generation (`vectorial-hash-templates`)
 
 - **Cell classification**: each grid cell is `OUT` / `MAYBE` / `IN` relative to the polygon. The fast path uses bbox rejection + lazy cell construction (`get_template_grid_fast`).
 - **8-symmetry dedup**: each generated template is compared (via binary hash) against all 8 rotations/flips (`eq, rCC, rC, r180, fLR, fTB, fTLBR, fTRBL`) so we keep only canonical templates.
