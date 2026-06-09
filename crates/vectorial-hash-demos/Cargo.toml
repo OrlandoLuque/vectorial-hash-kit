@@ -1,0 +1,14 @@
+[package]
+name = "vectorial-hash-demos"
+version = "0.1.0"
+description = "Runnable demos for vectorial-hash (insertion, culling, visualisations)."
+publish = false  # flip to true if you want crates.io to host the demos too
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vectorial-hash = { workspace = true }
+vectorial-hash-templates = { workspace = true }

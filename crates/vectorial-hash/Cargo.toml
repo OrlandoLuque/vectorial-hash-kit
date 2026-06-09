@@ -1,0 +1,15 @@
+[package]
+name = "vectorial-hash"
+version = "0.1.0"
+description = "Index and hash algorithms for vectorial spaces, tuned to modern CPU architecture."
+keywords = ["index", "hash", "spatial", "quadtree", "octree"]
+categories = ["data-structures", "algorithms"]
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+
+[dependencies]
+# Keep this crate dependency-light on purpose: it is the core algorithm.

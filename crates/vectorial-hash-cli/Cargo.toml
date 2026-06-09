@@ -1,0 +1,24 @@
+[package]
+name = "vectorial-hash-cli"
+version = "0.1.0"
+description = "CLI tools for vectorial-hash: template generation, inspection, benchmarks."
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "vh"
+path = "src/main.rs"
+
+[features]
+default = []
+redis-store = ["vectorial-hash-templates/redis-store"]
+
+[dependencies]
+vectorial-hash = { workspace = true }
+vectorial-hash-templates = { workspace = true }
+clap = { workspace = true }
+dotenv = { workspace = true }
+rayon = { workspace = true }

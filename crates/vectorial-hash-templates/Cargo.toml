@@ -1,0 +1,22 @@
+[package]
+name = "vectorial-hash-templates"
+version = "0.1.0"
+description = "Precomputed polygon-vs-grid intersection templates for vectorial-hash."
+keywords = ["templates", "intersection", "culling", "spatial"]
+categories = ["algorithms"]
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vectorial-hash = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rayon = { workspace = true }
+redis = { workspace = true, optional = true }
+
+[features]
+default = []
+redis-store = ["dep:redis"]
