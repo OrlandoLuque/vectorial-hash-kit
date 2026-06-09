@@ -1,3 +1,6 @@
+mod bench;
+mod quadtree;
+
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,11 +23,36 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Generate templates in-memory (single process).
-    Generate,
+    Generate {
+        /// Rotation step in degrees (smaller = more templates).
+        #[arg(long, default_value_t = 0.5)]
+        angle_step: f64,
+        /// Polygon scale.
+        #[arg(long, default_value_t = 128.0)]
+        scale: f64,
+        /// Grid size (cells per axis).
+        #[arg(long, default_value_t = 16)]
+        grid: i64,
+    },
     /// Parallel subtask benchmark (grids 16+32).
     Compare,
     /// Heavy benchmark (grids 16+32+64+128).
     Heavy,
+    /// 4-way cull benchmark: binary-split tree vs quadtree, templates on/off.
+    Bench {
+        /// Number of random points in the world.
+        #[arg(long, default_value_t = 200_000)]
+        points: usize,
+        /// Cull repetitions per configuration.
+        #[arg(long, default_value_t = 50)]
+        culls: usize,
+        /// Items per leaf before a cell splits.
+        #[arg(long, default_value_t = 16)]
+        item_limit: usize,
+        /// RNG seed (deterministic point cloud).
+        #[arg(long, default_value_t = 0xC0FFEE)]
+        seed: u64,
+    },
     /// Generate templates and store them in Redis (multi-process).
     #[cfg(feature = "redis-store")]
     GenerateRedis {
@@ -32,31 +60,42 @@ enum Cmd {
         redis_host: String,
         #[arg(long, default_value_t = 6379)]
         redis_port: u16,
+        /// Rotation step in degrees (smaller = more templates).
+        #[arg(long, default_value_t = 0.5)]
+        angle_step: f64,
+        /// Polygon scale.
+        #[arg(long, default_value_t = 128.0)]
+        scale: f64,
+        /// Grid size (cells per axis).
+        #[arg(long, default_value_t = 16)]
+        grid: i64,
     },
 }
 
 fn main() {
     let cli = Cli::parse();
     match cli.command {
-        Cmd::Generate => run_in_memory(),
+        Cmd::Generate { angle_step, scale, grid } => run_in_memory(angle_step, scale, grid),
         Cmd::Compare => comparison_test::run_comparison(),
         Cmd::Heavy => comparison_test::run_heavy(),
+        Cmd::Bench { points, culls, item_limit, seed } => {
+            bench::run(points, culls, item_limit, seed);
+        }
         #[cfg(feature = "redis-store")]
-        Cmd::GenerateRedis { redis_host, redis_port } => {
-            run_with_redis(&redis_host, redis_port);
+        Cmd::GenerateRedis { redis_host, redis_port, angle_step, scale, grid } => {
+            run_with_redis(&redis_host, redis_port, angle_step, scale, grid);
         }
     }
 }
 
-fn run_in_memory() {
+fn run_in_memory(angle_step: f64, scale: f64, grid: i64) {
     let polygons = vec![
         ("drop", create_drop(0.2, 0.8)),
         ("box", create_box(1.0)),
         ("circle", create_circle(1.0)),
     ];
-    let scales: Vec<f64> = vec![128.0];
-    let grid_sizes: Vec<i64> = vec![16];
-    let angle_step = 0.5;
+    let scales: Vec<f64> = vec![scale];
+    let grid_sizes: Vec<i64> = vec![grid];
     let angles = get_angles(angle_step);
     let max_per_task: u64 = 500_000;
 
@@ -137,7 +176,7 @@ fn process_subtask_mem(
 }
 
 #[cfg(feature = "redis-store")]
-fn run_with_redis(host: &str, port: u16) {
+fn run_with_redis(host: &str, port: u16, angle_step: f64, scale: f64, grid: i64) {
     use vectorial_hash_templates::redis_store::RedisStore;
 
     let polygons = vec![
@@ -145,9 +184,8 @@ fn run_with_redis(host: &str, port: u16) {
         ("box", create_box(1.0)),
         ("circle", create_circle(1.0)),
     ];
-    let scales: Vec<f64> = vec![128.0];
-    let grid_sizes: Vec<i64> = vec![16];
-    let angle_step = 0.5;
+    let scales: Vec<f64> = vec![scale];
+    let grid_sizes: Vec<i64> = vec![grid];
     let angles = get_angles(angle_step);
     let max_per_task: u64 = 500_000;
 
