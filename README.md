@@ -21,12 +21,18 @@ This is a Cargo workspace with several independently-versioned crates.
 # in-memory template generation (no Redis needed)
 cargo run -p vectorial-hash-cli -- generate
 
-# benchmark variants
-cargo run -p vectorial-hash-cli -- compare   # grids 16 + 32
-cargo run -p vectorial-hash-cli -- heavy     # grids 16 + 32 + 64 + 128
+# template-generation benchmarks
+cargo run -p vectorial-hash-cli --release -- compare   # grids 16 + 32
+cargo run -p vectorial-hash-cli --release -- heavy     # grids 16 + 32 + 64 + 128
 
-# tiny demo
+# runtime cull benchmark: binary-split tree vs quadtree, templates on/off
+cargo run -p vectorial-hash-cli --release -- bench
+
+# console demos (template dedup + end-to-end cull)
 cargo run -p vectorial-hash-demos
+
+# visual demo: critters on a live-subdividing map (macroquad)
+cargo run -p vectorial-hash-demos --bin critters --release
 ```
 
 ## Template generation modes

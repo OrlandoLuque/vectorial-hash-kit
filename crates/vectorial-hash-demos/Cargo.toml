@@ -12,3 +12,4 @@ rust-version.workspace = true
 [dependencies]
 vectorial-hash = { workspace = true }
 vectorial-hash-templates = { workspace = true }
+macroquad = { workspace = true }
