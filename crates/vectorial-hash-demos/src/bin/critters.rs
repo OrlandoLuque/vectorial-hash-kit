@@ -233,6 +233,38 @@ struct Effect {
     origin: VPoint,
     color: Color,
     until: f64,
+    /// Sampled outline of the actual attack polygon (arcs flattened).
+    outline: Vec<(f32, f32)>,
+}
+
+/// Flatten a polygon (lines + arcs) into a point list for rendering.
+fn sample_polygon(poly: &Polygon) -> Vec<(f32, f32)> {
+    let n = poly.vertices.len();
+    let mut pts = Vec::new();
+    for i in 0..n {
+        let v = &poly.vertices[i];
+        let w = &poly.vertices[(i + 1) % n];
+        pts.push((v.x as f32, v.y as f32));
+        if v.seg.d != 0 {
+            let (xc, yc) = (v.seg.xc, v.seg.yc);
+            let r = ((v.x - xc).powi(2) + (v.y - yc).powi(2)).sqrt();
+            let a0 = (v.y - yc).atan2(v.x - xc);
+            let a1 = (w.y - yc).atan2(w.x - xc);
+            let mut sweep = a1 - a0;
+            if v.seg.d == 1 && sweep <= 0.0 {
+                sweep += std::f64::consts::TAU;
+            }
+            if v.seg.d == -1 && sweep >= 0.0 {
+                sweep -= std::f64::consts::TAU;
+            }
+            let steps = (sweep.abs() / 0.2).ceil().max(2.0) as usize;
+            for s in 1..steps {
+                let a = a0 + sweep * s as f64 / steps as f64;
+                pts.push(((xc + r * a.cos()) as f32, (yc + r * a.sin()) as f32));
+            }
+        }
+    }
+    pts
 }
 
 /// Expanding ring marking a spawn, a removal, or a death.
@@ -364,6 +396,8 @@ async fn main() {
     let mut effects: Vec<Effect> = Vec::new();
     let mut rings: Vec<Ring> = Vec::new();
     let mut kills: u64 = 0;
+    let mut kills_by: HashMap<Kind, u64> = HashMap::new();
+    let mut last_paint: f64 = 0.0;
     let mut paused = false;
     let mut brush = Kind::Hunter;
     let mut time_scale: f64 = 1.0;
@@ -407,7 +441,13 @@ async fn main() {
         // --- interactive add / remove ---
         let (mx, my) = mouse_position();
         let mouse_in_map = (mx as f64) < MAP_W && mx >= 0.0 && my >= 0.0 && (my as f64) < MAP_H;
-        if is_mouse_button_pressed(MouseButton::Left) && mouse_in_map && tree.item_count() < 400 {
+        // Hold to paint a stream of critters.
+        if is_mouse_button_down(MouseButton::Left)
+            && mouse_in_map
+            && tree.item_count() < 400
+            && now - last_paint > 0.12
+        {
+            last_paint = now;
             let pos = spawn_at(
                 &mut tree,
                 &mut next_id,
@@ -486,7 +526,7 @@ async fn main() {
                 }
             });
 
-            let mut killed: Vec<(u32, VPoint)> = Vec::new();
+            let mut killed: Vec<(u32, VPoint, Kind)> = Vec::new();
             let mut killed_ids: HashSet<u32> = HashSet::new();
 
             for &(id, kind, pos, _) in &snap2 {
@@ -536,10 +576,11 @@ async fn main() {
                     for victim in tree.cull(&atk) {
                         if victim.id != id && !killed_ids.contains(&victim.id) {
                             killed_ids.insert(victim.id);
-                            killed.push((victim.id, victim.pos));
+                            killed.push((victim.id, victim.pos, kind));
                         }
                     }
                     effects.push(Effect {
+                        outline: sample_polygon(&atk.poly),
                         grid: atk.grid,
                         origin: pos,
                         color: kind.color(),
@@ -548,11 +589,12 @@ async fn main() {
                 }
             }
 
-            for (vid, vpos) in killed {
+            for (vid, vpos, attacker) in killed {
                 if let Some(c) = tree.remove(vpos, |c| c.id == vid) {
                     cooldowns.remove(&vid);
                     respawns.push((now + RESPAWN_DELAY, c.kind));
                     kills += 1;
+                    *kills_by.entry(attacker).or_default() += 1;
                     rings.push(Ring {
                         pos: vpos,
                         color: c.kind.color(),
@@ -628,6 +670,13 @@ async fn main() {
                         Color::new(e.color.r, e.color.g, e.color.b, alpha),
                     );
                 }
+            }
+            // The real attack polygon on top of its template cells.
+            let oc = Color::new(e.color.r, e.color.g, e.color.b, (0.9 * fade).min(1.0));
+            for i in 0..e.outline.len() {
+                let (x1, y1) = e.outline[i];
+                let (x2, y2) = e.outline[(i + 1) % e.outline.len()];
+                draw_line(x1, y1, x2, y2, 1.5, oc);
             }
             draw_circle(e.origin.x as f32, e.origin.y as f32, 3.0, e.color);
         }
@@ -740,6 +789,17 @@ async fn main() {
         }
         ty += 10.0;
         line(&format!("alive: {}   kills: {}", items, kills), 18.0, WHITE, &mut ty);
+        line(
+            &format!(
+                "  by: drifter {} / hunter {} / pulsar {}",
+                kills_by.get(&Kind::Drifter).copied().unwrap_or(0),
+                kills_by.get(&Kind::Hunter).copied().unwrap_or(0),
+                kills_by.get(&Kind::Pulsar).copied().unwrap_or(0),
+            ),
+            16.0,
+            LIGHTGRAY,
+            &mut ty,
+        );
         line(
             &format!("respawning: {}", respawns.len()),
             18.0,

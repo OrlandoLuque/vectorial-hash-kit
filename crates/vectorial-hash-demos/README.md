@@ -49,9 +49,10 @@ A live 2D map indexed by a `vectorial_hash::Tree` (item limit 3 per cell). Every
   - *hunter* (red): chases the nearest non-hunter; fires a drop aimed at it (angle snapped to the precomputed 15° set).
   - *pulsar* (gold): circles around; radial blast centred on itself.
 - Attack resolution is a real `Tree::cull` with the template short-circuit; victims are `Tree::remove`d (watch regions merge) and **respawn** a few seconds later (watch regions split).
-- Attack areas are drawn from the template cells themselves: bright = `In` (green cells), dim = `Maybe` (yellow cells).
+- Attack areas are drawn from the template cells themselves (bright = `In`, dim = `Maybe`) with the real attack polygon outlined on top (arcs flattened), so you can see exactly how the precomputed grid approximates the shape.
+- Kill credit is tracked per attacker kind; hunters show a faint sightline to their current prey.
 
-Controls: `1`/`2`/`3` select the spawn brush · left click spawns at the cursor · right click removes · `+`/`-` add/remove five at random · `R` cycles region rendering · `[` `]` change simulation speed · `Space` pauses · `Esc` quits.
+Controls: `1`/`2`/`3` select the spawn brush · left click (or hold-drag to paint) spawns at the cursor · right click removes · `+`/`-` add/remove five at random · `R` cycles region rendering · `[` `]` change simulation speed · `Space` pauses · `Esc` quits.
 
 `CRITTERS_MAX_FRAMES=N` exits after N frames (CI/smoke runs).
 
