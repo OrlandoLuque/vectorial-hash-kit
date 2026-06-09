@@ -192,6 +192,39 @@ impl<T: Positioned> Tree<T> {
     }
 
     pub fn node_count(&self) -> usize { self.nodes.len() }
+
+    /// Visit every live leaf reachable from the root, in depth-first order.
+    ///
+    /// Orphaned nodes left behind by `remove`/`update` merges are not visited.
+    /// This is the intended way to enumerate current regions (e.g. for
+    /// rendering the tree's subdivision) or to snapshot all stored items.
+    pub fn visit_leaves<F: FnMut(NodeId, &Node<T>)>(&self, mut f: F) {
+        self.visit_leaves_from(self.root, &mut f);
+    }
+
+    fn visit_leaves_from<F: FnMut(NodeId, &Node<T>)>(&self, id: NodeId, f: &mut F) {
+        match self.get(id).children {
+            Some([a, b]) => {
+                self.visit_leaves_from(a, f);
+                self.visit_leaves_from(b, f);
+            }
+            None => f(id, self.get(id)),
+        }
+    }
+
+    /// Number of items currently stored (live leaves only).
+    pub fn item_count(&self) -> usize {
+        let mut n = 0;
+        self.visit_leaves(|_, leaf| n += leaf.items.len());
+        n
+    }
+
+    /// Number of live leaves reachable from the root.
+    pub fn leaf_count(&self) -> usize {
+        let mut n = 0;
+        self.visit_leaves(|_, _| n += 1);
+        n
+    }
 }
 
 /// Pick how to split a cell.
@@ -366,6 +399,25 @@ mod tests {
         let landed = tree.locate(Point::new(70.0, 70.0));
         assert!(tree.get(landed).items.iter().any(|p| p.0 == Point::new(70.0, 70.0)),
             "moved item should live under the right subtree (root child = {:?})", right);
+    }
+
+    #[test]
+    fn visit_leaves_covers_live_leaves_only() {
+        let mut tree = Tree::<Pt>::new(Rect::new(0.0, 0.0, 100.0, 100.0), 1);
+        tree.insert(Pt(Point::new(10.0, 10.0)));
+        tree.insert(Pt(Point::new(80.0, 80.0)));
+        tree.insert(Pt(Point::new(90.0, 10.0)));
+        assert_eq!(tree.item_count(), 3);
+        let leaves = tree.leaf_count();
+        assert!(leaves >= 2);
+
+        // Remove one item; merges may shrink the leaf set, but counts stay consistent.
+        tree.remove(Point::new(90.0, 10.0), |it| it.0.x == 90.0);
+        assert_eq!(tree.item_count(), 2);
+        assert!(tree.leaf_count() <= leaves);
+
+        // Every visited node must actually be a leaf.
+        tree.visit_leaves(|_, leaf| assert!(leaf.children.is_none()));
     }
 
     #[test]

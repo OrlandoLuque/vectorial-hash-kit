@@ -6,7 +6,7 @@ Part of the [`vectorial-hash-kit`](https://github.com/OrlandoLuque/vectorial-has
 
 ## Status
 
-Runtime tree, template-driven culling, and the dynamic `remove` / `update` operations (with the paper's merge-up rule) are wired up. 3D support and a templates-crate adapter (binary template → `TemplateGrid`) are next.
+Runtime tree, template-driven culling, the dynamic `remove` / `update` operations (with the paper's merge-up rule), and the templates-crate adapter are wired up. `Tree::visit_leaves` exposes the live regions (used by the visual demo) and `TemplateGrid::translated` re-anchors a precomputed template at any world position. 3D support is next.
 
 ## What it does
 
@@ -22,8 +22,8 @@ Queries (`Tree::cull`) walk the tree against a [`Shape`]. If the shape carries a
 | Module | Type | Purpose |
 | --- | --- | --- |
 | `geom` | `Point`, `Rect` | 2D primitives (half-open `Rect`). |
-| `template` | `CellState`, `TemplateGrid` | Runtime cull template: classify a region as In/Out/Maybe. |
-| `tree` | `Tree<T>`, `Node<T>`, `NodeId`, `Positioned` | Arena-backed binary-split tree (`insert`, `remove`, `update`, `locate`, `cull`). |
+| `template` | `CellState`, `TemplateGrid` | Runtime cull template: classify a region as In/Out/Maybe; `translated` re-anchors a template anywhere. |
+| `tree` | `Tree<T>`, `Node<T>`, `NodeId`, `Positioned` | Arena-backed binary-split tree (`insert`, `remove`, `update`, `locate`, `cull`, `visit_leaves`). |
 | `culling` | `Shape`, `Tree::cull` | Query items inside a shape, with optional template short-circuit. |
 
 ## Example
@@ -60,7 +60,6 @@ assert_eq!(hits.len(), 2);
 
 ## Roadmap
 
-- Adapter in `vectorial-hash-templates` that decodes its binary templates into `TemplateGrid` for runtime use. **Indexing is time-optimised** (lookup-on-the-hot-path): hashed by `(polygon_id, scale, angle, cell_size)`, anchor stored alongside the grid so `classify_region` runs without per-cell arithmetic beyond a multiplication.
 - Arena free-list so `remove` reclaims orphaned nodes (today they stay as zombies; `NodeId`s are stable but `node_count()` overstates live nodes).
 - Stable `ItemRef` so callers can hold onto items across mutations without re-locating them by point + predicate every time.
 - 3D variant (probably feature-gated or via a generic dimension parameter once the 2D shape settles).

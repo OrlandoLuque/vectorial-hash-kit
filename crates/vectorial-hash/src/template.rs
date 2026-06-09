@@ -76,6 +76,18 @@ impl TemplateGrid {
         )
     }
 
+    /// Copy of this grid re-anchored at `origin + (dx, dy)`.
+    ///
+    /// Lets one precomputed template be stamped at any world position (the
+    /// cells are cloned; classification data is identical).
+    pub fn translated(&self, dx: f64, dy: f64) -> TemplateGrid {
+        TemplateGrid {
+            origin_x: self.origin_x + dx,
+            origin_y: self.origin_y + dy,
+            ..self.clone()
+        }
+    }
+
     /// Classify a rectangular region against the grid.
     ///
     /// - Returns [`CellState::Out`] if every overlapped cell is `Out` *and*
@@ -193,6 +205,13 @@ mod tests {
         let g = centre_in_grid();
         // straddles two corner Out cells and pokes outside on the right.
         assert_eq!(g.classify_region(&Rect::new(0.0, 0.0, 100.0, 10.0)), CellState::Out);
+    }
+
+    #[test]
+    fn translated_grid_classifies_at_the_new_anchor() {
+        let g = centre_in_grid().translated(100.0, 50.0);
+        assert_eq!(g.classify_region(&Rect::new(110.0, 60.0, 10.0, 10.0)), CellState::In);
+        assert_eq!(g.classify_region(&Rect::new(10.0, 10.0, 10.0, 10.0)), CellState::Out);
     }
 
     #[test]
