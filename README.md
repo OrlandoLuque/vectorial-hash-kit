@@ -4,7 +4,7 @@ Index and hash techniques for vectorial spaces, plus tooling to precompute spati
 
 **Author:** Orlando Jose Luque Moraira
 
-This is a Cargo workspace. Each crate is published independently on crates.io.
+This is a Cargo workspace with several independently-versioned crates.
 
 ## Crates
 
@@ -58,16 +58,3 @@ cargo run -p vectorial-hash-cli --features redis-store -- generate-redis \
 - **8-symmetry dedup**: each generated template is compared (via binary hash) against all 8 rotations/flips (`eq, rCC, rC, r180, fLR, fTB, fTLBR, fTRBL`) so we keep only canonical templates.
 - **Binary encoding**: 2-byte header (width, height) + 2 bits per cell. The encoding preserves a known PHP bug for hash compatibility with templates produced by the original `multiDimensionalIndexTemplateCreation` project — bits aren't flushed if cells aren't divisible by 4.
 - **Workload split**: subtasks are created with `max_per_task = 500_000` combinations. Rayon parallelises subtasks across CPU threads.
-
-## Publishing to crates.io
-
-Each crate has its own version. Publish in dependency order:
-
-```bash
-cargo publish -p vectorial-hash
-cargo publish -p vectorial-hash-templates
-cargo publish -p vectorial-hash-cli
-# vectorial-hash-demos has publish = false
-```
-
-Update `repository` and `license` in the workspace `Cargo.toml` before the first publish.
