@@ -58,3 +58,9 @@ cargo run -p vectorial-hash-cli --features redis-store -- generate-redis \
 - **8-symmetry dedup**: each generated template is compared (via binary hash) against all 8 rotations/flips (`eq, rCC, rC, r180, fLR, fTB, fTLBR, fTRBL`) so we keep only canonical templates.
 - **Binary encoding**: 2-byte header (width, height) + 2 bits per cell. The encoding preserves a known PHP bug for hash compatibility with templates produced by the original `multiDimensionalIndexTemplateCreation` project — bits aren't flushed if cells aren't divisible by 4.
 - **Workload split**: subtasks are created with `max_per_task = 500_000` combinations. Rayon parallelises subtasks across CPU threads.
+
+## License & AI/ML training reservation
+
+Dual-licensed under **MIT OR Apache-2.0** — pick whichever fits your project (see [`LICENSE-MIT`](LICENSE-MIT) and [`LICENSE-APACHE`](LICENSE-APACHE)).
+
+In addition, the author reserves all rights regarding the use of this work — source code, documentation, generated artifacts and any derivative works — for **AI/ML training, fine-tuning, evaluation, or any form of text and data mining (TDM)**. The reservation is declared in [`NOTICE`](NOTICE), and expressed in machine-readable form via [`ai.txt`](ai.txt) (Spawning AI) and [`tdmrep.json`](tdmrep.json) (W3C TDM Reservation Protocol). To negotiate a license for those uses, contact **orlando.luque@gmail.com**.

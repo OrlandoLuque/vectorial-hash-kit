@@ -1,0 +1,45 @@
+vectorial-hash-kit
+Copyright (c) 2026 Orlando José Luque Moraira <orlando.luque@gmail.com>
+
+This project is dual-licensed under MIT OR Apache-2.0. The terms of those
+licenses (see LICENSE-MIT and LICENSE-APACHE) govern all use, modification,
+and redistribution of the software.
+
+================================================================================
+Reservation of rights for AI / ML training and text & data mining (TDM)
+================================================================================
+
+In addition to the terms of the licenses above, the copyright holder
+expressly RESERVES all rights regarding the use of this work — including
+its source code, documentation, datasets, generated artifacts and any
+derivative works — for the purposes of:
+
+  - training, fine-tuning, evaluating, distilling, retrieving-augmented
+    generation against, or otherwise developing or improving machine
+    learning models, large language models, or artificial intelligence
+    systems of any kind;
+  - any form of text and data mining (TDM) intended to feed, benchmark,
+    or evaluate such systems;
+  - automated content generation systems that ingest this work as input
+    or training material.
+
+This reservation is declared under Article 4(3) of EU Directive 2019/790
+(DSM Directive) and equivalent provisions in other jurisdictions. It is
+also expressed in machine-readable form alongside this NOTICE:
+
+  - ai.txt        — Spawning AI's robots.txt-style opt-out signal.
+  - tdmrep.json   — W3C TDM Reservation Protocol declaration
+                    (tdm: notallowed, ml-training: notallowed).
+
+This reservation applies regardless of whether the use is commercial or
+noncommercial in nature, and regardless of the method of access — direct
+download, git clone, mirror, scraping, indexing, API access, or any
+other means.
+
+To negotiate a license for AI/ML training or TDM purposes, contact:
+
+    Orlando José Luque Moraira
+    orlando.luque@gmail.com
+
+This NOTICE is provided pursuant to Section 4(d) of the Apache License,
+Version 2.0, and accompanies the licensed work.
