@@ -10,6 +10,8 @@
 //! - **white**: skip the subtree.
 //! - **yellow**: recurse and fall back to per-point.
 
+use std::sync::Arc;
+
 use crate::geom::{Point, Rect};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -17,6 +19,39 @@ pub enum CellState {
     Out,
     Maybe,
     In,
+}
+
+/// A shared template grid *placed* at a world displacement.
+///
+/// Resolving a template at query time never clones cell data: the canonical
+/// grid stays behind an `Arc` and classification simply translates the query
+/// point by `(dx, dy)` before reading. This is what
+/// [`crate::Shape::template_for_cell`] and
+/// [`crate::Shape::point_template`] hand to the culling walk.
+#[derive(Clone, Debug)]
+pub struct PlacedTemplate {
+    pub grid: Arc<TemplateGrid>,
+    /// World displacement added to the grid's own origin.
+    pub dx: f64,
+    pub dy: f64,
+}
+
+impl PlacedTemplate {
+    pub fn new(grid: Arc<TemplateGrid>, dx: f64, dy: f64) -> Self {
+        Self { grid, dx, dy }
+    }
+
+    /// State of the cell containing world point `p`.
+    pub fn cell_at_world(&self, p: Point) -> CellState {
+        self.grid
+            .cell_at_world(Point::new(p.x - self.dx, p.y - self.dy))
+    }
+
+    /// Bounding box of the placed grid, in world coordinates.
+    pub fn bounding_box(&self) -> Rect {
+        let b = self.grid.bounding_box();
+        Rect::new(b.x + self.dx, b.y + self.dy, b.width, b.height)
+    }
 }
 
 /// A regular grid covering some region; each cell carries an [`CellState`].

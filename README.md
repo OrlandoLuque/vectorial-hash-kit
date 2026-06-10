@@ -25,8 +25,9 @@ cargo run -p vectorial-hash-cli -- generate
 cargo run -p vectorial-hash-cli --release -- compare   # grids 16 + 32
 cargo run -p vectorial-hash-cli --release -- heavy     # grids 16 + 32 + 64 + 128
 
-# runtime cull benchmark: binary-split tree vs quadtree, templates on/off
-cargo run -p vectorial-hash-cli --release -- bench
+# runtime cull benchmarks (results + analysis in docs/BENCHMARKS.md)
+cargo run -p vectorial-hash-cli --release -- bench        # tree vs quadtree, template on/off
+cargo run -p vectorial-hash-cli --release -- bench-sizes  # per-cell-size selection study
 
 # console demos (template dedup + end-to-end cull)
 cargo run -p vectorial-hash-demos

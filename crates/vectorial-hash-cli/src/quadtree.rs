@@ -5,7 +5,12 @@
 //! `Shape` trait with the green/yellow/white template short-circuit) but
 //! always splits into 4 equal quadrants — the classic quadtree layout.
 
-use vectorial_hash::{CellState, Positioned, Rect, Shape};
+use std::collections::HashMap;
+
+use vectorial_hash::{CellState, PlacedTemplate, Point, Positioned, Rect, Shape};
+
+/// Per-execution cache: one resolved template per distinct cell size.
+type SizeCache = HashMap<(u64, u64), Option<PlacedTemplate>>;
 
 /// Leaves smaller than this never split further; guards against degenerate
 /// recursion when many items share a position.
@@ -99,12 +104,14 @@ impl<T: Positioned> QuadTree<T> {
         self.nodes.len()
     }
 
-    /// Same culling contract as `vectorial_hash::Tree::cull`, including the
-    /// template short-circuit when the shape provides a `TemplateGrid`.
+    /// Same culling contract as `vectorial_hash::Tree::cull`, including
+    /// per-cell-size template selection (with the per-execution size cache),
+    /// the single-grid fallback, and the 1×1 raster for leaf items.
     pub fn cull<'a, S: Shape>(&'a self, shape: &S) -> Vec<&'a T> {
         let mut out = Vec::new();
         let bbox = shape.bounding_box();
-        self.cull_recurse(0, shape, &bbox, false, &mut out);
+        let mut sizes = SizeCache::new();
+        self.cull_recurse(0, shape, &bbox, false, &mut sizes, &mut out);
         out
     }
 
@@ -114,6 +121,7 @@ impl<T: Positioned> QuadTree<T> {
         shape: &S,
         shape_bbox: &Rect,
         fully_inside: bool,
+        sizes: &mut SizeCache,
         out: &mut Vec<&'a T>,
     ) {
         let node = &self.nodes[id];
@@ -122,7 +130,7 @@ impl<T: Positioned> QuadTree<T> {
             match node.children {
                 Some(kids) => {
                     for k in kids {
-                        self.cull_recurse(k, shape, shape_bbox, true, out);
+                        self.cull_recurse(k, shape, shape_bbox, true, sizes, out);
                     }
                 }
                 None => out.extend(node.items.iter()),
@@ -134,17 +142,30 @@ impl<T: Positioned> QuadTree<T> {
             Some(kids) => {
                 for k in kids {
                     let child_bbox = self.nodes[k].bbox;
-                    match classify(shape, shape_bbox, &child_bbox) {
+                    match classify(shape, shape_bbox, &child_bbox, sizes) {
                         CellState::Out => {}
-                        CellState::In => self.cull_recurse(k, shape, shape_bbox, true, out),
-                        CellState::Maybe => self.cull_recurse(k, shape, shape_bbox, false, out),
+                        CellState::In => self.cull_recurse(k, shape, shape_bbox, true, sizes, out),
+                        CellState::Maybe => {
+                            self.cull_recurse(k, shape, shape_bbox, false, sizes, out)
+                        }
                     }
                 }
             }
             None => {
+                let point_grid = shape.point_template();
                 for it in &node.items {
-                    if shape.contains_point(it.position()) {
-                        out.push(it);
+                    let p = it.position();
+                    if !shape_bbox.contains(p) {
+                        continue;
+                    }
+                    match point_grid.map(|g| g.cell_at_world(p)) {
+                        Some(CellState::In) => out.push(it),
+                        Some(CellState::Out) => {}
+                        _ => {
+                            if shape.contains_point(p) {
+                                out.push(it);
+                            }
+                        }
                     }
                 }
             }
@@ -152,7 +173,23 @@ impl<T: Positioned> QuadTree<T> {
     }
 }
 
-fn classify<S: Shape>(shape: &S, shape_bbox: &Rect, child_bbox: &Rect) -> CellState {
+fn classify<S: Shape>(
+    shape: &S,
+    shape_bbox: &Rect,
+    child_bbox: &Rect,
+    sizes: &mut SizeCache,
+) -> CellState {
+    let key = (child_bbox.width.to_bits(), child_bbox.height.to_bits());
+    let per_size = sizes
+        .entry(key)
+        .or_insert_with(|| shape.template_for_cell(child_bbox.width, child_bbox.height))
+        .clone();
+    if let Some(grid) = per_size {
+        return grid.cell_at_world(Point::new(
+            child_bbox.x + child_bbox.width / 2.0,
+            child_bbox.y + child_bbox.height / 2.0,
+        ));
+    }
     if let Some(grid) = shape.template_grid() {
         grid.classify_region(child_bbox)
     } else if child_bbox.intersects(shape_bbox) {

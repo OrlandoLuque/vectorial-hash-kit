@@ -66,6 +66,7 @@ assert_eq!(hits.len(), 2);
 ## Roadmap
 
 - Arena free-list so `remove` reclaims orphaned nodes (today they stay as zombies; `NodeId`s are stable but `node_count()` overstates live nodes).
+- Leaf neighbour lists (north/south/east/west) behind a cargo feature, so the bookkeeping compiles out entirely when the feature is off.
 - Stable `ItemRef` so callers can hold onto items across mutations without re-locating them by point + predicate every time.
 - 3D variant (probably feature-gated or via a generic dimension parameter once the 2D shape settles).
 - SIMD-friendly cell layout where it pays off.

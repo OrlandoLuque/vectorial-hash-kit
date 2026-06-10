@@ -34,6 +34,6 @@ pub mod tree;
 pub mod culling;
 
 pub use geom::{Point, Rect};
-pub use template::{CellState, TemplateGrid};
+pub use template::{CellState, PlacedTemplate, TemplateGrid};
 pub use tree::{Node, NodeId, Positioned, Tree};
 pub use culling::Shape;

@@ -1,10 +1,9 @@
 //! Culling: find tree items inside a shape.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use crate::geom::{Point, Rect};
-use crate::template::{CellState, TemplateGrid};
+use crate::template::{CellState, PlacedTemplate, TemplateGrid};
 use crate::tree::{NodeId, Positioned, Tree};
 
 /// A shape the culling algorithm can test against.
@@ -41,10 +40,11 @@ pub trait Shape {
     /// `cell_w` × `cell_h` for this shape at its current position, if one
     /// exists. Returning `None` falls back to `template_grid` / bbox.
     ///
-    /// Contract: the returned grid's cells must be exactly `cell_w` ×
-    /// `cell_h` and anchored on multiples of the cell size, so that aligned
-    /// tree nodes map 1:1 onto template cells.
-    fn template_for_cell(&self, cell_w: f64, cell_h: f64) -> Option<Arc<TemplateGrid>> {
+    /// The [`PlacedTemplate`] shares the canonical grid (`Arc`) — no cell
+    /// data is cloned at resolution time. Contract: the placed grid's cells
+    /// must be exactly `cell_w` × `cell_h` and sit on multiples of the cell
+    /// size, so that aligned tree nodes map 1:1 onto template cells.
+    fn template_for_cell(&self, cell_w: f64, cell_h: f64) -> Option<PlacedTemplate> {
         let _ = (cell_w, cell_h);
         None
     }
@@ -52,13 +52,13 @@ pub trait Shape {
     /// Optional 1×1-cell raster of the shape used for per-item tests in
     /// leaf cells: `In`/`Out` pixels answer immediately and only `Maybe`
     /// (boundary) pixels fall back to the exact `contains_point`.
-    fn point_template(&self) -> Option<&TemplateGrid> {
+    fn point_template(&self) -> Option<&PlacedTemplate> {
         None
     }
 }
 
 /// Per-execution cache: one resolved template per distinct cell size.
-type SizeCache = HashMap<(u64, u64), Option<Arc<TemplateGrid>>>;
+type SizeCache = HashMap<(u64, u64), Option<PlacedTemplate>>;
 
 impl<T: Positioned> Tree<T> {
     /// Return references to every item inside `shape`.
@@ -272,21 +272,25 @@ mod tests {
         fn contains_point(&self, _p: Point) -> bool {
             false
         }
-        fn template_for_cell(&self, cell_w: f64, cell_h: f64) -> Option<Arc<TemplateGrid>> {
+        fn template_for_cell(&self, cell_w: f64, cell_h: f64) -> Option<PlacedTemplate> {
             use CellState::*;
             self.resolved.borrow_mut().push((cell_w, cell_h));
             // Whatever the size, mark the cell range covering x >= 50 as In
             // within the right half of a 100x100 world.
             let cols = (50.0 / cell_w).max(1.0) as u32;
             let rows = (100.0 / cell_h).max(1.0) as u32;
-            Some(Arc::new(TemplateGrid::new(
-                Point::new(50.0, 0.0),
-                cell_w,
-                cell_h,
-                cols,
-                rows,
-                vec![In; (cols * rows) as usize],
-            )))
+            Some(PlacedTemplate::new(
+                std::sync::Arc::new(TemplateGrid::new(
+                    Point::new(50.0, 0.0),
+                    cell_w,
+                    cell_h,
+                    cols,
+                    rows,
+                    vec![In; (cols * rows) as usize],
+                )),
+                0.0,
+                0.0,
+            ))
         }
     }
 
@@ -319,7 +323,7 @@ mod tests {
     /// Maybe pixels defer to contains_point.
     struct RasterShape {
         bbox: Rect,
-        raster: TemplateGrid,
+        raster: PlacedTemplate,
     }
     impl Shape for RasterShape {
         fn bounding_box(&self) -> Rect {
@@ -328,7 +332,7 @@ mod tests {
         fn contains_point(&self, p: Point) -> bool {
             p.y < 2.0 // only used for Maybe pixels
         }
-        fn point_template(&self) -> Option<&TemplateGrid> {
+        fn point_template(&self) -> Option<&PlacedTemplate> {
             Some(&self.raster)
         }
     }
@@ -349,7 +353,10 @@ mod tests {
                 In, Maybe, Out,
             ],
         );
-        let shape = RasterShape { bbox: Rect::new(0.0, 0.0, 3.0, 3.0), raster };
+        let shape = RasterShape {
+            bbox: Rect::new(0.0, 0.0, 3.0, 3.0),
+            raster: PlacedTemplate::new(std::sync::Arc::new(raster), 0.0, 0.0),
+        };
         let mut tree = Tree::<Pt>::new(Rect::new(0.0, 0.0, 10.0, 10.0), 16);
         tree.insert(Pt(Point::new(0.5, 0.5))); // In pixel -> hit
         tree.insert(Pt(Point::new(1.5, 0.5))); // Maybe pixel, y < 2 -> exact says yes

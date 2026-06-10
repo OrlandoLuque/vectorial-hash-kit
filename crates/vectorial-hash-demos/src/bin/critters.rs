@@ -29,13 +29,13 @@
 //! Env: CRITTERS_MAX_FRAMES=N exits after N frames (smoke testing).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use macroquad::prelude::*;
 use macroquad::ui::{hash, root_ui, widgets};
 
 use vectorial_hash::{
-    CellState, Point as VPoint, Positioned, Rect as VRect, Shape, TemplateGrid, Tree,
+    CellState, PlacedTemplate, Point as VPoint, Positioned, Rect as VRect, Shape, TemplateGrid,
+    Tree,
 };
 use vectorial_hash_templates::bank::{FigureKey, TemplateBank};
 use vectorial_hash_templates::polygon::{create_circle, create_drop, rotated_copy, scaled_copy, Polygon};
@@ -182,7 +182,7 @@ struct AttackShape<'a> {
     origin: (i64, i64),
     poly: Polygon,
     bbox: VRect,
-    raster: Option<TemplateGrid>,
+    raster: Option<PlacedTemplate>,
 }
 
 impl Shape for AttackShape<'_> {
@@ -192,21 +192,19 @@ impl Shape for AttackShape<'_> {
     fn contains_point(&self, p: VPoint) -> bool {
         self.poly.is_inside(p.x, p.y)
     }
-    fn template_for_cell(&self, cell_w: f64, cell_h: f64) -> Option<Arc<TemplateGrid>> {
+    fn template_for_cell(&self, cell_w: f64, cell_h: f64) -> Option<PlacedTemplate> {
         if cell_w.fract() != 0.0 || cell_h.fract() != 0.0 {
             return None;
         }
-        self.bank
-            .template_for(
-                &self.figure,
-                cell_w as u32,
-                cell_h as u32,
-                self.angle_deg,
-                self.origin,
-            )
-            .map(Arc::new)
+        self.bank.placed_for(
+            &self.figure,
+            cell_w as u32,
+            cell_h as u32,
+            self.angle_deg,
+            self.origin,
+        )
     }
-    fn point_template(&self) -> Option<&TemplateGrid> {
+    fn point_template(&self) -> Option<&PlacedTemplate> {
         self.raster.as_ref()
     }
 }
@@ -238,7 +236,7 @@ fn make_attack<'a>(
         poly.x_max - poly.x_min,
         poly.y_max - poly.y_min,
     );
-    let raster = arsenal.bank.point_raster(&figure, angle_deg, origin);
+    let raster = arsenal.bank.placed_raster(&figure, angle_deg, origin);
 
     Some(AttackShape {
         bank: &arsenal.bank,

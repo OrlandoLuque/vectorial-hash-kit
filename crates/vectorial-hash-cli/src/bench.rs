@@ -10,10 +10,9 @@
 //! All four must return the same hit count; the bench asserts it.
 
 use std::hint::black_box;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use vectorial_hash::{Point, Positioned, Rect, Shape, TemplateGrid, Tree};
+use vectorial_hash::{PlacedTemplate, Point, Positioned, Rect, Shape, TemplateGrid, Tree};
 use vectorial_hash_templates::adapter::matrix_to_template_grid;
 use vectorial_hash_templates::bank::{FigureKey, TemplateBank};
 use vectorial_hash_templates::polygon::{create_drop, rotated_copy, scaled_copy, Polygon};
@@ -229,7 +228,7 @@ struct BankShape<'a> {
     origin: (i64, i64),
     poly: Polygon,
     bbox: Rect,
-    raster: Option<TemplateGrid>,
+    raster: Option<PlacedTemplate>,
 }
 
 impl Shape for BankShape<'_> {
@@ -239,15 +238,14 @@ impl Shape for BankShape<'_> {
     fn contains_point(&self, p: Point) -> bool {
         self.poly.is_inside(p.x, p.y)
     }
-    fn template_for_cell(&self, cell_w: f64, cell_h: f64) -> Option<Arc<TemplateGrid>> {
+    fn template_for_cell(&self, cell_w: f64, cell_h: f64) -> Option<PlacedTemplate> {
         if cell_w.fract() != 0.0 || cell_h.fract() != 0.0 {
             return None;
         }
         self.bank
-            .template_for(&self.figure, cell_w as u32, cell_h as u32, self.angle, self.origin)
-            .map(Arc::new)
+            .placed_for(&self.figure, cell_w as u32, cell_h as u32, self.angle, self.origin)
     }
-    fn point_template(&self) -> Option<&TemplateGrid> {
+    fn point_template(&self) -> Option<&PlacedTemplate> {
         self.raster.as_ref()
     }
 }
@@ -327,7 +325,7 @@ pub fn run_sizes(points: usize, culls: usize, item_limit: usize, seed: u64) {
     let t = Instant::now();
     bank.generate_size(&figure, &base, &[ANGLE], 1, 1);
     let raster_gen = t.elapsed();
-    let raster = bank.point_raster(&figure, ANGLE, origin);
+    let raster = bank.placed_raster(&figure, ANGLE, origin);
     println!(
         "generated 1x1 raster in {:.2}s ({} unique grids)",
         raster_gen.as_secs_f64(),
@@ -396,6 +394,59 @@ pub fn run_sizes(points: usize, culls: usize, item_limit: usize, seed: u64) {
     };
     time_config("bank <=64, no raster".into(), &no_raster, &tree);
 
+    // --- quadtree: same shapes, 4-way splits (square cells only) ---
+    let mut qtree: QuadTree<Pt> = QuadTree::new(world, item_limit);
+    for p in &pts {
+        qtree.insert(*p);
+    }
+    let bank_shape = BankShape {
+        bank: &bank,
+        figure: figure.clone(),
+        angle: ANGLE,
+        origin,
+        poly: poly.clone(),
+        bbox,
+        raster: raster.clone(),
+    };
+    {
+        let got = qtree.cull(&plain).len();
+        assert_eq!(got, expected, "quadtree plain: {got} != {expected}");
+        let t = Instant::now();
+        for _ in 0..culls {
+            black_box(qtree.cull(&plain).len());
+        }
+        results.push(("quadtree, no templates".into(), t.elapsed()));
+
+        let got = qtree.cull(&bank_shape).len();
+        assert_eq!(got, expected, "quadtree bank: {got} != {expected}");
+        let t = Instant::now();
+        for _ in 0..culls {
+            black_box(qtree.cull(&bank_shape).len());
+        }
+        results.push(("quadtree, bank <=64 + raster".into(), t.elapsed()));
+    }
+
+    // --- uniform grid (industry-standard broadphase baseline) ---
+    let grid_cell = 32.0;
+    let ugrid = UniformGrid::new(WORLD, grid_cell, &pts);
+    {
+        let got = ugrid.query(&bbox, None, &poly).len();
+        assert_eq!(got, expected, "uniform grid: {got} != {expected}");
+        let t = Instant::now();
+        for _ in 0..culls {
+            black_box(ugrid.query(&bbox, None, &poly).len());
+        }
+        results.push((format!("uniform grid {grid_cell}px (industry)"), t.elapsed()));
+
+        let got = ugrid.query(&bbox, raster.as_ref(), &poly).len();
+        assert_eq!(got, expected, "uniform grid + raster: {got} != {expected}");
+        let t = Instant::now();
+        for _ in 0..culls {
+            black_box(ugrid.query(&bbox, raster.as_ref(), &poly).len());
+        }
+        results.push((format!("uniform grid {grid_cell}px + raster"), t.elapsed()));
+    }
+
     println!("\n{:<38} {:>12} {:>14}", "config", "total (ms)", "avg/cull (ms)");
     let base_ms = results[0].1.as_secs_f64() * 1000.0;
     for (name, d) in &results {
@@ -410,13 +461,71 @@ pub fn run_sizes(points: usize, culls: usize, item_limit: usize, seed: u64) {
     }
 }
 
+/// Flat uniform grid of buckets — the classic games-industry broadphase
+/// (spatial hashing over a fixed cell size; see Ericson, *Real-Time
+/// Collision Detection*, ch. 7). Query: iterate the buckets overlapped by
+/// the query bbox and test each point.
+struct UniformGrid {
+    cell: f64,
+    cols: usize,
+    buckets: Vec<Vec<Point>>,
+}
+
+impl UniformGrid {
+    fn new(world: f64, cell: f64, pts: &[Pt]) -> Self {
+        let cols = (world / cell).ceil() as usize;
+        let mut buckets = vec![Vec::new(); cols * cols];
+        for p in pts {
+            let cx = ((p.0.x / cell) as usize).min(cols - 1);
+            let cy = ((p.0.y / cell) as usize).min(cols - 1);
+            buckets[cy * cols + cx].push(p.0);
+        }
+        Self { cell, cols, buckets }
+    }
+
+    /// Collect references to points inside the polygon (same contract as the
+    /// tree culls, for a fair comparison). `raster` optionally replaces the
+    /// exact per-point test (boundary pixels still use geometry).
+    fn query<'a>(
+        &'a self,
+        bbox: &Rect,
+        raster: Option<&PlacedTemplate>,
+        poly: &Polygon,
+    ) -> Vec<&'a Point> {
+        let c0 = ((bbox.x / self.cell).floor().max(0.0)) as usize;
+        let r0 = ((bbox.y / self.cell).floor().max(0.0)) as usize;
+        let c1 = (((bbox.x_max() / self.cell).ceil()) as usize).min(self.cols);
+        let r1 = (((bbox.y_max() / self.cell).ceil()) as usize).min(self.cols);
+        let mut out = Vec::new();
+        for row in r0..r1 {
+            for col in c0..c1 {
+                for p in &self.buckets[row * self.cols + col] {
+                    if !bbox.contains(*p) {
+                        continue;
+                    }
+                    match raster.map(|r| r.cell_at_world(*p)) {
+                        Some(vectorial_hash::CellState::In) => out.push(p),
+                        Some(vectorial_hash::CellState::Out) => {}
+                        _ => {
+                            if poly.is_inside(p.x, p.y) {
+                                out.push(p);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
 /// Object-safe shim so heterogeneous shapes can share one timing closure.
 trait ErasedShape {
     fn bounding_box(&self) -> Rect;
     fn contains_point(&self, p: Point) -> bool;
     fn template_grid(&self) -> Option<&TemplateGrid>;
-    fn template_for_cell(&self, w: f64, h: f64) -> Option<Arc<TemplateGrid>>;
-    fn point_template(&self) -> Option<&TemplateGrid>;
+    fn template_for_cell(&self, w: f64, h: f64) -> Option<PlacedTemplate>;
+    fn point_template(&self) -> Option<&PlacedTemplate>;
 }
 
 impl<S: Shape> ErasedShape for S {
@@ -429,10 +538,10 @@ impl<S: Shape> ErasedShape for S {
     fn template_grid(&self) -> Option<&TemplateGrid> {
         Shape::template_grid(self)
     }
-    fn template_for_cell(&self, w: f64, h: f64) -> Option<Arc<TemplateGrid>> {
+    fn template_for_cell(&self, w: f64, h: f64) -> Option<PlacedTemplate> {
         Shape::template_for_cell(self, w, h)
     }
-    fn point_template(&self) -> Option<&TemplateGrid> {
+    fn point_template(&self) -> Option<&PlacedTemplate> {
         Shape::point_template(self)
     }
 }
@@ -447,10 +556,10 @@ impl Shape for &dyn ErasedShape {
     fn template_grid(&self) -> Option<&TemplateGrid> {
         (**self).template_grid()
     }
-    fn template_for_cell(&self, w: f64, h: f64) -> Option<Arc<TemplateGrid>> {
+    fn template_for_cell(&self, w: f64, h: f64) -> Option<PlacedTemplate> {
         (**self).template_for_cell(w, h)
     }
-    fn point_template(&self) -> Option<&TemplateGrid> {
+    fn point_template(&self) -> Option<&PlacedTemplate> {
         (**self).point_template()
     }
 }

@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use rayon::prelude::*;
-use vectorial_hash::{Point, TemplateGrid};
+use vectorial_hash::{PlacedTemplate, Point, TemplateGrid};
 
 use crate::matrix;
 use crate::polygon::{rotated_copy, Polygon};
@@ -207,6 +207,43 @@ impl TemplateBank {
         self.template_for(figure, 1, 1, angle_deg, origin)
     }
 
+    /// Zero-clone variant of [`TemplateBank::template_for`]: returns a
+    /// [`PlacedTemplate`] sharing the canonical grid behind its `Arc`, with
+    /// the world displacement carried alongside. This is what the cull hot
+    /// path should use — no cell data is copied per resolution.
+    pub fn placed_for(
+        &self,
+        figure: &FigureKey,
+        cell_w: u32,
+        cell_h: u32,
+        angle_deg: f64,
+        origin: (i64, i64),
+    ) -> Option<PlacedTemplate> {
+        let idx = self.figures.get(figure)?.sizes.get(&(cell_w, cell_h))?;
+        let cw = cell_w as i64;
+        let ch = cell_h as i64;
+        let ox = origin.0.rem_euclid(cw);
+        let oy = origin.1.rem_euclid(ch);
+        let base_x = origin.0 - ox;
+        let base_y = origin.1 - oy;
+        let entry = idx.map.get(&(angle_deg.to_bits(), ox as u32, oy as u32))?;
+        Some(PlacedTemplate::new(
+            entry.grid.clone(),
+            entry.anchor_x + base_x as f64,
+            entry.anchor_y + base_y as f64,
+        ))
+    }
+
+    /// Zero-clone variant of [`TemplateBank::point_raster`].
+    pub fn placed_raster(
+        &self,
+        figure: &FigureKey,
+        angle_deg: f64,
+        origin: (i64, i64),
+    ) -> Option<PlacedTemplate> {
+        self.placed_for(figure, 1, 1, angle_deg, origin)
+    }
+
     /// Total index leaves (key combinations).
     pub fn entry_count(&self) -> usize {
         self.entries
@@ -288,6 +325,23 @@ mod tests {
         // Pixel well inside the square -> In; far outside -> Out.
         assert_eq!(raster.cell_at_world(Point::new(104.5, 54.5)), CellState::In);
         assert_eq!(raster.cell_at_world(Point::new(120.5, 54.5)), CellState::Out);
+    }
+
+    #[test]
+    fn placed_for_matches_materialized_template() {
+        let base = create_square(0.0, 0.0, 8.0, 8.0);
+        let fig = FigureKey::new(7, &[8.0]);
+        let mut bank = TemplateBank::new();
+        bank.generate_size(&fig, &base, &[0.0], 4, 4);
+        let origin = (37i64, 21i64);
+        let materialized = bank.template_for(&fig, 4, 4, 0.0, origin).unwrap();
+        let placed = bank.placed_for(&fig, 4, 4, 0.0, origin).unwrap();
+        for cx in (28..56).step_by(2) {
+            for cy in (12..40).step_by(2) {
+                let p = Point::new(cx as f64 + 1.0, cy as f64 + 1.0);
+                assert_eq!(placed.cell_at_world(p), materialized.cell_at_world(p), "at {p:?}");
+            }
+        }
     }
 
     #[test]
