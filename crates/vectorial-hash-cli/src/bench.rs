@@ -676,7 +676,7 @@ impl UniformGrid {
         for row in r0..r1 {
             for col in c0..c1 {
                 for p in &self.buckets[row * self.cols + col] {
-                    if !bbox.contains(*p) {
+                    if !bbox.contains_closed(*p) {
                         continue;
                     }
                     match raster.map(|r| r.cell_at_world(*p)) {

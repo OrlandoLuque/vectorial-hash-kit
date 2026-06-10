@@ -69,9 +69,25 @@ assert_eq!(hits.len(), 2);
 - **No I/O, no storage backends**: this crate stays dependency-light. Template generation (incl. Redis coordination) lives in [`vectorial-hash-templates`](../vectorial-hash-templates).
 - **Items as points** (for now): the PDF outlines extending to area/volume items by adjusting insert+cull. That's deferred.
 
+## Validation
+
+The cull is validated by an exhaustive property/fuzz campaign
+(`vectorial-hash-templates/tests/exhaustive_culling.rs`): deterministic seeds
+generate churned trees × random figures, scales, angles and integer origins,
+and every configuration (plain bbox, single grid, per-size bank ± raster, and
+all `cull_walk` strategies) must return exactly the brute-force item set.
+**Exactness contract**: results are exact for items farther than ~2×EPSILON
+(1e-5) from the figure boundary; items inside that epsilon halo may classify
+either way (the exact-geometry templates vs the epsilon-tolerant on-edge
+rule). The campaign found and fixed two real defects: unbounded subdivision
+when items share one position (now a soft limit), and unstable point-in-
+polygon answers when the casting ray grazed a vertex (now a safe-ray pick).
+Run the long campaign with
+`cargo test -p vectorial-hash-templates --release --test exhaustive_culling -- --ignored`
+(add `--features neighbors` for the ropes strategy).
+
 ## Roadmap
 
-- **Exhaustive culling validation**: a systematic test campaign proving the cull returns exactly the expected items — property-based/fuzz style (random trees with churn × random figures, scales, angles and origins), with every result cross-checked against brute-force point-in-shape over all items, covering boundary cases (items exactly on cell edges, on figure boundaries, integer-vs-fractional origins) and all paths (per-size templates, single grid, raster, bbox fallback, `cull_walk` strategies). Today's equality gates in the benches and the unit tests cover specific scenarios; this would cover the space.
 - Arena free-list so `remove` reclaims orphaned nodes (today they stay as zombies; `NodeId`s are stable but `node_count()` overstates live nodes).
 - Leaf neighbour lists (north/south/east/west) behind a cargo feature, so the bookkeeping compiles out entirely when the feature is off.
 - Stable `ItemRef` so callers can hold onto items across mutations without re-locating them by point + predicate every time.

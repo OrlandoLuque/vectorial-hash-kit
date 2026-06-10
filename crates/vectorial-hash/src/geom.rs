@@ -35,6 +35,14 @@ impl Rect {
         p.x >= self.x && p.x < self.x_max() && p.y >= self.y && p.y < self.y_max()
     }
 
+    /// Closed-boundary variant: includes the right/bottom edges. Use when
+    /// testing against regions whose boundary belongs to them (e.g. a
+    /// shape's bounding box — `contains` would wrongly reject a point lying
+    /// exactly on the box's max edge, where a closed shape boundary can sit).
+    pub fn contains_closed(&self, p: Point) -> bool {
+        p.x >= self.x && p.x <= self.x_max() && p.y >= self.y && p.y <= self.y_max()
+    }
+
     pub fn intersects(&self, other: &Rect) -> bool {
         !(other.x >= self.x_max()
             || other.x_max() <= self.x

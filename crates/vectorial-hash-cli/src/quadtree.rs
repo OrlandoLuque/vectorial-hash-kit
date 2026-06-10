@@ -155,7 +155,7 @@ impl<T: Positioned> QuadTree<T> {
                 let point_grid = shape.point_template();
                 for it in &node.items {
                     let p = it.position();
-                    if !shape_bbox.contains(p) {
+                    if !shape_bbox.contains_closed(p) {
                         continue;
                     }
                     match point_grid.map(|g| g.cell_at_world(p)) {

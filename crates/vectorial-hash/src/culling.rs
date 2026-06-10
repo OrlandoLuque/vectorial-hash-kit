@@ -138,7 +138,9 @@ impl<T: Positioned> Tree<T> {
         let point_grid = shape.point_template();
         for it in &self.get(leaf).items {
             let p = it.position();
-            if !shape_bbox.contains(p) {
+            // Closed contains: the shape's boundary belongs to the shape, so
+            // points exactly on the bbox max edges must not be pre-filtered.
+            if !shape_bbox.contains_closed(p) {
                 continue;
             }
             match point_grid.map(|g| g.cell_at_world(p)) {

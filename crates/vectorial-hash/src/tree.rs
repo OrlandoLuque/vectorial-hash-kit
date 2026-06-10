@@ -32,6 +32,7 @@ impl Side {
         }
     }
 
+    #[cfg_attr(not(feature = "neighbors"), allow(dead_code))]
     fn index(self) -> usize {
         match self {
             Side::West => 0,
@@ -78,6 +79,9 @@ pub struct Tree<T: Positioned> {
     /// items fit within this. Defaults to `item_limit`; setting it lower adds
     /// hysteresis so cells don't flap between split and merged.
     pub merge_limit: usize,
+    /// Leaves whose longest side is at or below this never split further,
+    /// even over `item_limit` (safety net against degenerate subdivision).
+    min_cell: f64,
     pub root: NodeId,
 }
 
@@ -95,8 +99,9 @@ impl<T: Positioned> Tree<T> {
             merge_limit <= item_limit,
             "merge_limit must be <= item_limit",
         );
+        let min_cell = bbox.width.max(bbox.height) * 1e-12;
         let root = Node::new_leaf(bbox, None);
-        Self { nodes: vec![root], item_limit, merge_limit, root: NodeId(0) }
+        Self { nodes: vec![root], item_limit, merge_limit, min_cell, root: NodeId(0) }
     }
 
     pub fn get(&self, id: NodeId) -> &Node<T> {
@@ -233,13 +238,23 @@ impl<T: Positioned> Tree<T> {
         }
     }
 
-    /// Split a leaf into two children, redistribute its items, and recurse if needed.
+    /// Split a leaf into two children, redistribute its items, and recurse if
+    /// needed. A leaf over `item_limit` stays unsplit (soft limit) when no
+    /// split can make progress: all its items share one position, or the
+    /// cell has already shrunk to the minimum size.
     fn divide(&mut self, id: NodeId) {
         let (bbox, items) = {
             let n = self.get_mut(id);
             let items = std::mem::take(&mut n.items);
             (n.bbox, items)
         };
+
+        let first = items[0].position();
+        let inseparable = items.iter().all(|it| it.position() == first);
+        if inseparable || bbox.width.max(bbox.height) <= self.min_cell {
+            self.get_mut(id).items = items;
+            return;
+        }
 
         let (a_bbox, b_bbox) = pick_split(bbox, &items);
 
@@ -684,6 +699,22 @@ mod tests {
         let landed = tree.locate(Point::new(70.0, 70.0));
         assert!(tree.get(landed).items.iter().any(|p| p.0 == Point::new(70.0, 70.0)),
             "moved item should live under the right subtree (root child = {:?})", right);
+    }
+
+    #[test]
+    fn duplicate_positions_do_not_split_forever() {
+        // 5 identical positions with item_limit 1: an unguarded divide would
+        // recurse forever (identical points can never be separated).
+        let mut tree = Tree::<Pt>::new(Rect::new(0.0, 0.0, 100.0, 100.0), 1);
+        for _ in 0..5 {
+            assert!(tree.insert(Pt(Point::new(10.0, 10.0))));
+        }
+        assert_eq!(tree.item_count(), 5);
+        // Mixed case: duplicates plus a separable point still divides sanely.
+        assert!(tree.insert(Pt(Point::new(90.0, 90.0))));
+        assert_eq!(tree.item_count(), 6);
+        let leaf = tree.locate(Point::new(10.0, 10.0));
+        assert_eq!(tree.get(leaf).items.len(), 5, "duplicates stay in one leaf");
     }
 
     #[test]

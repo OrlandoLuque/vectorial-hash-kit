@@ -158,18 +158,24 @@ impl Polygon {
     /// Check if a point is inside this polygon using winding number ray-casting.
     /// Faithfully ports the PHP isInside() logic including edge-on-point checks
     /// and special arc handling.
+    ///
+    /// Robustness: the classic horizontal ray degenerates when it passes
+    /// within EPSILON of a vertex (e.g. a square rotated 135° puts two
+    /// vertices at the test point's exact height) or nearly tangent to an
+    /// arc — crossing counts then become unstable and the same geometric
+    /// configuration can answer differently at different float offsets. We
+    /// therefore pick a ray direction that stays clear of every vertex and
+    /// arc tangency before counting; the first candidate is the original
+    /// horizontal ray, so clean cases behave exactly as before.
     pub fn is_inside(&self, vx: f64, vy: f64) -> bool {
         let test_point = Vertex::new(vx, vy);
-        let infinity = Vertex::new(-10_000_000.0, vy);
         let n = self.vertices.len();
-        let mut winding_number = 0;
 
+        // 1) On the boundary counts as inside.
         for i in 0..n {
             let j = self.next_idx(i);
             let q = &self.vertices[i];
             let r = &self.vertices[j];
-
-            // If the point lies exactly on an edge, it's inside
             let on_edge = if q.seg.d == 0 {
                 intersector::intersection(&test_point, &test_point, q, r)
             } else {
@@ -178,25 +184,70 @@ impl Polygon {
             if !on_edge.is_empty() {
                 return true;
             }
+        }
 
-            // Cast ray from infinity to test_point
+        // 2) Winding count with a numerically safe ray.
+        for k in 0..8u32 {
+            let ang = k as f64 * 0.39996; // k = 0 is the original horizontal ray
+            let infinity = Vertex::new(
+                vx - 10_000_000.0 * ang.cos(),
+                vy - 10_000_000.0 * ang.sin(),
+            );
+            if !self.ray_is_degenerate(&infinity, &test_point) {
+                return self.winding_is_odd(&infinity, &test_point);
+            }
+        }
+        // Every probe grazed something (pathological): legacy behaviour.
+        let infinity = Vertex::new(-10_000_000.0, vy);
+        self.winding_is_odd(&infinity, &test_point)
+    }
+
+    /// A ray is degenerate when it passes within ~EPSILON of any vertex or
+    /// almost tangent to any arc: intersection counts are then unreliable.
+    fn ray_is_degenerate(&self, infinity: &Vertex, test_point: &Vertex) -> bool {
+        let tol = 2.0 * intersector::EPSILON;
+        for v in &self.vertices {
+            if intersector::dist_point_to_line(v, infinity, test_point) <= tol {
+                return true;
+            }
+            if v.seg.d != 0 {
+                let centre = Vertex::new(v.seg.xc, v.seg.yc);
+                let radius = intersector::dist(v.seg.xc, v.seg.yc, v.x, v.y);
+                let d = intersector::dist_point_to_line(&centre, infinity, test_point);
+                if (d - radius).abs() <= tol {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Original PHP winding logic, parameterized by the ray start.
+    fn winding_is_odd(&self, infinity: &Vertex, test_point: &Vertex) -> bool {
+        let n = self.vertices.len();
+        let mut winding_number = 0;
+        for i in 0..n {
+            let j = self.next_idx(i);
+            let q = &self.vertices[i];
+            let r = &self.vertices[j];
+
             let int = if q.seg.d == 0 {
-                intersector::intersection(&infinity, &test_point, q, r)
+                intersector::intersection(infinity, test_point, q, r)
             } else {
-                intersector::line_arc_intersection(&infinity, &test_point, q, r, true)
+                intersector::line_arc_intersection(infinity, test_point, q, r, true)
             };
 
             if int.len() == 2 && q.seg.d != 0 {
                 // Arc with 2 intersections: check if endpoints are on the ray
-                let q_intercepts = !intersector::intersection(&infinity, &test_point, q, q).is_empty();
-                let r_intercepts = !intersector::intersection(&infinity, &test_point, r, r).is_empty();
+                let q_intercepts = !intersector::intersection(infinity, test_point, q, q).is_empty();
+                let r_intercepts = !intersector::intersection(infinity, test_point, r, r).is_empty();
                 if q_intercepts ^ r_intercepts {
                     winding_number += 1;
                 }
             } else if int.len() == 1 {
                 // Single intersection: check vertex cases
-                let q_intercepts = !intersector::intersection(&infinity, &test_point, q, q).is_empty();
-                let r_intercepts = !intersector::intersection(&infinity, &test_point, r, r).is_empty();
+                let q_intercepts = !intersector::intersection(infinity, test_point, q, q).is_empty();
+                let r_intercepts = !intersector::intersection(infinity, test_point, r, r).is_empty();
                 if (!q_intercepts && !r_intercepts)
                     || (q_intercepts && self.is_vertical_vertex(i))
                 {

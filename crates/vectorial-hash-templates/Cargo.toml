@@ -20,3 +20,6 @@ redis = { workspace = true, optional = true }
 [features]
 default = []
 redis-store = ["dep:redis"]
+# Enables the ropes neighbour strategy in the core crate so the exhaustive
+# culling campaign can cover cull_walk with stored neighbour lists.
+neighbors = ["vectorial-hash/neighbors"]

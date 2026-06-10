@@ -120,6 +120,12 @@ fn point_on_line(p: &Vertex, a1: &Vertex, a2: &Vertex) -> bool {
         && (p.y >= a1.y.min(a2.y) && p.y <= a1.y.max(a2.y))
 }
 
+/// Perpendicular distance from `p` to the infinite line through `q0`-`q1`.
+/// Used to detect numerically degenerate ray choices in point-in-polygon.
+pub fn dist_point_to_line(p: &Vertex, q0: &Vertex, q1: &Vertex) -> f64 {
+    dist_from_seg(p, q0, q1)
+}
+
 fn dist_from_seg(p: &Vertex, q0: &Vertex, q1: &Vertex) -> f64 {
     let dx21 = q1.x - q0.x;
     let dy21 = q1.y - q0.y;
