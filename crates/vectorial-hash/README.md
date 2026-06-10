@@ -71,6 +71,7 @@ assert_eq!(hits.len(), 2);
 
 ## Roadmap
 
+- **Exhaustive culling validation**: a systematic test campaign proving the cull returns exactly the expected items — property-based/fuzz style (random trees with churn × random figures, scales, angles and origins), with every result cross-checked against brute-force point-in-shape over all items, covering boundary cases (items exactly on cell edges, on figure boundaries, integer-vs-fractional origins) and all paths (per-size templates, single grid, raster, bbox fallback, `cull_walk` strategies). Today's equality gates in the benches and the unit tests cover specific scenarios; this would cover the space.
 - Arena free-list so `remove` reclaims orphaned nodes (today they stay as zombies; `NodeId`s are stable but `node_count()` overstates live nodes).
 - Leaf neighbour lists (north/south/east/west) behind a cargo feature, so the bookkeeping compiles out entirely when the feature is off.
 - Stable `ItemRef` so callers can hold onto items across mutations without re-locating them by point + predicate every time.
