@@ -76,6 +76,21 @@ impl TemplateGrid {
         )
     }
 
+    /// State of the single cell containing world point `p`.
+    /// Points outside the grid are `Out` (the grid covers the shape's
+    /// bounding box, so beyond it there is no shape).
+    pub fn cell_at_world(&self, p: Point) -> CellState {
+        if p.x < self.origin_x || p.y < self.origin_y {
+            return CellState::Out;
+        }
+        let col = ((p.x - self.origin_x) / self.cell_w).floor();
+        let row = ((p.y - self.origin_y) / self.cell_h).floor();
+        if col >= self.cols as f64 || row >= self.rows as f64 {
+            return CellState::Out;
+        }
+        self.cell(col as u32, row as u32)
+    }
+
     /// Copy of this grid re-anchored at `origin + (dx, dy)`.
     ///
     /// Lets one precomputed template be stamped at any world position (the
@@ -205,6 +220,15 @@ mod tests {
         let g = centre_in_grid();
         // straddles two corner Out cells and pokes outside on the right.
         assert_eq!(g.classify_region(&Rect::new(0.0, 0.0, 100.0, 10.0)), CellState::Out);
+    }
+
+    #[test]
+    fn cell_at_world_reads_single_cells_and_outside_is_out() {
+        let g = centre_in_grid();
+        assert_eq!(g.cell_at_world(Point::new(15.0, 15.0)), CellState::In);
+        assert_eq!(g.cell_at_world(Point::new(5.0, 5.0)), CellState::Out);
+        assert_eq!(g.cell_at_world(Point::new(-1.0, 15.0)), CellState::Out);
+        assert_eq!(g.cell_at_world(Point::new(30.0, 15.0)), CellState::Out);
     }
 
     #[test]

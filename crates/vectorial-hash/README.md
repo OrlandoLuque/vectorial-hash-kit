@@ -15,7 +15,12 @@ A binary-split spatial tree where items live in leaf cells. When a cell exceeds 
 - Rectangles split along the long axis so children are closer to square.
 - Squares pick the axis that distributes their items most evenly.
 
-Queries (`Tree::cull`) walk the tree against a [`Shape`]. If the shape carries a [`TemplateGrid`], each node's bbox is classified as **green** (fully inside the shape — take every item without per-point checks), **white** (fully outside — skip the subtree) or **yellow** (recurse). Without a template, the path falls back to bbox-intersect + per-point check.
+Queries (`Tree::cull`) walk the tree against a [`Shape`]. Each node's bbox is classified as **green** (fully inside the shape — take every item without per-point checks), **white** (fully outside — skip the subtree) or **yellow** (recurse). Two template mechanisms drive this, tried in order:
+
+1. **Per-cell-size selection** (`Shape::template_for_cell`, the paper's scheme): the shape resolves, for each tree-cell size, the precomputed template whose generation offset matches the figure's real position within the global virtual grid of that size. Template cells align 1:1 with same-size tree cells, so a node classifies with one direct cell read; `cull` resolves each size once per execution and caches it. The figure is never moved — the matching template is selected.
+2. **Single fixed grid** (`Shape::template_grid`): one grid covering the whole shape, classified per node via `classify_region`.
+
+Leaf items can additionally be answered by a 1×1 raster (`Shape::point_template`): `In`/`Out` pixels skip geometry entirely and only boundary (`Maybe`) pixels run the exact `contains_point`, after a bounding-box pre-filter. Without any template, the path falls back to bbox-intersect + per-point check.
 
 ## Public surface
 

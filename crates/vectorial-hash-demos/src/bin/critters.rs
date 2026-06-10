@@ -1,27 +1,35 @@
-//! Visual critters demo.
+//! Visual critters demo — precise template application.
 //!
 //! A 2D map indexed by a `vectorial_hash::Tree`. Critters of three kinds move
 //! with distinct behaviours and attack using **precomputed template areas**
-//! (a template set generated at startup and served from a `TemplateIndex`).
-//! Dead critters respawn after a delay. Each live tree region is drawn in its
-//! own colour, so splits and merge-ups are visible in real time.
+//! served from a hierarchical [`TemplateBank`] (shape → dims → cell width →
+//! cell height → angle → offset x → offset y), generated at startup.
+//!
+//! The attack figure is **never moved to fit a grid**: it is applied at its
+//! real (integer) origin, and for every tree-cell size touched the bank
+//! serves the template whose generation offset matches the origin's
+//! displacement within the global virtual grid of that size — so template
+//! cells align 1:1 with the map's cells. Leaf items are resolved with a 1×1
+//! raster (only boundary pixels need exact geometry). Dead critters respawn;
+//! each live tree region is drawn in its own colour, so splits and merge-ups
+//! are visible in real time.
 //!
 //! Run: `cargo run -p vectorial-hash-demos --bin critters --release`
 //!
 //! Controls:
 //! - `1`/`2`/`3` select the spawn brush (drifter / hunter / pulsar)
-//! - left click spawns a brush critter at the cursor, right click removes the
-//!   critter under the cursor (no respawn)
+//! - left click (hold to paint) spawns at the cursor, right click removes
 //! - `+`/`-` spawn / remove five critters at random
 //! - `R` cycles region rendering (fill+lines / lines / off)
 //! - `[` / `]` halve / double simulation speed, `Space` pauses, `Esc` quits
-//! - the "tuning (live)" panel adjusts, while running: the tree's split and
-//!   merge thresholds (tree is rebuilt on change), per-kind population
-//!   targets, respawn delay, simulation speed and fire rate
+//! - the "tuning (live)" panel adjusts split/merge thresholds (tree rebuilt
+//!   on change), per-kind population targets, respawn delay, speed and fire
+//!   rate while the simulation runs
 //!
 //! Env: CRITTERS_MAX_FRAMES=N exits after N frames (smoke testing).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use macroquad::prelude::*;
 use macroquad::ui::{hash, root_ui, widgets};
@@ -29,26 +37,29 @@ use macroquad::ui::{hash, root_ui, widgets};
 use vectorial_hash::{
     CellState, Point as VPoint, Positioned, Rect as VRect, Shape, TemplateGrid, Tree,
 };
-use vectorial_hash_templates::adapter::{matrix_to_template_grid, TemplateIndex, TemplateKey};
+use vectorial_hash_templates::bank::{FigureKey, TemplateBank};
 use vectorial_hash_templates::polygon::{create_circle, create_drop, rotated_copy, scaled_copy, Polygon};
-use vectorial_hash_templates::templates::{angle_to_radians, get_template_grid_fast, TemplateStore};
+use vectorial_hash_templates::templates::angle_to_radians;
 
-const MAP_W: f64 = 800.0;
-const MAP_H: f64 = 800.0;
+/// World size (map units). Power of two so binary splits produce integer
+/// cell sizes aligned with the global virtual grids.
+const MAP_W: f64 = 1024.0;
+const MAP_H: f64 = 1024.0;
+/// Render scale: world 1024 drawn at 768 px.
+const S: f32 = 0.75;
 const PANEL_W: f32 = 320.0;
 const MARGIN: f64 = 4.0;
 
-/// Template-grid cell size (px) used for the attack templates.
-const G: i64 = 20;
-/// Sub-cell anchor quantization: 4 offsets per axis, 5 px apart.
-const OFF_STEPS: i32 = 4;
-const OFF_STEP: f64 = G as f64 / OFF_STEPS as f64;
 const ANGLE_STEP_DEG: f64 = 15.0;
-
 const DROP_ID: u32 = 0;
 const CIRCLE_ID: u32 = 1;
 const DROP_SCALE: f64 = 110.0;
-const CIRCLE_SCALE: f64 = 48.0;
+const CIRCLE_RADIUS: f64 = 48.0;
+
+/// Cell sizes (w, h) with full template sets. Tree cells of other sizes fall
+/// back to bbox recursion (internal nodes) or the 1×1 raster (leaf items).
+const TEMPLATE_SIZES: [(u32, u32); 7] =
+    [(8, 8), (16, 16), (32, 32), (8, 16), (16, 8), (16, 32), (32, 16)];
 
 const ITEM_LIMIT: usize = 3;
 const RESPAWN_DELAY: f64 = 2.5;
@@ -78,9 +89,9 @@ impl Kind {
     }
     fn speed(self) -> f64 {
         match self {
-            Kind::Drifter => 60.0,
-            Kind::Hunter => 85.0,
-            Kind::Pulsar => 70.0,
+            Kind::Drifter => 75.0,
+            Kind::Hunter => 105.0,
+            Kind::Pulsar => 88.0,
         }
     }
     fn cooldown(self) -> (f32, f32) {
@@ -106,101 +117,109 @@ impl Positioned for Critter {
     }
 }
 
-/// The "occasion" template set: every (shape, angle, sub-cell offset) combo
-/// decoded once at startup into the hash-keyed TemplateIndex, plus the base
-/// rotated polygons used for the per-point fallback at attack time.
+/// The startup-generated template bank plus per-figure metadata.
 struct Arsenal {
-    index: TemplateIndex,
+    bank: TemplateBank,
+    figures: HashMap<u32, FigureKey>,
     base_polys: HashMap<(u32, i64), Polygon>,
-    combos: usize,
-    unique: u32,
+    gen_seconds: f64,
 }
 
 fn build_arsenal() -> Arsenal {
-    let store = TemplateStore::new();
-    let mut index = TemplateIndex::new();
+    let start = std::time::Instant::now();
+    let mut bank = TemplateBank::new();
+    let mut figures = HashMap::new();
     let mut base_polys = HashMap::new();
-    let mut combos = 0usize;
 
-    let shapes: [(u32, f64, Polygon, Vec<f64>); 2] = [
+    let drop_angles: Vec<f64> = (0..(360.0 / ANGLE_STEP_DEG) as i64)
+        .map(|i| i as f64 * ANGLE_STEP_DEG)
+        .collect();
+
+    // (shape_id, dims, scaled base polygon, angles)
+    let shapes: [(u32, Vec<f64>, Polygon, Vec<f64>); 2] = [
         (
             DROP_ID,
-            DROP_SCALE,
+            vec![0.2 * DROP_SCALE, 0.8 * DROP_SCALE],
             scaled_copy(&create_drop(0.2, 0.8), DROP_SCALE, DROP_SCALE),
-            (0..(360.0 / ANGLE_STEP_DEG) as i64)
-                .map(|i| i as f64 * ANGLE_STEP_DEG)
-                .collect(),
+            drop_angles,
         ),
         (
             CIRCLE_ID,
-            CIRCLE_SCALE,
-            scaled_copy(&create_circle(1.0), CIRCLE_SCALE, CIRCLE_SCALE),
+            vec![CIRCLE_RADIUS],
+            scaled_copy(&create_circle(1.0), CIRCLE_RADIUS, CIRCLE_RADIUS),
             vec![0.0],
         ),
     ];
 
-    for (shape_id, scale, base, angles) in shapes {
-        for angle in angles {
-            let rotated = rotated_copy(&base, angle_to_radians(angle));
-            base_polys.insert((shape_id, angle as i64), rotated.clone());
-            for ox in 0..OFF_STEPS {
-                for oy in 0..OFF_STEPS {
-                    let mut moved = rotated.clone();
-                    moved.move_by(ox as f64 * OFF_STEP, oy as f64 * OFF_STEP);
-                    let gxr = [
-                        (moved.x_min / G as f64).floor() as i64,
-                        (moved.x_max / G as f64).ceil() as i64,
-                    ];
-                    let gyr = [
-                        (moved.y_min / G as f64).floor() as i64,
-                        (moved.y_max / G as f64).ceil() as i64,
-                    ];
-                    let matrix =
-                        get_template_grid_fast(gxr[0], gyr[0], gxr[1], gyr[1], G, G, &moved);
-                    store.store_dedup(
-                        &matrix,
-                        &format!("s{}-a{}-o{},{}", shape_id, angle, ox, oy),
-                    );
-                    let anchor =
-                        VPoint::new(gxr[0] as f64 * G as f64, gyr[0] as f64 * G as f64);
-                    let grid = matrix_to_template_grid(&matrix, anchor, G as f64, G as f64);
-                    index.insert(
-                        TemplateKey::new(shape_id, scale, angle, G, ox, oy),
-                        grid,
-                    );
-                    combos += 1;
-                }
-            }
+    for (shape_id, dims, base, angles) in shapes {
+        let figure = FigureKey::new(shape_id, &dims);
+        for &(cw, ch) in &TEMPLATE_SIZES {
+            bank.generate_size(&figure, &base, &angles, cw, ch);
         }
+        // 1×1 point rasters: one per angle (integer origins → offset (0,0)).
+        bank.generate_size(&figure, &base, &angles, 1, 1);
+        for &angle in &angles {
+            base_polys.insert((shape_id, angle as i64), rotated_copy(&base, angle_to_radians(angle)));
+        }
+        figures.insert(shape_id, figure);
     }
 
-    Arsenal { index, base_polys, combos, unique: store.template_count() }
+    Arsenal {
+        bank,
+        figures,
+        base_polys,
+        gen_seconds: start.elapsed().as_secs_f64(),
+    }
 }
 
-/// Attack area: precomputed template re-anchored at the (quantized) attack
-/// position + the matching polygon for yellow-cell per-point checks.
-struct AttackShape {
+/// Attack area applied at its real integer origin. Internal tree nodes are
+/// classified via per-size templates from the bank; leaf items use the 1×1
+/// raster with exact geometry only on boundary pixels.
+struct AttackShape<'a> {
+    bank: &'a TemplateBank,
+    figure: FigureKey,
+    angle_deg: f64,
+    origin: (i64, i64),
     poly: Polygon,
     bbox: VRect,
-    grid: TemplateGrid,
+    raster: Option<TemplateGrid>,
 }
 
-impl Shape for AttackShape {
+impl Shape for AttackShape<'_> {
     fn bounding_box(&self) -> VRect {
         self.bbox
     }
     fn contains_point(&self, p: VPoint) -> bool {
         self.poly.is_inside(p.x, p.y)
     }
-    fn template_grid(&self) -> Option<&TemplateGrid> {
-        Some(&self.grid)
+    fn template_for_cell(&self, cell_w: f64, cell_h: f64) -> Option<Arc<TemplateGrid>> {
+        if cell_w.fract() != 0.0 || cell_h.fract() != 0.0 {
+            return None;
+        }
+        self.bank
+            .template_for(
+                &self.figure,
+                cell_w as u32,
+                cell_h as u32,
+                self.angle_deg,
+                self.origin,
+            )
+            .map(Arc::new)
+    }
+    fn point_template(&self) -> Option<&TemplateGrid> {
+        self.raster.as_ref()
     }
 }
 
-/// Build an attack at `pos`. For the drop, `aim` is the direction to fire
-/// along (the drop's body extends along +y at angle 0). For the circle blast,
-/// pass `None`.
-fn make_attack(arsenal: &Arsenal, shape_id: u32, pos: VPoint, aim: Option<(f64, f64)>) -> Option<AttackShape> {
+/// Build an attack at `pos` (rounded to the integer lattice the templates
+/// were generated on). For the drop, `aim` is the firing direction (the
+/// drop's body extends along +y at angle 0); the circle blast passes `None`.
+fn make_attack<'a>(
+    arsenal: &'a Arsenal,
+    shape_id: u32,
+    pos: VPoint,
+    aim: Option<(f64, f64)>,
+) -> Option<AttackShape<'a>> {
     let angle_deg = match aim {
         Some((dx, dy)) => {
             let a = (-dx).atan2(dy).to_degrees();
@@ -208,37 +227,45 @@ fn make_attack(arsenal: &Arsenal, shape_id: u32, pos: VPoint, aim: Option<(f64, 
         }
         None => 0.0,
     };
+    let origin = (pos.x.round() as i64, pos.y.round() as i64);
 
-    let bx = (pos.x / G as f64).floor();
-    let by = (pos.y / G as f64).floor();
-    let ox = (((pos.x - bx * G as f64) / OFF_STEP).floor() as i32).clamp(0, OFF_STEPS - 1);
-    let oy = (((pos.y - by * G as f64) / OFF_STEP).floor() as i32).clamp(0, OFF_STEPS - 1);
-
-    let scale = if shape_id == DROP_ID { DROP_SCALE } else { CIRCLE_SCALE };
-    let key = TemplateKey::new(shape_id, scale, angle_deg, G, ox, oy);
-    let grid = arsenal.index.get(&key)?.translated(bx * G as f64, by * G as f64);
-
+    let figure = arsenal.figures.get(&shape_id)?.clone();
     let mut poly = arsenal.base_polys.get(&(shape_id, angle_deg as i64))?.clone();
-    poly.move_by(
-        bx * G as f64 + ox as f64 * OFF_STEP,
-        by * G as f64 + oy as f64 * OFF_STEP,
-    );
+    poly.move_by(origin.0 as f64, origin.1 as f64);
     let bbox = VRect::new(
         poly.x_min,
         poly.y_min,
         poly.x_max - poly.x_min,
         poly.y_max - poly.y_min,
     );
-    Some(AttackShape { poly, bbox, grid })
+    let raster = arsenal.bank.point_raster(&figure, angle_deg, origin);
+
+    Some(AttackShape {
+        bank: &arsenal.bank,
+        figure,
+        angle_deg,
+        origin,
+        poly,
+        bbox,
+        raster,
+    })
 }
 
 struct Effect {
-    grid: TemplateGrid,
+    /// Template at a representative cell size (for visualisation).
+    grid: Option<TemplateGrid>,
+    outline: Vec<(f32, f32)>,
     origin: VPoint,
     color: Color,
     until: f64,
-    /// Sampled outline of the actual attack polygon (arcs flattened).
-    outline: Vec<(f32, f32)>,
+}
+
+/// Expanding ring marking a spawn, a removal, or a death.
+struct Ring {
+    pos: VPoint,
+    color: Color,
+    start: f64,
+    until: f64,
 }
 
 /// Flatten a polygon (lines + arcs) into a point list for rendering.
@@ -269,14 +296,6 @@ fn sample_polygon(poly: &Polygon) -> Vec<(f32, f32)> {
         }
     }
     pts
-}
-
-/// Expanding ring marking a spawn, a removal, or a death.
-struct Ring {
-    pos: VPoint,
-    color: Color,
-    start: f64,
-    until: f64,
 }
 
 fn spawn_at(tree: &mut Tree<Critter>, next_id: &mut u32, kind: Kind, pos: VPoint) -> VPoint {
@@ -370,8 +389,8 @@ fn hue_to_rgb(hue: f32) -> Color {
 fn window_conf() -> Conf {
     Conf {
         window_title: "vectorial-hash critters".to_owned(),
-        window_width: MAP_W as i32 + PANEL_W as i32,
-        window_height: MAP_H as i32,
+        window_width: (MAP_W as f32 * S) as i32 + PANEL_W as i32,
+        window_height: (MAP_H as f32 * S) as i32,
         ..Default::default()
     }
 }
@@ -380,15 +399,27 @@ fn window_conf() -> Conf {
 async fn main() {
     rand::srand(42);
 
+    // Loading frame while the bank generates.
+    clear_background(Color::new(0.07, 0.07, 0.10, 1.0));
+    draw_text("generating template bank...", 40.0, 60.0, 28.0, WHITE);
+    next_frame().await;
+
     let arsenal = build_arsenal();
+    println!(
+        "template bank: {} combos -> {} unique grids in {:.2}s",
+        arsenal.bank.entry_count(),
+        arsenal.bank.unique_count(),
+        arsenal.gen_seconds,
+    );
+
     let world = VRect::new(0.0, 0.0, MAP_W, MAP_H);
     let mut tree: Tree<Critter> = Tree::with_limits(world, ITEM_LIMIT, ITEM_LIMIT);
     let mut next_id = 0u32;
     let mut cooldowns: HashMap<u32, f64> = HashMap::new();
 
     // Live-tunable settings (sliders in the side panel).
-    let mut split_f: f32 = ITEM_LIMIT as f32; // leaf splits above this
-    let mut merge_f: f32 = ITEM_LIMIT as f32; // siblings merge at/below this
+    let mut split_f: f32 = ITEM_LIMIT as f32;
+    let mut merge_f: f32 = ITEM_LIMIT as f32;
     let mut drifters_f: f32 = 16.0;
     let mut hunters_f: f32 = 12.0;
     let mut pulsars_f: f32 = 14.0;
@@ -451,22 +482,17 @@ async fn main() {
         let now = get_time();
         let dt = (get_frame_time() as f64).min(0.05) * speed_f as f64;
 
-        // --- interactive add / remove ---
+        // --- interactive add / remove (mouse works in screen px; world = /S) ---
         let (mx, my) = mouse_position();
-        let mouse_in_map = (mx as f64) < MAP_W && mx >= 0.0 && my >= 0.0 && (my as f64) < MAP_H;
-        // Hold to paint a stream of critters.
+        let (wx, wy) = ((mx / S) as f64, (my / S) as f64);
+        let mouse_in_map = wx >= 0.0 && wx < MAP_W && wy >= 0.0 && wy < MAP_H && mx < MAP_W as f32 * S;
         if is_mouse_button_down(MouseButton::Left)
             && mouse_in_map
             && tree.item_count() < 400
             && now - last_paint > 0.12
         {
             last_paint = now;
-            let pos = spawn_at(
-                &mut tree,
-                &mut next_id,
-                brush,
-                VPoint::new(mx as f64, my as f64),
-            );
+            let pos = spawn_at(&mut tree, &mut next_id, brush, VPoint::new(wx, wy));
             rings.push(Ring { pos, color: brush.color(), start: now, until: now + 0.4 });
             match brush {
                 Kind::Drifter => drifters_f += 1.0,
@@ -475,11 +501,11 @@ async fn main() {
             }
         }
         if is_mouse_button_pressed(MouseButton::Right) && mouse_in_map {
-            // Remove the critter closest to the cursor (within 30 px), no respawn.
+            // Remove the critter closest to the cursor (within 30 world px).
             let mut best: Option<(f64, u32, VPoint, Kind)> = None;
             tree.visit_leaves(|_, leaf| {
                 for c in &leaf.items {
-                    let d = (c.pos.x - mx as f64).powi(2) + (c.pos.y - my as f64).powi(2);
+                    let d = (c.pos.x - wx).powi(2) + (c.pos.y - wy).powi(2);
                     if d < 30.0 * 30.0 && best.is_none_or(|(bd, ..)| d < bd) {
                         best = Some((d, c.id, c.pos, c.kind));
                     }
@@ -508,7 +534,6 @@ async fn main() {
             }
         }
         if is_key_pressed(KeyCode::Minus) {
-            // Remove up to five random critters, no respawn.
             let mut all: Vec<(u32, VPoint, Kind)> = Vec::new();
             tree.visit_leaves(|_, leaf| {
                 for c in &leaf.items {
@@ -613,8 +638,14 @@ async fn main() {
                         }
                     }
                     effects.push(Effect {
+                        grid: arsenal.bank.template_for(
+                            &atk.figure,
+                            16,
+                            16,
+                            atk.angle_deg,
+                            atk.origin,
+                        ),
                         outline: sample_polygon(&atk.poly),
-                        grid: atk.grid,
                         origin: pos,
                         color: kind.color(),
                         until: now + EFFECT_TTL,
@@ -655,7 +686,7 @@ async fn main() {
         // ---------- live tuning panel ----------
         widgets::Window::new(
             hash!(),
-            vec2(MAP_W as f32 + 10.0, 446.0),
+            vec2(MAP_W as f32 * S + 10.0, 446.0),
             vec2(PANEL_W - 20.0, 280.0),
         )
         .label("tuning (live)")
@@ -674,8 +705,7 @@ async fn main() {
             ui.slider(hash!(), "fire x", 0.25f32..3f32, &mut fire_f);
         });
 
-        // Apply split/merge thresholds; rebuild the tree when they change so
-        // the whole structure obeys the new rules immediately.
+        // Apply split/merge thresholds; rebuild the tree when they change.
         split_f = split_f.clamp(1.0, 12.0);
         merge_f = merge_f.clamp(1.0, split_f);
         let want_split = split_f.round() as usize;
@@ -690,8 +720,7 @@ async fn main() {
             tree = rebuilt;
         }
 
-        // Steer populations toward the slider targets (counting queued
-        // respawns so deaths don't double-spawn).
+        // Steer populations toward the slider targets.
         let mut alive: HashMap<Kind, Vec<(u32, VPoint)>> = HashMap::new();
         tree.visit_leaves(|_, leaf| {
             for c in &leaf.items {
@@ -714,7 +743,6 @@ async fn main() {
             }
             if diff < 0 {
                 let mut to_remove = -diff;
-                // Cancel queued respawns first (invisible), then remove live ones.
                 let mut i = 0;
                 while i < respawns.len() && to_remove > 0 {
                     if respawns[i].1 == kind {
@@ -743,7 +771,7 @@ async fn main() {
             }
         }
 
-        // ---------- draw ----------
+        // ---------- draw (world coords × S) ----------
         clear_background(Color::new(0.07, 0.07, 0.10, 1.0));
 
         // Tree regions: one colour per live leaf.
@@ -756,56 +784,57 @@ async fn main() {
             let c = region_color(id.0);
             if region_mode == 0 {
                 draw_rectangle(
-                    b.x as f32,
-                    b.y as f32,
-                    b.width as f32,
-                    b.height as f32,
+                    b.x as f32 * S,
+                    b.y as f32 * S,
+                    b.width as f32 * S,
+                    b.height as f32 * S,
                     Color::new(c.r, c.g, c.b, 0.28),
                 );
             }
             if region_mode <= 1 {
                 draw_rectangle_lines(
-                    b.x as f32,
-                    b.y as f32,
-                    b.width as f32,
-                    b.height as f32,
+                    b.x as f32 * S,
+                    b.y as f32 * S,
+                    b.width as f32 * S,
+                    b.height as f32 * S,
                     1.0,
                     Color::new(1.0, 1.0, 1.0, 0.18),
                 );
             }
         });
 
-        // Attack effects: the template cells themselves (green = In, dimmer =
-        // Maybe), fading out.
+        // Attack effects: template cells at a representative size, the real
+        // polygon outline on top, and the origin dot.
         for e in &effects {
             let fade = ((e.until - now) / EFFECT_TTL) as f32;
-            for row in 0..e.grid.rows {
-                for col in 0..e.grid.cols {
-                    let alpha = match e.grid.cell(col, row) {
-                        CellState::In => 0.5 * fade,
-                        CellState::Maybe => 0.22 * fade,
-                        CellState::Out => continue,
-                    };
-                    draw_rectangle(
-                        (e.grid.origin_x + col as f64 * e.grid.cell_w) as f32,
-                        (e.grid.origin_y + row as f64 * e.grid.cell_h) as f32,
-                        e.grid.cell_w as f32,
-                        e.grid.cell_h as f32,
-                        Color::new(e.color.r, e.color.g, e.color.b, alpha),
-                    );
+            if let Some(grid) = &e.grid {
+                for row in 0..grid.rows {
+                    for col in 0..grid.cols {
+                        let alpha = match grid.cell(col, row) {
+                            CellState::In => 0.5 * fade,
+                            CellState::Maybe => 0.22 * fade,
+                            CellState::Out => continue,
+                        };
+                        draw_rectangle(
+                            (grid.origin_x + col as f64 * grid.cell_w) as f32 * S,
+                            (grid.origin_y + row as f64 * grid.cell_h) as f32 * S,
+                            grid.cell_w as f32 * S,
+                            grid.cell_h as f32 * S,
+                            Color::new(e.color.r, e.color.g, e.color.b, alpha),
+                        );
+                    }
                 }
             }
-            // The real attack polygon on top of its template cells.
             let oc = Color::new(e.color.r, e.color.g, e.color.b, (0.9 * fade).min(1.0));
             for i in 0..e.outline.len() {
                 let (x1, y1) = e.outline[i];
                 let (x2, y2) = e.outline[(i + 1) % e.outline.len()];
-                draw_line(x1, y1, x2, y2, 1.5, oc);
+                draw_line(x1 * S, y1 * S, x2 * S, y2 * S, 1.5, oc);
             }
-            draw_circle(e.origin.x as f32, e.origin.y as f32, 3.0, e.color);
+            draw_circle(e.origin.x as f32 * S, e.origin.y as f32 * S, 3.0, e.color);
         }
 
-        // Critters (single snapshot reused for hunter sightlines + counts).
+        // Critters (single snapshot reused for sightlines + counts).
         let mut draw_snap: Vec<(u32, Kind, VPoint, f64)> = Vec::new();
         tree.visit_leaves(|_, leaf| {
             for c in &leaf.items {
@@ -828,10 +857,10 @@ async fn main() {
                 });
             if let Some(&(_, _, tpos, _)) = target {
                 draw_line(
-                    pos.x as f32,
-                    pos.y as f32,
-                    tpos.x as f32,
-                    tpos.y as f32,
+                    pos.x as f32 * S,
+                    pos.y as f32 * S,
+                    tpos.x as f32 * S,
+                    tpos.y as f32 * S,
                     1.0,
                     Color::new(1.0, 0.3, 0.3, 0.18),
                 );
@@ -839,13 +868,13 @@ async fn main() {
         }
 
         for &(_, kind, pos, heading) in &draw_snap {
-            let (x, y) = (pos.x as f32, pos.y as f32);
+            let (x, y) = (pos.x as f32 * S, pos.y as f32 * S);
             draw_circle(x, y, 5.0, kind.color());
             draw_line(
                 x,
                 y,
-                x + (heading.cos() * 9.0) as f32,
-                y + (heading.sin() * 9.0) as f32,
+                x + (heading.cos() * 9.0) as f32 * S,
+                y + (heading.sin() * 9.0) as f32 * S,
                 1.5,
                 WHITE,
             );
@@ -855,18 +884,20 @@ async fn main() {
         for r in &rings {
             let t = ((now - r.start) / (r.until - r.start).max(1e-6)) as f32;
             draw_circle_lines(
-                r.pos.x as f32,
-                r.pos.y as f32,
-                4.0 + 16.0 * t,
+                r.pos.x as f32 * S,
+                r.pos.y as f32 * S,
+                (4.0 + 16.0 * t) * S,
                 2.0,
                 Color::new(r.color.r, r.color.g, r.color.b, (1.0 - t).max(0.0)),
             );
         }
 
         // Map border + side panel.
-        draw_rectangle_lines(0.0, 0.0, MAP_W as f32, MAP_H as f32, 2.0, GRAY);
-        let px = MAP_W as f32 + 14.0;
-        draw_rectangle(MAP_W as f32, 0.0, PANEL_W, MAP_H as f32, Color::new(0.04, 0.04, 0.06, 1.0));
+        let map_px = MAP_W as f32 * S;
+        let map_py = MAP_H as f32 * S;
+        draw_rectangle_lines(0.0, 0.0, map_px, map_py, 2.0, GRAY);
+        let px = map_px + 14.0;
+        draw_rectangle(map_px, 0.0, PANEL_W, map_py, Color::new(0.04, 0.04, 0.06, 1.0));
         let mut ty = 28.0;
         let line = |text: &str, size: f32, color: Color, ty: &mut f32| {
             draw_text(text, px, *ty, size, color);
@@ -875,23 +906,22 @@ async fn main() {
         line("vectorial-hash critters", 26.0, WHITE, &mut ty);
         ty += 8.0;
         line(
-            &format!("template set: {} combos", arsenal.combos),
+            &format!("bank: {} combos", arsenal.bank.entry_count()),
             18.0,
             LIGHTGRAY,
             &mut ty,
         );
         line(
-            &format!("  -> {} unique after 8-sym dedup", arsenal.unique),
+            &format!(
+                "  -> {} unique grids ({:.1}s gen)",
+                arsenal.bank.unique_count(),
+                arsenal.gen_seconds,
+            ),
             18.0,
             LIGHTGRAY,
             &mut ty,
         );
-        line(
-            &format!("  index entries: {}", arsenal.index.len()),
-            18.0,
-            LIGHTGRAY,
-            &mut ty,
-        );
+        line("  sizes 8..32 + 1x1 raster", 18.0, LIGHTGRAY, &mut ty);
         ty += 10.0;
         let mut counts: HashMap<Kind, usize> = HashMap::new();
         for &(_, kind, _, _) in &draw_snap {
@@ -978,7 +1008,7 @@ async fn main() {
             draw_text(
                 h,
                 px,
-                MAP_H as f32 - 16.0 - 20.0 * (help.len() - 1 - i) as f32,
+                map_py - 16.0 - 20.0 * (help.len() - 1 - i) as f32,
                 17.0,
                 GRAY,
             );

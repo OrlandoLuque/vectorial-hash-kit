@@ -42,13 +42,14 @@ Walks the full pipeline:
 cargo run -p vectorial-hash-demos --bin critters --release
 ```
 
-A live 2D map indexed by a `vectorial_hash::Tree` (item limit 3 per cell). Every live leaf region is filled with its own colour, so you watch the map **divide and merge in real time** as items move.
+A live 2D map (1024×1024 world, drawn at 0.75×) indexed by a `vectorial_hash::Tree` (item limit 3 per cell). Every live leaf region is filled with its own colour, so you watch the map **divide and merge in real time** as items move.
 
-- **Critters** of three kinds with distinct movement and attacks, all using **precomputed template areas** (a set generated at startup — drop at 24 angles × 16 sub-cell offsets + radial circle — deduplicated via the 8 symmetries and served from a hash-keyed `TemplateIndex`):
+- **Precise template application** (the paper's scheme): attacks are applied at their real integer origin — the figure is **never moved to fit a grid**. A hierarchical `TemplateBank` (shape → dims → cell width → cell height → angle → offset x → offset y) is generated at startup for cell sizes 8–32 px (squares and 2:1 rectangles) plus a 1×1 raster per angle; identical templates are deduplicated and shared (~65k combos collapse to ~8k unique grids in well under a second). During a cull, each tree-cell size resolves the template whose generation offset matches the figure origin's displacement within the global virtual grid of that size — template cells align 1:1 with map cells, so internal nodes classify with a single direct cell read (resolved once per size per attack and cached). Leaf items are answered by the 1×1 raster; only boundary (`Maybe`) pixels run exact geometry, pre-filtered by the bounding box.
+- **Critters** of three kinds with distinct movement and attacks:
   - *drifter* (blue): random walk; fires a drop-shaped area in a random direction.
   - *hunter* (red): chases the nearest non-hunter; fires a drop aimed at it (angle snapped to the precomputed 15° set).
   - *pulsar* (gold): circles around; radial blast centred on itself.
-- Attack resolution is a real `Tree::cull` with the template short-circuit; victims are `Tree::remove`d (watch regions merge) and **respawn** a few seconds later (watch regions split).
+- Attack resolution is a real `Tree::cull` with the green/yellow/white short-circuit; victims are `Tree::remove`d (watch regions merge) and **respawn** a few seconds later (watch regions split).
 - Attack areas are drawn from the template cells themselves (bright = `In`, dim = `Maybe`) with the real attack polygon outlined on top (arcs flattened), so you can see exactly how the precomputed grid approximates the shape.
 - Kill credit is tracked per attacker kind; hunters show a faint sightline to their current prey.
 

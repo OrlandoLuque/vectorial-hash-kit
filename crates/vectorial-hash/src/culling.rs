@@ -1,5 +1,8 @@
 //! Culling: find tree items inside a shape.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use crate::geom::{Point, Rect};
 use crate::template::{CellState, TemplateGrid};
 use crate::tree::{NodeId, Positioned, Tree};
@@ -7,10 +10,24 @@ use crate::tree::{NodeId, Positioned, Tree};
 /// A shape the culling algorithm can test against.
 ///
 /// `bounding_box` and `contains_point` are required. Implementations may
-/// additionally provide a [`TemplateGrid`] to enable the green/yellow/white
+/// additionally provide templates to enable the green/yellow/white
 /// short-circuit: tree nodes whose bbox falls entirely on green cells are
 /// included wholesale, white cells let us skip whole subtrees, and only
 /// yellow cells fall back to per-point checks.
+///
+/// Two template mechanisms are supported, tried in this order:
+///
+/// 1. **Per-cell-size selection** ([`Shape::template_for_cell`], the paper's
+///    scheme): for each tree-cell size touched by the query, the shape
+///    resolves the precomputed template whose generation offset matches the
+///    figure's real position within the global virtual grid of that cell
+///    size. Template cells then align 1:1 with same-size tree cells, so each
+///    node classifies with a single direct cell read. The figure is **never
+///    moved** to fit the grid — the matching template is selected instead.
+///    `cull` resolves at most one template per distinct cell size per
+///    execution and caches it for the rest of that query.
+/// 2. **Single fixed grid** ([`Shape::template_grid`]): one grid covering the
+///    whole shape, classified per node via [`TemplateGrid::classify_region`].
 pub trait Shape {
     fn bounding_box(&self) -> Rect;
     fn contains_point(&self, point: Point) -> bool;
@@ -19,14 +36,37 @@ pub trait Shape {
     fn template_grid(&self) -> Option<&TemplateGrid> {
         None
     }
+
+    /// Resolve the template aligned to the global virtual grid of cells
+    /// `cell_w` × `cell_h` for this shape at its current position, if one
+    /// exists. Returning `None` falls back to `template_grid` / bbox.
+    ///
+    /// Contract: the returned grid's cells must be exactly `cell_w` ×
+    /// `cell_h` and anchored on multiples of the cell size, so that aligned
+    /// tree nodes map 1:1 onto template cells.
+    fn template_for_cell(&self, cell_w: f64, cell_h: f64) -> Option<Arc<TemplateGrid>> {
+        let _ = (cell_w, cell_h);
+        None
+    }
+
+    /// Optional 1×1-cell raster of the shape used for per-item tests in
+    /// leaf cells: `In`/`Out` pixels answer immediately and only `Maybe`
+    /// (boundary) pixels fall back to the exact `contains_point`.
+    fn point_template(&self) -> Option<&TemplateGrid> {
+        None
+    }
 }
+
+/// Per-execution cache: one resolved template per distinct cell size.
+type SizeCache = HashMap<(u64, u64), Option<Arc<TemplateGrid>>>;
 
 impl<T: Positioned> Tree<T> {
     /// Return references to every item inside `shape`.
     pub fn cull<'a, S: Shape>(&'a self, shape: &S) -> Vec<&'a T> {
         let mut out = Vec::new();
         let bbox = shape.bounding_box();
-        self.cull_recurse(self.root, shape, &bbox, false, &mut out);
+        let mut sizes = SizeCache::new();
+        self.cull_recurse(self.root, shape, &bbox, false, &mut sizes, &mut out);
         out
     }
 
@@ -36,6 +76,7 @@ impl<T: Positioned> Tree<T> {
         shape: &S,
         shape_bbox: &Rect,
         fully_inside: bool,
+        sizes: &mut SizeCache,
         out: &mut Vec<&'a T>,
     ) {
         let node = self.get(node_id);
@@ -43,8 +84,8 @@ impl<T: Positioned> Tree<T> {
         if fully_inside {
             match node.children {
                 Some([a, b]) => {
-                    self.cull_recurse(a, shape, shape_bbox, true, out);
-                    self.cull_recurse(b, shape, shape_bbox, true, out);
+                    self.cull_recurse(a, shape, shape_bbox, true, sizes, out);
+                    self.cull_recurse(b, shape, shape_bbox, true, sizes, out);
                 }
                 None => out.extend(node.items.iter()),
             }
@@ -55,21 +96,35 @@ impl<T: Positioned> Tree<T> {
             Some([a, b]) => {
                 for child_id in [a, b] {
                     let child_bbox = self.get(child_id).bbox;
-                    match classify_child(shape, shape_bbox, &child_bbox) {
+                    match classify_child(shape, shape_bbox, &child_bbox, sizes) {
                         CellState::Out => {}
                         CellState::In => {
-                            self.cull_recurse(child_id, shape, shape_bbox, true, out);
+                            self.cull_recurse(child_id, shape, shape_bbox, true, sizes, out);
                         }
                         CellState::Maybe => {
-                            self.cull_recurse(child_id, shape, shape_bbox, false, out);
+                            self.cull_recurse(child_id, shape, shape_bbox, false, sizes, out);
                         }
                     }
                 }
             }
             None => {
+                let point_grid = shape.point_template();
                 for it in &node.items {
-                    if shape.contains_point(it.position()) {
-                        out.push(it);
+                    let p = it.position();
+                    // Bbox pre-filter: anything outside the shape's bounding
+                    // box is out, no geometry needed.
+                    if !shape_bbox.contains(p) {
+                        continue;
+                    }
+                    match point_grid.map(|g| g.cell_at_world(p)) {
+                        Some(CellState::In) => out.push(it),
+                        Some(CellState::Out) => {}
+                        // Boundary pixel or no raster: exact test.
+                        _ => {
+                            if shape.contains_point(p) {
+                                out.push(it);
+                            }
+                        }
                     }
                 }
             }
@@ -77,7 +132,28 @@ impl<T: Positioned> Tree<T> {
     }
 }
 
-fn classify_child<S: Shape>(shape: &S, shape_bbox: &Rect, child_bbox: &Rect) -> CellState {
+fn classify_child<S: Shape>(
+    shape: &S,
+    shape_bbox: &Rect,
+    child_bbox: &Rect,
+    sizes: &mut SizeCache,
+) -> CellState {
+    // 1. Per-cell-size template, resolved once per size per execution. The
+    //    node bbox is exactly one cell of the global virtual grid of its own
+    //    size, so its centre reads the matching template cell directly.
+    let key = (child_bbox.width.to_bits(), child_bbox.height.to_bits());
+    let per_size = sizes
+        .entry(key)
+        .or_insert_with(|| shape.template_for_cell(child_bbox.width, child_bbox.height))
+        .clone();
+    if let Some(grid) = per_size {
+        return grid.cell_at_world(Point::new(
+            child_bbox.x + child_bbox.width / 2.0,
+            child_bbox.y + child_bbox.height / 2.0,
+        ));
+    }
+
+    // 2. Single fixed grid (region classification), then bbox fallback.
     if let Some(grid) = shape.template_grid() {
         grid.classify_region(child_bbox)
     } else if child_bbox.intersects(shape_bbox) {
@@ -179,6 +255,111 @@ mod tests {
         let mut positions: Vec<_> = hits.iter().map(|p| p.0).collect();
         positions.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap());
         assert_eq!(positions, vec![Point::new(60.0, 60.0), Point::new(90.0, 90.0)]);
+    }
+
+    /// Per-cell-size selection: the shape serves a template aligned to each
+    /// requested cell size; nodes classify via a single direct cell read.
+    /// `contains_point` always false would drop everything if the green
+    /// short-circuit didn't include the In-cell subtree wholesale.
+    struct PerSizeShape {
+        bbox: Rect,
+        resolved: std::cell::RefCell<Vec<(f64, f64)>>,
+    }
+    impl Shape for PerSizeShape {
+        fn bounding_box(&self) -> Rect {
+            self.bbox
+        }
+        fn contains_point(&self, _p: Point) -> bool {
+            false
+        }
+        fn template_for_cell(&self, cell_w: f64, cell_h: f64) -> Option<Arc<TemplateGrid>> {
+            use CellState::*;
+            self.resolved.borrow_mut().push((cell_w, cell_h));
+            // Whatever the size, mark the cell range covering x >= 50 as In
+            // within the right half of a 100x100 world.
+            let cols = (50.0 / cell_w).max(1.0) as u32;
+            let rows = (100.0 / cell_h).max(1.0) as u32;
+            Some(Arc::new(TemplateGrid::new(
+                Point::new(50.0, 0.0),
+                cell_w,
+                cell_h,
+                cols,
+                rows,
+                vec![In; (cols * rows) as usize],
+            )))
+        }
+    }
+
+    #[test]
+    fn per_size_template_short_circuits_and_caches_per_size() {
+        let shape = PerSizeShape {
+            bbox: Rect::new(50.0, 0.0, 50.0, 100.0),
+            resolved: std::cell::RefCell::new(Vec::new()),
+        };
+        let mut tree = Tree::<Pt>::new(Rect::new(0.0, 0.0, 100.0, 100.0), 1);
+        tree.insert(Pt(Point::new(10.0, 10.0))); // left half: Out
+        tree.insert(Pt(Point::new(60.0, 60.0))); // right half: In
+        tree.insert(Pt(Point::new(90.0, 90.0))); // right half: In
+
+        let hits = tree.cull(&shape);
+        let mut positions: Vec<_> = hits.iter().map(|p| p.0).collect();
+        positions.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap());
+        assert_eq!(positions, vec![Point::new(60.0, 60.0), Point::new(90.0, 90.0)]);
+
+        // The per-execution cache must resolve each distinct size only once.
+        let resolved = shape.resolved.borrow();
+        let mut unique = resolved.clone();
+        unique.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        unique.dedup();
+        assert_eq!(resolved.len(), unique.len(), "sizes resolved more than once: {resolved:?}");
+    }
+
+    /// Leaf fallback uses the 1x1 raster: In pixels accepted without exact
+    /// tests, Out pixels rejected even if contains_point says otherwise,
+    /// Maybe pixels defer to contains_point.
+    struct RasterShape {
+        bbox: Rect,
+        raster: TemplateGrid,
+    }
+    impl Shape for RasterShape {
+        fn bounding_box(&self) -> Rect {
+            self.bbox
+        }
+        fn contains_point(&self, p: Point) -> bool {
+            p.y < 2.0 // only used for Maybe pixels
+        }
+        fn point_template(&self) -> Option<&TemplateGrid> {
+            Some(&self.raster)
+        }
+    }
+
+    #[test]
+    fn point_template_resolves_leaf_items_with_exact_test_only_on_maybe() {
+        use CellState::*;
+        // 3x1 raster of 1x1 cells at x = 0..3: In, Maybe, Out.
+        let raster = TemplateGrid::new(
+            Point::new(0.0, 0.0),
+            1.0,
+            1.0,
+            3,
+            3,
+            vec![
+                In, Maybe, Out,
+                In, Maybe, Out,
+                In, Maybe, Out,
+            ],
+        );
+        let shape = RasterShape { bbox: Rect::new(0.0, 0.0, 3.0, 3.0), raster };
+        let mut tree = Tree::<Pt>::new(Rect::new(0.0, 0.0, 10.0, 10.0), 16);
+        tree.insert(Pt(Point::new(0.5, 0.5))); // In pixel -> hit
+        tree.insert(Pt(Point::new(1.5, 0.5))); // Maybe pixel, y < 2 -> exact says yes
+        tree.insert(Pt(Point::new(1.5, 2.5))); // Maybe pixel, y >= 2 -> exact says no
+        tree.insert(Pt(Point::new(2.5, 0.5))); // Out pixel -> miss (contains_point not consulted)
+        tree.insert(Pt(Point::new(8.0, 8.0))); // outside bbox -> pre-filtered
+
+        let mut positions: Vec<_> = tree.cull(&shape).iter().map(|p| p.0).collect();
+        positions.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap());
+        assert_eq!(positions, vec![Point::new(0.5, 0.5), Point::new(1.5, 0.5)]);
     }
 
     /// Mirror of the above for white cells: a shape whose template is all Out
