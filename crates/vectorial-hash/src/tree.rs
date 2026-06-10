@@ -20,15 +20,31 @@ pub struct Node<T> {
 
 pub struct Tree<T: Positioned> {
     nodes: Vec<Node<T>>,
+    /// A leaf splits when it holds more than this many items.
     pub item_limit: usize,
+    /// Two sibling leaves merge back into their parent when their combined
+    /// items fit within this. Defaults to `item_limit`; setting it lower adds
+    /// hysteresis so cells don't flap between split and merged.
+    pub merge_limit: usize,
     pub root: NodeId,
 }
 
 impl<T: Positioned> Tree<T> {
     pub fn new(bbox: Rect, item_limit: usize) -> Self {
+        Self::with_limits(bbox, item_limit, item_limit)
+    }
+
+    /// Like [`Tree::new`] but with a separate merge-up threshold.
+    /// `merge_limit` must not exceed `item_limit` (a parent holding more than
+    /// `item_limit` items would immediately split again).
+    pub fn with_limits(bbox: Rect, item_limit: usize, merge_limit: usize) -> Self {
         assert!(item_limit >= 1, "item_limit must be >= 1");
+        assert!(
+            merge_limit <= item_limit,
+            "merge_limit must be <= item_limit",
+        );
         let root = Node { bbox, parent: None, children: None, items: Vec::new() };
-        Self { nodes: vec![root], item_limit, root: NodeId(0) }
+        Self { nodes: vec![root], item_limit, merge_limit, root: NodeId(0) }
     }
 
     pub fn get(&self, id: NodeId) -> &Node<T> {
@@ -75,7 +91,7 @@ impl<T: Positioned> Tree<T> {
     /// Remove the first item in the leaf at `point` matching `predicate` and
     /// return it. Triggers the merge-up rule from the paper: when a leaf's
     /// parent ends up with two leaf children whose combined items would fit
-    /// in `item_limit`, the parent re-absorbs them and becomes a leaf again.
+    /// in `merge_limit`, the parent re-absorbs them and becomes a leaf again.
     /// The collapse cascades upward as long as the rule keeps applying.
     ///
     /// Returns `None` if `point` is outside the tree or no item in the leaf
@@ -135,7 +151,7 @@ impl<T: Positioned> Tree<T> {
 
     /// Walk upward from `node` collapsing parents that satisfy the merge-up
     /// rule: both children are leaves and their combined items fit in
-    /// `item_limit`.
+    /// `merge_limit`.
     fn try_merge_up(&mut self, mut node: NodeId) {
         loop {
             let parent_id = match self.get(node).parent {
@@ -150,7 +166,7 @@ impl<T: Positioned> Tree<T> {
                 return;
             }
             let combined = self.get(a).items.len() + self.get(b).items.len();
-            if combined > self.item_limit {
+            if combined > self.merge_limit {
                 return;
             }
             let mut items_a = std::mem::take(&mut self.get_mut(a).items);
@@ -399,6 +415,32 @@ mod tests {
         let landed = tree.locate(Point::new(70.0, 70.0));
         assert!(tree.get(landed).items.iter().any(|p| p.0 == Point::new(70.0, 70.0)),
             "moved item should live under the right subtree (root child = {:?})", right);
+    }
+
+    #[test]
+    fn merge_limit_adds_hysteresis() {
+        // Split above 2, but only merge back when 1 item remains.
+        let mut tree = Tree::<Pt>::with_limits(Rect::new(0.0, 0.0, 100.0, 100.0), 2, 1);
+        tree.insert(Pt(Point::new(10.0, 10.0)));
+        tree.insert(Pt(Point::new(20.0, 20.0)));
+        tree.insert(Pt(Point::new(80.0, 80.0)));
+        assert!(tree.get(tree.root).children.is_some());
+
+        // 2 items remain: with merge_limit = item_limit this would collapse,
+        // but merge_limit = 1 keeps the split.
+        tree.remove(Point::new(80.0, 80.0), |it| it.0.x == 80.0);
+        assert!(tree.get(tree.root).children.is_some(), "hysteresis must keep the split");
+
+        // 1 item remains: now it collapses.
+        tree.remove(Point::new(20.0, 20.0), |it| it.0.x == 20.0);
+        assert!(tree.get(tree.root).children.is_none());
+        assert_eq!(tree.get(tree.root).items.len(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "merge_limit must be <= item_limit")]
+    fn merge_limit_above_item_limit_panics() {
+        let _ = Tree::<Pt>::with_limits(Rect::new(0.0, 0.0, 10.0, 10.0), 2, 3);
     }
 
     #[test]

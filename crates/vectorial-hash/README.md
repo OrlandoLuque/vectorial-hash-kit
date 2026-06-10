@@ -23,7 +23,7 @@ Queries (`Tree::cull`) walk the tree against a [`Shape`]. If the shape carries a
 | --- | --- | --- |
 | `geom` | `Point`, `Rect` | 2D primitives (half-open `Rect`). |
 | `template` | `CellState`, `TemplateGrid` | Runtime cull template: classify a region as In/Out/Maybe; `translated` re-anchors a template anywhere. |
-| `tree` | `Tree<T>`, `Node<T>`, `NodeId`, `Positioned` | Arena-backed binary-split tree (`insert`, `remove`, `update`, `locate`, `cull`, `visit_leaves`). |
+| `tree` | `Tree<T>`, `Node<T>`, `NodeId`, `Positioned` | Arena-backed binary-split tree (`insert`, `remove`, `update`, `locate`, `cull`, `visit_leaves`). `Tree::with_limits` sets a separate merge-up threshold (`merge_limit <= item_limit`) for split/merge hysteresis. |
 | `culling` | `Shape`, `Tree::cull` | Query items inside a shape, with optional template short-circuit. |
 
 ## Example

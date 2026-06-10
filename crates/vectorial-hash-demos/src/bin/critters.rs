@@ -15,12 +15,16 @@
 //! - `+`/`-` spawn / remove five critters at random
 //! - `R` cycles region rendering (fill+lines / lines / off)
 //! - `[` / `]` halve / double simulation speed, `Space` pauses, `Esc` quits
+//! - the "tuning (live)" panel adjusts, while running: the tree's split and
+//!   merge thresholds (tree is rebuilt on change), per-kind population
+//!   targets, respawn delay, simulation speed and fire rate
 //!
 //! Env: CRITTERS_MAX_FRAMES=N exits after N frames (smoke testing).
 
 use std::collections::{HashMap, HashSet};
 
 use macroquad::prelude::*;
+use macroquad::ui::{hash, root_ui, widgets};
 
 use vectorial_hash::{
     CellState, Point as VPoint, Positioned, Rect as VRect, Shape, TemplateGrid, Tree,
@@ -378,9 +382,19 @@ async fn main() {
 
     let arsenal = build_arsenal();
     let world = VRect::new(0.0, 0.0, MAP_W, MAP_H);
-    let mut tree: Tree<Critter> = Tree::new(world, ITEM_LIMIT);
+    let mut tree: Tree<Critter> = Tree::with_limits(world, ITEM_LIMIT, ITEM_LIMIT);
     let mut next_id = 0u32;
     let mut cooldowns: HashMap<u32, f64> = HashMap::new();
+
+    // Live-tunable settings (sliders in the side panel).
+    let mut split_f: f32 = ITEM_LIMIT as f32; // leaf splits above this
+    let mut merge_f: f32 = ITEM_LIMIT as f32; // siblings merge at/below this
+    let mut drifters_f: f32 = 16.0;
+    let mut hunters_f: f32 = 12.0;
+    let mut pulsars_f: f32 = 14.0;
+    let mut respawn_f: f32 = RESPAWN_DELAY as f32;
+    let mut speed_f: f32 = 1.0;
+    let mut fire_f: f32 = 1.0;
 
     for _ in 0..16 {
         spawn(&mut tree, &mut next_id, Kind::Drifter);
@@ -400,7 +414,6 @@ async fn main() {
     let mut last_paint: f64 = 0.0;
     let mut paused = false;
     let mut brush = Kind::Hunter;
-    let mut time_scale: f64 = 1.0;
     let mut region_mode: u8 = 0; // 0 = fill + lines, 1 = lines, 2 = off
 
     let max_frames: u64 = std::env::var("CRITTERS_MAX_FRAMES")
@@ -429,14 +442,14 @@ async fn main() {
             region_mode = (region_mode + 1) % 3;
         }
         if is_key_pressed(KeyCode::LeftBracket) {
-            time_scale = (time_scale * 0.5).max(0.25);
+            speed_f = (speed_f * 0.5).max(0.25);
         }
         if is_key_pressed(KeyCode::RightBracket) {
-            time_scale = (time_scale * 2.0).min(4.0);
+            speed_f = (speed_f * 2.0).min(4.0);
         }
 
         let now = get_time();
-        let dt = (get_frame_time() as f64).min(0.05) * time_scale;
+        let dt = (get_frame_time() as f64).min(0.05) * speed_f as f64;
 
         // --- interactive add / remove ---
         let (mx, my) = mouse_position();
@@ -455,36 +468,51 @@ async fn main() {
                 VPoint::new(mx as f64, my as f64),
             );
             rings.push(Ring { pos, color: brush.color(), start: now, until: now + 0.4 });
+            match brush {
+                Kind::Drifter => drifters_f += 1.0,
+                Kind::Hunter => hunters_f += 1.0,
+                Kind::Pulsar => pulsars_f += 1.0,
+            }
         }
         if is_mouse_button_pressed(MouseButton::Right) && mouse_in_map {
             // Remove the critter closest to the cursor (within 30 px), no respawn.
-            let mut best: Option<(f64, u32, VPoint, Color)> = None;
+            let mut best: Option<(f64, u32, VPoint, Kind)> = None;
             tree.visit_leaves(|_, leaf| {
                 for c in &leaf.items {
                     let d = (c.pos.x - mx as f64).powi(2) + (c.pos.y - my as f64).powi(2);
                     if d < 30.0 * 30.0 && best.is_none_or(|(bd, ..)| d < bd) {
-                        best = Some((d, c.id, c.pos, c.kind.color()));
+                        best = Some((d, c.id, c.pos, c.kind));
                     }
                 }
             });
-            if let Some((_, id, pos, color)) = best {
+            if let Some((_, id, pos, kind)) = best {
                 tree.remove(pos, |c| c.id == id);
                 cooldowns.remove(&id);
-                rings.push(Ring { pos, color, start: now, until: now + 0.4 });
+                rings.push(Ring { pos, color: kind.color(), start: now, until: now + 0.4 });
+                match kind {
+                    Kind::Drifter => drifters_f = (drifters_f - 1.0).max(0.0),
+                    Kind::Hunter => hunters_f = (hunters_f - 1.0).max(0.0),
+                    Kind::Pulsar => pulsars_f = (pulsars_f - 1.0).max(0.0),
+                }
             }
         }
         if is_key_pressed(KeyCode::Equal) && tree.item_count() < 400 {
             for _ in 0..5 {
                 let pos = spawn(&mut tree, &mut next_id, brush);
                 rings.push(Ring { pos, color: brush.color(), start: now, until: now + 0.4 });
+                match brush {
+                    Kind::Drifter => drifters_f += 1.0,
+                    Kind::Hunter => hunters_f += 1.0,
+                    Kind::Pulsar => pulsars_f += 1.0,
+                }
             }
         }
         if is_key_pressed(KeyCode::Minus) {
             // Remove up to five random critters, no respawn.
-            let mut all: Vec<(u32, VPoint, Color)> = Vec::new();
+            let mut all: Vec<(u32, VPoint, Kind)> = Vec::new();
             tree.visit_leaves(|_, leaf| {
                 for c in &leaf.items {
-                    all.push((c.id, c.pos, c.kind.color()));
+                    all.push((c.id, c.pos, c.kind));
                 }
             });
             for _ in 0..5 {
@@ -492,10 +520,15 @@ async fn main() {
                     break;
                 }
                 let i = rand::gen_range(0, all.len());
-                let (id, pos, color) = all.swap_remove(i);
+                let (id, pos, kind) = all.swap_remove(i);
                 tree.remove(pos, |c| c.id == id);
                 cooldowns.remove(&id);
-                rings.push(Ring { pos, color, start: now, until: now + 0.4 });
+                rings.push(Ring { pos, color: kind.color(), start: now, until: now + 0.4 });
+                match kind {
+                    Kind::Drifter => drifters_f = (drifters_f - 1.0).max(0.0),
+                    Kind::Hunter => hunters_f = (hunters_f - 1.0).max(0.0),
+                    Kind::Pulsar => pulsars_f = (pulsars_f - 1.0).max(0.0),
+                }
             }
         }
 
@@ -541,7 +574,7 @@ async fn main() {
                 if *cd > 0.0 {
                     continue;
                 }
-                *cd = rand::gen_range(cd_min, cd_max) as f64;
+                *cd = rand::gen_range(cd_min, cd_max) as f64 / fire_f as f64;
 
                 let attack = match kind {
                     // Aimed: drop pointed at the nearest non-hunter.
@@ -592,7 +625,7 @@ async fn main() {
             for (vid, vpos, attacker) in killed {
                 if let Some(c) = tree.remove(vpos, |c| c.id == vid) {
                     cooldowns.remove(&vid);
-                    respawns.push((now + RESPAWN_DELAY, c.kind));
+                    respawns.push((now + respawn_f as f64, c.kind));
                     kills += 1;
                     *kills_by.entry(attacker).or_default() += 1;
                     rings.push(Ring {
@@ -618,6 +651,97 @@ async fn main() {
             effects.retain(|e| e.until > now);
         }
         rings.retain(|r| r.until > now);
+
+        // ---------- live tuning panel ----------
+        widgets::Window::new(
+            hash!(),
+            vec2(MAP_W as f32 + 10.0, 446.0),
+            vec2(PANEL_W - 20.0, 280.0),
+        )
+        .label("tuning (live)")
+        .titlebar(true)
+        .movable(false)
+        .ui(&mut *root_ui(), |ui| {
+            ui.slider(hash!(), "split >", 1f32..12f32, &mut split_f);
+            ui.slider(hash!(), "merge <=", 1f32..12f32, &mut merge_f);
+            ui.separator();
+            ui.slider(hash!(), "drifters", 0f32..120f32, &mut drifters_f);
+            ui.slider(hash!(), "hunters", 0f32..120f32, &mut hunters_f);
+            ui.slider(hash!(), "pulsars", 0f32..120f32, &mut pulsars_f);
+            ui.separator();
+            ui.slider(hash!(), "respawn s", 0.5f32..10f32, &mut respawn_f);
+            ui.slider(hash!(), "speed x", 0.25f32..4f32, &mut speed_f);
+            ui.slider(hash!(), "fire x", 0.25f32..3f32, &mut fire_f);
+        });
+
+        // Apply split/merge thresholds; rebuild the tree when they change so
+        // the whole structure obeys the new rules immediately.
+        split_f = split_f.clamp(1.0, 12.0);
+        merge_f = merge_f.clamp(1.0, split_f);
+        let want_split = split_f.round() as usize;
+        let want_merge = (merge_f.round() as usize).min(want_split);
+        if want_split != tree.item_limit || want_merge != tree.merge_limit {
+            let mut items: Vec<Critter> = Vec::new();
+            tree.visit_leaves(|_, leaf| items.extend(leaf.items.iter().cloned()));
+            let mut rebuilt = Tree::with_limits(world, want_split, want_merge);
+            for c in items {
+                rebuilt.insert(c);
+            }
+            tree = rebuilt;
+        }
+
+        // Steer populations toward the slider targets (counting queued
+        // respawns so deaths don't double-spawn).
+        let mut alive: HashMap<Kind, Vec<(u32, VPoint)>> = HashMap::new();
+        tree.visit_leaves(|_, leaf| {
+            for c in &leaf.items {
+                alive.entry(c.kind).or_default().push((c.id, c.pos));
+            }
+        });
+        for (kind, target_f) in [
+            (Kind::Drifter, drifters_f),
+            (Kind::Hunter, hunters_f),
+            (Kind::Pulsar, pulsars_f),
+        ] {
+            let target = target_f.round() as i64;
+            let queued = respawns.iter().filter(|(_, k)| *k == kind).count() as i64;
+            let live = alive.get(&kind).map_or(0, |v| v.len()) as i64;
+            let mut diff = target - live - queued;
+            while diff > 0 {
+                let pos = spawn(&mut tree, &mut next_id, kind);
+                rings.push(Ring { pos, color: kind.color(), start: now, until: now + 0.4 });
+                diff -= 1;
+            }
+            if diff < 0 {
+                let mut to_remove = -diff;
+                // Cancel queued respawns first (invisible), then remove live ones.
+                let mut i = 0;
+                while i < respawns.len() && to_remove > 0 {
+                    if respawns[i].1 == kind {
+                        respawns.swap_remove(i);
+                        to_remove -= 1;
+                    } else {
+                        i += 1;
+                    }
+                }
+                if let Some(list) = alive.get_mut(&kind) {
+                    while to_remove > 0 && !list.is_empty() {
+                        let idx = rand::gen_range(0, list.len());
+                        let (id, pos) = list.swap_remove(idx);
+                        if tree.remove(pos, |c| c.id == id).is_some() {
+                            cooldowns.remove(&id);
+                            rings.push(Ring {
+                                pos,
+                                color: kind.color(),
+                                start: now,
+                                until: now + 0.4,
+                            });
+                        }
+                        to_remove -= 1;
+                    }
+                }
+            }
+        }
 
         // ---------- draw ----------
         clear_background(Color::new(0.07, 0.07, 0.10, 1.0));
@@ -808,7 +932,10 @@ async fn main() {
         );
         ty += 10.0;
         line(
-            &format!("tree leaves: {}   (limit {}/cell)", leaves, ITEM_LIMIT),
+            &format!(
+                "tree leaves: {}   (split >{}, merge <={})",
+                leaves, tree.item_limit, tree.merge_limit,
+            ),
             18.0,
             SKYBLUE,
             &mut ty,
@@ -828,7 +955,7 @@ async fn main() {
             &mut ty,
         );
         line(
-            &format!("speed: {:.2}x   regions: {}", time_scale, match region_mode {
+            &format!("speed: {:.2}x   regions: {}", speed_f, match region_mode {
                 0 => "fill+lines",
                 1 => "lines",
                 _ => "off",

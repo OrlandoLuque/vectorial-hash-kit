@@ -54,6 +54,8 @@ A live 2D map indexed by a `vectorial_hash::Tree` (item limit 3 per cell). Every
 
 Controls: `1`/`2`/`3` select the spawn brush · left click (or hold-drag to paint) spawns at the cursor · right click removes · `+`/`-` add/remove five at random · `R` cycles region rendering · `[` `]` change simulation speed · `Space` pauses · `Esc` quits.
 
+The **"tuning (live)" panel** adjusts everything while the simulation runs: the tree's **split threshold** (a leaf divides above it) and **merge threshold** (siblings collapse at/below it — set it lower than split for hysteresis; the tree is rebuilt on change), per-kind **population targets** (spawns/removes to match), respawn delay, simulation speed and fire rate. Manual spawns/removals (clicks, `+`/`-`) update the population sliders so both mechanisms cooperate.
+
 `CRITTERS_MAX_FRAMES=N` exits after N frames (CI/smoke runs).
 
 ## Run
