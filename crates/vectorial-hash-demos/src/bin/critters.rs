@@ -23,8 +23,12 @@
 //! - `R` cycles region rendering (fill+lines / lines / off)
 //! - `[` / `]` halve / double simulation speed, `Space` pauses, `Esc` quits
 //! - the "tuning (live)" panel adjusts split/merge thresholds (tree rebuilt
-//!   on change), per-kind population targets, respawn delay, speed and fire
-//!   rate while the simulation runs
+//!   on change), per-kind population targets (up to 400 each), respawn
+//!   delay, speed and fire rate while the simulation runs
+//!
+//! Hunters acquire prey with a real `Tree::cull` over a vision circle. The
+//! right-hand column plots live performance: frame time, average attack-cull
+//! and vision-cull times, and the movement/update cost per frame.
 //!
 //! Env: CRITTERS_MAX_FRAMES=N exits after N frames (smoke testing).
 
@@ -48,7 +52,13 @@ const MAP_H: f64 = 1024.0;
 /// Render scale: world 1024 drawn at 768 px.
 const S: f32 = 0.75;
 const PANEL_W: f32 = 320.0;
+/// Right-hand column with live performance graphs.
+const GRAPH_W: f32 = 300.0;
 const MARGIN: f64 = 4.0;
+/// Hunters acquire prey with a `Tree::cull` of this vision radius.
+const VISION_RADIUS: f64 = 280.0;
+/// Hard cap on the total population.
+const MAX_CRITTERS: usize = 1500;
 
 const ANGLE_STEP_DEG: f64 = 15.0;
 const DROP_ID: u32 = 0;
@@ -312,14 +322,14 @@ fn spawn(tree: &mut Tree<Critter>, next_id: &mut u32, kind: Kind) -> VPoint {
     spawn_at(tree, next_id, kind, pos)
 }
 
-/// One movement step. Returns (new position, new heading).
+/// One movement step. Returns (new position, new heading). Hunters receive
+/// their prey position (found beforehand with a vision-circle cull).
 fn step_critter(
     kind: Kind,
     pos: VPoint,
     heading: f64,
     dt: f64,
-    snap: &[(u32, Kind, VPoint, f64)],
-    self_id: u32,
+    target: Option<VPoint>,
 ) -> (VPoint, f64) {
     let mut h = heading;
     match kind {
@@ -327,27 +337,17 @@ fn step_critter(
         Kind::Drifter => h += rand::gen_range(-2.5_f32, 2.5) as f64 * dt,
         // Constant turn rate: circles around the map.
         Kind::Pulsar => h += 1.6 * dt,
-        // Steer toward the nearest critter of another kind.
-        Kind::Hunter => {
-            let target = snap
-                .iter()
-                .filter(|(id, k, _, _)| *id != self_id && *k != Kind::Hunter)
-                .min_by(|a, b| {
-                    let da = (a.2.x - pos.x).powi(2) + (a.2.y - pos.y).powi(2);
-                    let db = (b.2.x - pos.x).powi(2) + (b.2.y - pos.y).powi(2);
-                    da.partial_cmp(&db).unwrap()
-                });
-            match target {
-                Some(&(_, _, tpos, _)) => {
-                    let desired = (tpos.y - pos.y).atan2(tpos.x - pos.x);
-                    let diff = (desired - h + std::f64::consts::PI)
-                        .rem_euclid(std::f64::consts::TAU)
-                        - std::f64::consts::PI;
-                    h += diff.clamp(-3.0 * dt, 3.0 * dt);
-                }
-                None => h += rand::gen_range(-2.0_f32, 2.0) as f64 * dt,
+        // Steer toward the prey, or wander when nothing is in sight.
+        Kind::Hunter => match target {
+            Some(tpos) => {
+                let desired = (tpos.y - pos.y).atan2(tpos.x - pos.x);
+                let diff = (desired - h + std::f64::consts::PI)
+                    .rem_euclid(std::f64::consts::TAU)
+                    - std::f64::consts::PI;
+                h += diff.clamp(-3.0 * dt, 3.0 * dt);
             }
-        }
+            None => h += rand::gen_range(-2.0_f32, 2.0) as f64 * dt,
+        },
     }
 
     let speed = kind.speed();
@@ -387,10 +387,96 @@ fn hue_to_rgb(hue: f32) -> Color {
 fn window_conf() -> Conf {
     Conf {
         window_title: "vectorial-hash critters".to_owned(),
-        window_width: (MAP_W as f32 * S) as i32 + PANEL_W as i32,
+        window_width: (MAP_W as f32 * S) as i32 + PANEL_W as i32 + GRAPH_W as i32,
         window_height: (MAP_H as f32 * S) as i32,
         ..Default::default()
     }
+}
+
+/// Hunter vision: a plain circle shape culled against the tree.
+struct VisionCircle {
+    center: VPoint,
+    r: f64,
+}
+
+impl Shape for VisionCircle {
+    fn bounding_box(&self) -> VRect {
+        VRect::new(
+            self.center.x - self.r,
+            self.center.y - self.r,
+            self.r * 2.0,
+            self.r * 2.0,
+        )
+    }
+    fn contains_point(&self, p: VPoint) -> bool {
+        let dx = p.x - self.center.x;
+        let dy = p.y - self.center.y;
+        dx * dx + dy * dy <= self.r * self.r
+    }
+}
+
+/// Nearest non-hunter within vision range, found with a real tree cull.
+/// Returns the prey position and the cull's duration in microseconds.
+fn nearest_prey(tree: &Tree<Critter>, pos: VPoint, self_id: u32) -> (Option<VPoint>, f64) {
+    let t = std::time::Instant::now();
+    let vision = VisionCircle { center: pos, r: VISION_RADIUS };
+    let prey = tree
+        .cull(&vision)
+        .into_iter()
+        .filter(|c| c.id != self_id && c.kind != Kind::Hunter)
+        .min_by(|a, b| {
+            let da = (a.pos.x - pos.x).powi(2) + (a.pos.y - pos.y).powi(2);
+            let db = (b.pos.x - pos.x).powi(2) + (b.pos.y - pos.y).powi(2);
+            da.partial_cmp(&db).unwrap()
+        })
+        .map(|c| c.pos);
+    (prey, t.elapsed().as_secs_f64() * 1e6)
+}
+
+/// Fixed-capacity rolling series for the live graphs.
+struct Series {
+    data: Vec<f32>,
+    cap: usize,
+}
+
+impl Series {
+    fn new(cap: usize) -> Self {
+        Self { data: Vec::with_capacity(cap), cap }
+    }
+    fn push(&mut self, v: f32) {
+        if self.data.len() == self.cap {
+            self.data.remove(0);
+        }
+        self.data.push(v);
+    }
+    fn last(&self) -> f32 {
+        self.data.last().copied().unwrap_or(0.0)
+    }
+}
+
+/// Autoscaled polyline graph with label and current value.
+fn draw_graph(x: f32, y: f32, w: f32, h: f32, label: &str, unit: &str, s: &Series, color: Color) {
+    draw_rectangle(x, y, w, h, Color::new(0.02, 0.02, 0.045, 1.0));
+    draw_rectangle_lines(x, y, w, h, 1.0, Color::new(1.0, 1.0, 1.0, 0.15));
+    let max = s.data.iter().cloned().fold(0.0_f32, f32::max).max(1e-6) * 1.1;
+    if s.data.len() >= 2 {
+        let plot_h = h - 26.0;
+        let step = w / (s.cap.max(2) - 1) as f32;
+        for i in 1..s.data.len() {
+            let x1 = x + (i - 1) as f32 * step;
+            let x2 = x + i as f32 * step;
+            let y1 = y + h - 4.0 - (s.data[i - 1] / max) * plot_h;
+            let y2 = y + h - 4.0 - (s.data[i] / max) * plot_h;
+            draw_line(x1, y1, x2, y2, 1.5, color);
+        }
+    }
+    draw_text(
+        &format!("{label}: {:.2}{unit}  (max {:.2})", s.last(), max / 1.1),
+        x + 6.0,
+        y + 16.0,
+        16.0,
+        WHITE,
+    );
 }
 
 #[macroquad::main(window_conf)]
@@ -451,6 +537,13 @@ async fn main() {
         .unwrap_or(0);
     let mut frame: u64 = 0;
 
+    // Live performance series (rolling windows for the graphs column).
+    let mut g_frame = Series::new(240);
+    let mut g_atk_cull = Series::new(240);
+    let mut g_vision_cull = Series::new(240);
+    let mut g_move = Series::new(240);
+    let mut sightlines: Vec<(VPoint, VPoint)> = Vec::new();
+
     loop {
         if is_key_pressed(KeyCode::Escape) {
             break;
@@ -486,7 +579,7 @@ async fn main() {
         let mouse_in_map = wx >= 0.0 && wx < MAP_W && wy >= 0.0 && wy < MAP_H && mx < MAP_W as f32 * S;
         if is_mouse_button_down(MouseButton::Left)
             && mouse_in_map
-            && tree.item_count() < 400
+            && tree.item_count() < MAX_CRITTERS
             && now - last_paint > 0.12
         {
             last_paint = now;
@@ -520,7 +613,7 @@ async fn main() {
                 }
             }
         }
-        if is_key_pressed(KeyCode::Equal) && tree.item_count() < 400 {
+        if is_key_pressed(KeyCode::Equal) && tree.item_count() < MAX_CRITTERS {
             for _ in 0..5 {
                 let pos = spawn(&mut tree, &mut next_id, brush);
                 rings.push(Ring { pos, color: brush.color(), start: now, until: now + 0.4 });
@@ -565,14 +658,36 @@ async fn main() {
             });
 
             // Movement: each update relocates the item across leaves when it
-            // walks out of its cell (split/merge happens live here).
+            // walks out of its cell (split/merge happens live here). Hunters
+            // acquire prey with a vision-circle cull against the tree.
+            let move_start = std::time::Instant::now();
+            let mut vision_us_total = 0.0;
+            let mut vision_culls = 0u32;
+            sightlines.clear();
             for &(id, kind, pos, heading) in &snap {
-                let (np, nh) = step_critter(kind, pos, heading, dt, &snap, id);
+                let target = if kind == Kind::Hunter {
+                    let (prey, us) = nearest_prey(&tree, pos, id);
+                    vision_us_total += us;
+                    vision_culls += 1;
+                    if let Some(t) = prey {
+                        sightlines.push((pos, t));
+                    }
+                    prey
+                } else {
+                    None
+                };
+                let (np, nh) = step_critter(kind, pos, heading, dt, target);
                 tree.update(pos, |c| c.id == id, |c| {
                     c.pos = np;
                     c.heading = nh;
                 });
             }
+            g_move.push(move_start.elapsed().as_secs_f64() as f32 * 1000.0);
+            g_vision_cull.push(if vision_culls > 0 {
+                (vision_us_total / vision_culls as f64) as f32
+            } else {
+                0.0
+            });
 
             // Post-move snapshot for firing.
             let mut snap2: Vec<(u32, Kind, VPoint, f64)> = Vec::new();
@@ -584,6 +699,8 @@ async fn main() {
 
             let mut killed: Vec<(u32, VPoint, Kind)> = Vec::new();
             let mut killed_ids: HashSet<u32> = HashSet::new();
+            let mut atk_us_total = 0.0;
+            let mut atk_culls = 0u32;
 
             for &(id, kind, pos, _) in &snap2 {
                 if killed_ids.contains(&id) {
@@ -600,25 +717,15 @@ async fn main() {
                 *cd = rand::gen_range(cd_min, cd_max) as f64 / fire_f as f64;
 
                 let attack = match kind {
-                    // Aimed: drop pointed at the nearest non-hunter.
-                    Kind::Hunter => snap2
-                        .iter()
-                        .filter(|(tid, k, _, _)| {
-                            *tid != id && *k != Kind::Hunter && !killed_ids.contains(tid)
-                        })
-                        .min_by(|a, b| {
-                            let da = (a.2.x - pos.x).powi(2) + (a.2.y - pos.y).powi(2);
-                            let db = (b.2.x - pos.x).powi(2) + (b.2.y - pos.y).powi(2);
-                            da.partial_cmp(&db).unwrap()
-                        })
-                        .and_then(|&(_, _, tpos, _)| {
-                            make_attack(
-                                &arsenal,
-                                DROP_ID,
-                                pos,
-                                Some((tpos.x - pos.x, tpos.y - pos.y)),
-                            )
-                        }),
+                    // Aimed: drop pointed at the prey found by the vision cull.
+                    Kind::Hunter => nearest_prey(&tree, pos, id).0.and_then(|tpos| {
+                        make_attack(
+                            &arsenal,
+                            DROP_ID,
+                            pos,
+                            Some((tpos.x - pos.x, tpos.y - pos.y)),
+                        )
+                    }),
                     // Random direction drop.
                     Kind::Drifter => {
                         let a = rand::gen_range(0.0_f32, std::f32::consts::TAU) as f64;
@@ -629,7 +736,11 @@ async fn main() {
                 };
 
                 if let Some(atk) = attack {
-                    for victim in tree.cull(&atk) {
+                    let t = std::time::Instant::now();
+                    let victims = tree.cull(&atk);
+                    atk_us_total += t.elapsed().as_secs_f64() * 1e6;
+                    atk_culls += 1;
+                    for victim in victims {
                         if victim.id != id && !killed_ids.contains(&victim.id) {
                             killed_ids.insert(victim.id);
                             killed.push((victim.id, victim.pos, kind));
@@ -677,9 +788,16 @@ async fn main() {
                 }
             }
 
+            g_atk_cull.push(if atk_culls > 0 {
+                (atk_us_total / atk_culls as f64) as f32
+            } else {
+                0.0
+            });
+
             effects.retain(|e| e.until > now);
         }
         rings.retain(|r| r.until > now);
+        g_frame.push(get_frame_time() * 1000.0);
 
         // ---------- live tuning panel ----------
         widgets::Window::new(
@@ -694,9 +812,9 @@ async fn main() {
             ui.slider(hash!(), "split >", 1f32..12f32, &mut split_f);
             ui.slider(hash!(), "merge <=", 1f32..12f32, &mut merge_f);
             ui.separator();
-            ui.slider(hash!(), "drifters", 0f32..120f32, &mut drifters_f);
-            ui.slider(hash!(), "hunters", 0f32..120f32, &mut hunters_f);
-            ui.slider(hash!(), "pulsars", 0f32..120f32, &mut pulsars_f);
+            ui.slider(hash!(), "drifters", 0f32..400f32, &mut drifters_f);
+            ui.slider(hash!(), "hunters", 0f32..400f32, &mut hunters_f);
+            ui.slider(hash!(), "pulsars", 0f32..400f32, &mut pulsars_f);
             ui.separator();
             ui.slider(hash!(), "respawn s", 0.5f32..10f32, &mut respawn_f);
             ui.slider(hash!(), "speed x", 0.25f32..4f32, &mut speed_f);
@@ -840,29 +958,16 @@ async fn main() {
             }
         });
 
-        // Hunter sightlines to their current prey.
-        for &(id, kind, pos, _) in &draw_snap {
-            if kind != Kind::Hunter {
-                continue;
-            }
-            let target = draw_snap
-                .iter()
-                .filter(|(tid, k, _, _)| *tid != id && *k != Kind::Hunter)
-                .min_by(|a, b| {
-                    let da = (a.2.x - pos.x).powi(2) + (a.2.y - pos.y).powi(2);
-                    let db = (b.2.x - pos.x).powi(2) + (b.2.y - pos.y).powi(2);
-                    da.partial_cmp(&db).unwrap()
-                });
-            if let Some(&(_, _, tpos, _)) = target {
-                draw_line(
-                    pos.x as f32 * S,
-                    pos.y as f32 * S,
-                    tpos.x as f32 * S,
-                    tpos.y as f32 * S,
-                    1.0,
-                    Color::new(1.0, 0.3, 0.3, 0.18),
-                );
-            }
+        // Hunter sightlines to the prey found by their vision culls.
+        for &(from, to) in &sightlines {
+            draw_line(
+                from.x as f32 * S,
+                from.y as f32 * S,
+                to.x as f32 * S,
+                to.y as f32 * S,
+                1.0,
+                Color::new(1.0, 0.3, 0.3, 0.18),
+            );
         }
 
         for &(_, kind, pos, heading) in &draw_snap {
@@ -997,17 +1102,35 @@ async fn main() {
         if paused {
             line("PAUSED", 22.0, ORANGE, &mut ty);
         }
+        // ---------- graphs column ----------
+        let gx = map_px + PANEL_W;
+        draw_rectangle(gx, 0.0, GRAPH_W, map_py, Color::new(0.05, 0.05, 0.08, 1.0));
+        let gpad = 10.0;
+        let gw = GRAPH_W - 2.0 * gpad;
+        let gh = 140.0;
+        let mut gy = 14.0;
+        draw_text("performance (live)", gx + gpad, gy + 6.0, 20.0, WHITE);
+        gy += 18.0;
+        draw_graph(gx + gpad, gy, gw, gh, "frame", " ms", &g_frame, GREEN);
+        gy += gh + 12.0;
+        draw_graph(gx + gpad, gy, gw, gh, "attack cull", " us", &g_atk_cull, ORANGE);
+        gy += gh + 12.0;
+        draw_graph(gx + gpad, gy, gw, gh, "vision cull", " us", &g_vision_cull, SKYBLUE);
+        gy += gh + 12.0;
+        draw_graph(gx + gpad, gy, gw, gh, "move+update", " ms", &g_move, PINK);
+
         let help = [
-            "[LMB] spawn brush   [RMB] remove",
-            "[+/-] spawn/remove 5   [R] regions",
-            "[ / ] speed   [Space] pause   [Esc] quit",
+            "[1/2/3] brush   [LMB] spawn (hold = paint)",
+            "[RMB] remove   [+/-] spawn/remove 5",
+            "[R] regions   [ / ] speed",
+            "[Space] pause   [Esc] quit",
         ];
         for (i, h) in help.iter().enumerate() {
             draw_text(
                 h,
-                px,
-                map_py - 16.0 - 20.0 * (help.len() - 1 - i) as f32,
-                17.0,
+                gx + gpad,
+                map_py - 14.0 - 20.0 * (help.len() - 1 - i) as f32,
+                16.0,
                 GRAY,
             );
         }

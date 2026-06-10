@@ -52,6 +52,8 @@ A live 2D map (1024×1024 world, drawn at 0.75×) indexed by a `vectorial_hash::
 - Attack resolution is a real `Tree::cull` with the green/yellow/white short-circuit; victims are `Tree::remove`d (watch regions merge) and **respawn** a few seconds later (watch regions split).
 - Attack areas are drawn from the template cells themselves (bright = `In`, dim = `Maybe`) with the real attack polygon outlined on top (arcs flattened), so you can see exactly how the precomputed grid approximates the shape.
 - Kill credit is tracked per attacker kind; hunters show a faint sightline to their current prey.
+- **Hunters hunt with the tree too**: prey acquisition is a real `Tree::cull` over a vision circle (radius 280), so targeting scales with the index instead of a linear scan — populations go up to 400 per kind (1,500 total).
+- A third column plots **live performance graphs**: frame time, average attack-cull time, average vision-cull time, and the movement/update cost per frame.
 
 Controls: `1`/`2`/`3` select the spawn brush · left click (or hold-drag to paint) spawns at the cursor · right click removes · `+`/`-` add/remove five at random · `R` cycles region rendering · `[` `]` change simulation speed · `Space` pauses · `Esc` quits.
 
