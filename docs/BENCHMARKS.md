@@ -119,6 +119,61 @@ Bank generation (offline, 16 threads): 1×1 raster 0.05s; sizes ≤16 in 0.19s
    distributions, many simultaneous queries, larger worlds, mixed query
    sizes, and the planned "granularity as fallback" aggregation.
 
+## Results 3 — `vh bench-walk`: tree descent vs neighbour-walk (flood fill)
+
+Same world and bank setup as Results 2 (bank ≤64 + raster everywhere, so the
+comparison isolates the **traversal strategy**). The walk starts at the leaf
+containing a seed point inside the figure and expands through leaf
+neighbours, stopping at `Out` leaves. Three neighbour sources: Samet-style
+ascent/descent over the existing parent pointers (zero storage), point
+probing + `locate` from the root (zero storage), and stored per-leaf
+neighbour lists — *ropes* — behind the `neighbors` cargo feature (compiled
+out entirely when off). All strategies pass the equality gate against
+`Tree::cull`.
+
+| config | scale 350 (ms/cull) | scale 1400 (ms/cull) |
+| --- | ---: | ---: |
+| descent (`Tree::cull`) | **0.012** | **0.076** |
+| walk + Samet ascent | 0.024 (0.49x) | 0.213 (0.35x) |
+| walk + locate probe | 0.026 (0.45x) | 0.318 (0.24x) |
+| walk + ropes (stored) | 0.017 (0.70x) | 0.108 (0.70x) |
+
+Rope maintenance cost: building the 200k-point tree takes 49.9 ms without
+the feature vs 78.0 ms with it (~+56% on inserts; splits/merges rewire the
+neighbour lists). Descent cull times are unaffected by the feature.
+
+### Conclusions
+
+1. **Descent wins, and the reason is structural**: with per-cell-size
+   templates, an internal node classified green/white takes or skips its
+   *entire subtree* without visiting leaves. The flood-fill walk has no
+   subtree short-circuit — it must touch every leaf in the region, pay a
+   visited-set membership check per leaf, and run 4 neighbour queries per
+   leaf. The gap *widens* with query size (0.70x → 0.35x for the zero-storage
+   variants) precisely because larger queries contain more wholesale-takeable
+   subtrees.
+2. **Among walk variants, ropes > Samet > probe**, as expected: O(1) stored
+   lists beat O(1)-amortized ascent, which beats O(depth) root descents. But
+   even ropes lose ~30% to descent while making every insert/split/merge
+   ~56% more expensive — a bad trade for this workload.
+3. Where a neighbour walk could still win: queries *without* useful templates
+   (no green short-circuit to exploit), incremental queries that slide
+   between frames (reuse the previous frontier), or region operations that
+   are inherently neighbour-based (e.g. connected-component analysis,
+   contour extraction). The mechanism stays available (`Tree::cull_walk`,
+   `neighbors_samet`/`neighbors_probe`/`neighbors_ropes`) for those cases.
+4. References for the strategies: H. Samet, *Neighbor Finding Techniques for
+   Images Represented by Quadtrees* (1982); "ropes" as used in stackless
+   spatial traversal (Popov et al., *Stackless KD-Tree Traversal for High
+   Performance GPU Ray Tracing*, 2007); flood fill / region growing from
+   image processing.
+
+```bash
+cargo run -p vectorial-hash-cli --release -- bench-walk            # ropes included
+cargo run -p vectorial-hash-cli --release -- bench-walk --scale 1400
+cargo run -p vectorial-hash-cli --release --no-default-features -- bench-walk  # no rope bookkeeping
+```
+
 ## Industry context
 
 What games/physics engines typically use for this class of query (and what we

@@ -11,5 +11,11 @@ repository.workspace = true
 rust-version.workspace = true
 readme = "README.md"
 
+[features]
+# Leaf neighbour lists ("ropes") maintained on every split/merge, plus the
+# accessor used by the flood-fill cull. Off by default: when disabled, the
+# bookkeeping does not exist in the compiled code at all.
+neighbors = []
+
 [dependencies]
 # Keep this crate dependency-light on purpose: it is the core algorithm.

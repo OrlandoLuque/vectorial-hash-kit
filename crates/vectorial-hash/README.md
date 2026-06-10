@@ -29,7 +29,13 @@ Leaf items can additionally be answered by a 1×1 raster (`Shape::point_template
 | `geom` | `Point`, `Rect` | 2D primitives (half-open `Rect`). |
 | `template` | `CellState`, `TemplateGrid` | Runtime cull template: classify a region as In/Out/Maybe; `translated` re-anchors a template anywhere. |
 | `tree` | `Tree<T>`, `Node<T>`, `NodeId`, `Positioned` | Arena-backed binary-split tree (`insert`, `remove`, `update`, `locate`, `cull`, `visit_leaves`). `Tree::with_limits` sets a separate merge-up threshold (`merge_limit <= item_limit`) for split/merge hysteresis. |
-| `culling` | `Shape`, `Tree::cull` | Query items inside a shape, with optional template short-circuit. |
+| `culling` | `Shape`, `Tree::cull`, `Tree::cull_walk`, `WalkNeighbors` | Query items inside a shape, with optional template short-circuit; `cull_walk` traverses by flood fill over leaf neighbours instead of descending. |
+
+## Features
+
+| Feature | Effect |
+| --- | --- |
+| `neighbors` | Per-leaf stored neighbour lists ("ropes", `Side`-indexed), rewired on every split/merge, plus `Tree::neighbors_ropes` and `WalkNeighbors::Ropes`. Off by default — none of the bookkeeping exists in the compiled code without it. The zero-storage neighbour finders (`neighbors_samet`, `neighbors_probe`) are always available. |
 
 ## Example
 

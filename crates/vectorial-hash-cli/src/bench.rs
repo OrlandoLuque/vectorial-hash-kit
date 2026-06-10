@@ -461,6 +461,137 @@ pub fn run_sizes(points: usize, culls: usize, item_limit: usize, seed: u64) {
     }
 }
 
+/// `vh bench-walk`: tree descent vs flood-fill traversal over leaf
+/// neighbours, with every neighbour source (Samet ascent, locate probing,
+/// and — with the `neighbors` feature — stored ropes). All configs use the
+/// best per-size template setup (bank ≤64 + 1×1 raster) so the comparison
+/// isolates the traversal strategy.
+pub fn run_walk(points: usize, culls: usize, item_limit: usize, seed: u64, scale: f64) {
+    use vectorial_hash::WalkNeighbors;
+
+    const ANGLE: f64 = 30.0;
+    let origin = (2048i64, 1024i64);
+
+    println!("=== Cull benchmark: descent vs neighbour-walk (flood fill) ===");
+    println!(
+        "world {w}x{w} | {points} points | item_limit {item_limit} | {culls} culls/config | seed {seed}",
+        w = WORLD as i64,
+    );
+    println!("query: drop scale {scale} @{ANGLE}deg, origin {origin:?}\n");
+
+    let base = scaled_copy(&create_drop(0.2, 0.8), scale, scale);
+    let figure = FigureKey::new(0, &[0.2 * scale, 0.8 * scale]);
+    let mut poly = rotated_copy(&base, angle_to_radians(ANGLE));
+    poly.move_by(origin.0 as f64, origin.1 as f64);
+    let bbox = Rect::new(
+        poly.x_min,
+        poly.y_min,
+        poly.x_max - poly.x_min,
+        poly.y_max - poly.y_min,
+    );
+    // Walk seed: the polygon's vertex centroid (inside — the drop is convex).
+    let (mut cx, mut cy) = (0.0, 0.0);
+    for v in &poly.vertices {
+        cx += v.x;
+        cy += v.y;
+    }
+    let n = poly.vertices.len() as f64;
+    let seed_point = Point::new(cx / n, cy / n);
+    assert!(poly.is_inside(seed_point.x, seed_point.y), "walk seed must be inside the figure");
+
+    let mut bank = TemplateBank::new();
+    let t = Instant::now();
+    bank.generate_size(&figure, &base, &[ANGLE], 1, 1);
+    for &(w, h) in &[
+        (8u32, 8u32), (8, 16), (16, 8), (16, 16), (16, 32), (32, 16), (32, 32),
+        (32, 64), (64, 32), (64, 64),
+    ] {
+        bank.generate_size(&figure, &base, &[ANGLE], w, h);
+    }
+    println!(
+        "bank ready in {:.2}s ({} combos, {} unique)\n",
+        t.elapsed().as_secs_f64(),
+        bank.entry_count(),
+        bank.unique_count(),
+    );
+    let raster = bank.placed_raster(&figure, ANGLE, origin);
+
+    let mut rng = Rng(seed.max(1));
+    let pts: Vec<Pt> = (0..points)
+        .map(|_| Pt(Point::new(rng.unit_f64() * WORLD, rng.unit_f64() * WORLD)))
+        .collect();
+    let world = Rect::new(0.0, 0.0, WORLD, WORLD);
+    let t = Instant::now();
+    let mut tree: Tree<Pt> = Tree::new(world, item_limit);
+    for p in &pts {
+        tree.insert(*p);
+    }
+    println!(
+        "tree built in {:.1} ms ({} nodes){}",
+        t.elapsed().as_secs_f64() * 1000.0,
+        tree.node_count(),
+        if cfg!(feature = "neighbors") {
+            "  [ropes maintained]"
+        } else {
+            "  [no rope bookkeeping compiled in]"
+        },
+    );
+
+    let shape = BankShape {
+        bank: &bank,
+        figure: figure.clone(),
+        angle: ANGLE,
+        origin,
+        poly: poly.clone(),
+        bbox,
+        raster,
+    };
+
+    let expected = tree.cull(&shape).len();
+    println!("correctness reference: {expected} hits\n");
+
+    let mut results: Vec<(String, Duration)> = Vec::new();
+
+    let t = Instant::now();
+    for _ in 0..culls {
+        black_box(tree.cull(&shape).len());
+    }
+    results.push(("descent (Tree::cull)".into(), t.elapsed()));
+
+    #[allow(unused_mut)] // mutated only with the `neighbors` feature
+    let mut walk_configs: Vec<(&str, WalkNeighbors)> = vec![
+        ("walk + Samet ascent", WalkNeighbors::Samet),
+        ("walk + locate probe", WalkNeighbors::Probe),
+    ];
+    #[cfg(feature = "neighbors")]
+    walk_configs.push(("walk + ropes (stored)", WalkNeighbors::Ropes));
+
+    for (label, strategy) in walk_configs {
+        let got = tree.cull_walk(&shape, seed_point, strategy).len();
+        assert_eq!(got, expected, "{label}: {got} != {expected}");
+        let t = Instant::now();
+        for _ in 0..culls {
+            black_box(tree.cull_walk(&shape, seed_point, strategy).len());
+        }
+        results.push((label.to_string(), t.elapsed()));
+    }
+
+    println!("{:<26} {:>12} {:>14}", "config", "total (ms)", "avg/cull (ms)");
+    let base_ms = results[0].1.as_secs_f64() * 1000.0;
+    for (name, d) in &results {
+        let ms = d.as_secs_f64() * 1000.0;
+        println!(
+            "{:<26} {:>12.2} {:>14.3}   ({:.2}x vs descent)",
+            name,
+            ms,
+            ms / culls as f64,
+            base_ms / ms,
+        );
+    }
+    #[cfg(not(feature = "neighbors"))]
+    println!("\n(ropes config omitted: rebuild with --features neighbors)");
+}
+
 /// Flat uniform grid of buckets — the classic games-industry broadphase
 /// (spatial hashing over a fixed cell size; see Ericson, *Real-Time
 /// Collision Detection*, ch. 7). Query: iterate the buckets overlapped by

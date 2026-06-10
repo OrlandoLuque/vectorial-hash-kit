@@ -1,10 +1,25 @@
 //! Culling: find tree items inside a shape.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::geom::{Point, Rect};
 use crate::template::{CellState, PlacedTemplate, TemplateGrid};
-use crate::tree::{NodeId, Positioned, Tree};
+use crate::tree::{NodeId, Positioned, Side, Tree};
+
+/// How [`Tree::cull_walk`] finds each leaf's neighbours.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WalkNeighbors {
+    /// Ascend/descend through the existing parent pointers (Samet-style).
+    /// Zero extra storage; O(1) amortized per neighbour.
+    Samet,
+    /// Probe a point just across each edge and `locate` it from the root.
+    /// Zero extra storage; O(depth) per neighbour.
+    Probe,
+    /// Stored per-leaf neighbour lists, O(1); requires the `neighbors`
+    /// feature (maintained on every split/merge).
+    #[cfg(feature = "neighbors")]
+    Ropes,
+}
 
 /// A shape the culling algorithm can test against.
 ///
@@ -107,28 +122,85 @@ impl<T: Positioned> Tree<T> {
                     }
                 }
             }
-            None => {
-                let point_grid = shape.point_template();
-                for it in &node.items {
-                    let p = it.position();
-                    // Bbox pre-filter: anything outside the shape's bounding
-                    // box is out, no geometry needed.
-                    if !shape_bbox.contains(p) {
-                        continue;
-                    }
-                    match point_grid.map(|g| g.cell_at_world(p)) {
-                        Some(CellState::In) => out.push(it),
-                        Some(CellState::Out) => {}
-                        // Boundary pixel or no raster: exact test.
-                        _ => {
-                            if shape.contains_point(p) {
-                                out.push(it);
-                            }
-                        }
+            None => self.leaf_items_into(node_id, shape, shape_bbox, out),
+        }
+    }
+
+    /// Per-item resolution of a `Maybe` leaf: bbox pre-filter, then the 1×1
+    /// raster when available (exact geometry only on boundary pixels).
+    fn leaf_items_into<'a, S: Shape>(
+        &'a self,
+        leaf: NodeId,
+        shape: &S,
+        shape_bbox: &Rect,
+        out: &mut Vec<&'a T>,
+    ) {
+        let point_grid = shape.point_template();
+        for it in &self.get(leaf).items {
+            let p = it.position();
+            if !shape_bbox.contains(p) {
+                continue;
+            }
+            match point_grid.map(|g| g.cell_at_world(p)) {
+                Some(CellState::In) => out.push(it),
+                Some(CellState::Out) => {}
+                _ => {
+                    if shape.contains_point(p) {
+                        out.push(it);
                     }
                 }
             }
         }
+    }
+
+    /// Flood-fill cull: start at the leaf containing `seed` (a point that
+    /// must lie inside `shape`) and expand through leaf neighbours instead
+    /// of descending the tree. Expansion continues through `In`/`Maybe`
+    /// leaves and stops at `Out` ones; the collected result is identical to
+    /// [`Tree::cull`] for connected shapes.
+    pub fn cull_walk<'a, S: Shape>(
+        &'a self,
+        shape: &S,
+        seed: Point,
+        strategy: WalkNeighbors,
+    ) -> Vec<&'a T> {
+        let mut out = Vec::new();
+        if !self.get(self.root).bbox.contains(seed) {
+            return out;
+        }
+        let shape_bbox = shape.bounding_box();
+        let mut sizes = SizeCache::new();
+        let mut visited: HashSet<NodeId> = HashSet::new();
+        let start = self.locate(seed);
+        visited.insert(start);
+        let mut queue: Vec<NodeId> = vec![start];
+        let mut nbuf: Vec<NodeId> = Vec::new();
+
+        while let Some(leaf) = queue.pop() {
+            let lb = self.get(leaf).bbox;
+            match classify_child(shape, &shape_bbox, &lb, &mut sizes) {
+                CellState::Out => continue, // don't collect, don't expand
+                CellState::In => out.extend(self.get(leaf).items.iter()),
+                CellState::Maybe => self.leaf_items_into(leaf, shape, &shape_bbox, &mut out),
+            }
+            for side in Side::ALL {
+                nbuf.clear();
+                match strategy {
+                    WalkNeighbors::Samet => self.neighbors_samet(leaf, side, &mut nbuf),
+                    WalkNeighbors::Probe => self.neighbors_probe(leaf, side, &mut nbuf),
+                    #[cfg(feature = "neighbors")]
+                    WalkNeighbors::Ropes => {
+                        nbuf.extend_from_slice(self.neighbors_ropes(leaf, side))
+                    }
+                }
+                for &n in &nbuf {
+                    if visited.insert(n) {
+                        queue.push(n);
+                    }
+                }
+            }
+        }
+        out
     }
 }
 
@@ -367,6 +439,49 @@ mod tests {
         let mut positions: Vec<_> = tree.cull(&shape).iter().map(|p| p.0).collect();
         positions.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap());
         assert_eq!(positions, vec![Point::new(0.5, 0.5), Point::new(1.5, 0.5)]);
+    }
+
+    /// `cull_walk` must agree with `cull` for every neighbour strategy, on a
+    /// churned tree (splits and merges) with a circle query.
+    #[test]
+    fn cull_walk_matches_descent_for_all_strategies() {
+        let mut tree = Tree::<Pt>::new(Rect::new(0.0, 0.0, 256.0, 256.0), 2);
+        let mut x = 0xABCD1234u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut pts = Vec::new();
+        for _ in 0..150 {
+            let p = Point::new(next() * 256.0, next() * 256.0);
+            pts.push(p);
+            tree.insert(Pt(p));
+        }
+        for p in pts.iter().step_by(4) {
+            tree.remove(*p, |it| it.0 == *p);
+        }
+
+        let circle = Circle { center: Point::new(120.0, 140.0), radius: 70.0 };
+        let mut expected: Vec<Point> = tree.cull(&circle).iter().map(|p| p.0).collect();
+        expected.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap().then(a.y.partial_cmp(&b.y).unwrap()));
+
+        let strategies: Vec<WalkNeighbors> = vec![
+            WalkNeighbors::Samet,
+            WalkNeighbors::Probe,
+            #[cfg(feature = "neighbors")]
+            WalkNeighbors::Ropes,
+        ];
+        for strategy in strategies {
+            let mut got: Vec<Point> = tree
+                .cull_walk(&circle, circle.center, strategy)
+                .iter()
+                .map(|p| p.0)
+                .collect();
+            got.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap().then(a.y.partial_cmp(&b.y).unwrap()));
+            assert_eq!(got, expected, "strategy {strategy:?}");
+        }
     }
 
     /// Mirror of the above for white cells: a shape whose template is all Out

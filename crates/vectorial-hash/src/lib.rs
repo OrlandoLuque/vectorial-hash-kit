@@ -35,5 +35,5 @@ pub mod culling;
 
 pub use geom::{Point, Rect};
 pub use template::{CellState, PlacedTemplate, TemplateGrid};
-pub use tree::{Node, NodeId, Positioned, Tree};
-pub use culling::Shape;
+pub use tree::{Node, NodeId, Positioned, Side, Tree};
+pub use culling::{Shape, WalkNeighbors};

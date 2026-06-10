@@ -11,11 +11,63 @@ pub trait Positioned {
     fn position(&self) -> Point;
 }
 
+/// One of a cell's four sides, used by the neighbour-finding APIs.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Side {
+    West,
+    East,
+    North,
+    South,
+}
+
+impl Side {
+    pub const ALL: [Side; 4] = [Side::West, Side::East, Side::North, Side::South];
+
+    pub fn opposite(self) -> Side {
+        match self {
+            Side::West => Side::East,
+            Side::East => Side::West,
+            Side::North => Side::South,
+            Side::South => Side::North,
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Side::West => 0,
+            Side::East => 1,
+            Side::North => 2,
+            Side::South => 3,
+        }
+    }
+}
+
+/// Probe offset used by [`Tree::neighbors_probe`]; must be smaller than any
+/// cell extent the tree can produce.
+const PROBE_EPS: f64 = 1e-6;
+
 pub struct Node<T> {
     pub bbox: Rect,
     pub parent: Option<NodeId>,
     pub children: Option<[NodeId; 2]>,
     pub items: Vec<T>,
+    /// Leaf neighbour lists ("ropes") per side (W, E, N, S). Maintained on
+    /// every split and merge; only meaningful for leaves.
+    #[cfg(feature = "neighbors")]
+    pub ropes: [Vec<NodeId>; 4],
+}
+
+impl<T> Node<T> {
+    fn new_leaf(bbox: Rect, parent: Option<NodeId>) -> Self {
+        Node {
+            bbox,
+            parent,
+            children: None,
+            items: Vec::new(),
+            #[cfg(feature = "neighbors")]
+            ropes: Default::default(),
+        }
+    }
 }
 
 pub struct Tree<T: Positioned> {
@@ -43,7 +95,7 @@ impl<T: Positioned> Tree<T> {
             merge_limit <= item_limit,
             "merge_limit must be <= item_limit",
         );
-        let root = Node { bbox, parent: None, children: None, items: Vec::new() };
+        let root = Node::new_leaf(bbox, None);
         Self { nodes: vec![root], item_limit, merge_limit, root: NodeId(0) }
     }
 
@@ -175,6 +227,8 @@ impl<T: Positioned> Tree<T> {
             let parent = self.get_mut(parent_id);
             parent.items = items_a;
             parent.children = None;
+            #[cfg(feature = "neighbors")]
+            self.update_ropes_on_merge(parent_id, a, b);
             node = parent_id;
         }
     }
@@ -189,8 +243,8 @@ impl<T: Positioned> Tree<T> {
 
         let (a_bbox, b_bbox) = pick_split(bbox, &items);
 
-        let a = self.alloc(Node { bbox: a_bbox, parent: Some(id), children: None, items: Vec::new() });
-        let b = self.alloc(Node { bbox: b_bbox, parent: Some(id), children: None, items: Vec::new() });
+        let a = self.alloc(Node::new_leaf(a_bbox, Some(id)));
+        let b = self.alloc(Node::new_leaf(b_bbox, Some(id)));
 
         for item in items {
             let pos = item.position();
@@ -202,6 +256,9 @@ impl<T: Positioned> Tree<T> {
         }
 
         self.get_mut(id).children = Some([a, b]);
+
+        #[cfg(feature = "neighbors")]
+        self.update_ropes_on_split(id, a, b, a_bbox.width < bbox.width);
 
         if self.get(a).items.len() > self.item_limit { self.divide(a); }
         if self.get(b).items.len() > self.item_limit { self.divide(b); }
@@ -240,6 +297,218 @@ impl<T: Positioned> Tree<T> {
         let mut n = 0;
         self.visit_leaves(|_, _| n += 1);
         n
+    }
+
+    // ----- neighbour finding -----
+
+    /// Samet-style neighbour finding: ascend from `leaf` until the first
+    /// ancestor whose split crosses `side`, then descend the sibling along
+    /// the shared edge, collecting every adjacent leaf. Uses the parent
+    /// pointers the arena already has — zero extra storage; O(1) amortized,
+    /// O(depth) worst case.
+    ///
+    /// Reference: H. Samet, "Neighbor Finding Techniques for Images
+    /// Represented by Quadtrees" (1982), adapted to a binary-split tree.
+    pub fn neighbors_samet(&self, leaf: NodeId, side: Side, out: &mut Vec<NodeId>) {
+        let mut node = leaf;
+        let target = loop {
+            let Some(parent) = self.get(node).parent else {
+                return; // reached the root: `side` is the map border
+            };
+            let [a, b] = self.get(parent).children.expect("parent has children");
+            let vertical = self.get(a).bbox.width < self.get(parent).bbox.width;
+            // `a` is always the west (vertical) / north (horizontal) child.
+            let crossing = match (side, vertical) {
+                (Side::East, true) if node == a => Some(b),
+                (Side::West, true) if node == b => Some(a),
+                (Side::South, false) if node == a => Some(b),
+                (Side::North, false) if node == b => Some(a),
+                _ => None,
+            };
+            match crossing {
+                Some(sibling) => break sibling,
+                None => node = parent,
+            }
+        };
+        let lb = self.get(leaf).bbox;
+        self.collect_edge_leaves(target, side, &lb, out);
+    }
+
+    /// Descend `node`, keeping only subtrees that touch the `side` edge of
+    /// `lb` and overlap its perpendicular extent; push the reached leaves.
+    fn collect_edge_leaves(&self, node: NodeId, side: Side, lb: &Rect, out: &mut Vec<NodeId>) {
+        match self.get(node).children {
+            None => out.push(node),
+            Some([a, b]) => {
+                for child in [a, b] {
+                    let cb = self.get(child).bbox;
+                    let touches = match side {
+                        Side::East => cb.x == lb.x_max(),
+                        Side::West => cb.x_max() == lb.x,
+                        Side::South => cb.y == lb.y_max(),
+                        Side::North => cb.y_max() == lb.y,
+                    };
+                    let overlaps = match side {
+                        Side::East | Side::West => cb.y < lb.y_max() && lb.y < cb.y_max(),
+                        Side::North | Side::South => cb.x < lb.x_max() && lb.x < cb.x_max(),
+                    };
+                    if touches && overlaps {
+                        self.collect_edge_leaves(child, side, lb, out);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Pointerless neighbour finding by probing: take points just across the
+    /// `side` edge and `locate` each adjacent leaf from the root, advancing
+    /// along the edge by each found leaf's extent. Zero storage; O(depth)
+    /// per adjacent leaf.
+    pub fn neighbors_probe(&self, leaf: NodeId, side: Side, out: &mut Vec<NodeId>) {
+        let b = self.get(leaf).bbox;
+        let root = self.get(self.root).bbox;
+        match side {
+            Side::East | Side::West => {
+                let x = if side == Side::East { b.x_max() + PROBE_EPS } else { b.x - PROBE_EPS };
+                if x < root.x || x >= root.x_max() {
+                    return;
+                }
+                let mut y = b.y + PROBE_EPS;
+                while y < b.y_max() {
+                    let n = self.locate(Point::new(x, y));
+                    out.push(n);
+                    y = self.get(n).bbox.y_max() + PROBE_EPS;
+                }
+            }
+            Side::North | Side::South => {
+                let y = if side == Side::South { b.y_max() + PROBE_EPS } else { b.y - PROBE_EPS };
+                if y < root.y || y >= root.y_max() {
+                    return;
+                }
+                let mut x = b.x + PROBE_EPS;
+                while x < b.x_max() {
+                    let n = self.locate(Point::new(x, y));
+                    out.push(n);
+                    x = self.get(n).bbox.x_max() + PROBE_EPS;
+                }
+            }
+        }
+    }
+
+    /// Stored neighbour lists ("ropes"): O(1) access, maintained on every
+    /// split and merge. Only available with the `neighbors` feature.
+    #[cfg(feature = "neighbors")]
+    pub fn neighbors_ropes(&self, leaf: NodeId, side: Side) -> &[NodeId] {
+        &self.get(leaf).ropes[side.index()]
+    }
+
+    /// Rewire ropes when leaf `p` splits into `a` (west/north) and `b`.
+    #[cfg(feature = "neighbors")]
+    fn update_ropes_on_split(&mut self, p: NodeId, a: NodeId, b: NodeId, vertical: bool) {
+        let p_ropes = std::mem::take(&mut self.get_mut(p).ropes);
+        let (wi, ei, ni, si) = (
+            Side::West.index(),
+            Side::East.index(),
+            Side::North.index(),
+            Side::South.index(),
+        );
+        // Sides parallel to the split: one child inherits the whole list.
+        // Sides perpendicular: the list is divided by overlap (a neighbour
+        // can border both children).
+        let (full_a, full_b, splits) = if vertical {
+            // a west, b east; N/S lists divide by x-overlap.
+            ((wi, ei), (ei, wi), [ni, si])
+        } else {
+            // a north, b south; W/E lists divide by y-overlap.
+            ((ni, si), (si, ni), [wi, ei])
+        };
+
+        // Inherited full sides.
+        let (a_side, a_opp) = full_a;
+        for &n in &p_ropes[a_side] {
+            Self::replace_rope(&mut self.get_mut(n).ropes[a_opp], p, &[a]);
+        }
+        self.get_mut(a).ropes[a_side] = p_ropes[a_side].clone();
+        let (b_side, b_opp) = full_b;
+        for &n in &p_ropes[b_side] {
+            Self::replace_rope(&mut self.get_mut(n).ropes[b_opp], p, &[b]);
+        }
+        self.get_mut(b).ropes[b_side] = p_ropes[b_side].clone();
+
+        // The new internal edge.
+        self.get_mut(a).ropes[b_side] = vec![b];
+        self.get_mut(b).ropes[a_side] = vec![a];
+
+        // Perpendicular sides: distribute by overlap.
+        let (ab_a, ab_b) = (self.get(a).bbox, self.get(b).bbox);
+        for side_idx in splits {
+            let opp = match side_idx {
+                x if x == ni => si,
+                x if x == si => ni,
+                x if x == wi => ei,
+                _ => wi,
+            };
+            let mut list_a = Vec::new();
+            let mut list_b = Vec::new();
+            for &n in &p_ropes[side_idx] {
+                let nb = self.get(n).bbox;
+                let overlap = |cb: &Rect| {
+                    if vertical {
+                        nb.x < cb.x_max() && cb.x < nb.x_max()
+                    } else {
+                        nb.y < cb.y_max() && cb.y < nb.y_max()
+                    }
+                };
+                let mut subs: Vec<NodeId> = Vec::with_capacity(2);
+                if overlap(&ab_a) {
+                    list_a.push(n);
+                    subs.push(a);
+                }
+                if overlap(&ab_b) {
+                    list_b.push(n);
+                    subs.push(b);
+                }
+                Self::replace_rope(&mut self.get_mut(n).ropes[opp], p, &subs);
+            }
+            self.get_mut(a).ropes[side_idx] = list_a;
+            self.get_mut(b).ropes[side_idx] = list_b;
+        }
+    }
+
+    /// Rewire ropes when `p` re-absorbs its leaf children `a` and `b`.
+    #[cfg(feature = "neighbors")]
+    fn update_ropes_on_merge(&mut self, p: NodeId, a: NodeId, b: NodeId) {
+        let ra = std::mem::take(&mut self.get_mut(a).ropes);
+        let rb = std::mem::take(&mut self.get_mut(b).ropes);
+        for side in Side::ALL {
+            let i = side.index();
+            let opp = side.opposite().index();
+            let mut merged: Vec<NodeId> = Vec::with_capacity(ra[i].len() + rb[i].len());
+            for &n in ra[i].iter().chain(rb[i].iter()) {
+                if n != a && n != b && !merged.contains(&n) {
+                    merged.push(n);
+                }
+            }
+            for &n in &merged {
+                let list = &mut self.get_mut(n).ropes[opp];
+                list.retain(|&x| x != a && x != b);
+                if !list.contains(&p) {
+                    list.push(p);
+                }
+            }
+            self.get_mut(p).ropes[i] = merged;
+        }
+    }
+
+    /// Remove `old` from `list` and append `subs` (no duplicates expected).
+    #[cfg(feature = "neighbors")]
+    fn replace_rope(list: &mut Vec<NodeId>, old: NodeId, subs: &[NodeId]) {
+        list.retain(|&x| x != old);
+        for &s in subs {
+            if !list.contains(&s) {
+                list.push(s);
+            }
+        }
     }
 }
 
@@ -460,6 +729,94 @@ mod tests {
 
         // Every visited node must actually be a leaf.
         tree.visit_leaves(|_, leaf| assert!(leaf.children.is_none()));
+    }
+
+    /// Brute-force adjacency: leaves sharing an edge segment on `side`.
+    fn neighbors_brute(tree: &Tree<Pt>, leaf: NodeId, side: Side) -> Vec<NodeId> {
+        let lb = tree.get(leaf).bbox;
+        let mut out = Vec::new();
+        tree.visit_leaves(|id, n| {
+            if id == leaf {
+                return;
+            }
+            let cb = n.bbox;
+            let touches = match side {
+                Side::East => cb.x == lb.x_max(),
+                Side::West => cb.x_max() == lb.x,
+                Side::South => cb.y == lb.y_max(),
+                Side::North => cb.y_max() == lb.y,
+            };
+            let overlaps = match side {
+                Side::East | Side::West => cb.y < lb.y_max() && lb.y < cb.y_max(),
+                Side::North | Side::South => cb.x < lb.x_max() && lb.x < cb.x_max(),
+            };
+            if touches && overlaps {
+                out.push(id);
+            }
+        });
+        out
+    }
+
+    fn scattered_tree() -> Tree<Pt> {
+        // Deterministic pseudo-random points, with removals to force merges.
+        let mut tree = Tree::<Pt>::new(Rect::new(0.0, 0.0, 256.0, 256.0), 2);
+        let mut x = 0xDEADBEEFu64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut pts = Vec::new();
+        for _ in 0..120 {
+            let p = Point::new(next() * 256.0, next() * 256.0);
+            pts.push(p);
+            tree.insert(Pt(p));
+        }
+        for p in pts.iter().step_by(3) {
+            tree.remove(*p, |it| it.0 == *p);
+        }
+        tree
+    }
+
+    #[test]
+    fn samet_and_probe_neighbors_match_brute_force() {
+        let tree = scattered_tree();
+        let mut leaves = Vec::new();
+        tree.visit_leaves(|id, _| leaves.push(id));
+        for &leaf in &leaves {
+            for side in Side::ALL {
+                let mut expected = neighbors_brute(&tree, leaf, side);
+                expected.sort_by_key(|n| n.0);
+
+                let mut samet = Vec::new();
+                tree.neighbors_samet(leaf, side, &mut samet);
+                samet.sort_by_key(|n| n.0);
+                assert_eq!(samet, expected, "samet {side:?} of {leaf:?}");
+
+                let mut probe = Vec::new();
+                tree.neighbors_probe(leaf, side, &mut probe);
+                probe.sort_by_key(|n| n.0);
+                assert_eq!(probe, expected, "probe {side:?} of {leaf:?}");
+            }
+        }
+    }
+
+    #[cfg(feature = "neighbors")]
+    #[test]
+    fn ropes_match_brute_force_after_churn() {
+        let tree = scattered_tree();
+        let mut leaves = Vec::new();
+        tree.visit_leaves(|id, _| leaves.push(id));
+        for &leaf in &leaves {
+            for side in Side::ALL {
+                let mut expected = neighbors_brute(&tree, leaf, side);
+                expected.sort_by_key(|n| n.0);
+                let mut ropes: Vec<NodeId> = tree.neighbors_ropes(leaf, side).to_vec();
+                ropes.sort_by_key(|n| n.0);
+                assert_eq!(ropes, expected, "ropes {side:?} of {leaf:?}");
+            }
+        }
     }
 
     #[test]

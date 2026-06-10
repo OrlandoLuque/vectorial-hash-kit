@@ -13,7 +13,11 @@ name = "vh"
 path = "src/main.rs"
 
 [features]
-default = []
+# neighbors is on by default so `vh bench-walk` can compare the ropes
+# strategy; run with --no-default-features to measure the tree without any
+# rope bookkeeping compiled in.
+default = ["neighbors"]
+neighbors = ["vectorial-hash/neighbors"]
 redis-store = ["vectorial-hash-templates/redis-store"]
 
 [dependencies]

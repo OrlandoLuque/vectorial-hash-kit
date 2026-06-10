@@ -54,6 +54,25 @@ enum Cmd {
         #[arg(long, default_value_t = 0xC0FFEE)]
         seed: u64,
     },
+    /// Traversal benchmark: tree descent vs neighbour-walk flood fill
+    /// (Samet ascent / locate probe / stored ropes).
+    BenchWalk {
+        /// Number of random points in the world.
+        #[arg(long, default_value_t = 200_000)]
+        points: usize,
+        /// Cull repetitions per configuration.
+        #[arg(long, default_value_t = 50)]
+        culls: usize,
+        /// Items per leaf before a cell splits.
+        #[arg(long, default_value_t = 16)]
+        item_limit: usize,
+        /// RNG seed (deterministic point cloud).
+        #[arg(long, default_value_t = 0xC0FFEE)]
+        seed: u64,
+        /// Query figure scale (drop polygon).
+        #[arg(long, default_value_t = 350.0)]
+        scale: f64,
+    },
     /// 4-way cull benchmark: binary-split tree vs quadtree, templates on/off.
     Bench {
         /// Number of random points in the world.
@@ -99,6 +118,9 @@ fn main() {
         }
         Cmd::BenchSizes { points, culls, item_limit, seed } => {
             bench::run_sizes(points, culls, item_limit, seed);
+        }
+        Cmd::BenchWalk { points, culls, item_limit, seed, scale } => {
+            bench::run_walk(points, culls, item_limit, seed, scale);
         }
         #[cfg(feature = "redis-store")]
         Cmd::GenerateRedis { redis_host, redis_port, angle_step, scale, grid } => {
