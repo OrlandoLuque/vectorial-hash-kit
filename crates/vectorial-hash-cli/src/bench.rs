@@ -10,10 +10,12 @@
 //! All four must return the same hit count; the bench asserts it.
 
 use std::hint::black_box;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use vectorial_hash::{Point, Positioned, Rect, Shape, TemplateGrid, Tree};
 use vectorial_hash_templates::adapter::matrix_to_template_grid;
+use vectorial_hash_templates::bank::{FigureKey, TemplateBank};
 use vectorial_hash_templates::polygon::{create_drop, rotated_copy, scaled_copy, Polygon};
 use vectorial_hash_templates::templates::{angle_to_radians, get_template_grid_fast};
 
@@ -214,4 +216,251 @@ pub fn run(points: usize, culls: usize, item_limit: usize, seed: u64) {
     println!("  templates on quadtree       : {:>6.2}x", ms(3) / ms(2));
     println!("  vectorial vs quadtree (tpl) : {:>6.2}x", ms(2) / ms(0));
     println!("  vectorial vs quadtree (raw) : {:>6.2}x", ms(3) / ms(1));
+}
+
+/// Shape backed by the hierarchical `TemplateBank` (the paper's per-cell-size
+/// selection): the figure sits at its real integer origin and each tree-cell
+/// size resolves the template matching that origin's offset in the global
+/// virtual grid of that size.
+struct BankShape<'a> {
+    bank: &'a TemplateBank,
+    figure: FigureKey,
+    angle: f64,
+    origin: (i64, i64),
+    poly: Polygon,
+    bbox: Rect,
+    raster: Option<TemplateGrid>,
+}
+
+impl Shape for BankShape<'_> {
+    fn bounding_box(&self) -> Rect {
+        self.bbox
+    }
+    fn contains_point(&self, p: Point) -> bool {
+        self.poly.is_inside(p.x, p.y)
+    }
+    fn template_for_cell(&self, cell_w: f64, cell_h: f64) -> Option<Arc<TemplateGrid>> {
+        if cell_w.fract() != 0.0 || cell_h.fract() != 0.0 {
+            return None;
+        }
+        self.bank
+            .template_for(&self.figure, cell_w as u32, cell_h as u32, self.angle, self.origin)
+            .map(Arc::new)
+    }
+    fn point_template(&self) -> Option<&TemplateGrid> {
+        self.raster.as_ref()
+    }
+}
+
+/// `vh bench-sizes`: where do per-cell-size templates start paying off?
+///
+/// Compares, over the same tree and the same drop-shaped query applied at a
+/// real integer origin:
+///
+/// 1. no templates (bbox + per-point geometry)
+/// 2. one fixed fine grid + `classify_region` (≈ the old snap-to-offset
+///    method's runtime cost)
+/// 3. per-size template bank capped at ≤16, then ≤32, then ≤64 px cells
+///    (cumulative), leaf items answered by the 1×1 raster
+/// 4. the ≤64 bank again with the raster disabled (isolates its effect)
+pub fn run_sizes(points: usize, culls: usize, item_limit: usize, seed: u64) {
+    const SCALE: f64 = 350.0;
+    const ANGLE: f64 = 30.0;
+    let origin = (2048i64, 1024i64);
+
+    println!("=== Cull benchmark: per-cell-size template selection ===");
+    println!(
+        "world {w}x{w} | {points} points | item_limit {item_limit} | {culls} culls/config | seed {seed}",
+        w = WORLD as i64,
+    );
+    println!(
+        "query: drop scale {SCALE} @{ANGLE}deg, origin {origin:?} (figure never moved)\n",
+    );
+
+    let base = scaled_copy(&create_drop(0.2, 0.8), SCALE, SCALE);
+    let figure = FigureKey::new(0, &[0.2 * SCALE, 0.8 * SCALE]);
+    let mut poly = rotated_copy(&base, angle_to_radians(ANGLE));
+    poly.move_by(origin.0 as f64, origin.1 as f64);
+    let bbox = Rect::new(
+        poly.x_min,
+        poly.y_min,
+        poly.x_max - poly.x_min,
+        poly.y_max - poly.y_min,
+    );
+
+    // Point cloud + tree (binary-split only; quadtree comparison lives in `bench`).
+    let mut rng = Rng(seed.max(1));
+    let pts: Vec<Pt> = (0..points)
+        .map(|_| Pt(Point::new(rng.unit_f64() * WORLD, rng.unit_f64() * WORLD)))
+        .collect();
+    let world = Rect::new(0.0, 0.0, WORLD, WORLD);
+    let mut tree: Tree<Pt> = Tree::new(world, item_limit);
+    for p in &pts {
+        tree.insert(*p);
+    }
+
+    // Old-method stand-in: one fine fixed grid classified per node region.
+    let single_cell: i64 = 16;
+    let gxr = [
+        (poly.x_min / single_cell as f64).floor() as i64,
+        (poly.x_max / single_cell as f64).ceil() as i64,
+    ];
+    let gyr = [
+        (poly.y_min / single_cell as f64).floor() as i64,
+        (poly.y_max / single_cell as f64).ceil() as i64,
+    ];
+    let m = get_template_grid_fast(gxr[0], gyr[0], gxr[1], gyr[1], single_cell, single_cell, &poly);
+    let single_grid = matrix_to_template_grid(
+        &m,
+        Point::new(
+            gxr[0] as f64 * single_cell as f64,
+            gyr[0] as f64 * single_cell as f64,
+        ),
+        single_cell as f64,
+        single_cell as f64,
+    );
+    let plain = PlainShape { poly: poly.clone(), bbox };
+    let single = TplShape { poly: poly.clone(), bbox, grid: single_grid };
+
+    // Bank: 1x1 raster + cumulative size families.
+    let mut bank = TemplateBank::new();
+    let t = Instant::now();
+    bank.generate_size(&figure, &base, &[ANGLE], 1, 1);
+    let raster_gen = t.elapsed();
+    let raster = bank.point_raster(&figure, ANGLE, origin);
+    println!(
+        "generated 1x1 raster in {:.2}s ({} unique grids)",
+        raster_gen.as_secs_f64(),
+        bank.unique_count(),
+    );
+
+    let families: [(&str, &[(u32, u32)]); 3] = [
+        ("<=16", &[(8, 8), (8, 16), (16, 8), (16, 16)]),
+        ("<=32", &[(16, 32), (32, 16), (32, 32)]),
+        ("<=64", &[(32, 64), (64, 32), (64, 64)]),
+    ];
+
+    // Correctness reference.
+    let expected = tree.cull(&plain).len();
+
+    let mut results: Vec<(String, Duration)> = Vec::new();
+    let mut time_config = |label: String, shape: &dyn ErasedShape, tree: &Tree<Pt>| {
+        let got = tree.cull_dyn(shape).len();
+        assert_eq!(got, expected, "{label}: {got} hits != {expected}");
+        let t = Instant::now();
+        for _ in 0..culls {
+            black_box(tree.cull_dyn(shape).len());
+        }
+        results.push((label, t.elapsed()));
+    };
+
+    time_config("no templates".into(), &plain, &tree);
+    time_config(
+        format!("single {single_cell}px grid (old snap method)"),
+        &single,
+        &tree,
+    );
+
+    for (label, sizes) in families {
+        let t = Instant::now();
+        for &(w, h) in sizes {
+            bank.generate_size(&figure, &base, &[ANGLE], w, h);
+        }
+        let gen_time = t.elapsed();
+        println!(
+            "generated {label} family in {:.2}s (bank: {} combos, {} unique)",
+            gen_time.as_secs_f64(),
+            bank.entry_count(),
+            bank.unique_count(),
+        );
+        let shape = BankShape {
+            bank: &bank,
+            figure: figure.clone(),
+            angle: ANGLE,
+            origin,
+            poly: poly.clone(),
+            bbox,
+            raster: raster.clone(),
+        };
+        time_config(format!("bank {label} + raster"), &shape, &tree);
+    }
+
+    let no_raster = BankShape {
+        bank: &bank,
+        figure: figure.clone(),
+        angle: ANGLE,
+        origin,
+        poly: poly.clone(),
+        bbox,
+        raster: None,
+    };
+    time_config("bank <=64, no raster".into(), &no_raster, &tree);
+
+    println!("\n{:<38} {:>12} {:>14}", "config", "total (ms)", "avg/cull (ms)");
+    let base_ms = results[0].1.as_secs_f64() * 1000.0;
+    for (name, d) in &results {
+        let ms = d.as_secs_f64() * 1000.0;
+        println!(
+            "{:<38} {:>12.2} {:>14.3}   ({:.2}x vs none)",
+            name,
+            ms,
+            ms / culls as f64,
+            base_ms / ms,
+        );
+    }
+}
+
+/// Object-safe shim so heterogeneous shapes can share one timing closure.
+trait ErasedShape {
+    fn bounding_box(&self) -> Rect;
+    fn contains_point(&self, p: Point) -> bool;
+    fn template_grid(&self) -> Option<&TemplateGrid>;
+    fn template_for_cell(&self, w: f64, h: f64) -> Option<Arc<TemplateGrid>>;
+    fn point_template(&self) -> Option<&TemplateGrid>;
+}
+
+impl<S: Shape> ErasedShape for S {
+    fn bounding_box(&self) -> Rect {
+        Shape::bounding_box(self)
+    }
+    fn contains_point(&self, p: Point) -> bool {
+        Shape::contains_point(self, p)
+    }
+    fn template_grid(&self) -> Option<&TemplateGrid> {
+        Shape::template_grid(self)
+    }
+    fn template_for_cell(&self, w: f64, h: f64) -> Option<Arc<TemplateGrid>> {
+        Shape::template_for_cell(self, w, h)
+    }
+    fn point_template(&self) -> Option<&TemplateGrid> {
+        Shape::point_template(self)
+    }
+}
+
+impl Shape for &dyn ErasedShape {
+    fn bounding_box(&self) -> Rect {
+        (**self).bounding_box()
+    }
+    fn contains_point(&self, p: Point) -> bool {
+        (**self).contains_point(p)
+    }
+    fn template_grid(&self) -> Option<&TemplateGrid> {
+        (**self).template_grid()
+    }
+    fn template_for_cell(&self, w: f64, h: f64) -> Option<Arc<TemplateGrid>> {
+        (**self).template_for_cell(w, h)
+    }
+    fn point_template(&self) -> Option<&TemplateGrid> {
+        (**self).point_template()
+    }
+}
+
+trait CullDyn<T: Positioned> {
+    fn cull_dyn<'a>(&'a self, shape: &dyn ErasedShape) -> Vec<&'a T>;
+}
+
+impl<T: Positioned> CullDyn<T> for Tree<T> {
+    fn cull_dyn<'a>(&'a self, shape: &dyn ErasedShape) -> Vec<&'a T> {
+        self.cull(&shape)
+    }
 }

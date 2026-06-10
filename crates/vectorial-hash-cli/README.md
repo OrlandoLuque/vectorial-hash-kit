@@ -10,6 +10,7 @@ Command-line tools for the [`vectorial-hash`](../vectorial-hash) workspace. Inst
 | `compare` | in-memory | Benchmark across grids 16 + 32. |
 | `heavy` | in-memory | Benchmark across grids 16 + 32 + 64 + 128. |
 | `bench` | in-memory | 4-way cull benchmark: binary-split tree vs quadtree, templates on/off. Accepts `--points`, `--culls`, `--item-limit`, `--seed`. |
+| `bench-sizes` | in-memory | Per-cell-size template benchmark: no templates vs the old single-grid snap method vs the hierarchical bank capped at ≤16/≤32/≤64 px cells, with and without the 1×1 leaf raster. Same flags as `bench`. |
 | `generate-redis` | Redis | Requires feature `redis-store`. Multi-process via per-task locks. Accepts the same generation params as `generate`. |
 
 ## Usage

@@ -38,6 +38,22 @@ enum Cmd {
     Compare,
     /// Heavy benchmark (grids 16+32+64+128).
     Heavy,
+    /// Per-cell-size template benchmark: none vs old single-grid method vs
+    /// the bank capped at <=16/<=32/<=64 px cells, with/without 1x1 raster.
+    BenchSizes {
+        /// Number of random points in the world.
+        #[arg(long, default_value_t = 200_000)]
+        points: usize,
+        /// Cull repetitions per configuration.
+        #[arg(long, default_value_t = 50)]
+        culls: usize,
+        /// Items per leaf before a cell splits.
+        #[arg(long, default_value_t = 16)]
+        item_limit: usize,
+        /// RNG seed (deterministic point cloud).
+        #[arg(long, default_value_t = 0xC0FFEE)]
+        seed: u64,
+    },
     /// 4-way cull benchmark: binary-split tree vs quadtree, templates on/off.
     Bench {
         /// Number of random points in the world.
@@ -80,6 +96,9 @@ fn main() {
         Cmd::Heavy => comparison_test::run_heavy(),
         Cmd::Bench { points, culls, item_limit, seed } => {
             bench::run(points, culls, item_limit, seed);
+        }
+        Cmd::BenchSizes { points, culls, item_limit, seed } => {
+            bench::run_sizes(points, culls, item_limit, seed);
         }
         #[cfg(feature = "redis-store")]
         Cmd::GenerateRedis { redis_host, redis_port, angle_step, scale, grid } => {
