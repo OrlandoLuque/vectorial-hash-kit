@@ -253,6 +253,60 @@ impl TemplateBank {
     pub fn unique_count(&self) -> usize {
         self.dedup.len()
     }
+
+    /// Estimated heap memory, split into what stores the templates
+    /// themselves and what stores the lookup structure. Hash-map overhead is
+    /// estimated from each map's allocated capacity.
+    pub fn memory_usage(&self) -> BankMemory {
+        use std::mem::size_of;
+
+        // Unique template grids (shared behind Arcs).
+        let mut grids_bytes = 0usize;
+        for grid in self.dedup.values() {
+            grids_bytes += size_of::<TemplateGrid>() + grid.cells.capacity();
+        }
+
+        // The dedup map also retains a flat copy of each unique template's
+        // cells as its key (build-time only; could be dropped after
+        // generation).
+        let mut dedup_keys_bytes = 0usize;
+        for (key, _) in self.dedup.iter() {
+            dedup_keys_bytes += size_of::<DedupKey>() + key.4.capacity();
+        }
+        dedup_keys_bytes +=
+            self.dedup.capacity() * (size_of::<DedupKey>() + size_of::<Arc<TemplateGrid>>() + 1);
+
+        // Index levels: figure map -> size maps -> offset maps of Entry.
+        let mut index_bytes = self.figures.capacity()
+            * (size_of::<FigureKey>() + size_of::<SizeIndex>() + 1);
+        for fig in self.figures.values() {
+            index_bytes += fig.sizes.capacity()
+                * (size_of::<(u32, u32)>() + size_of::<OffsetIndex>() + 1);
+            for offsets in fig.sizes.values() {
+                index_bytes += offsets.map.capacity()
+                    * (size_of::<(u64, u32, u32)>() + size_of::<Entry>() + 1);
+            }
+        }
+
+        BankMemory { grids_bytes, index_bytes, dedup_keys_bytes }
+    }
+}
+
+/// Heap breakdown returned by [`TemplateBank::memory_usage`].
+#[derive(Debug, Clone, Copy)]
+pub struct BankMemory {
+    /// Unique, deduplicated template grids (the actual cell data).
+    pub grids_bytes: usize,
+    /// The hierarchical lookup index (keys, anchors, shared pointers).
+    pub index_bytes: usize,
+    /// Flat cell copies retained as dedup-map keys (generation-time aid).
+    pub dedup_keys_bytes: usize,
+}
+
+impl BankMemory {
+    pub fn total(&self) -> usize {
+        self.grids_bytes + self.index_bytes + self.dedup_keys_bytes
+    }
 }
 
 #[cfg(test)]

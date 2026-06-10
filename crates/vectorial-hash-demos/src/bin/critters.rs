@@ -489,11 +489,19 @@ async fn main() {
     next_frame().await;
 
     let arsenal = build_arsenal();
+    let mem = arsenal.bank.memory_usage();
     println!(
         "template bank: {} combos -> {} unique grids in {:.2}s",
         arsenal.bank.entry_count(),
         arsenal.bank.unique_count(),
         arsenal.gen_seconds,
+    );
+    println!(
+        "bank memory: {:.2} MB total (grids {:.2} MB, index {:.2} MB, dedup keys {:.2} MB)",
+        mem.total() as f64 / 1e6,
+        mem.grids_bytes as f64 / 1e6,
+        mem.index_bytes as f64 / 1e6,
+        mem.dedup_keys_bytes as f64 / 1e6,
     );
 
     let world = VRect::new(0.0, 0.0, MAP_W, MAP_H);

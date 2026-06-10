@@ -87,6 +87,9 @@ enum Cmd {
         /// RNG seed (deterministic point cloud).
         #[arg(long, default_value_t = 0xC0FFEE)]
         seed: u64,
+        /// 0 = uniform distribution; N > 0 = N gaussian clusters.
+        #[arg(long, default_value_t = 0)]
+        clusters: usize,
     },
     /// Generate templates and store them in Redis (multi-process).
     #[cfg(feature = "redis-store")]
@@ -113,8 +116,8 @@ fn main() {
         Cmd::Generate { angle_step, scale, grid } => run_in_memory(angle_step, scale, grid),
         Cmd::Compare => comparison_test::run_comparison(),
         Cmd::Heavy => comparison_test::run_heavy(),
-        Cmd::Bench { points, culls, item_limit, seed } => {
-            bench::run(points, culls, item_limit, seed);
+        Cmd::Bench { points, culls, item_limit, seed, clusters } => {
+            bench::run(points, culls, item_limit, seed, clusters);
         }
         Cmd::BenchSizes { points, culls, item_limit, seed } => {
             bench::run_sizes(points, culls, item_limit, seed);

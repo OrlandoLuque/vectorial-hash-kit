@@ -79,19 +79,70 @@ impl Rng {
     }
 }
 
-pub fn run(points: usize, culls: usize, item_limit: usize, seed: u64) {
+/// Deterministic point cloud: uniform, or `clusters` gaussian-ish blobs
+/// (sum of uniforms) when `clusters > 0`. Returns the points and, in
+/// clustered mode, the first cluster centre (so the query can be aimed at a
+/// populated area instead of empty space).
+fn make_points(rng: &mut Rng, points: usize, clusters: usize) -> (Vec<Pt>, Option<(f64, f64)>) {
+    if clusters == 0 {
+        let pts = (0..points)
+            .map(|_| Pt(Point::new(rng.unit_f64() * WORLD, rng.unit_f64() * WORLD)))
+            .collect();
+        return (pts, None);
+    }
+    let centers: Vec<(f64, f64)> = (0..clusters)
+        .map(|_| {
+            (
+                WORLD * (0.1 + 0.8 * rng.unit_f64()),
+                WORLD * (0.1 + 0.8 * rng.unit_f64()),
+            )
+        })
+        .collect();
+    let sigma = WORLD / 40.0;
+    let pts = (0..points)
+        .map(|_| {
+            let (cx, cy) = centers[(rng.next_u64() as usize) % clusters];
+            let dx = (rng.unit_f64() + rng.unit_f64() + rng.unit_f64() + rng.unit_f64() - 2.0) * sigma;
+            let dy = (rng.unit_f64() + rng.unit_f64() + rng.unit_f64() + rng.unit_f64() - 2.0) * sigma;
+            Pt(Point::new(
+                (cx + dx).clamp(0.0, WORLD - 1e-9),
+                (cy + dy).clamp(0.0, WORLD - 1e-9),
+            ))
+        })
+        .collect();
+    (pts, Some(centers[0]))
+}
+
+pub fn run(points: usize, culls: usize, item_limit: usize, seed: u64, clusters: usize) {
     println!("=== Cull benchmark: binary-split tree vs quadtree, templates on/off ===");
     println!(
-        "world {w}x{w} | {points} points | item_limit {item_limit} | {culls} culls/config | seed {seed}\n",
+        "world {w}x{w} | {points} points ({dist}) | item_limit {item_limit} | {culls} culls/config | seed {seed}\n",
         w = WORLD as i64,
+        dist = if clusters == 0 {
+            "uniform".to_string()
+        } else {
+            format!("{clusters} clusters")
+        },
     );
 
-    // Query polygon: a big rotated drop near the middle of the world.
+    // Points first: in clustered mode the query is aimed at the first
+    // cluster so it actually covers populated space.
+    let mut rng = Rng(seed.max(1));
+    let (pts, query_center) = make_points(&mut rng, points, clusters);
+
+    // Query polygon: a big rotated drop.
     let mut poly = rotated_copy(
         &scaled_copy(&create_drop(0.2, 0.8), 1400.0, 1400.0),
         angle_to_radians(30.0),
     );
-    poly.move_by(WORLD / 2.0, WORLD / 4.0);
+    match query_center {
+        Some((tx, ty)) => {
+            let bcx = (poly.x_min + poly.x_max) / 2.0;
+            let bcy = (poly.y_min + poly.y_max) / 2.0;
+            poly.move_by(tx - bcx, ty - bcy);
+        }
+        None => poly.move_by(WORLD / 2.0, WORLD / 4.0),
+    }
     let bbox = Rect::new(
         poly.x_min,
         poly.y_min,
@@ -127,12 +178,6 @@ pub fn run(points: usize, culls: usize, item_limit: usize, seed: u64) {
 
     let tpl_shape = TplShape { poly: poly.clone(), bbox, grid };
     let plain_shape = PlainShape { poly, bbox };
-
-    // Same points for both trees.
-    let mut rng = Rng(seed.max(1));
-    let pts: Vec<Pt> = (0..points)
-        .map(|_| Pt(Point::new(rng.unit_f64() * WORLD, rng.unit_f64() * WORLD)))
-        .collect();
 
     let world = Rect::new(0.0, 0.0, WORLD, WORLD);
 

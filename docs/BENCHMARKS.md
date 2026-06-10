@@ -60,6 +60,15 @@ Conclusions:
 - With uniformly distributed points, the binary-split tree and the quadtree
   are equivalent (±10%). The binary tree's edge is structural (cheap
   incremental `remove`/`update` with the merge-up rule), not raw cull speed.
+- **Clustered data doesn't change the picture** (`--clusters N` aims the
+  query at the first cluster): with 12 clusters and ~27k hits, or 4 clusters
+  and ~80k hits, both trees stay within ±1% of each other, with or without
+  templates. Cull cost is dominated by classification work that is identical
+  in both. Where they do differ: the quadtree *builds* ~1.8x faster (one
+  4-way redistribution per level vs two 2-way ones) and only needs square
+  template sets, while the binary split owes its place to the dynamic
+  mechanics (merge-up with hysteresis, data-aware split axis, non-square
+  worlds) rather than to query speed.
 
 ## Results 2 — `vh bench-sizes`: per-cell-size selection (the paper's scheme)
 
@@ -76,6 +85,15 @@ Bank generation (offline, 16 threads): 1×1 raster 0.05s; sizes ≤16 in 0.19s
 (577 combos → 410 unique); ≤32 in 0.19s (2,625 → 852); ≤64 in 0.14s
 (10,817 → 1,081). Content dedup shares identical grids behind `Arc`s — at
 ≤64, **90% of index leaves point at a shared template**.
+
+Memory (measured via `TemplateBank::memory_usage`, demo-sized bank — 2
+figures, 24+1 angles, sizes 8–32 px + 1×1 rasters, 65,625 combos → 7,797
+unique grids): **5.84 MB total**, of which the deduplicated template data is
+only **1.06 MB** (~136 B per unique grid), the hierarchical lookup index is
+**3.20 MB** (one ~41 B entry per key combination plus hash-map overhead —
+the explicit price of O(1) lookup per key), and **1.58 MB** are flat cell
+copies retained as dedup-map keys, a generation-time aid that could be
+dropped after building.
 
 | config | avg/cull (ms) | speedup |
 | --- | ---: | ---: |
