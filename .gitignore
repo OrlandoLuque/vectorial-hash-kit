@@ -1,7 +1,8 @@
 /target/
 **/*.rs.bk
 *.pdb
-.idea/
+.idea/*
+!.idea/runConfigurations/
 .vscode/
 .claude/
 .env
