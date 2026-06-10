@@ -821,9 +821,13 @@ async fn main() {
             ui.slider(hash!(), "fire x", 0.25f32..3f32, &mut fire_f);
         });
 
-        // Apply split/merge thresholds; rebuild the tree when they change.
-        split_f = split_f.clamp(1.0, 12.0);
-        merge_f = merge_f.clamp(1.0, split_f);
+        // Integer-valued sliders: snap to whole numbers right after the UI
+        // so neither the displayed value nor the applied one carries decimals.
+        split_f = split_f.round().clamp(1.0, 12.0);
+        merge_f = merge_f.round().clamp(1.0, split_f);
+        drifters_f = drifters_f.round();
+        hunters_f = hunters_f.round();
+        pulsars_f = pulsars_f.round();
         let want_split = split_f.round() as usize;
         let want_merge = (merge_f.round() as usize).min(want_split);
         if want_split != tree.item_limit || want_merge != tree.merge_limit {
