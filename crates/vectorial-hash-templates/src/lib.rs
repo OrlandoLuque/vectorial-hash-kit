@@ -11,6 +11,7 @@ pub mod task;
 pub mod comparison_test;
 pub mod adapter;
 pub mod bank;
+pub mod fingerprint;
 
 #[cfg(feature = "redis-store")]
 pub mod redis_store;

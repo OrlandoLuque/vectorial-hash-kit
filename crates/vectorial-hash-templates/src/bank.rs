@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use rayon::prelude::*;
-use vectorial_hash::{CellState, PlacedTemplate, Point, TemplateGrid};
+use vectorial_hash::{PlacedTemplate, Point, TemplateGrid};
 
 use crate::matrix;
 use crate::polygon::{rotated_copy, Polygon};

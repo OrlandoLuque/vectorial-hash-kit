@@ -54,6 +54,11 @@ enum Cmd {
         #[arg(long, default_value_t = 0xC0FFEE)]
         seed: u64,
     },
+    /// Dump a deterministic fingerprint of a fixed template set to stdout
+    /// (one line per (figure, scale, angle, cell, ox, oy): hex of the
+    /// PHP-compatible binary encoding). Used to compare template output
+    /// across code revisions byte-by-byte.
+    TemplatesFingerprint,
     /// Granularity-as-fallback benchmark: tree cull with every size
     /// precomputed vs only a fine set plus on-the-fly block aggregation.
     BenchFallback {
@@ -142,11 +147,19 @@ fn main() {
         Cmd::BenchFallback { points, culls, item_limit, seed, scale } => {
             bench::run_fallback(points, culls, item_limit, seed, scale);
         }
+        Cmd::TemplatesFingerprint => run_templates_fingerprint(),
         #[cfg(feature = "redis-store")]
         Cmd::GenerateRedis { redis_host, redis_port, angle_step, scale, grid } => {
             run_with_redis(&redis_host, redis_port, angle_step, scale, grid);
         }
     }
+}
+
+/// Deterministic fingerprint of a fixed template set; printed to stdout for
+/// regenerating the regression-test fixture when the generation pipeline
+/// changes intentionally.
+fn run_templates_fingerprint() {
+    print!("{}", vectorial_hash_templates::fingerprint::generate());
 }
 
 fn run_in_memory(angle_step: f64, scale: f64, grid: i64) {
