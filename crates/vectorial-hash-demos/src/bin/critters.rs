@@ -768,22 +768,7 @@ async fn main() {
         if is_key_pressed(KeyCode::Space) {
             paused = !paused;
         }
-        if is_key_pressed(KeyCode::M) {
-            let items: Vec<Critter> = {
-                let snap = sims.snapshot();
-                snap.into_iter()
-                    .map(|(id, kind, pos, heading)| Critter { id, kind, pos, heading })
-                    .collect()
-            };
-            let new_mode = sims.mode().next();
-            sims.apply_mode(
-                new_mode,
-                world,
-                split_f.round() as usize,
-                (merge_f.round() as usize).min(split_f.round() as usize),
-                &items,
-            );
-        }
+        let mut want_mode_switch = is_key_pressed(KeyCode::M);
         if is_key_pressed(KeyCode::Key1) {
             brush = Kind::Drifter;
         }
@@ -982,6 +967,10 @@ async fn main() {
         .titlebar(true)
         .movable(false)
         .ui(&mut *root_ui(), |ui| {
+            if ui.button(None, format!("structure: {}  [click or M]", sims.mode().name())) {
+                want_mode_switch = true;
+            }
+            ui.separator();
             ui.slider(hash!(), "split >", 1f32..12f32, &mut split_f);
             ui.slider(hash!(), "merge <=", 1f32..12f32, &mut merge_f);
             ui.separator();
@@ -997,6 +986,23 @@ async fn main() {
         // Integer-valued sliders snap to whole numbers.
         split_f = split_f.round().clamp(1.0, 12.0);
         merge_f = merge_f.round().clamp(1.0, split_f);
+
+        // Structure switch (M key or the panel button).
+        if want_mode_switch {
+            let items: Vec<Critter> = sims
+                .snapshot()
+                .into_iter()
+                .map(|(id, kind, pos, heading)| Critter { id, kind, pos, heading })
+                .collect();
+            let new_mode = sims.mode().next();
+            sims.apply_mode(
+                new_mode,
+                world,
+                split_f as usize,
+                (merge_f as usize).min(split_f as usize),
+                &items,
+            );
+        }
         drifters_f = drifters_f.round();
         hunters_f = hunters_f.round();
         pulsars_f = pulsars_f.round();
