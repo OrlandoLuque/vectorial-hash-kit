@@ -155,6 +155,30 @@ impl Polygon {
         p
     }
 
+    /// Legacy `is_inside`: the original PHP-port logic without the
+    /// ray-degeneracy guard. Kept ONLY to A/B compare against the current
+    /// implementation in regression-investigation tests.
+    #[doc(hidden)]
+    pub fn is_inside_legacy(&self, vx: f64, vy: f64) -> bool {
+        let test_point = Vertex::new(vx, vy);
+        let infinity = Vertex::new(-10_000_000.0, vy);
+        let n = self.vertices.len();
+        for i in 0..n {
+            let j = self.next_idx(i);
+            let q = &self.vertices[i];
+            let r = &self.vertices[j];
+            let on_edge = if q.seg.d == 0 {
+                intersector::intersection(&test_point, &test_point, q, r)
+            } else {
+                intersector::line_arc_intersection(&test_point, &test_point, q, r, false)
+            };
+            if !on_edge.is_empty() {
+                return true;
+            }
+        }
+        self.winding_is_odd(&infinity, &test_point)
+    }
+
     /// Check if a point is inside this polygon using winding number ray-casting.
     /// Faithfully ports the PHP isInside() logic including edge-on-point checks
     /// and special arc handling.
@@ -186,13 +210,22 @@ impl Polygon {
             }
         }
 
-        // 2) Winding count with a numerically safe ray.
+        // 2) Winding count with a numerically safe ray. k = 0 reproduces
+        // the original horizontal ray byte-for-byte (origin at world x =
+        // -1e7) so clean cases behave EXACTLY as the legacy code — moving
+        // the origin even by a translation shifts float epsilons in the
+        // line-segment-parameter check and can flip a borderline arc
+        // intersection between "in segment" and "out of segment".
         for k in 0..8u32 {
-            let ang = k as f64 * 0.39996; // k = 0 is the original horizontal ray
-            let infinity = Vertex::new(
-                vx - 10_000_000.0 * ang.cos(),
-                vy - 10_000_000.0 * ang.sin(),
-            );
+            let infinity = if k == 0 {
+                Vertex::new(-10_000_000.0, vy)
+            } else {
+                let ang = k as f64 * 0.39996;
+                Vertex::new(
+                    vx - 10_000_000.0 * ang.cos(),
+                    vy - 10_000_000.0 * ang.sin(),
+                )
+            };
             if !self.ray_is_degenerate(&infinity, &test_point) {
                 return self.winding_is_odd(&infinity, &test_point);
             }
@@ -223,7 +256,7 @@ impl Polygon {
     }
 
     /// Original PHP winding logic, parameterized by the ray start.
-    fn winding_is_odd(&self, infinity: &Vertex, test_point: &Vertex) -> bool {
+    pub(crate) fn winding_is_odd(&self, infinity: &Vertex, test_point: &Vertex) -> bool {
         let n = self.vertices.len();
         let mut winding_number = 0;
         for i in 0..n {
