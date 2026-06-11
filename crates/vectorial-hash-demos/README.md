@@ -52,8 +52,10 @@ A live 2D map (1024×1024 world, drawn at 0.75×) indexed by a `vectorial_hash::
 - Attack resolution is a real `Tree::cull` with the green/yellow/white short-circuit; victims are `Tree::remove`d (watch regions merge) and **respawn** a few seconds later (watch regions split).
 - Attack areas are drawn from the template cells themselves (bright = `In`, dim = `Maybe`) with the real attack polygon outlined on top (arcs flattened), so you can see exactly how the precomputed grid approximates the shape.
 - Kill credit is tracked per attacker kind; hunters show a faint sightline to their current prey.
-- **Hunters hunt with the tree too**: prey acquisition is a real `Tree::cull` over a vision circle (radius 280), so targeting scales with the index instead of a linear scan — populations go up to 400 per kind (1,500 total).
-- A third column plots **live performance graphs**: frame time, average attack-cull time, average vision-cull time, and the movement/update cost per frame.
+- **Hunters hunt with the tree too**: prey acquisition is a real cull over a vision circle (radius 280), so targeting scales with the index instead of a linear scan — populations go up to 1,200 per kind (4,000 total).
+- **Three structure modes** (`M` cycles): the binary-split tree, the reference quadtree, or **both at once**. In dual mode every operation — insert, remove, update, attack cull, vision cull — runs on both structures with identical inputs; their cull results are compared live (an "agree" indicator turns red on any mismatch), the sliders rebuild both identically, and the quadtree's subdivision is overlaid as cyan outlines on top of the binary tree's coloured regions.
+- A third column plots **live performance graphs** (one polyline per structure where applicable): frame time, average attack-cull and vision-cull times, per-frame movement/update cost, and per-frame insert+remove cost.
+- The simulation runs on a single thread (only the startup bank generation parallelizes), so the graphs show exactly where that thread's budget goes as you scale populations up.
 
 Controls: `1`/`2`/`3` select the spawn brush · left click (or hold-drag to paint) spawns at the cursor · right click removes · `+`/`-` add/remove five at random · `R` cycles region rendering · `[` `]` change simulation speed · `Space` pauses · `Esc` quits.
 

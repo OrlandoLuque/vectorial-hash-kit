@@ -18,7 +18,7 @@ use vectorial_hash_templates::bank::{FigureKey, TemplateBank};
 use vectorial_hash_templates::polygon::{create_drop, rotated_copy, scaled_copy, Polygon};
 use vectorial_hash_templates::templates::{angle_to_radians, get_template_grid_fast};
 
-use crate::quadtree::QuadTree;
+use vectorial_hash::QuadTree;
 
 const WORLD: f64 = 4096.0;
 const TEMPLATE_CELL: i64 = 64;

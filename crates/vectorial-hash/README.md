@@ -30,6 +30,7 @@ Leaf items can additionally be answered by a 1×1 raster (`Shape::point_template
 | `template` | `CellState`, `TemplateGrid` | Runtime cull template: classify a region as In/Out/Maybe; `translated` re-anchors a template anywhere. |
 | `tree` | `Tree<T>`, `Node<T>`, `NodeId`, `Positioned` | Arena-backed binary-split tree (`insert`, `remove`, `update`, `locate`, `cull`, `visit_leaves`). `Tree::with_limits` sets a separate merge-up threshold (`merge_limit <= item_limit`) for split/merge hysteresis. |
 | `culling` | `Shape`, `Tree::cull`, `Tree::cull_walk`, `WalkNeighbors` | Query items inside a shape, with optional template short-circuit; `cull_walk` traverses by flood fill over leaf neighbours instead of descending. |
+| `quadtree` | `QuadTree<T>`, `QNode<T>`, `QNodeId` | Reference 4-way structure with the tree's full dynamic contract (`insert`, `remove`, `update`, 4-way merge rule, `cull` through the same template machinery) for head-to-head comparisons. |
 
 ## Features
 

@@ -1,5 +1,4 @@
 mod bench;
-mod quadtree;
 
 use clap::{Parser, Subcommand};
 use std::sync::Arc;

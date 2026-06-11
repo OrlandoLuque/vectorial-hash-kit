@@ -73,7 +73,37 @@ pub trait Shape {
 }
 
 /// Per-execution cache: one resolved template per distinct cell size.
-type SizeCache = HashMap<(u64, u64), Option<PlacedTemplate>>;
+/// Shared with the reference quadtree so both structures classify cells
+/// through the exact same machinery.
+pub(crate) type SizeCache = HashMap<(u64, u64), Option<PlacedTemplate>>;
+
+/// Per-item resolution of a `Maybe` leaf, shared by every structure:
+/// bbox pre-filter (closed bounds — the figure boundary belongs to the
+/// figure), then the 1×1 raster when available (exact geometry only on
+/// boundary pixels).
+pub(crate) fn collect_matching_items<'a, T: Positioned, S: Shape>(
+    items: &'a [T],
+    shape: &S,
+    shape_bbox: &Rect,
+    out: &mut Vec<&'a T>,
+) {
+    let point_grid = shape.point_template();
+    for it in items {
+        let p = it.position();
+        if !shape_bbox.contains_closed(p) {
+            continue;
+        }
+        match point_grid.map(|g| g.cell_at_world(p)) {
+            Some(CellState::In) => out.push(it),
+            Some(CellState::Out) => {}
+            _ => {
+                if shape.contains_point(p) {
+                    out.push(it);
+                }
+            }
+        }
+    }
+}
 
 impl<T: Positioned> Tree<T> {
     /// Return references to every item inside `shape`.
@@ -122,36 +152,7 @@ impl<T: Positioned> Tree<T> {
                     }
                 }
             }
-            None => self.leaf_items_into(node_id, shape, shape_bbox, out),
-        }
-    }
-
-    /// Per-item resolution of a `Maybe` leaf: bbox pre-filter, then the 1×1
-    /// raster when available (exact geometry only on boundary pixels).
-    fn leaf_items_into<'a, S: Shape>(
-        &'a self,
-        leaf: NodeId,
-        shape: &S,
-        shape_bbox: &Rect,
-        out: &mut Vec<&'a T>,
-    ) {
-        let point_grid = shape.point_template();
-        for it in &self.get(leaf).items {
-            let p = it.position();
-            // Closed contains: the shape's boundary belongs to the shape, so
-            // points exactly on the bbox max edges must not be pre-filtered.
-            if !shape_bbox.contains_closed(p) {
-                continue;
-            }
-            match point_grid.map(|g| g.cell_at_world(p)) {
-                Some(CellState::In) => out.push(it),
-                Some(CellState::Out) => {}
-                _ => {
-                    if shape.contains_point(p) {
-                        out.push(it);
-                    }
-                }
-            }
+            None => collect_matching_items(&self.get(node_id).items, shape, shape_bbox, out),
         }
     }
 
@@ -183,7 +184,9 @@ impl<T: Positioned> Tree<T> {
             match classify_child(shape, &shape_bbox, &lb, &mut sizes) {
                 CellState::Out => continue, // don't collect, don't expand
                 CellState::In => out.extend(self.get(leaf).items.iter()),
-                CellState::Maybe => self.leaf_items_into(leaf, shape, &shape_bbox, &mut out),
+                CellState::Maybe => {
+                    collect_matching_items(&self.get(leaf).items, shape, &shape_bbox, &mut out)
+                }
             }
             for side in Side::ALL {
                 nbuf.clear();
@@ -206,7 +209,7 @@ impl<T: Positioned> Tree<T> {
     }
 }
 
-fn classify_child<S: Shape>(
+pub(crate) fn classify_child<S: Shape>(
     shape: &S,
     shape_bbox: &Rect,
     child_bbox: &Rect,
