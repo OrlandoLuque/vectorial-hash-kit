@@ -88,8 +88,23 @@ Run the long campaign with
 
 ## Roadmap
 
-- Arena free-list so `remove` reclaims orphaned nodes (today they stay as zombies; `NodeId`s are stable but `node_count()` overstates live nodes).
-- Leaf neighbour lists (north/south/east/west) behind a cargo feature, so the bookkeeping compiles out entirely when the feature is off.
+Ordered roughly by impact. The first block was harvested from the original design notes (the unpublished draft of the publication) and is the next round of work.
+
+- **Items with area or volume**: an item may live in more than one leaf when its extent overlaps several cells. Requires generalizing `Positioned` to an `Areal` variant (returning a `Rect` / `Aabb`), distributing across children on split, counting once per item under the merge-up rule, and deduplicating in `cull`. The mechanic enables collision-style queries (player↔monster, line-of-sight against extended objects) where today every item is a point.
+- **Figure↔grid scale equivalence**: a template generated for figure F over cells of size C is identical to the one for F/2 over cells of size C/2 (and so on for any uniform scaling). When a figure is going to be queried at many scales, generate the smallest version once and reuse it for the others by scaling the cell size; this composes with the granularity-as-fallback already implemented.
+- **Parametric circle templates**: instead of `In/Out/Maybe` per cell, store, per (offset, cell), the minimum radius that makes the cell `Maybe` and the minimum that makes it `In`. One parametric grid then answers every radius — exact, no aggregation. Generalizable to any one-parameter family (squares, regular polygons, …).
+- **Partial-symmetry templates beyond 8 ops**: a quarter circle stamped 4 times reproduces the full circle; half a drop reproduces the whole drop. Goes further than the current 8-way dedup by exploiting the figure's own symmetries to halve/quarter the precomputed payload.
+- **Bit-shifts for power-of-two worlds**: when the root extent is a power of two and splits are 1:1 binary, cell locating and divisions can use shifts instead of float arithmetic. The `Tree<T>` API stays the same; a typed `IntegerTree` (or a const generic) selects the shift-based path at compile time.
+- **Specific-case validation**: add explicit scenarios to the exhaustive campaign for query shapes the design notes call out — a donut (annulus, hole-in-middle figures), a long thin line / wide corridor (route-like GPS queries), and irregular concave polygons — so the contract holds for the harder geometries too.
+
+Continuing work:
+
+- **Validation contract refinement**: the cull is exact beyond a ~2×EPSILON halo around the figure boundary (1e-5 in the intersector); inside the halo, items may classify either way. Tightening this either with exact-arithmetic predicates or with consistent epsilon-tolerant templates would close the last source of discrepancy.
+- **Aggregation cache across culls**: today the fallback rebuilds the aggregated template once per cull. Memoizing it on the bank (keyed by figure / angle / origin / target size) would close the gap to the fully precomputed variant when memory matters more than precompute.
+- **Arena free-list** so `remove` reclaims orphaned nodes (today they stay as zombies; `NodeId`s are stable but `node_count()` overstates live nodes).
+- **Stable `ItemRef`** so callers can hold onto items across mutations without re-locating them by point + predicate every time.
+- **3D variant** (probably feature-gated or via a generic dimension parameter once the 2D shape settles).
+- **SIMD-friendly cell layout** where it pays off.
 - Stable `ItemRef` so callers can hold onto items across mutations without re-locating them by point + predicate every time.
 - 3D variant (probably feature-gated or via a generic dimension parameter once the 2D shape settles).
 - SIMD-friendly cell layout where it pays off.

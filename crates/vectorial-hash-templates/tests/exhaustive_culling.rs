@@ -124,8 +124,14 @@ impl Shape for BankShape<'_> {
         if cell_w.fract() != 0.0 || cell_h.fract() != 0.0 {
             return None;
         }
-        self.bank
-            .placed_for(&self.figure, cell_w as u32, cell_h as u32, self.angle, self.origin)
+        // Aggregated fallback is exact, so the campaign also covers it.
+        self.bank.placed_for_or_aggregated(
+            &self.figure,
+            cell_w as u32,
+            cell_h as u32,
+            self.angle,
+            self.origin,
+        )
     }
     fn point_template(&self) -> Option<&PlacedTemplate> {
         self.raster.as_ref()

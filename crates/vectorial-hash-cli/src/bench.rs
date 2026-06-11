@@ -262,6 +262,186 @@ pub fn run(points: usize, culls: usize, item_limit: usize, seed: u64, clusters: 
     println!("  vectorial vs quadtree (raw) : {:>6.2}x", ms(3) / ms(1));
 }
 
+/// `vh bench-fallback`: granularity-as-fallback study.
+///
+/// Compares, over the same tree and the same query, three culling configs:
+///
+/// 1. **no template**: the tree has nothing to short-circuit with.
+/// 2. **fine set only + aggregate-on-the-fly**: the bank contains only one
+///    small cell size (e.g. 8×8); the cull asks for every other size and
+///    receives an aggregated grid. Lossless per the .docx property —
+///    classification matches a directly-generated set exactly.
+/// 3. **every size precomputed**: the bank already has sets for the full
+///    family of cell sizes the tree uses; no aggregation needed.
+///
+/// All three configs must return the same hit count (asserted) before
+/// timing. The interesting question is config #2's overhead vs #3, since #2
+/// trades precomputation memory and time for per-cull aggregation work.
+pub fn run_fallback(points: usize, culls: usize, item_limit: usize, seed: u64, scale: f64) {
+    const ANGLE: f64 = 30.0;
+    let origin = (2048i64, 1024i64);
+
+    println!("=== Cull benchmark: granularity-as-fallback aggregation ===");
+    println!(
+        "world {w}x{w} | {points} points | item_limit {item_limit} | {culls} culls/config | seed {seed}",
+        w = WORLD as i64,
+    );
+    println!("query: drop scale {scale} @{ANGLE}deg, origin {origin:?}\n");
+
+    let base = scaled_copy(&create_drop(0.2, 0.8), scale, scale);
+    let figure = FigureKey::new(0, &[0.2 * scale, 0.8 * scale]);
+    let mut poly = rotated_copy(&base, angle_to_radians(ANGLE));
+    poly.move_by(origin.0 as f64, origin.1 as f64);
+    let bbox = Rect::new(
+        poly.x_min,
+        poly.y_min,
+        poly.x_max - poly.x_min,
+        poly.y_max - poly.y_min,
+    );
+
+    let mut rng = Rng(seed.max(1));
+    let pts: Vec<Pt> = (0..points)
+        .map(|_| Pt(Point::new(rng.unit_f64() * WORLD, rng.unit_f64() * WORLD)))
+        .collect();
+    let world = Rect::new(0.0, 0.0, WORLD, WORLD);
+    let mut tree: Tree<Pt> = Tree::new(world, item_limit);
+    for p in &pts {
+        tree.insert(*p);
+    }
+
+    // Three banks.
+    let t = Instant::now();
+    let mut bank_full = TemplateBank::new();
+    for &(w, h) in &[
+        (1u32, 1u32), (8, 8), (8, 16), (16, 8), (16, 16),
+        (16, 32), (32, 16), (32, 32), (32, 64), (64, 32), (64, 64),
+    ] {
+        bank_full.generate_size(&figure, &base, &[ANGLE], w, h);
+    }
+    let full_gen = t.elapsed();
+    let full_mem = bank_full.memory_usage();
+
+    let t = Instant::now();
+    let mut bank_small = TemplateBank::new();
+    for &(w, h) in &[(1u32, 1u32), (8, 8), (8, 16), (16, 8)] {
+        bank_small.generate_size(&figure, &base, &[ANGLE], w, h);
+    }
+    let small_gen = t.elapsed();
+    let small_mem = bank_small.memory_usage();
+
+    println!(
+        "bank full   ({}us gen, {} combos, {} unique grids, {:.2} MB) — every cell size precomputed",
+        full_gen.as_micros(),
+        bank_full.entry_count(),
+        bank_full.unique_count(),
+        full_mem.total() as f64 / 1e6,
+    );
+    println!(
+        "bank small  ({}us gen, {} combos, {} unique grids, {:.2} MB) — only sizes <=16; rest aggregated\n",
+        small_gen.as_micros(),
+        bank_small.entry_count(),
+        bank_small.unique_count(),
+        small_mem.total() as f64 / 1e6,
+    );
+
+    let raster_full = bank_full.placed_raster(&figure, ANGLE, origin);
+    let raster_small = bank_small.placed_raster(&figure, ANGLE, origin);
+    let plain = PlainShape { poly: poly.clone(), bbox };
+    let shape_full = BankShape {
+        bank: &bank_full,
+        figure: figure.clone(),
+        angle: ANGLE,
+        origin,
+        poly: poly.clone(),
+        bbox,
+        raster: raster_full,
+    };
+    let shape_small = FallbackShape {
+        bank: &bank_small,
+        figure: figure.clone(),
+        angle: ANGLE,
+        origin,
+        poly: poly.clone(),
+        bbox,
+        raster: raster_small,
+    };
+
+    let expected = tree.cull(&plain).len();
+    let got_full = tree.cull(&shape_full).len();
+    let got_small = tree.cull(&shape_small).len();
+    assert_eq!(got_full, expected, "full bank disagrees: {got_full} != {expected}");
+    assert_eq!(got_small, expected, "small bank disagrees: {got_small} != {expected}");
+    println!("correctness: all 3 configs return {expected} hits — OK\n");
+
+    let mut results: Vec<(&str, Duration)> = Vec::new();
+
+    let t = Instant::now();
+    for _ in 0..culls {
+        black_box(tree.cull(&plain).len());
+    }
+    results.push(("no templates", t.elapsed()));
+
+    let t = Instant::now();
+    for _ in 0..culls {
+        black_box(tree.cull(&shape_small).len());
+    }
+    results.push(("bank <=16 + aggregated fallback", t.elapsed()));
+
+    let t = Instant::now();
+    for _ in 0..culls {
+        black_box(tree.cull(&shape_full).len());
+    }
+    results.push(("bank full (every size precomputed)", t.elapsed()));
+
+    println!("{:<38} {:>12} {:>14}", "config", "total (ms)", "avg/cull (ms)");
+    let base_ms = results[0].1.as_secs_f64() * 1000.0;
+    for (name, d) in &results {
+        let ms = d.as_secs_f64() * 1000.0;
+        println!(
+            "{:<38} {:>12.2} {:>14.3}   ({:.2}x vs none)",
+            name,
+            ms,
+            ms / culls as f64,
+            base_ms / ms,
+        );
+    }
+}
+
+/// Same as `BankShape` but goes through the aggregating fallback.
+struct FallbackShape<'a> {
+    bank: &'a TemplateBank,
+    figure: FigureKey,
+    angle: f64,
+    origin: (i64, i64),
+    poly: Polygon,
+    bbox: Rect,
+    raster: Option<PlacedTemplate>,
+}
+
+impl Shape for FallbackShape<'_> {
+    fn bounding_box(&self) -> Rect {
+        self.bbox
+    }
+    fn contains_point(&self, p: Point) -> bool {
+        self.poly.is_inside(p.x, p.y)
+    }
+    fn template_for_cell(&self, cell_w: f64, cell_h: f64) -> Option<PlacedTemplate> {
+        if cell_w.fract() != 0.0 || cell_h.fract() != 0.0 {
+            return None;
+        }
+        self.bank.placed_for_or_aggregated(
+            &self.figure,
+            cell_w as u32,
+            cell_h as u32,
+            self.angle,
+            self.origin,
+        )
+    }
+    fn point_template(&self) -> Option<&PlacedTemplate> {
+        self.raster.as_ref()
+    }
+}
+
 /// Shape backed by the hierarchical `TemplateBank` (the paper's per-cell-size
 /// selection): the figure sits at its real integer origin and each tree-cell
 /// size resolves the template matching that origin's offset in the global

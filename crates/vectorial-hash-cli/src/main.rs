@@ -54,6 +54,20 @@ enum Cmd {
         #[arg(long, default_value_t = 0xC0FFEE)]
         seed: u64,
     },
+    /// Granularity-as-fallback benchmark: tree cull with every size
+    /// precomputed vs only a fine set plus on-the-fly block aggregation.
+    BenchFallback {
+        #[arg(long, default_value_t = 200_000)]
+        points: usize,
+        #[arg(long, default_value_t = 50)]
+        culls: usize,
+        #[arg(long, default_value_t = 16)]
+        item_limit: usize,
+        #[arg(long, default_value_t = 0xC0FFEE)]
+        seed: u64,
+        #[arg(long, default_value_t = 350.0)]
+        scale: f64,
+    },
     /// Traversal benchmark: tree descent vs neighbour-walk flood fill
     /// (Samet ascent / locate probe / stored ropes).
     BenchWalk {
@@ -124,6 +138,9 @@ fn main() {
         }
         Cmd::BenchWalk { points, culls, item_limit, seed, scale } => {
             bench::run_walk(points, culls, item_limit, seed, scale);
+        }
+        Cmd::BenchFallback { points, culls, item_limit, seed, scale } => {
+            bench::run_fallback(points, culls, item_limit, seed, scale);
         }
         #[cfg(feature = "redis-store")]
         Cmd::GenerateRedis { redis_host, redis_port, angle_step, scale, grid } => {

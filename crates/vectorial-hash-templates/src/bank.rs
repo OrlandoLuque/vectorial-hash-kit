@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use rayon::prelude::*;
-use vectorial_hash::{PlacedTemplate, Point, TemplateGrid};
+use vectorial_hash::{CellState, PlacedTemplate, Point, TemplateGrid};
 
 use crate::matrix;
 use crate::polygon::{rotated_copy, Polygon};
@@ -244,6 +244,45 @@ impl TemplateBank {
         self.placed_for(figure, 1, 1, angle_deg, origin)
     }
 
+    /// Like [`TemplateBank::placed_for`] but, when no set exists for the
+    /// requested cell size, falls back to a smaller-cell set whose
+    /// dimensions divide the request and aggregates its cells into the
+    /// requested size. The aggregation is exact (see
+    /// [`TemplateGrid::aggregate`]): the result has the same classification
+    /// the directly-generated set would have, only paid at query time
+    /// instead of at precomputation. Returns `None` only when no smaller
+    /// set with integer-divisor dimensions exists either.
+    pub fn placed_for_or_aggregated(
+        &self,
+        figure: &FigureKey,
+        cell_w: u32,
+        cell_h: u32,
+        angle_deg: f64,
+        origin: (i64, i64),
+    ) -> Option<PlacedTemplate> {
+        if let Some(direct) = self.placed_for(figure, cell_w, cell_h, angle_deg, origin) {
+            return Some(direct);
+        }
+        // Pick the largest available (sw, sh) that divides (cell_w, cell_h).
+        let sizes = self.figures.get(figure)?;
+        let mut best: Option<((u32, u32), u32)> = None; // ((sw,sh), area)
+        for &(sw, sh) in sizes.sizes.keys() {
+            if sw == 0 || sh == 0 || cell_w % sw != 0 || cell_h % sh != 0 {
+                continue;
+            }
+            if sw == cell_w && sh == cell_h {
+                continue; // already tried above
+            }
+            let area = sw * sh;
+            if best.is_none_or(|(_, ba)| area > ba) {
+                best = Some(((sw, sh), area));
+            }
+        }
+        let ((sw, sh), _) = best?;
+        let small = self.placed_for(figure, sw, sh, angle_deg, origin)?;
+        Some(small.aggregated(cell_w / sw, cell_h / sh))
+    }
+
     /// Total index leaves (key combinations).
     pub fn entry_count(&self) -> usize {
         self.entries
@@ -396,6 +435,77 @@ mod tests {
                 assert_eq!(placed.cell_at_world(p), materialized.cell_at_world(p), "at {p:?}");
             }
         }
+    }
+
+    #[test]
+    fn aggregated_fallback_matches_directly_generated_set() {
+        // Generate small AND large sets; the aggregated lookup must give the
+        // same In/Out/Maybe classification as the directly-generated large.
+        let side = 8.0;
+        let base = create_square(0.0, 0.0, side, side);
+        let fig = FigureKey::new(7, &[side]);
+        let mut bank = TemplateBank::new();
+        bank.generate_size(&fig, &base, &[0.0], 1, 1);
+        bank.generate_size(&fig, &base, &[0.0], 4, 4); // ground truth
+
+        // A "no-large" bank for the fallback path.
+        let mut bank_small_only = TemplateBank::new();
+        bank_small_only.generate_size(&fig, &base, &[0.0], 1, 1);
+
+        let origin = (37i64, 19i64);
+        let direct = bank.placed_for(&fig, 4, 4, 0.0, origin).unwrap();
+        let agg = bank_small_only
+            .placed_for_or_aggregated(&fig, 4, 4, 0.0, origin)
+            .expect("aggregation should succeed via the 1x1 set");
+
+        for cx in (28..56).step_by(4) {
+            for cy in (12..36).step_by(4) {
+                let p = Point::new(cx as f64 + 2.0, cy as f64 + 2.0);
+                assert_eq!(
+                    agg.cell_at_world(p),
+                    direct.cell_at_world(p),
+                    "({cx},{cy}): aggregated must equal directly-generated",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn placed_for_or_aggregated_returns_direct_when_available() {
+        let base = create_square(0.0, 0.0, 8.0, 8.0);
+        let fig = FigureKey::new(7, &[8.0]);
+        let mut bank = TemplateBank::new();
+        bank.generate_size(&fig, &base, &[0.0], 4, 4);
+        // No fallback should be needed.
+        let placed = bank
+            .placed_for_or_aggregated(&fig, 4, 4, 0.0, (40, 20))
+            .unwrap();
+        assert_eq!(placed.grid.cell_w, 4.0);
+        // Sanity: at least one In cell exists inside the figure bbox.
+        let mut any_in = false;
+        for cx in (40..72).step_by(4) {
+            for cy in (20..52).step_by(4) {
+                if placed.cell_at_world(Point::new(cx as f64 + 2.0, cy as f64 + 2.0))
+                    == CellState::In
+                {
+                    any_in = true;
+                }
+            }
+        }
+        assert!(any_in);
+    }
+
+    #[test]
+    fn placed_for_or_aggregated_returns_none_without_divisor_set() {
+        let base = create_square(0.0, 0.0, 8.0, 8.0);
+        let fig = FigureKey::new(7, &[8.0]);
+        let mut bank = TemplateBank::new();
+        // 3 does not divide 4.
+        bank.generate_size(&fig, &base, &[0.0], 3, 3);
+        assert!(
+            bank.placed_for_or_aggregated(&fig, 4, 4, 0.0, (0, 0))
+                .is_none(),
+        );
     }
 
     #[test]

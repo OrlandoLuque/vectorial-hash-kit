@@ -192,6 +192,46 @@ cargo run -p vectorial-hash-cli --release -- bench-walk --scale 1400
 cargo run -p vectorial-hash-cli --release --no-default-features -- bench-walk  # no rope bookkeeping
 ```
 
+## Results 4 — `vh bench-fallback`: granularity-as-fallback aggregation
+
+Same scenario as Results 2. The .docx design notes record an exact property:
+a template generated for a small cell size can stand in for *any* larger
+cell size whose dimensions are an integer multiple, by aggregating blocks
+with the rule `all-In → In, all-Out → Out, otherwise → Maybe`. This is
+**not an approximation** — a cell is fully inside the figure iff every
+sub-cell is, etc. So an aggregated template carries exactly the
+classification a directly-generated one would have, only paid at query
+time instead of at precomputation.
+
+`PlacedTemplate::aggregated(fx, fy)` realizes the property (aligning the
+output to the world grid of the new cell size), and
+`TemplateBank::placed_for_or_aggregated(...)` automates the fallback: it
+serves the directly-precomputed set when available, otherwise picks the
+largest stored sub-size that divides the request and aggregates.
+
+| config | bank size | gen time | avg/cull (ms) | speedup |
+| --- | ---: | ---: | ---: | ---: |
+| no templates | — | — | 0.155 | 1.0x |
+| bank ≤16 + aggregated fallback | 0.59 MB | 0.20 s | 0.092 | 1.7x |
+| bank full (every size precomputed) | 1.70 MB | 0.66 s | 0.011 | 14.2x |
+
+Conclusions:
+
+- **Correctness is preserved exactly.** The campaign (Results elsewhere)
+  runs 2,000 random scenarios with the aggregating shape in the cull path
+  and they all match brute force. The aggregated and the directly-generated
+  templates return the same In/Out/Maybe classification for every aligned
+  cell — verified by a unit test that picks the same shape and angle and
+  asserts cell-by-cell equality.
+- **The fallback is a memory/precompute knob, not a precision knob.** It
+  costs ~3× the no-template baseline because aggregation builds a fresh
+  template per cull (the per-execution `SizeCache` reuses it within a
+  single cull, but not across culls); precomputing the full family pays
+  itself back at runtime. Use the fallback when: (a) memory or generation
+  time matters more than query speed, (b) only a few cell sizes carry the
+  load (the fallback covers the rest), or (c) you are prototyping and
+  haven't decided which sizes to precompute.
+
 ## Industry context
 
 What games/physics engines typically use for this class of query (and what we

@@ -52,6 +52,80 @@ impl PlacedTemplate {
         let b = self.grid.bounding_box();
         Rect::new(b.x + self.dx, b.y + self.dy, b.width, b.height)
     }
+
+    /// Aggregated copy with cells `fx`×`fy` times larger.
+    ///
+    /// The result is aligned to the **world** grid of the new cell size
+    /// (origin `floor(world_origin / new_cell_size) * new_cell_size`), so a
+    /// query node of that size — which always sits on the same lattice —
+    /// reads exactly one aggregated cell. See [`TemplateGrid::aggregate`]
+    /// for the exact (lossless) classification rule.
+    pub fn aggregated(&self, fx: u32, fy: u32) -> PlacedTemplate {
+        assert!(fx >= 1 && fy >= 1, "aggregate factors must be >= 1");
+        let new_cw = self.grid.cell_w * fx as f64;
+        let new_ch = self.grid.cell_h * fy as f64;
+
+        // World extent of the source grid.
+        let src_world_x = self.grid.origin_x + self.dx;
+        let src_world_y = self.grid.origin_y + self.dy;
+        let src_world_x_max = src_world_x + self.grid.cell_w * self.grid.cols as f64;
+        let src_world_y_max = src_world_y + self.grid.cell_h * self.grid.rows as f64;
+
+        // World origin of the aggregated grid: aligned to the global lattice.
+        let new_world_x = (src_world_x / new_cw).floor() * new_cw;
+        let new_world_y = (src_world_y / new_ch).floor() * new_ch;
+        let new_cols =
+            (((src_world_x_max - new_world_x) / new_cw).ceil() as u32).max(1);
+        let new_rows =
+            (((src_world_y_max - new_world_y) / new_ch).ceil() as u32).max(1);
+
+        let mut cells = Vec::with_capacity((new_cols * new_rows) as usize);
+        for j in 0..new_rows {
+            for i in 0..new_cols {
+                let cell_world_x = new_world_x + i as f64 * new_cw;
+                let cell_world_y = new_world_y + j as f64 * new_ch;
+                let mut saw_in = false;
+                let mut saw_out = false;
+                'outer: for sub_j in 0..fy {
+                    let sub_y = cell_world_y + sub_j as f64 * self.grid.cell_h;
+                    for sub_i in 0..fx {
+                        let sub_x = cell_world_x + sub_i as f64 * self.grid.cell_w;
+                        // Probe slightly inside each sub-cell for stable
+                        // mapping back to (col, row) under float jitter.
+                        let probe_x = sub_x + self.grid.cell_w * 0.5;
+                        let probe_y = sub_y + self.grid.cell_h * 0.5;
+                        match self.cell_at_world(Point::new(probe_x, probe_y)) {
+                            CellState::In => saw_in = true,
+                            CellState::Out => saw_out = true,
+                            CellState::Maybe => {
+                                saw_in = true;
+                                saw_out = true;
+                            }
+                        }
+                        if saw_in && saw_out {
+                            break 'outer;
+                        }
+                    }
+                }
+                cells.push(match (saw_in, saw_out) {
+                    (true, false) => CellState::In,
+                    (false, true) => CellState::Out,
+                    (true, true) => CellState::Maybe,
+                    (false, false) => CellState::Out,
+                });
+            }
+        }
+        let grid = TemplateGrid {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            cell_w: new_cw,
+            cell_h: new_ch,
+            cols: new_cols,
+            rows: new_rows,
+            cells,
+        };
+        PlacedTemplate::new(Arc::new(grid), new_world_x, new_world_y)
+    }
 }
 
 /// A regular grid covering some region; each cell carries an [`CellState`].
@@ -124,6 +198,101 @@ impl TemplateGrid {
             return CellState::Out;
         }
         self.cell(col as u32, row as u32)
+    }
+
+    /// Aggregate this grid into one whose cells are `fx`×`fy` times larger.
+    ///
+    /// Each output cell summarizes a `fx`×`fy` block of input cells with the
+    /// rule: every block cell `In` → `In`; every block cell `Out` → `Out`;
+    /// anything else → `Maybe`. This rule is **exactly** the classification
+    /// the larger-cell template would carry if it had been generated
+    /// directly: a cell is `In` only when the *whole* cell is inside the
+    /// figure, which is equivalent to every sub-cell being `In`; same for
+    /// `Out`. So an aggregated grid loses no precision compared to the
+    /// directly-generated one — only memory/time spent on precomputation.
+    /// This is the "granularity as fallback" property recorded in the
+    /// design notes (a small-cell set stands in for any missing larger set
+    /// whose dimensions are an integer multiple).
+    ///
+    /// The output is anchored at the largest multiple of `(cell_w*fx,
+    /// cell_h*fy)` not exceeding this grid's origin; uncovered sub-cells in
+    /// the resulting blocks are treated as `Out` (outside the figure).
+    pub fn aggregate(&self, fx: u32, fy: u32) -> TemplateGrid {
+        assert!(fx >= 1 && fy >= 1, "aggregate factors must be >= 1");
+        let new_cw = self.cell_w * fx as f64;
+        let new_ch = self.cell_h * fy as f64;
+
+        // Aligned origin: largest multiple of new cell size <= our origin.
+        let new_origin_x = (self.origin_x / new_cw).floor() * new_cw;
+        let new_origin_y = (self.origin_y / new_ch).floor() * new_ch;
+
+        let in_x_max = self.origin_x + self.cell_w * self.cols as f64;
+        let in_y_max = self.origin_y + self.cell_h * self.rows as f64;
+        let new_cols =
+            (((in_x_max - new_origin_x) / new_cw).ceil() as u32).max(1);
+        let new_rows =
+            (((in_y_max - new_origin_y) / new_ch).ceil() as u32).max(1);
+
+        // For each output cell, scan its `fx*fy` covering sub-cells.
+        let mut cells = Vec::with_capacity((new_cols * new_rows) as usize);
+        for j in 0..new_rows {
+            for i in 0..new_cols {
+                // World-space bounds of this output cell.
+                let ox = new_origin_x + i as f64 * new_cw;
+                let oy = new_origin_y + j as f64 * new_ch;
+                let mut saw_in = false;
+                let mut saw_out = false;
+                for sub_j in 0..fy {
+                    let world_y = oy + sub_j as f64 * self.cell_h;
+                    // Map back to input-grid integer index.
+                    let row_f = (world_y - self.origin_y) / self.cell_h;
+                    let row = row_f.round() as i64;
+                    for sub_i in 0..fx {
+                        let world_x = ox + sub_i as f64 * self.cell_w;
+                        let col_f = (world_x - self.origin_x) / self.cell_w;
+                        let col = col_f.round() as i64;
+                        let inside = col >= 0
+                            && row >= 0
+                            && (col as u32) < self.cols
+                            && (row as u32) < self.rows;
+                        match if inside {
+                            self.cell(col as u32, row as u32)
+                        } else {
+                            CellState::Out // sub-cells outside the input grid
+                        } {
+                            CellState::In => saw_in = true,
+                            CellState::Out => saw_out = true,
+                            CellState::Maybe => {
+                                saw_in = true;
+                                saw_out = true;
+                            }
+                        }
+                        if saw_in && saw_out {
+                            break;
+                        }
+                    }
+                    if saw_in && saw_out {
+                        break;
+                    }
+                }
+                cells.push(match (saw_in, saw_out) {
+                    (true, false) => CellState::In,
+                    (false, true) => CellState::Out,
+                    (true, true) => CellState::Maybe,
+                    (false, false) => CellState::Out, // empty block: never occurs after the asserts above
+                });
+            }
+        }
+
+        TemplateGrid {
+            origin_x: new_origin_x,
+            origin_y: new_origin_y,
+            cell_w: new_cw,
+            cell_h: new_ch,
+            cols: new_cols,
+            rows: new_rows,
+            cells,
+        }
     }
 
     /// Copy of this grid re-anchored at `origin + (dx, dy)`.
@@ -264,6 +433,52 @@ mod tests {
         assert_eq!(g.cell_at_world(Point::new(5.0, 5.0)), CellState::Out);
         assert_eq!(g.cell_at_world(Point::new(-1.0, 15.0)), CellState::Out);
         assert_eq!(g.cell_at_world(Point::new(30.0, 15.0)), CellState::Out);
+    }
+
+    #[test]
+    fn aggregate_collapses_blocks_with_the_exact_rule() {
+        use CellState::*;
+        // 4 cols × 2 rows of 1×1, then aggregate to 2×2 blocks of 2×1.
+        let g = TemplateGrid::new(
+            Point::new(0.0, 0.0),
+            1.0,
+            1.0,
+            4,
+            2,
+            vec![
+                In, In, Out, Maybe,   // row 0: blocks (In,In) (Out,Maybe)
+                In, In, Out, Out,     // row 1: blocks (In,In) (Out,Out)
+            ],
+        );
+        let agg = g.aggregate(2, 1);
+        assert_eq!(agg.cell_w, 2.0);
+        assert_eq!(agg.cell_h, 1.0);
+        assert_eq!(agg.cols, 2);
+        assert_eq!(agg.rows, 2);
+        assert_eq!(agg.cell(0, 0), In);    // pure In
+        assert_eq!(agg.cell(1, 0), Maybe); // Out + Maybe → Maybe
+        assert_eq!(agg.cell(0, 1), In);    // pure In
+        assert_eq!(agg.cell(1, 1), Out);   // pure Out
+    }
+
+    #[test]
+    fn aggregate_with_misaligned_origin_pads_with_out() {
+        use CellState::*;
+        // Origin 10; aggregating to cells of 20 anchors at 0, extending one
+        // (Out) column to the left.
+        let g = TemplateGrid::new(
+            Point::new(10.0, 0.0),
+            10.0,
+            10.0,
+            2,
+            1,
+            vec![In, In],
+        );
+        let agg = g.aggregate(2, 1);
+        assert_eq!(agg.origin_x, 0.0);
+        assert_eq!(agg.cols, 2);
+        assert_eq!(agg.cell(0, 0), Maybe); // half outside grid (Out) + In
+        assert_eq!(agg.cell(1, 0), Maybe); // half In + half outside (Out)
     }
 
     #[test]
