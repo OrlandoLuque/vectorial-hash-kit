@@ -54,6 +54,18 @@ enum Cmd {
         #[arg(long, default_value_t = 0xC0FFEE)]
         seed: u64,
     },
+    /// Figure↔grid scale-equivalence benchmark: one stored set served at
+    /// multiple query scales vs one set per scale.
+    BenchScale {
+        #[arg(long, default_value_t = 200_000)]
+        points: usize,
+        #[arg(long, default_value_t = 50)]
+        culls: usize,
+        #[arg(long, default_value_t = 16)]
+        item_limit: usize,
+        #[arg(long, default_value_t = 0xC0FFEE)]
+        seed: u64,
+    },
     /// Dump a deterministic fingerprint of a fixed template set to stdout
     /// (one line per (figure, scale, angle, cell, ox, oy): hex of the
     /// PHP-compatible binary encoding). Used to compare template output
@@ -148,6 +160,9 @@ fn main() {
             bench::run_fallback(points, culls, item_limit, seed, scale);
         }
         Cmd::TemplatesFingerprint => run_templates_fingerprint(),
+        Cmd::BenchScale { points, culls, item_limit, seed } => {
+            bench::run_scale(points, culls, item_limit, seed);
+        }
         #[cfg(feature = "redis-store")]
         Cmd::GenerateRedis { redis_host, redis_port, angle_step, scale, grid } => {
             run_with_redis(&redis_host, redis_port, angle_step, scale, grid);

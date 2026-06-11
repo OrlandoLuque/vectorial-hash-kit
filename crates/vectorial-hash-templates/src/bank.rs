@@ -234,6 +234,62 @@ impl TemplateBank {
         ))
     }
 
+    /// Reuse a precomputed set for another scale of the **same figure shape**,
+    /// applying the figure↔grid scale equivalence: a template generated for
+    /// figure F over cells of size C is identical, cell for cell, to one for
+    /// `F·k` over cells of size `C·k`. With this, **one stored set per shape
+    /// canonical size covers infinitely many query scales** when `k` allows
+    /// integer offsets — no extra precomputation.
+    ///
+    /// `source_figure` identifies a set already in the bank. `k > 0` is the
+    /// scale ratio (target dims / source dims). The query cell size and
+    /// origin must map to integers when divided by `k` (so the stored
+    /// per-offset entry exists); otherwise the call returns `None` and the
+    /// caller can fall back to other strategies.
+    pub fn placed_for_scaled(
+        &self,
+        source_figure: &FigureKey,
+        k: f64,
+        cell_w_query: u32,
+        cell_h_query: u32,
+        angle_deg: f64,
+        origin_query: (i64, i64),
+    ) -> Option<PlacedTemplate> {
+        if k <= 0.0 {
+            return None;
+        }
+        let cw_stored_f = cell_w_query as f64 / k;
+        let ch_stored_f = cell_h_query as f64 / k;
+        let ox_stored_f = origin_query.0 as f64 / k;
+        let oy_stored_f = origin_query.1 as f64 / k;
+        let eps = 1e-9;
+        let is_int = |v: f64| (v - v.round()).abs() < eps && v >= 0.5 - eps;
+        if !is_int(cw_stored_f) || !is_int(ch_stored_f) {
+            return None;
+        }
+        if (ox_stored_f - ox_stored_f.round()).abs() > eps
+            || (oy_stored_f - oy_stored_f.round()).abs() > eps
+        {
+            return None;
+        }
+        let cw_stored = cw_stored_f.round() as u32;
+        let ch_stored = ch_stored_f.round() as u32;
+        let origin_stored = (
+            ox_stored_f.round() as i64,
+            oy_stored_f.round() as i64,
+        );
+        let stored = self.placed_for(source_figure, cw_stored, ch_stored, angle_deg, origin_stored)?;
+        // Compose with the stored scale (almost always 1.0): multiplying
+        // world distances by `k` covers both this lookup and any future
+        // stacking, should it ever happen.
+        Some(PlacedTemplate::with_scale(
+            stored.grid,
+            stored.dx * k,
+            stored.dy * k,
+            stored.scale * k,
+        ))
+    }
+
     /// Zero-clone variant of [`TemplateBank::point_raster`].
     pub fn placed_raster(
         &self,
@@ -506,6 +562,60 @@ mod tests {
             bank.placed_for_or_aggregated(&fig, 4, 4, 0.0, (0, 0))
                 .is_none(),
         );
+    }
+
+    #[test]
+    fn placed_for_scaled_matches_directly_generated_larger_set() {
+        // A small box (side 4) with cells 1 and a 3× larger box (side 12)
+        // with cells 3 must classify identically at corresponding world
+        // points. Boxes — no arcs — keep the bbox exact under scaling so
+        // both grids end up with the same dimensions.
+        let small_base = create_square(0.0, 0.0, 4.0, 4.0);
+        let big_base = create_square(0.0, 0.0, 12.0, 12.0);
+        let small_fig = FigureKey::new(11, &[4.0]);
+        let big_fig = FigureKey::new(11, &[12.0]);
+
+        let mut bank = TemplateBank::new();
+        bank.generate_size(&small_fig, &small_base, &[0.0], 1, 1);
+        bank.generate_size(&big_fig, &big_base, &[0.0], 3, 3);
+
+        let origin_big = (60i64, 30i64); // multiple of 3 → integer small origin
+        let direct = bank.placed_for(&big_fig, 3, 3, 0.0, origin_big).unwrap();
+        let scaled = bank
+            .placed_for_scaled(&small_fig, 3.0, 3, 3, 0.0, origin_big)
+            .expect("scaled lookup should succeed");
+        assert_eq!(direct.grid.cols, scaled.grid.cols);
+        assert_eq!(direct.grid.rows, scaled.grid.rows);
+
+        let mut total = 0;
+        let mut hits = 0;
+        for x in (54..78).step_by(3) {
+            for y in (24..48).step_by(3) {
+                let p = Point::new(x as f64 + 1.5, y as f64 + 1.5);
+                let a = direct.cell_at_world(p);
+                let b = scaled.cell_at_world(p);
+                assert_eq!(a, b, "({x},{y}) direct={a:?} scaled={b:?}");
+                total += 1;
+                if a == CellState::In {
+                    hits += 1;
+                }
+            }
+        }
+        assert!(hits > 0 && hits < total, "sanity: at least some In and some non-In ({hits}/{total})");
+    }
+
+    #[test]
+    fn placed_for_scaled_returns_none_when_query_does_not_quantize() {
+        let base = create_square(0.0, 0.0, 4.0, 4.0);
+        let fig = FigureKey::new(7, &[4.0]);
+        let mut bank = TemplateBank::new();
+        bank.generate_size(&fig, &base, &[0.0], 1, 1);
+        // k=3 but query cell 5 → stored 5/3, non-integer → None.
+        assert!(bank.placed_for_scaled(&fig, 3.0, 5, 5, 0.0, (0, 0)).is_none());
+        // k=2 and query origin 7 → stored origin 3.5, non-integer → None.
+        assert!(bank.placed_for_scaled(&fig, 2.0, 4, 4, 0.0, (7, 0)).is_none());
+        // k=4 with cells 4 → stored cells 1 (which the bank has) → Some.
+        assert!(bank.placed_for_scaled(&fig, 4.0, 4, 4, 0.0, (8, 4)).is_some());
     }
 
     #[test]

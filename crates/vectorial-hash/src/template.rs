@@ -21,36 +21,70 @@ pub enum CellState {
     In,
 }
 
-/// A shared template grid *placed* at a world displacement.
+/// A shared template grid *placed* at a world displacement and optional
+/// uniform scale factor.
 ///
 /// Resolving a template at query time never clones cell data: the canonical
 /// grid stays behind an `Arc` and classification simply translates the query
-/// point by `(dx, dy)` before reading. This is what
+/// point by `(dx, dy)` and divides by `scale` before reading. This is what
 /// [`crate::Shape::template_for_cell`] and
 /// [`crate::Shape::point_template`] hand to the culling walk.
+///
+/// The `scale` field implements the figure↔grid scale equivalence (the
+/// classifications of a template generated for figure F with cells C are
+/// identical to those of F·k with cells C·k for any k > 0). One stored set
+/// per shape canonical size therefore covers infinitely many query scales
+/// — see [`crate::Shape::template_for_cell`] and the templates crate's
+/// `TemplateBank::placed_for_scaled` for the consumer side.
 #[derive(Clone, Debug)]
 pub struct PlacedTemplate {
     pub grid: Arc<TemplateGrid>,
-    /// World displacement added to the grid's own origin.
+    /// World displacement added to the grid's own (scaled) origin.
     pub dx: f64,
     pub dy: f64,
+    /// World cell size = `grid.cell_w * scale` (likewise for height). 1.0
+    /// when the stored grid is consumed at its generation scale.
+    pub scale: f64,
 }
 
 impl PlacedTemplate {
     pub fn new(grid: Arc<TemplateGrid>, dx: f64, dy: f64) -> Self {
-        Self { grid, dx, dy }
+        Self { grid, dx, dy, scale: 1.0 }
+    }
+
+    /// Place the grid at `(dx, dy)` and present its cells as `scale`×
+    /// larger than their canonical size. Equivalent to using the same
+    /// template for a figure scaled by `scale` with cells scaled by `scale`.
+    pub fn with_scale(grid: Arc<TemplateGrid>, dx: f64, dy: f64, scale: f64) -> Self {
+        assert!(scale > 0.0, "scale must be positive");
+        Self { grid, dx, dy, scale }
+    }
+
+    /// World-space cell width (= `grid.cell_w * scale`).
+    pub fn world_cell_w(&self) -> f64 {
+        self.grid.cell_w * self.scale
+    }
+    /// World-space cell height.
+    pub fn world_cell_h(&self) -> f64 {
+        self.grid.cell_h * self.scale
     }
 
     /// State of the cell containing world point `p`.
     pub fn cell_at_world(&self, p: Point) -> CellState {
-        self.grid
-            .cell_at_world(Point::new(p.x - self.dx, p.y - self.dy))
+        let local_x = (p.x - self.dx) / self.scale;
+        let local_y = (p.y - self.dy) / self.scale;
+        self.grid.cell_at_world(Point::new(local_x, local_y))
     }
 
     /// Bounding box of the placed grid, in world coordinates.
     pub fn bounding_box(&self) -> Rect {
         let b = self.grid.bounding_box();
-        Rect::new(b.x + self.dx, b.y + self.dy, b.width, b.height)
+        Rect::new(
+            b.x * self.scale + self.dx,
+            b.y * self.scale + self.dy,
+            b.width * self.scale,
+            b.height * self.scale,
+        )
     }
 
     /// Aggregated copy with cells `fx`×`fy` times larger.
@@ -62,14 +96,16 @@ impl PlacedTemplate {
     /// for the exact (lossless) classification rule.
     pub fn aggregated(&self, fx: u32, fy: u32) -> PlacedTemplate {
         assert!(fx >= 1 && fy >= 1, "aggregate factors must be >= 1");
-        let new_cw = self.grid.cell_w * fx as f64;
-        let new_ch = self.grid.cell_h * fy as f64;
+        let src_cw = self.world_cell_w();
+        let src_ch = self.world_cell_h();
+        let new_cw = src_cw * fx as f64;
+        let new_ch = src_ch * fy as f64;
 
-        // World extent of the source grid.
-        let src_world_x = self.grid.origin_x + self.dx;
-        let src_world_y = self.grid.origin_y + self.dy;
-        let src_world_x_max = src_world_x + self.grid.cell_w * self.grid.cols as f64;
-        let src_world_y_max = src_world_y + self.grid.cell_h * self.grid.rows as f64;
+        // World extent of the source grid (respecting scale).
+        let src_world_x = self.grid.origin_x * self.scale + self.dx;
+        let src_world_y = self.grid.origin_y * self.scale + self.dy;
+        let src_world_x_max = src_world_x + src_cw * self.grid.cols as f64;
+        let src_world_y_max = src_world_y + src_ch * self.grid.rows as f64;
 
         // World origin of the aggregated grid: aligned to the global lattice.
         let new_world_x = (src_world_x / new_cw).floor() * new_cw;
@@ -87,13 +123,13 @@ impl PlacedTemplate {
                 let mut saw_in = false;
                 let mut saw_out = false;
                 'outer: for sub_j in 0..fy {
-                    let sub_y = cell_world_y + sub_j as f64 * self.grid.cell_h;
+                    let sub_y = cell_world_y + sub_j as f64 * src_ch;
                     for sub_i in 0..fx {
-                        let sub_x = cell_world_x + sub_i as f64 * self.grid.cell_w;
+                        let sub_x = cell_world_x + sub_i as f64 * src_cw;
                         // Probe slightly inside each sub-cell for stable
                         // mapping back to (col, row) under float jitter.
-                        let probe_x = sub_x + self.grid.cell_w * 0.5;
-                        let probe_y = sub_y + self.grid.cell_h * 0.5;
+                        let probe_x = sub_x + src_cw * 0.5;
+                        let probe_y = sub_y + src_ch * 0.5;
                         match self.cell_at_world(Point::new(probe_x, probe_y)) {
                             CellState::In => saw_in = true,
                             CellState::Out => saw_out = true,
@@ -307,6 +343,22 @@ impl TemplateGrid {
         }
     }
 
+    /// Uniformly-scaled copy: every cell `k`× larger, classifications kept.
+    /// Used by the figure↔grid scale equivalence: a template generated for
+    /// figure F over cells of size C is identical to one for F·k over cells
+    /// of size C·k. Cells are cloned; for a zero-clone version use
+    /// [`PlacedTemplate::with_scale`].
+    pub fn rescaled(&self, k: f64) -> TemplateGrid {
+        assert!(k > 0.0, "scale factor must be positive");
+        TemplateGrid {
+            origin_x: self.origin_x * k,
+            origin_y: self.origin_y * k,
+            cell_w: self.cell_w * k,
+            cell_h: self.cell_h * k,
+            ..self.clone()
+        }
+    }
+
     /// Classify a rectangular region against the grid.
     ///
     /// - Returns [`CellState::Out`] if every overlapped cell is `Out` *and*
@@ -424,6 +476,50 @@ mod tests {
         let g = centre_in_grid();
         // straddles two corner Out cells and pokes outside on the right.
         assert_eq!(g.classify_region(&Rect::new(0.0, 0.0, 100.0, 10.0)), CellState::Out);
+    }
+
+    #[test]
+    fn rescaled_grid_classifies_proportionally() {
+        use CellState::*;
+        // 3x1 of cell 2 with cells In, Maybe, Out.
+        let g = TemplateGrid::new(
+            Point::new(0.0, 0.0),
+            2.0,
+            2.0,
+            3,
+            1,
+            vec![In, Maybe, Out],
+        );
+        let big = g.rescaled(3.0);
+        assert_eq!(big.cell_w, 6.0);
+        // Classifications unchanged at the scaled coordinates.
+        assert_eq!(big.cell_at_world(Point::new(3.0, 3.0)), In);
+        assert_eq!(big.cell_at_world(Point::new(9.0, 3.0)), Maybe);
+        assert_eq!(big.cell_at_world(Point::new(15.0, 3.0)), Out);
+    }
+
+    #[test]
+    fn placed_template_with_scale_matches_zero_clone_rescale() {
+        use CellState::*;
+        let g = std::sync::Arc::new(TemplateGrid::new(
+            Point::new(0.0, 0.0),
+            2.0,
+            2.0,
+            3,
+            1,
+            vec![In, Maybe, Out],
+        ));
+        // Same grid presented at 3x scale should classify like a manually
+        // rescaled standalone grid translated to the same world origin.
+        let placed = PlacedTemplate::with_scale(g.clone(), 0.0, 0.0, 3.0);
+        let manual = g.rescaled(3.0);
+        for x in (1..=17).step_by(2) {
+            let p = Point::new(x as f64, 3.0);
+            assert_eq!(placed.cell_at_world(p), manual.cell_at_world(p), "x={x}");
+        }
+        // World cell sizes reflect the scale.
+        assert_eq!(placed.world_cell_w(), 6.0);
+        assert_eq!(placed.world_cell_h(), 6.0);
     }
 
     #[test]

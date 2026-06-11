@@ -13,6 +13,8 @@ Command-line tools for the [`vectorial-hash`](../vectorial-hash) workspace. Inst
 | `bench-sizes` | in-memory | Per-cell-size template benchmark: no templates vs the old single-grid snap method vs the hierarchical bank capped at ≤16/≤32/≤64 px cells, with and without the 1×1 leaf raster. Same flags as `bench`. |
 | `bench-walk` | in-memory | Traversal benchmark: tree descent vs flood-fill over leaf neighbours (Samet ascent / locate probe / stored ropes). Adds `--scale`; run with `--no-default-features` to build without rope bookkeeping. |
 | `bench-fallback` | in-memory | Granularity-as-fallback benchmark: precompute every cell size vs only a fine set + block aggregation on the fly. Same flags as `bench-walk`. |
+| `bench-scale` | in-memory | Figure↔grid scale equivalence: one canonical set served at multiple query scales vs one set per scale. |
+| `templates-fingerprint` | in-memory | Deterministic dump of the fixture set used by the snapshot regression test. Pipe to the fixture file when intentionally regenerating after a pipeline change. |
 | `generate-redis` | Redis | Requires feature `redis-store`. Multi-process via per-task locks. Accepts the same generation params as `generate`. |
 
 ## Usage

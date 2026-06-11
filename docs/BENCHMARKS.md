@@ -232,6 +232,40 @@ Conclusions:
   load (the fallback covers the rest), or (c) you are prototyping and
   haven't decided which sizes to precompute.
 
+## Results 5 — `vh bench-scale`: figure↔grid scale equivalence
+
+Per the .docx design notes: a template generated for figure F over cells C
+is identical, cell by cell, to one for F·k over cells C·k (the
+classification of a cell is invariant under uniform scaling). So one stored
+set per shape's canonical size can serve any query scale by reading the
+shared grid through a multiplier — no extra precomputation, no cell-data
+clones (the grid stays behind an `Arc`).
+
+`PlacedTemplate::with_scale` and `TemplateBank::placed_for_scaled` realize
+the property at lookup time. Benchmark: a box-shaped query at four scales
+× the same cull, with bank A (only the canonical set, served via
+`placed_for_scaled`) vs bank B (one stored set per scale):
+
+| query scale | scaled lookup (ms) | per-scale set (ms) | ratio |
+| ---: | ---: | ---: | ---: |
+| 1× | 0.002 | 0.002 | 1.0x |
+| 2× | 0.003 | 0.004 | 1.3x **A** |
+| 4× | 0.006 | 0.004 | 0.7x **B** |
+| 8× | 0.014 | 0.006 | 0.4x **B** |
+
+Memory: bank A is **25× smaller** (one set, 1 unique grid) and **10×
+faster to generate**. The scaled lookup is competitive at low factors, but
+cull time degrades at high ones because the canonical grid is small and
+the cull walks more sub-cells per query node. The trade-off in words:
+
+- Many query scales of the same shape, memory or precompute matters more
+  than the last bit of cull speed → **bank A** wins overwhelmingly.
+- A few well-known scales, cull speed dominates → **bank B**.
+- The two compose with the granularity-as-fallback (Results 4): generate
+  the canonical set + a few aggregating sizes, and the bank covers every
+  scale and every cell size through a mix of direct hits, aggregation and
+  scale equivalence.
+
 ## Industry context
 
 What games/physics engines typically use for this class of query (and what we

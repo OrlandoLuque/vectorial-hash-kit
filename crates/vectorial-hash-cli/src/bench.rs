@@ -407,6 +407,183 @@ pub fn run_fallback(points: usize, culls: usize, item_limit: usize, seed: u64, s
     }
 }
 
+/// `vh bench-scale`: figure↔grid scale equivalence study.
+///
+/// One stored set covers many query scales for the same shape. Compare:
+/// (a) bank with a separate set per query scale (the baseline);
+/// (b) bank with **one** stored set, served at every query scale via
+///     `placed_for_scaled` (no extra precomputation, no cell-data clones).
+/// Both must return the same hit counts (asserted). Reports per-cull
+/// timings and total memory.
+pub fn run_scale(points: usize, culls: usize, item_limit: usize, seed: u64) {
+    const ANGLE: f64 = 0.0; // box: angle is uninteresting here
+    const BASE_DIM: f64 = 8.0;
+    const FACTORS: [u32; 4] = [1, 2, 4, 8];
+    let cells_at_factor = |f: u32| (f, f); // cell size scales with the figure
+
+    println!("=== Cull benchmark: figure-grid scale equivalence ===");
+    println!(
+        "world {w}x{w} | {points} points | item_limit {item_limit} | {culls} culls/(config x query) | seed {seed}",
+        w = WORLD as i64,
+    );
+    println!(
+        "shapes: box side {BASE_DIM} × scales {:?} (one box per scale, queried at every factor)\n",
+        FACTORS,
+    );
+
+    let mut rng = Rng(seed.max(1));
+    let pts: Vec<Pt> = (0..points)
+        .map(|_| Pt(Point::new(rng.unit_f64() * WORLD, rng.unit_f64() * WORLD)))
+        .collect();
+    let world = Rect::new(0.0, 0.0, WORLD, WORLD);
+    let mut tree: Tree<Pt> = Tree::new(world, item_limit);
+    for p in &pts {
+        tree.insert(*p);
+    }
+
+    let base = vectorial_hash_templates::polygon::create_square(0.0, 0.0, BASE_DIM, BASE_DIM);
+    let canonical_fig = FigureKey::new(0, &[BASE_DIM]);
+
+    // Bank A: one stored set (canonical, factor 1), served via placed_for_scaled.
+    let t = Instant::now();
+    let mut bank_one = TemplateBank::new();
+    bank_one.generate_size(&canonical_fig, &base, &[ANGLE], 1, 1);
+    let (cw_canon, ch_canon) = cells_at_factor(1);
+    bank_one.generate_size(&canonical_fig, &base, &[ANGLE], cw_canon, ch_canon);
+    let one_gen = t.elapsed();
+    let one_mem = bank_one.memory_usage();
+
+    // Bank B: one stored set per factor.
+    let t = Instant::now();
+    let mut bank_per = TemplateBank::new();
+    let mut figs_per = Vec::new();
+    for &f in &FACTORS {
+        let side = BASE_DIM * f as f64;
+        let big_base =
+            vectorial_hash_templates::polygon::create_square(0.0, 0.0, side, side);
+        let fig = FigureKey::new(f, &[side]);
+        bank_per.generate_size(&fig, &big_base, &[ANGLE], 1, 1);
+        let (cw, ch) = cells_at_factor(f);
+        bank_per.generate_size(&fig, &big_base, &[ANGLE], cw, ch);
+        figs_per.push(fig);
+    }
+    let per_gen = t.elapsed();
+    let per_mem = bank_per.memory_usage();
+
+    println!(
+        "bank A (one canonical set + placed_for_scaled): {} combos, {} unique, {:.2} MB, gen {:.0} us",
+        bank_one.entry_count(),
+        bank_one.unique_count(),
+        one_mem.total() as f64 / 1e6,
+        one_gen.as_micros(),
+    );
+    println!(
+        "bank B (one set per scale):                     {} combos, {} unique, {:.2} MB, gen {:.0} us\n",
+        bank_per.entry_count(),
+        bank_per.unique_count(),
+        per_mem.total() as f64 / 1e6,
+        per_gen.as_micros(),
+    );
+
+    let mut results: Vec<(String, Duration)> = Vec::new();
+    for (idx, &factor) in FACTORS.iter().enumerate() {
+        let side = BASE_DIM * factor as f64;
+        let mut poly =
+            vectorial_hash_templates::polygon::create_square(0.0, 0.0, side, side);
+        // Place the box somewhere away from the origin, aligned to its cell.
+        let (cw, _) = cells_at_factor(factor);
+        let origin = (
+            (cw as i64) * 100i64,
+            (cw as i64) * 60i64,
+        );
+        poly.move_by(origin.0 as f64, origin.1 as f64);
+        let bbox = Rect::new(
+            poly.x_min, poly.y_min,
+            poly.x_max - poly.x_min, poly.y_max - poly.y_min,
+        );
+
+        let raster_one = bank_one.placed_for_scaled(
+            &canonical_fig, factor as f64, 1, 1, ANGLE, origin,
+        );
+        let shape_one = ScaledShape {
+            bank: &bank_one,
+            base_figure: canonical_fig.clone(),
+            scale_factor: factor as f64,
+            angle: ANGLE,
+            origin,
+            poly: poly.clone(),
+            bbox,
+            raster: raster_one,
+        };
+        let raster_per = bank_per.placed_raster(&figs_per[idx], ANGLE, origin);
+        let shape_per = BankShape {
+            bank: &bank_per,
+            figure: figs_per[idx].clone(),
+            angle: ANGLE,
+            origin,
+            poly: poly.clone(),
+            bbox,
+            raster: raster_per,
+        };
+
+        let baseline = PlainShape { poly: poly.clone(), bbox };
+        let expected = tree.cull(&baseline).len();
+        let got_one = tree.cull(&shape_one).len();
+        let got_per = tree.cull(&shape_per).len();
+        assert_eq!(got_one, expected, "factor {factor}: scaled={got_one} != {expected}");
+        assert_eq!(got_per, expected, "factor {factor}: per-scale={got_per} != {expected}");
+
+        let t = Instant::now();
+        for _ in 0..culls { black_box(tree.cull(&shape_one).len()); }
+        results.push((format!("factor {factor} | scaled lookup"), t.elapsed()));
+
+        let t = Instant::now();
+        for _ in 0..culls { black_box(tree.cull(&shape_per).len()); }
+        results.push((format!("factor {factor} | per-scale set"), t.elapsed()));
+    }
+
+    println!("{:<40} {:>12} {:>14}", "config", "total (ms)", "avg/cull (ms)");
+    for (name, d) in &results {
+        let ms = d.as_secs_f64() * 1000.0;
+        println!(
+            "{:<40} {:>12.2} {:>14.3}",
+            name, ms, ms / culls as f64,
+        );
+    }
+    println!(
+        "\nmemory ratio (per-scale / one): {:.2}x; generation ratio: {:.2}x",
+        per_mem.total() as f64 / one_mem.total() as f64,
+        per_gen.as_secs_f64() / one_gen.as_secs_f64().max(1e-9),
+    );
+}
+
+struct ScaledShape<'a> {
+    bank: &'a TemplateBank,
+    base_figure: FigureKey,
+    scale_factor: f64,
+    angle: f64,
+    origin: (i64, i64),
+    poly: Polygon,
+    bbox: Rect,
+    raster: Option<PlacedTemplate>,
+}
+
+impl Shape for ScaledShape<'_> {
+    fn bounding_box(&self) -> Rect { self.bbox }
+    fn contains_point(&self, p: Point) -> bool { self.poly.is_inside(p.x, p.y) }
+    fn template_for_cell(&self, cell_w: f64, cell_h: f64) -> Option<PlacedTemplate> {
+        if cell_w.fract() != 0.0 || cell_h.fract() != 0.0 { return None; }
+        self.bank.placed_for_scaled(
+            &self.base_figure,
+            self.scale_factor,
+            cell_w as u32, cell_h as u32,
+            self.angle,
+            self.origin,
+        )
+    }
+    fn point_template(&self) -> Option<&PlacedTemplate> { self.raster.as_ref() }
+}
+
 /// Same as `BankShape` but goes through the aggregating fallback.
 struct FallbackShape<'a> {
     bank: &'a TemplateBank,
