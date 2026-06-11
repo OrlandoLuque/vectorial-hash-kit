@@ -6,6 +6,16 @@ Index and hash techniques for vectorial spaces, plus tooling to precompute spati
 
 This is a Cargo workspace with several independently-versioned crates.
 
+## Documentation
+
+| Document | What it is |
+| --- | --- |
+| [`docs/INDEX.md`](docs/INDEX.md) | Map of every doc, crate, test layer, and roadmap pointer in one page. |
+| [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | Methodology + reproducible empirical results for every `vh bench-*` command, plus industry-context references. Five result sections covering single-template culling, per-cell-size selection, descent vs neighbour walk, granularity-as-fallback aggregation, and figure↔grid scale equivalence. |
+| [`docs/DEFECTS_FOUND.md`](docs/DEFECTS_FOUND.md) | Living log of every bug the test suite has caught: reproducer, cause, fix, and which test pins it permanently. |
+| Per-crate READMEs | [`vectorial-hash`](crates/vectorial-hash/README.md), [`vectorial-hash-templates`](crates/vectorial-hash-templates/README.md), [`vectorial-hash-cli`](crates/vectorial-hash-cli/README.md), [`vectorial-hash-demos`](crates/vectorial-hash-demos/README.md). |
+| Publication paper | [`OrlandoLuque/vectorialHash`](https://github.com/OrlandoLuque/vectorialHash) — original May 2019 + June 2026 addendum reporting this reference implementation. |
+
 ## Crates
 
 | Crate | Role |
@@ -25,9 +35,12 @@ cargo run -p vectorial-hash-cli -- generate
 cargo run -p vectorial-hash-cli --release -- compare   # grids 16 + 32
 cargo run -p vectorial-hash-cli --release -- heavy     # grids 16 + 32 + 64 + 128
 
-# runtime cull benchmarks (results + analysis in docs/BENCHMARKS.md)
-cargo run -p vectorial-hash-cli --release -- bench        # tree vs quadtree, template on/off
-cargo run -p vectorial-hash-cli --release -- bench-sizes  # per-cell-size selection study
+# runtime cull benchmarks (full results + analysis in docs/BENCHMARKS.md)
+cargo run -p vectorial-hash-cli --release -- bench           # tree vs quadtree, single template on/off
+cargo run -p vectorial-hash-cli --release -- bench-sizes     # per-cell-size selection (the paper's scheme)
+cargo run -p vectorial-hash-cli --release -- bench-walk      # descent vs neighbour-walk traversal
+cargo run -p vectorial-hash-cli --release -- bench-fallback  # granularity-as-fallback aggregation
+cargo run -p vectorial-hash-cli --release -- bench-scale     # figure↔grid scale equivalence
 
 # console demos (template dedup + end-to-end cull)
 cargo run -p vectorial-hash-demos

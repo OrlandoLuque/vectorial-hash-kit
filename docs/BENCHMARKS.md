@@ -4,6 +4,16 @@ Performance analysis of the vectorial-hash culling pipeline. All numbers are
 reproducible with the commands below; rerun them after any change to the cull
 path or the template bank, and refresh the tables.
 
+## Sections at a glance
+
+| # | What | Headline |
+| --- | --- | --- |
+| [1](#results-1--vh-bench-single-fixed-template-tree-vs-quadtree) | `vh bench`: single fixed template, binary-split tree vs quadtree | ~4× speedup from a single template; both trees within 10% on uniform data. |
+| [2](#results-2--vh-bench-sizes-per-cell-size-selection-the-papers-scheme) | `vh bench-sizes`: per-cell-size selection (the paper's scheme) | 12–19× over no-template baseline; the precise method beats the old "snap" shortcut by ~5×; ~88% of index leaves share storage via content dedup. |
+| [3](#results-3--vh-bench-walk-tree-descent-vs-neighbour-walk-flood-fill) | `vh bench-walk`: descent vs neighbour-walk flood fill | Hierarchical descent dominates; ropes is the best neighbour source but still 0.7× of descent and costs ~56% extra on inserts. |
+| [4](#results-4--vh-bench-fallback-granularity-as-fallback-aggregation) | `vh bench-fallback`: granularity-as-fallback aggregation | The aggregated fallback is **exact**, costs 0.59 MB vs 1.70 MB of full precomputation, ~3× the no-template baseline. Memory/precompute knob. |
+| [5](#results-5--vh-bench-scale-figureleftrightgrid-scale-equivalence) | `vh bench-scale`: figure↔grid scale equivalence | One canonical set serves many query scales: 25× less memory, 10× faster generation; cull cost equals direct at low factors, ~2.5× at factor 8. |
+
 ## Environment
 
 | | |

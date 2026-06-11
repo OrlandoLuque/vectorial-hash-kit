@@ -1,0 +1,62 @@
+# Documentation index
+
+The workspace is split between the published paper, the runnable crates,
+and a growing set of design notes that came out of the implementation.
+This file is the map; everything else is one click away.
+
+## Theory
+
+| Document | Where | What |
+| --- | --- | --- |
+| [Multidimensional vector index](https://github.com/OrlandoLuque/vectorialHash) | Sibling repo `vectorialHash` | The paper. Original (May 2019) + June 2026 addendum covering the reference implementation and the empirical results below. |
+
+## Implementation overview
+
+| Crate | Role | Surface |
+| --- | --- | --- |
+| [`vectorial-hash`](../crates/vectorial-hash/README.md) | Core spatial index | `Tree`, `Shape`, `Tree::cull`, `Tree::cull_walk`, `TemplateGrid`, `PlacedTemplate`, `Side`, `WalkNeighbors` |
+| [`vectorial-hash-templates`](../crates/vectorial-hash-templates/README.md) | Template generator and runtime bank | `polygon`, `templates`, `matrix`, `adapter`, `bank::TemplateBank`, `fingerprint` |
+| [`vectorial-hash-cli`](../crates/vectorial-hash-cli/README.md) | `vh` command — generation, inspection, benchmarks | `generate`, `compare`, `heavy`, `bench`, `bench-sizes`, `bench-walk`, `bench-fallback`, `bench-scale`, `templates-fingerprint`, `generate-redis` |
+| [`vectorial-hash-demos`](../crates/vectorial-hash-demos/README.md) | Runnable demos (visual + console) | Console end-to-end pipeline + the live macroquad critters demo |
+
+## Empirical results & methodology
+
+| Document | Covers |
+| --- | --- |
+| [BENCHMARKS.md](BENCHMARKS.md) | Methodology and reproducible results for every `vh bench-*` command, with industry-context references. Five result sections (single-template, per-cell-size selection, descent vs neighbour walk, granularity-as-fallback, figure↔grid scale equivalence). |
+
+## Quality & correctness
+
+| Document | Covers |
+| --- | --- |
+| [DEFECTS_FOUND.md](DEFECTS_FOUND.md) | Living log of every bug the test suite has caught, with reproducer, cause, fix, and the test that pins each one against regressions. Currently four entries (D-1 to D-4). |
+
+## Regression infrastructure (at a glance)
+
+| Test | What it does | Source |
+| --- | --- | --- |
+| Unit tests | Single-operation contracts (`Tree`, `TemplateGrid`, `TemplateBank`, `Polygon`, `Rect`) | `crates/*/src/**/*.rs` |
+| Boundary regressions | Permanent reproducers for the geometric configurations that have ever been broken | `crates/vectorial-hash-templates/tests/boundary_regressions.rs` |
+| Snapshot fingerprint | Byte-for-byte diff of a deterministic template set against a versioned fixture | `crates/vectorial-hash-templates/tests/fingerprint_regression.rs` |
+| Cell-by-cell verification | Every template that ever differed from a previous reference, classified against pure-math ground truth | `crates/vectorial-hash-templates/tests/verify_88_ray_fix_templates.rs` |
+| Exhaustive culling campaign | Property/fuzz over random churned trees × random figures, every cull config equality-gated against brute force | `crates/vectorial-hash-templates/tests/exhaustive_culling.rs` |
+
+```bash
+cargo test --workspace                                                       # everything in the default set
+cargo test -p vectorial-hash-templates --release --test exhaustive_culling \  # long campaign (~60 s)
+    -- --ignored
+cargo test -p vectorial-hash --features neighbors                            # opt-in ropes path
+```
+
+## Roadmap & open ideas
+
+The main roadmap lives in
+[`crates/vectorial-hash/README.md`](../crates/vectorial-hash/README.md#roadmap)
+(implementation-side ideas, ordered by impact). The templates-side notes
+live in
+[`crates/vectorial-hash-templates/README.md`](../crates/vectorial-hash-templates/README.md#pending-design-notes)
+(generation-side ideas). Highlights: items with area/volume (full
+`Areal` and the Minkowski-flavoured "index dilation" alternative),
+parametric circle templates, partial-symmetry templates beyond the 8-way
+dedup, bit-shift paths for power-of-two worlds, and specific-case
+validation (donut, long line, wide corridor).
