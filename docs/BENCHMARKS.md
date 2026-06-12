@@ -13,6 +13,7 @@ path or the template bank, and refresh the tables.
 | [3](#results-3--vh-bench-walk-tree-descent-vs-neighbour-walk-flood-fill) | `vh bench-walk`: descent vs neighbour-walk flood fill | Hierarchical descent dominates; ropes is the best neighbour source but still 0.7× of descent and costs ~56% extra on inserts. |
 | [4](#results-4--vh-bench-fallback-granularity-as-fallback-aggregation) | `vh bench-fallback`: granularity-as-fallback aggregation | The aggregated fallback is **exact**, costs 0.59 MB vs 1.70 MB of full precomputation, ~3× the no-template baseline. Memory/precompute knob. |
 | [5](#results-5--vh-bench-scale-figureleftrightgrid-scale-equivalence) | `vh bench-scale`: figure↔grid scale equivalence | One canonical set serves many query scales: 25× less memory, 10× faster generation; cull cost equals direct at low factors, ~2.5× at factor 8. |
+| [6](#results-6--headless-critters-a-full-dynamic-workload) | `critters_headless`: full dynamic workload (updates + culls + churn) | Quadtree ahead 10–35% even on dynamic ops (depth halves `locate`); hysteresis helps the binary tree; `item_limit` is the dominant knob; deterministic cross-structure runs with zero cull mismatches. |
 
 ## Environment
 
@@ -275,6 +276,70 @@ the cull walks more sub-cells per query node. The trade-off in words:
   the canonical set + a few aggregating sizes, and the bank covers every
   scale and every cell size through a mix of direct hits, aggregation and
   scale equivalence.
+
+## Results 6 — headless critters: a full dynamic workload
+
+Everything above measures culls over a *static* tree. The critters
+simulation exercises the whole dynamic contract at once: per-frame
+`update` for every critter (with leaf relocation, splits and merges),
+vision culls (one per hunter per frame), attack culls, kills (`remove`)
+and respawns (`insert`) — all on one thread. The headless binary
+(`critters_headless`) runs the exact simulation of the visual demo
+without a window or vsync, deterministic per seed, so binary-tree and
+quadtree numbers come from the *identical* event sequence (verified: a
+`binary` run and the binary half of a `both` run produce the same kill
+count and final tree shape, and the `both` mode's live agreement check
+reports zero cull mismatches across entire runs).
+
+```bash
+cargo run -p vectorial-hash-demos --bin critters_headless --release -- \
+    --mode binary|quad|both --frames 300 --drifters 1200 --hunters 1200 --pulsars 1200 \
+    [--split N --merge N --dt S --seed N --fire X --respawn S --csv out.csv]
+```
+
+Scenario: targets 1200+1200+1200 (heavy combat keeps ~1.7k alive and a
+large respawn queue), dt = 1/60 s, 120 warmup + 300 measured frames.
+Mean per-frame timings in µs (move+update and insert+remove are totals;
+attack/vision cull are per-cull averages):
+
+| config | steps/s | move+update | attack cull | vision cull | insert+remove |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| binary, split 3 / merge 3 | 62 | 186 | 6.2 | 21.3 | 5.3 |
+| binary, split 3 / merge 1 (hysteresis) | 68 | 157 | 6.4 | 20.3 | 4.6 |
+| binary, split 6 / merge 3 | 108 | 133 | 3.9 | 12.4 | 3.9 |
+| quadtree, split 3 / merge 3 | **83** | 180 | 4.3 | 16.0 | 4.4 |
+| quadtree, split 6 / merge 3 | **120** | 126 | 3.7 | 11.4 | 3.7 |
+
+At a softer 400+400+400 the whole simulation costs ~1.8 ms/frame
+(563 steps/s, binary) — the *visual* demo is vsync-bound, not sim-bound.
+
+### Conclusions
+
+1. **The quadtree comes out ahead in this dynamic workload too** — about
+   10–35% across configurations, and not only on culls: `update`,
+   `insert` and `remove` are also faster. The structural reason is depth:
+   one 4-way level does the work of two binary levels, and `locate` (the
+   first step of every dynamic operation) walks half the levels. This
+   *revises* the earlier static-bench framing that "the binary split's
+   edge is the dynamics": measured under real churn, fine-grained pair
+   merging is *more* maintenance, not an advantage.
+2. **Hysteresis helps the binary tree** (62 → 68 steps/s with merge 1
+   vs merge 3): with `merge == split` the pair-granular merge rule
+   genuinely flaps under churn. The quadtree's 4-way merge is naturally
+   hysteretic (four leaves rarely sum under the threshold), which is
+   part of its win at default settings.
+3. **`item_limit` is the dominant knob for both**: split 6 / merge 3
+   nearly doubles throughput over split 3 / merge 3 (binary 62 → 108,
+   quad 83 → 120) — at ~1.7k items, limit 3 over-subdivides.
+4. What remains genuinely in the binary split's favour: anisotropic
+   distributions (data-aware split axis — not exercised by this roughly
+   uniform scenario), rectangular / non-power-of-two worlds, smaller
+   per-node footprint, and finer-grained memory growth. For uniform-ish
+   dynamic worlds on square maps, the measured recommendation is the
+   quadtree with a generous `item_limit`.
+5. Vision culls dominate the budget (one per hunter per frame); the next
+   scaling lever is re-evaluating prey every N frames rather than making
+   individual culls faster.
 
 ## Industry context
 

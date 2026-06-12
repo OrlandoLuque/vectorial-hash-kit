@@ -45,8 +45,11 @@ cargo run -p vectorial-hash-cli --release -- bench-scale     # figure↔grid sca
 # console demos (template dedup + end-to-end cull)
 cargo run -p vectorial-hash-demos
 
-# visual demo: critters on a live-subdividing map (macroquad)
+# visual demo: critters on a live-subdividing map (binary / quadtree / both)
 cargo run -p vectorial-hash-demos --bin critters --release
+
+# same simulation, headless: per-operation statistics at CPU speed
+cargo run -p vectorial-hash-demos --bin critters_headless --release -- --mode both
 ```
 
 ## Template generation modes

@@ -17,7 +17,7 @@ This file is the map; everything else is one click away.
 | [`vectorial-hash`](../crates/vectorial-hash/README.md) | Core spatial index | `Tree`, `Shape`, `Tree::cull`, `Tree::cull_walk`, `TemplateGrid`, `PlacedTemplate`, `Side`, `WalkNeighbors` |
 | [`vectorial-hash-templates`](../crates/vectorial-hash-templates/README.md) | Template generator and runtime bank | `polygon`, `templates`, `matrix`, `adapter`, `bank::TemplateBank`, `fingerprint` |
 | [`vectorial-hash-cli`](../crates/vectorial-hash-cli/README.md) | `vh` command — generation, inspection, benchmarks | `generate`, `compare`, `heavy`, `bench`, `bench-sizes`, `bench-walk`, `bench-fallback`, `bench-scale`, `templates-fingerprint`, `generate-redis` |
-| [`vectorial-hash-demos`](../crates/vectorial-hash-demos/README.md) | Runnable demos (visual + console) | Console end-to-end pipeline + the live macroquad critters demo |
+| [`vectorial-hash-demos`](../crates/vectorial-hash-demos/README.md) | Runnable demos (visual + console + headless) | Console end-to-end pipeline, the live macroquad critters demo (binary / quadtree / dual mode), and `critters_headless` — the same deterministic sim core without a window, reporting per-operation statistics |
 
 ## Empirical results & methodology
 
