@@ -57,6 +57,16 @@ A live 2D map (1024×1024 world, drawn at 0.75×) indexed by a `vectorial_hash::
 - A third column plots **live performance graphs** (one polyline per structure where applicable): frame time, average attack-cull and vision-cull times, per-frame movement/update cost, and per-frame insert+remove cost.
 - The simulation runs on a single thread (only the startup bank generation parallelizes), so the graphs show exactly where that thread's budget goes as you scale populations up.
 
+### Demo 4 — critters headless (statistics)
+
+```bash
+cargo run -p vectorial-hash-demos --bin critters_headless --release -- \
+    --mode both --frames 600 --drifters 400 --hunters 400 --pulsars 400 \
+    [--split 3 --merge 3 --dt 0.0167 --seed 42 --fire 1.0 --respawn 2.5 --csv out.csv]
+```
+
+The exact same simulation core (shared `sim` module, fully deterministic for a given seed) without a window or vsync: it runs at CPU speed and reports per-structure statistics — mean/p50/p95 of per-frame movement+update, attack-cull and vision-cull averages, and insert+remove cost — plus steps/s, final tree shapes and the live cull-agreement counter in `both` mode. `--csv` dumps per-frame rows for plotting. Determinism means a `binary` run and the binary half of a `both` run produce identical simulations (same kills, same final tree), so cross-structure numbers are directly comparable.
+
 Controls: `1`/`2`/`3` select the spawn brush · left click (or hold-drag to paint) spawns at the cursor · right click removes · `+`/`-` add/remove five at random · `R` cycles region rendering · `[` `]` change simulation speed · `Space` pauses · `Esc` quits.
 
 The **"tuning (live)" panel** adjusts everything while the simulation runs: the tree's **split threshold** (a leaf divides above it) and **merge threshold** (siblings collapse at/below it — set it lower than split for hysteresis; the tree is rebuilt on change), per-kind **population targets** (spawns/removes to match), respawn delay, simulation speed and fire rate. Manual spawns/removals (clicks, `+`/`-`) update the population sliders so both mechanisms cooperate.
