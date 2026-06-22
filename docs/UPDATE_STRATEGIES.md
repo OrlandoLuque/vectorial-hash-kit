@@ -680,16 +680,27 @@ completeness.
 
 ## Final verdict / decisions
 
+> **Note (2026-06-23):** points 1–2 below were refined by the overnight
+> batch. At the *recommended* `item_limit = 100`, LCA and Legacy are at
+> speed parity (the LCA speed win only exists at small item_limit / deep
+> trees); LCA still wins on arena footprint (~22% fewer zombie nodes). And
+> the `neighbors` feature is now confirmed to have **no** beneficial
+> consumer on the critters workload (cull_walk loses to descent by
+> 28–47%). See the "Overnight sweep batch" section for the data.
+
 1. **Default `Tree::update` to `Lca`.** Already wired. `Legacy` survives
-   only as a benchmark target via `update_with`. **Action: keep current
-   API; no further code change needed.**
+   only as a benchmark target via `update_with`. The win is up to ~10% on
+   speed at small item_limit, narrowing to speed-parity at il=100 but a
+   persistent ~22% arena-footprint advantage at every item_limit.
+   **Action: keep current API; no further code change needed.**
 
 2. **Keep the `neighbors` feature off by default.** Its bookkeeping cost
    on `update` ranges from 5% (shallow trees) to **81%** (deep tree, high
-   pop) — and the only consumer that benefits from it directly is
-   `cull_walk` (and the LCA-ropes lookup). Turning it on is correct only
-   when those benefits outweigh the update cost. **Action: leave default;
-   document the tradeoff so users opt in deliberately.**
+   pop). The overnight cull_walk break-even confirmed the only potential
+   consumers (LcaRopes lookup, cull_walk) both *lose* to the feature-off
+   path on this workload. **Action: leave default off; it should be turned
+   on only by a workload with templateless or incremental culls where
+   cull_walk could win (none here).**
 
 3. **When `neighbors` is on, default to `LcaRopes`.** Already wired
    through `UpdateStrategy::default()`. Worth 0.5–4.5% over pure `Lca` at
@@ -854,37 +865,161 @@ going in.
 For now, the `ITEM_LIMIT = 100` constant in `crates/vectorial-hash-demos/src/sim.rs`
 is empirically defended for the demo's workload.
 
+## Overnight sweep batch (2026-06-23)
+
+Five measurement-only sweeps run in sequence (never in parallel — concurrent
+benches contaminate each other's cache). All at pop=10000 unless noted,
+il=100 (the recommended optimum), lca, full sim, `--respawn 0.05`, 3 seeds.
+Scripts: `docs/sweep_{cull_walk,strategy_il100,quad_vs_binary,movement_step,30k}.ps1`.
+Aggregator: `docs/analyze_night.ps1`. Total-frame estimate uses
+`vis_n ≈ 0.30·pop`, `atk_n ≈ 0.005·pop`.
+
+### 1. cull_walk break-even: descent wins decisively, `neighbors` never pays
+
+| feature | cull | mv | vis_avg | total est µs/frame |
+| --- | --- | ---: | ---: | ---: |
+| off | descent | 849 | 13.0 | **40,206** |
+| off | walk-samet | 868 | 19.0 | 58,246 |
+| off | walk-probe | 871 | 19.3 | 59,153 |
+| on | descent | 874 | 13.2 | 40,836 |
+| on | walk-ropes | 889 | 16.7 | 51,363 |
+
+Descent's vision cull is 13.0 µs; the best walk (ropes, feature on) is
+16.7 µs (+28%), and the zero-storage walks are +45–47%. **No walk strategy
+beats descent on this workload**, confirming the BENCHMARKS Results 3
+finding (200k static points) holds under the dynamic critters workload too.
+The reason is structural: descent classifies internal nodes wholesale via
+templates and short-circuits whole subtrees green/white; the flood-fill
+walk must touch every leaf in the region and run a neighbour query per leaf.
+
+**This closes the `neighbors` feature question**: on the critters workload
+there is no consumer that benefits from it (neither LcaRopes update nor
+cull_walk), so it is pure cost. Keep it off — which is the default.
+
+### 2. Strategy at il=100: LCA's *speed* win evaporates, *memory* win persists
+
+The original strategy sweep was at il ∈ {3,10,30}, where LCA was up to ~10%
+faster than Legacy on `mv`. At the now-recommended il=100 the tree is much
+shallower, so the ascent-vs-descent difference shrinks to nothing:
+
+| il | strategy | mv | mv p95 | arena |
+| ---: | --- | ---: | ---: | ---: |
+| 30 | lca | 894 | 937 | 9,968 |
+| 30 | legacy | 908 | 954 | 12,658 |
+| 100 | lca | 857 | 903 | 1,867 |
+| 100 | legacy | 856 | 910 | 2,278 |
+| 200 | lca | 891 | 944 | 606 |
+| 200 | legacy | 887 | 939 | 730 |
+
+At il=100, **LCA and Legacy are at speed parity** (857 vs 856 µs — within
+noise; LCA marginally better on p95). The headline "LCA is faster" is
+therefore **only true at small item_limit** (deep trees). At the
+recommended il=100 the speed difference is gone.
+
+**But LCA still wins on arena footprint at every item_limit**: il=100 gives
+1,867 nodes (lca) vs 2,278 (legacy) — Legacy's remove+insert path orphans
+~22% more zombie nodes. So the LCA-as-default decision still holds, but the
+justification shifts: at the recommended config it's "same speed, ~22% less
+memory churn", not "faster".
+
+Also visible: `lca-ropes` (feature on) is consistently a hair *slower* than
+`lca` (feature off) — 866 vs 857 at il=100 — the rope bookkeeping cost with
+no payback. Reconfirms: feature off.
+
+### 3. Quadtree vs binary: the quad advantage shrinks to ~2% at il=100
+
+BENCHMARKS Results 6 found the quadtree 10–35% ahead — but that was at
+il=3/6 (deep trees, where the quad's half-depth helps `locate` most). At
+the recommended il=100:
+
+| il | mode | mv | vis_avg | total est µs/frame |
+| ---: | --- | ---: | ---: | ---: |
+| 30 | binary | 894 | 15.8 | **48,695** |
+| 30 | quad | 832 | 16.3 | 50,099 |
+| 100 | binary | 844 | 12.9 | 39,881 |
+| 100 | quad | 792 | 12.6 | **38,912** |
+| 200 | binary | 887 | 13.4 | 41,423 |
+| 200 | quad | 846 | 13.2 | **40,775** |
+
+At il=100 the quad is ~2.4% ahead on total; at il=30 the binary is ~2.8%
+ahead (its smaller leaf count gives a cheaper vision cull there). **At the
+recommended item_limit the two structures are within ~2% of each other** —
+the structural advantage that mattered at il=3/6 has all but vanished once
+trees are shallow. This validates keeping the binary tree as the primary
+structure: its other advantages (anisotropic / data-aware splits,
+rectangular and non-power-of-two worlds, smaller node footprint) come at
+negligible throughput cost at the recommended config.
+
+### 4. Movement-step sensitivity: the LCA relocation path is robust
+
+`--no-attack` (pure movement), il=100, varying dt (movement per step):
+
+| dt | mv mean | mv p95 |
+| ---: | ---: | ---: |
+| 0.0083 | 904 | 932 |
+| 0.0167 | 909 | 931 |
+| 0.0333 | 924 | 946 |
+| 0.0667 | 948 | 974 |
+
+8× more movement per step (more cross-leaf jumps per update) costs only
+**+5% on `mv`**. The relocation path doesn't degrade under heavier churn:
+at il=100 the tree is shallow, so even a long jump's LCA ascent is short,
+and most of `update`'s cost is the locate + predicate scan, not the
+relocation itself.
+
+### 5. 30k: optimum drifts slightly upward; sim is very stable
+
+| il | mv mean | mv stdev | vis_avg | total est ms/frame |
+| ---: | ---: | ---: | ---: | ---: |
+| 50 | 3,026 | 5.4 | 35.2 | 321.9 |
+| 100 | 2,877 | 25.2 | 30.9 | 282.9 |
+| 150 | 2,913 | 9.6 | 30.2 | **276.6** |
+| 200 | 2,925 | 19.6 | 30.5 | 279.3 |
+| 300 | 3,099 | 6.5 | 31.5 | 288.6 |
+
+Seed-to-seed variance is tiny (stdev < 1% of mean) — the sim is highly
+deterministic. The optimum at 30k is **il=150** (276.6 ms/frame), with a
+flat bottom: il ∈ [100, 200] are all within ~2% of each other. The
+optimum has **drifted upward from 100 (at 10k) to ~150 (at 30k)**.
+
+The mechanism: more population → denser → at a fixed item_limit the leaves
+carry more boundary items, so a larger item_limit keeps leaves "big enough"
+to stay efficient. The drift is **sub-linear** in population: 3× the pop
+(10k→30k) moves the optimum ~1.5× (100→150). A rough rule for this
+workload: **optimum item_limit ≈ 100·(pop/10000)^0.4**, but the flat bottom
+means anything in [100, 200] is within ~2% of optimal across the 10k–30k
+range — precise tuning of item_limit past "around 100–150" is not worth the
+effort here.
+
+### Updated tuning recommendation
+
+| Population | Recommended item_limit (= merge_limit) |
+| ---: | --- |
+| ~1k–10k | 100 |
+| ~10k–30k | 100–150 (flat; 150 best at 30k) |
+| general | the flat bottom is wide; `100` is a safe single default, nudge toward `150` for sustained 20k+ |
+
 ## Pending follow-ups (not yet measured)
 
-Ordered roughly by value / effort.
-- **`cull_walk` honest break-even**. Run cull_walk on the same workload
-  the LCA sweep used, with `--features neighbors`, to measure whether
-  ropes' upside on cull beats the +5–81% bookkeeping cost on update.
-  Without this, the verdict on the `neighbors` feature stays
-  workload-dependent.
-- **Add denser template sizes (64, 128) and re-bench**. Confirms the
-  hypothesis that the `item_limit` crossover shifts upward as more
-  template sizes are available. Cheap probe (one run per added size at
-  the current optimum + above).
-- **Bit-shift extension to cull**. `IntegerTree<T>` today implements
-  `insert`/`locate`/`update`/`remove` only. The cull machinery (Shape
-  trait, classify_child, template descent) is float-bound. Extending
-  this would let us measure TOTAL throughput on integer-native
-  workloads (not just update). Significant work — touches the template
-  and Shape surfaces — but the right milestone once Areal lands or the
-  user has a target int-native game in mind.
+Ordered roughly by value / effort. (cull_walk break-even, denser
+templates, 30k variance, movement-step sensitivity, and strategy-at-il100
+were measured 2026-06-23 — see the "Overnight sweep batch" section above.)
+
+- **Bit-shift extension to cull is now done** (`IntegerTree::cull`); the
+  head-to-head vs `Tree` in the full sim is in the "Full-sim head-to-head"
+  section. What remains open here is only int-native game integration
+  (where items wouldn't carry a float `pos` at all).
 - **Items with area / volume** (`Areal` / index dilation). Roadmap item
-  from `vectorial-hash/README.md`. Changes the data model — items live
-  in multiple leaves — so every tuning rule above has to be rederived.
-  High-impact, high-effort, separate milestone.
-- **3D**. Roadmap. Translates everything we've measured to volumes. The
-  LCA strategy, the integer tree, and the merge/split rules carry over
-  in principle.
-- **Variance across seeds at 30k pop** (each run takes 15+ minutes).
-  Adds statistical rigor; unlikely to change the qualitative picture.
-- **Sensitivity to movement step size**. Fast critters cross leaves
-  more often, exercising the relocation path harder. Easy to wire in
-  the bench.
+  from `vectorial-hash/README.md`. WIP for the dilation half exists
+  (`polygon::inflated_convex`, one failing sharp-corner test). Changes the
+  data model — items live in multiple leaves — so every tuning rule above
+  has to be rederived. High-impact, high-effort, separate milestone.
+- **3D**. Two candidate strategies now written up in the
+  `vectorial-hash` README roadmap: a true 3D tree (octree, N³ template
+  explosion) vs. the author's projection-indexing idea (two/three 2D
+  trees, intersect candidate sets, exact 3D narrowphase). The proposed
+  cheap first experiment is to measure the broadphase/exact false-positive
+  ratio per shape for the 2-projection scheme before building any 3D tree.
 - **Multithreaded path.** The whole headless workload — every cull,
   every update, every insert/remove — runs single-threaded today. A real
   game loop would parallelise movement (each critter's `update` against

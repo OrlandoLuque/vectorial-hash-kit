@@ -15,7 +15,7 @@
 use std::time::Instant;
 
 use vectorial_hash::UpdateStrategy;
-use vectorial_hash_demos::sim::{build_arsenal_scaled, Mode, Sim, SimParams, ITEM_LIMIT};
+use vectorial_hash_demos::sim::{build_arsenal_scaled, CullStrategy, Mode, Sim, SimParams, ITEM_LIMIT};
 
 fn parse_strategy(s: &str) -> Option<UpdateStrategy> {
     match s {
@@ -31,6 +31,25 @@ fn strategy_label(s: UpdateStrategy) -> &'static str {
         UpdateStrategy::Legacy => "legacy",
         UpdateStrategy::Lca => "lca",
         UpdateStrategy::LcaRopes => "lca-ropes",
+    }
+}
+
+fn parse_cull_strategy(s: &str) -> Option<CullStrategy> {
+    match s {
+        "descent" => Some(CullStrategy::Descent),
+        "walk-samet" | "samet" => Some(CullStrategy::WalkSamet),
+        "walk-probe" | "probe" => Some(CullStrategy::WalkProbe),
+        "walk-ropes" | "ropes" => Some(CullStrategy::WalkRopes),
+        _ => None,
+    }
+}
+
+fn cull_strategy_label(s: CullStrategy) -> &'static str {
+    match s {
+        CullStrategy::Descent => "descent",
+        CullStrategy::WalkSamet => "walk-samet",
+        CullStrategy::WalkProbe => "walk-probe",
+        CullStrategy::WalkRopes => "walk-ropes",
     }
 }
 
@@ -50,6 +69,7 @@ struct Args {
     strategy: UpdateStrategy,
     no_attack: bool,
     figure_scale: f64,
+    cull_strategy: CullStrategy,
 }
 
 fn parse_args() -> Args {
@@ -68,6 +88,7 @@ fn parse_args() -> Args {
         strategy: UpdateStrategy::default(),
         no_attack: false,
         figure_scale: 1.0,
+        cull_strategy: CullStrategy::default(),
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -95,6 +116,8 @@ fn parse_args() -> Args {
                 .expect("update-strategy: legacy|lca|lca-ropes"),
             "--no-attack" => { a.no_attack = true; i -= 1; }
             "--figure-scale" => a.figure_scale = need(&val).parse().unwrap(),
+            "--cull-strategy" => a.cull_strategy = parse_cull_strategy(&need(&val))
+                .expect("cull-strategy: descent|walk-samet|walk-probe|walk-ropes"),
             other => panic!("unknown argument: {other}"),
         }
         i += 2;
@@ -132,7 +155,7 @@ impl SeriesStats {
 fn main() {
     let args = parse_args();
     println!(
-        "headless critters | mode={} | pop target={}+{}+{}={} | frames={} (+{} warmup) | dt={:.4}s | split>{} merge<={} | seed={} | update={}",
+        "headless critters | mode={} | pop target={}+{}+{}={} | frames={} (+{} warmup) | dt={:.4}s | split>{} merge<={} | seed={} | update={} | cull={}",
         args.mode.name(),
         args.targets[0],
         args.targets[1],
@@ -145,6 +168,7 @@ fn main() {
         args.merge,
         args.seed,
         strategy_label(args.strategy),
+        cull_strategy_label(args.cull_strategy),
     );
 
     let t0 = Instant::now();
@@ -164,6 +188,7 @@ fn main() {
     };
     let mut sim = Sim::new(args.mode, args.split, args.merge, args.seed);
     sim.sims.update_strategy = args.strategy;
+    sim.sims.cull_strategy = args.cull_strategy;
 
     // Warmup: reach the target population and a steady tree shape.
     for _ in 0..args.warmup {

@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use vectorial_hash::{
     IntegerTree, IPoint, IPositioned, IRect, IUpdateStrategy, PlacedTemplate, Point as VPoint,
-    Positioned, QuadTree, Rect as VRect, Shape, Tree, UpdateStrategy,
+    Positioned, QuadTree, Rect as VRect, Shape, Tree, UpdateStrategy, WalkNeighbors,
 };
 use vectorial_hash_templates::bank::{FigureKey, TemplateBank};
 use vectorial_hash_templates::polygon::{
@@ -227,6 +227,32 @@ pub struct Sims {
     /// Strategy used by [`Sims::update_critter`]. Headless bench flips this
     /// per run; the interactive demo just uses the default.
     pub update_strategy: UpdateStrategy,
+    /// Strategy used by [`Sims::vision_prey`] to find prey. `Descent` is
+    /// `Tree::cull`; `Walk*` are `Tree::cull_walk` variants. `vision_prey`
+    /// is the dominant cull (3000+ per frame), so this is where the
+    /// `neighbors` feature can in principle pay back its bookkeeping cost
+    /// — this switch is what the cull_walk break-even measures.
+    pub cull_strategy: CullStrategy,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CullStrategy {
+    /// `Tree::cull` (the default): template-driven hierarchical descent.
+    Descent,
+    /// `Tree::cull_walk` with [`WalkNeighbors::Samet`]: walk by reading
+    /// parent pointers, no extra storage.
+    WalkSamet,
+    /// `Tree::cull_walk` with [`WalkNeighbors::Probe`]: walk by probing
+    /// from the root, no extra storage.
+    WalkProbe,
+    /// `Tree::cull_walk` with [`WalkNeighbors::Ropes`]: walk through the
+    /// pre-stored rope lists. Only meaningful with the `neighbors`
+    /// feature on. Without the feature this falls back to `WalkSamet`.
+    WalkRopes,
+}
+
+impl Default for CullStrategy {
+    fn default() -> Self { CullStrategy::Descent }
 }
 
 impl Sims {
@@ -240,6 +266,7 @@ impl Sims {
             it: OpStats::default(),
             mismatches: 0,
             update_strategy: UpdateStrategy::default(),
+            cull_strategy: CullStrategy::default(),
         };
         s.apply_mode(mode, world, split, merge, &[]);
         s
@@ -456,7 +483,16 @@ impl Sims {
         let mut from_itree = None;
         if let Some(t) = &self.tree {
             let s = Instant::now();
-            from_tree = nearest(t.cull(&vision));
+            let hits = match self.cull_strategy {
+                CullStrategy::Descent   => t.cull(&vision),
+                CullStrategy::WalkSamet => t.cull_walk(&vision, vision.center, WalkNeighbors::Samet),
+                CullStrategy::WalkProbe => t.cull_walk(&vision, vision.center, WalkNeighbors::Probe),
+                #[cfg(feature = "neighbors")]
+                CullStrategy::WalkRopes => t.cull_walk(&vision, vision.center, WalkNeighbors::Ropes),
+                #[cfg(not(feature = "neighbors"))]
+                CullStrategy::WalkRopes => t.cull_walk(&vision, vision.center, WalkNeighbors::Samet),
+            };
+            from_tree = nearest(hits);
             self.t.vis += s.elapsed().as_secs_f64() * 1e6;
             self.t.vis_n += 1;
         }
