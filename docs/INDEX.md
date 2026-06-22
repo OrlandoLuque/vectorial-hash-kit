@@ -24,7 +24,8 @@ This file is the map; everything else is one click away.
 | Document | Covers |
 | --- | --- |
 | [BENCHMARKS.md](BENCHMARKS.md) | Methodology and reproducible results for every `vh bench-*` command, with industry-context references. Five result sections (single-template, per-cell-size selection, descent vs neighbour walk, granularity-as-fallback, figure↔grid scale equivalence). |
-| [UPDATE_STRATEGIES.md](UPDATE_STRATEGIES.md) | Empirical comparison of `Tree::update` relocation strategies (Legacy / Lca / LcaRopes), cost of the `neighbors` feature, and the IntegerTree<T> bit-shift experiment. 135-cell formal sweep + IntegerTree head-to-head with verdict on the API defaults. |
+| [UPDATE_STRATEGIES.md](UPDATE_STRATEGIES.md) | Empirical comparison of `Tree::update` relocation strategies (Legacy / Lca / LcaRopes), cost of the `neighbors` feature, and the IntegerTree<T> bit-shift experiment. 135-cell formal sweep + IntegerTree head-to-head, item_limit×merge_limit tuning, cull_walk break-even, and quad-vs-binary, with verdict on the API defaults. |
+| [THREE_D.md](THREE_D.md) | 3D indexing: true 3D tree (`Tree3`, binary split, analytic sphere classification, 1×1×1 `VoxelRaster`) vs the author's projection-indexing idea (three 2D trees + exact narrowphase). Static time/precision comparison + the `critters3d_headless` dynamic workload. |
 
 ## Quality & correctness
 

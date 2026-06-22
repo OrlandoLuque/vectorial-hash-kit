@@ -510,6 +510,161 @@ pub fn create_square(sx: f64, sy: f64, ex: f64, ey: f64) -> Polygon {
     p
 }
 
+/// Minkowski dilation of a **convex** polygon by radius `r`: the returned
+/// polygon contains exactly the points within distance `r` of the original
+/// (boundary included). Line edges shift outward by `r`, existing arcs grow
+/// from radius `R` to `R + r` (same centre), and each corner gains a joining
+/// arc of radius `r` centred on the original vertex.
+///
+/// This is the "index dilation" device for items with circular extent: a
+/// figure F hits an item of body radius `r` iff the item's *centre* lies
+/// inside `inflated_convex(F, r)` — so the spatial index keeps storing
+/// points, and only the template bank gains an inflated set per radius.
+///
+/// Concave polygons are not supported (offsets would self-intersect).
+pub fn inflated_convex(poly: &Polygon, r: f64) -> Polygon {
+    assert!(r > 0.0, "inflation radius must be positive");
+    let n = poly.vertices.len();
+    assert!(n >= 2, "need at least two vertices");
+
+    // Orientation from the signed area of the vertex loop (arc bulges do
+    // not change the winding of a convex figure).
+    let mut signed2 = 0.0;
+    for i in 0..n {
+        let a = &poly.vertices[i];
+        let b = &poly.vertices[(i + 1) % n];
+        signed2 += a.x * b.y - b.x * a.y;
+    }
+    let ccw = signed2 > 0.0;
+    // Corner arcs turn the same way the polygon winds.
+    let corner_d: i8 = if ccw { 1 } else { -1 };
+
+    // Offset endpoints of every edge.
+    struct OffsetEdge {
+        start: (f64, f64),
+        end: (f64, f64),
+        // None = line; Some((xc, yc, d)) = arc with grown radius.
+        arc: Option<(f64, f64, i8)>,
+    }
+    let mut edges: Vec<OffsetEdge> = Vec::with_capacity(n);
+    for i in 0..n {
+        let v = &poly.vertices[i];
+        let w = &poly.vertices[(i + 1) % n];
+        if v.seg.d == 0 {
+            let dx = w.x - v.x;
+            let dy = w.y - v.y;
+            let len = (dx * dx + dy * dy).sqrt();
+            assert!(len > 0.0, "degenerate edge");
+            // Outward normal: right of travel for CW, left for CCW.
+            let (nx, ny) = if ccw {
+                (dy / len, -dx / len)
+            } else {
+                (-dy / len, dx / len)
+            };
+            edges.push(OffsetEdge {
+                start: (v.x + nx * r, v.y + ny * r),
+                end: (w.x + nx * r, w.y + ny * r),
+                arc: None,
+            });
+        } else {
+            // Convex arc: centre on the interior side; growing the radius
+            // offsets it outward. Endpoints move radially away from centre.
+            let (xc, yc) = (v.seg.xc, v.seg.yc);
+            let radius = intersector::dist(xc, yc, v.x, v.y);
+            let k = (radius + r) / radius;
+            edges.push(OffsetEdge {
+                start: (xc + (v.x - xc) * k, yc + (v.y - yc) * k),
+                end: (xc + (w.x - xc) * k, yc + (w.y - yc) * k),
+                arc: Some((xc, yc, v.seg.d)),
+            });
+        }
+    }
+
+    // Stitch: each offset edge, then a corner arc (centred on the original
+    // shared vertex) bridging to the next offset edge — skipped when the
+    // endpoints already coincide (tangent-continuous joins, e.g. circles).
+    let mut out = Polygon::new();
+    for i in 0..n {
+        let e = &edges[i];
+        match e.arc {
+            None => out.addv(e.start.0, e.start.1),
+            Some((xc, yc, d)) => out.addv_arc(e.start.0, e.start.1, xc, yc, d),
+        }
+        let next_start = edges[(i + 1) % n].start;
+        let gap = ((e.end.0 - next_start.0).powi(2) + (e.end.1 - next_start.1).powi(2)).sqrt();
+        if gap > intersector::EPSILON {
+            let corner = &poly.vertices[(i + 1) % n];
+            out.addv_arc(e.end.0, e.end.1, corner.x, corner.y, corner_d);
+        }
+    }
+    out.finalize_bounds();
+    out
+}
+
+impl Polygon {
+    /// Shortest distance from `(px, py)` to this polygon's boundary
+    /// (line edges and arcs). Unsigned — interior and exterior points at
+    /// the same offset return the same value.
+    ///
+    /// This is the robust primitive behind the **dilation narrowphase**:
+    /// a point is within the Minkowski dilation of this polygon by `r` iff
+    /// `self.is_inside(p) || self.dist_to_boundary(p) <= r`. Using the
+    /// *original* polygon's `is_inside` (few segments, reliable) plus a
+    /// distance check sidesteps the ray-casting fragility that
+    /// `is_inside` exhibits on many-arc *inflated* polygons — see
+    /// `inflated_convex` and `tests/dilation.rs`.
+    pub fn dist_to_boundary(&self, px: f64, py: f64) -> f64 {
+        let n = self.vertices.len();
+        let mut best = f64::MAX;
+        for i in 0..n {
+            let v = &self.vertices[i];
+            let w = &self.vertices[(i + 1) % n];
+            let d = if v.seg.d == 0 {
+                dist_point_segment(px, py, v.x, v.y, w.x, w.y)
+            } else {
+                let (xc, yc) = (v.seg.xc, v.seg.yc);
+                let radius = intersector::dist(xc, yc, v.x, v.y);
+                let pa = intersector::angle(xc, yc, px, py);
+                let mut a1 = intersector::angle(xc, yc, v.x, v.y);
+                let mut a2 = intersector::angle(xc, yc, w.x, w.y);
+                if v.seg.d == -1 {
+                    std::mem::swap(&mut a1, &mut a2);
+                }
+                let in_span = if a2 >= a1 { pa >= a1 && pa <= a2 } else { pa >= a1 || pa <= a2 };
+                if in_span {
+                    (intersector::dist(xc, yc, px, py) - radius).abs()
+                } else {
+                    intersector::dist(px, py, v.x, v.y).min(intersector::dist(px, py, w.x, w.y))
+                }
+            };
+            best = best.min(d);
+        }
+        best
+    }
+
+    /// Robust dilation membership: is `(px, py)` within the Minkowski
+    /// dilation of this polygon by radius `r`? Equivalent to
+    /// `is_inside(p) || dist_to_boundary(p) <= r`, but computed without
+    /// ever building or ray-casting the inflated polygon — the production
+    /// **narrowphase** for an agent of body radius `r` (used on `Maybe`
+    /// raster pixels; `In`/`Out` pixels are resolved by the precomputed
+    /// inflated raster lookup and never reach here).
+    pub fn within_dilation(&self, r: f64, px: f64, py: f64) -> bool {
+        self.is_inside(px, py) || self.dist_to_boundary(px, py) <= r
+    }
+}
+
+fn dist_point_segment(px: f64, py: f64, ax: f64, ay: f64, bx: f64, by: f64) -> f64 {
+    let dx = bx - ax;
+    let dy = by - ay;
+    let len2 = dx * dx + dy * dy;
+    if len2 == 0.0 {
+        return intersector::dist(px, py, ax, ay);
+    }
+    let t = (((px - ax) * dx + (py - ay) * dy) / len2).clamp(0.0, 1.0);
+    intersector::dist(px, py, ax + t * dx, ay + t * dy)
+}
+
 pub fn scaled_copy(poly: &Polygon, sx: f64, sy: f64) -> Polygon {
     let mut p = poly.clone();
     p.scale(sx, sy);
