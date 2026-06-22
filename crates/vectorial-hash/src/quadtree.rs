@@ -13,7 +13,7 @@
 
 use crate::culling::{classify_child, collect_matching_items, SizeCache};
 use crate::geom::{Point, Rect};
-use crate::tree::Positioned;
+use crate::tree::{Positioned, UpdateStrategy};
 use crate::CellState;
 use crate::Shape;
 
@@ -83,7 +83,12 @@ impl<T: Positioned> QuadTree<T> {
 
     /// Find the leaf that contains `point`. Caller must ensure `point` is in-bounds.
     pub fn locate(&self, point: Point) -> QNodeId {
-        let mut current = self.root;
+        self.locate_from(self.root, point)
+    }
+
+    /// Like [`QuadTree::locate`] but starting the descent at an arbitrary node.
+    pub fn locate_from(&self, start: QNodeId, point: Point) -> QNodeId {
+        let mut current = start;
         loop {
             match self.get(current).children {
                 None => return current,
@@ -94,6 +99,18 @@ impl<T: Positioned> QuadTree<T> {
                         .expect("quadrants tile the parent");
                 }
             }
+        }
+    }
+
+    /// Walk parents up from `leaf` until one whose bbox contains `point`.
+    /// Returns `None` if the search escapes the root.
+    fn ascend_to_lca(&self, leaf: QNodeId, point: Point) -> Option<QNodeId> {
+        let mut node = self.get(leaf).parent?;
+        loop {
+            if self.get(node).bbox.contains(point) {
+                return Some(node);
+            }
+            node = self.get(node).parent?;
         }
     }
 
@@ -119,6 +136,22 @@ impl<T: Positioned> QuadTree<T> {
         F: Fn(&T) -> bool,
         M: FnOnce(&mut T),
     {
+        self.update_with(UpdateStrategy::default(), old_position, predicate, mutator)
+    }
+
+    /// Same contract as [`crate::Tree::update_with`]. The `LcaRopes` variant
+    /// falls back to `Lca` here — the quadtree has no rope lists.
+    pub fn update_with<F, M>(
+        &mut self,
+        strategy: UpdateStrategy,
+        old_position: Point,
+        predicate: F,
+        mutator: M,
+    ) -> bool
+    where
+        F: Fn(&T) -> bool,
+        M: FnOnce(&mut T),
+    {
         if !self.get(self.root).bbox.contains(old_position) {
             return false;
         }
@@ -133,9 +166,32 @@ impl<T: Positioned> QuadTree<T> {
         if self.get(leaf).bbox.contains(new_pos) {
             return true;
         }
-        let item = self.get_mut(leaf).items.remove(idx);
-        self.try_merge_up(leaf);
-        self.insert(item)
+
+        match strategy {
+            UpdateStrategy::Legacy => {
+                let item = self.get_mut(leaf).items.remove(idx);
+                self.try_merge_up(leaf);
+                self.insert(item)
+            }
+            UpdateStrategy::Lca | UpdateStrategy::LcaRopes => {
+                let lca = match self.ascend_to_lca(leaf, new_pos) {
+                    Some(id) => id,
+                    None => {
+                        let _ = self.get_mut(leaf).items.remove(idx);
+                        self.try_merge_up(leaf);
+                        return false;
+                    }
+                };
+                let item = self.get_mut(leaf).items.remove(idx);
+                let dest = self.locate_from(lca, new_pos);
+                self.get_mut(dest).items.push(item);
+                if self.get(dest).items.len() > self.item_limit {
+                    self.divide(dest);
+                }
+                self.try_merge_up(leaf);
+                true
+            }
+        }
     }
 
     /// 4-way merge rule: collapse parents whose four children are all leaves

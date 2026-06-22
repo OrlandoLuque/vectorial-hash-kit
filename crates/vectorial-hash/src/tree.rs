@@ -47,6 +47,36 @@ impl Side {
 /// cell extent the tree can produce.
 const PROBE_EPS: f64 = 1e-6;
 
+/// Strategy used by [`Tree::update_with`] (and the matching `QuadTree` API)
+/// to relocate an item that walked out of its leaf.
+///
+/// `update` itself picks the best path available at compile time
+/// ([`UpdateStrategy::default`]); benchmarks call `update_with` to force a
+/// specific path.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum UpdateStrategy {
+    /// Remove the item and re-insert from the root. The pre-2026 path.
+    Legacy,
+    /// Ascend to the lowest common ancestor of the old leaf and the new
+    /// position, then descend only within that subtree.
+    Lca,
+    /// First scan the old leaf's rope neighbours — if one of them contains
+    /// the new position, move directly. Falls back to [`Self::Lca`] on miss.
+    /// Without the `neighbors` feature the rope lists are empty, so this
+    /// behaves like [`Self::Lca`] but pays for one cheap empty-list scan.
+    LcaRopes,
+}
+
+impl Default for UpdateStrategy {
+    fn default() -> Self {
+        if cfg!(feature = "neighbors") {
+            UpdateStrategy::LcaRopes
+        } else {
+            UpdateStrategy::Lca
+        }
+    }
+}
+
 pub struct Node<T> {
     pub bbox: Rect,
     pub parent: Option<NodeId>,
@@ -134,7 +164,14 @@ impl<T: Positioned> Tree<T> {
 
     /// Find the leaf that contains `point`. Caller must ensure `point` is in-bounds.
     pub fn locate(&self, point: Point) -> NodeId {
-        let mut current = self.root;
+        self.locate_from(self.root, point)
+    }
+
+    /// Like [`Tree::locate`] but starting the descent at an arbitrary node.
+    /// Used by the ascend-to-LCA `update` path so re-locating a moved item
+    /// only walks the subtree rooted at the LCA.
+    pub fn locate_from(&self, start: NodeId, point: Point) -> NodeId {
+        let mut current = start;
         loop {
             match self.get(current).children {
                 None => return current,
@@ -142,6 +179,18 @@ impl<T: Positioned> Tree<T> {
                     current = if self.get(a).bbox.contains(point) { a } else { b };
                 }
             }
+        }
+    }
+
+    /// Walk parents up from `leaf` until one whose bbox contains `point`.
+    /// Returns `None` if the search escapes the root (`point` out of bounds).
+    fn ascend_to_lca(&self, leaf: NodeId, point: Point) -> Option<NodeId> {
+        let mut node = self.get(leaf).parent?;
+        loop {
+            if self.get(node).bbox.contains(point) {
+                return Some(node);
+            }
+            node = self.get(node).parent?;
         }
     }
 
@@ -180,7 +229,26 @@ impl<T: Positioned> Tree<T> {
     ///
     /// If the mutator pushes the item outside the tree's root bbox, the
     /// item is removed and dropped, and the function returns `false`.
+    ///
+    /// Uses [`UpdateStrategy::default`] for the relocation path. Call
+    /// [`Tree::update_with`] to force a specific strategy.
     pub fn update<F, M>(&mut self, old_position: Point, predicate: F, mutator: M) -> bool
+    where
+        F: Fn(&T) -> bool,
+        M: FnOnce(&mut T),
+    {
+        self.update_with(UpdateStrategy::default(), old_position, predicate, mutator)
+    }
+
+    /// Like [`Tree::update`] but with an explicit relocation strategy.
+    /// Exists for benchmarking; production callers should use `update`.
+    pub fn update_with<F, M>(
+        &mut self,
+        strategy: UpdateStrategy,
+        old_position: Point,
+        predicate: F,
+        mutator: M,
+    ) -> bool
     where
         F: Fn(&T) -> bool,
         M: FnOnce(&mut T),
@@ -200,10 +268,72 @@ impl<T: Positioned> Tree<T> {
             return true;
         }
 
-        // Item walked out of its leaf: remove and reinsert at the new position.
+        match strategy {
+            UpdateStrategy::Legacy => {
+                let item = self.get_mut(leaf).items.remove(idx);
+                self.try_merge_up(leaf);
+                self.insert(item)
+            }
+            UpdateStrategy::Lca => self.relocate_via_lca(leaf, idx, new_pos),
+            UpdateStrategy::LcaRopes => {
+                #[cfg(feature = "neighbors")]
+                if let Some(nbr) = self.find_rope_neighbour(leaf, new_pos) {
+                    return self.relocate_to_neighbour(leaf, idx, nbr);
+                }
+                self.relocate_via_lca(leaf, idx, new_pos)
+            }
+        }
+    }
+
+    /// LCA path: ascend from `leaf` until an ancestor contains `new_pos`,
+    /// then descend into that subtree to find the destination leaf. Returns
+    /// `false` if `new_pos` is out of root bounds (item dropped).
+    fn relocate_via_lca(&mut self, leaf: NodeId, idx: usize, new_pos: Point) -> bool {
+        let lca = match self.ascend_to_lca(leaf, new_pos) {
+            Some(id) => id,
+            None => {
+                // Out of bounds: drop the item, then merge-up.
+                let _ = self.get_mut(leaf).items.remove(idx);
+                self.try_merge_up(leaf);
+                return false;
+            }
+        };
         let item = self.get_mut(leaf).items.remove(idx);
+        let dest = self.locate_from(lca, new_pos);
+        self.get_mut(dest).items.push(item);
+        if self.get(dest).items.len() > self.item_limit {
+            self.divide(dest);
+        }
         self.try_merge_up(leaf);
-        self.insert(item)
+        true
+    }
+
+    /// Direct neighbour-leaf move: pop the item from `leaf` and push to `nbr`.
+    /// Triggers the usual divide/merge-up bookkeeping on each side.
+    #[cfg(feature = "neighbors")]
+    fn relocate_to_neighbour(&mut self, leaf: NodeId, idx: usize, nbr: NodeId) -> bool {
+        let item = self.get_mut(leaf).items.remove(idx);
+        self.get_mut(nbr).items.push(item);
+        if self.get(nbr).items.len() > self.item_limit {
+            self.divide(nbr);
+        }
+        self.try_merge_up(leaf);
+        true
+    }
+
+    /// Scan the leaf's four rope lists for a neighbour leaf whose bbox
+    /// contains `point`. `O(rope sum)` — for a balanced tree, a small
+    /// constant.
+    #[cfg(feature = "neighbors")]
+    fn find_rope_neighbour(&self, leaf: NodeId, point: Point) -> Option<NodeId> {
+        for side in Side::ALL {
+            for &nbr in &self.get(leaf).ropes[side.index()] {
+                if self.get(nbr).bbox.contains(point) {
+                    return Some(nbr);
+                }
+            }
+        }
+        None
     }
 
     /// Walk upward from `node` collapsing parents that satisfy the merge-up
@@ -856,5 +986,41 @@ mod tests {
         tree.insert(Pt(Point::new(10.0, 10.0)));
         assert!(!tree.update(Point::new(10.0, 10.0), |it| it.0.x == 99.0, |_| {}));
         assert!(!tree.update(Point::new(500.0, 500.0), |_| true, |_| {})); // out of bounds
+    }
+
+    /// Build a tree with the same seeded points and return the sorted leaf
+    /// positions — used to confirm two strategies converge on identical state.
+    fn relocate_under(strategy: UpdateStrategy) -> Vec<Point> {
+        let mut tree = Tree::<Pt>::new(Rect::new(0.0, 0.0, 256.0, 256.0), 2);
+        let pts = [
+            (10.0, 10.0), (30.0, 30.0), (80.0, 50.0),
+            (120.0, 200.0), (200.0, 220.0), (50.0, 150.0),
+            (180.0, 30.0), (220.0, 90.0), (5.0, 250.0),
+        ];
+        for (x, y) in pts { tree.insert(Pt(Point::new(x, y))); }
+        // A handful of moves: in-leaf, sibling, cross-LCA-up-the-tree, out of bounds.
+        tree.update_with(strategy, Point::new(10.0, 10.0), |it| it.0.x == 10.0,
+            |it| it.0 = Point::new(15.0, 15.0));
+        tree.update_with(strategy, Point::new(200.0, 220.0), |it| it.0.x == 200.0,
+            |it| it.0 = Point::new(5.0, 5.0));
+        tree.update_with(strategy, Point::new(180.0, 30.0), |it| it.0.x == 180.0,
+            |it| it.0 = Point::new(190.0, 240.0));
+        tree.update_with(strategy, Point::new(50.0, 150.0), |it| it.0.x == 50.0,
+            |it| it.0 = Point::new(1000.0, 1000.0)); // out of bounds: dropped
+        let mut out: Vec<Point> = Vec::new();
+        tree.visit_leaves(|_, leaf| { for it in &leaf.items { out.push(it.0); } });
+        out.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap().then(a.y.partial_cmp(&b.y).unwrap()));
+        out
+    }
+
+    #[test]
+    fn lca_strategy_matches_legacy_state() {
+        assert_eq!(relocate_under(UpdateStrategy::Lca), relocate_under(UpdateStrategy::Legacy));
+    }
+
+    #[cfg(feature = "neighbors")]
+    #[test]
+    fn lca_ropes_strategy_matches_legacy_state() {
+        assert_eq!(relocate_under(UpdateStrategy::LcaRopes), relocate_under(UpdateStrategy::Legacy));
     }
 }

@@ -33,9 +33,11 @@ pub mod template;
 pub mod tree;
 pub mod culling;
 pub mod quadtree;
+pub mod itree;
 
 pub use geom::{Point, Rect};
 pub use template::{CellState, PlacedTemplate, TemplateGrid};
-pub use tree::{Node, NodeId, Positioned, Side, Tree};
+pub use tree::{Node, NodeId, Positioned, Side, Tree, UpdateStrategy};
 pub use culling::{Shape, WalkNeighbors};
 pub use quadtree::{QNode, QNodeId, QuadTree};
+pub use itree::{INode, INodeId, IPoint, IPositioned, IRect, IUpdateStrategy, IntegerTree};

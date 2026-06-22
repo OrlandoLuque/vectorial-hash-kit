@@ -9,6 +9,11 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# Propagates to vectorial-hash so the LcaRopes update strategy is compiled in
+# (otherwise it silently degrades to Lca).
+neighbors = ["vectorial-hash/neighbors"]
+
 [dependencies]
 vectorial-hash = { workspace = true }
 vectorial-hash-templates = { workspace = true }

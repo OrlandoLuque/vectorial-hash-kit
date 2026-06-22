@@ -12,7 +12,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use vectorial_hash::{
-    PlacedTemplate, Point as VPoint, Positioned, QuadTree, Rect as VRect, Shape, Tree,
+    IntegerTree, IPoint, IPositioned, IRect, IUpdateStrategy, PlacedTemplate, Point as VPoint,
+    Positioned, QuadTree, Rect as VRect, Shape, Tree, UpdateStrategy,
 };
 use vectorial_hash_templates::bank::{FigureKey, TemplateBank};
 use vectorial_hash_templates::polygon::{
@@ -24,7 +25,7 @@ pub const MAP_W: f64 = 1024.0;
 pub const MAP_H: f64 = 1024.0;
 pub const MARGIN: f64 = 4.0;
 pub const VISION_RADIUS: f64 = 280.0;
-pub const MAX_CRITTERS: usize = 4000;
+pub const MAX_CRITTERS: usize = 40000;
 
 pub const ANGLE_STEP_DEG: f64 = 15.0;
 pub const DROP_ID: u32 = 0;
@@ -33,10 +34,16 @@ pub const DROP_SCALE: f64 = 110.0;
 pub const CIRCLE_RADIUS: f64 = 48.0;
 
 /// Cell sizes (w, h) with full template sets.
-pub const TEMPLATE_SIZES: [(u32, u32); 7] =
-    [(8, 8), (16, 16), (32, 32), (8, 16), (16, 8), (16, 32), (32, 16)];
+pub const TEMPLATE_SIZES: [(u32, u32); 9] =
+    [(8, 8), (16, 16), (32, 32), (64, 64), (128, 128),
+     (8, 16), (16, 8), (16, 32), (32, 16)];
 
-pub const ITEM_LIMIT: usize = 3;
+/// Default split / merge threshold for both trees. 100 is the empirical
+/// throughput optimum on this workload (1024² world, 10k pop, drop +
+/// circle figures) — see `docs/UPDATE_STRATEGIES.md`'s extended sweep.
+/// The optimum is workload-dependent: small figures or sparser
+/// populations push it lower; richer template sets push it higher.
+pub const ITEM_LIMIT: usize = 100;
 pub const RESPAWN_DELAY: f64 = 2.5;
 
 // ------------------------------------------------------------------ random
@@ -114,13 +121,45 @@ pub struct Critter {
     pub id: u32,
     pub kind: Kind,
     pub pos: VPoint,
+    /// Integer-rounded copy of `pos`, maintained whenever `pos` is set.
+    /// Cached so the `IPositioned` impl reads a field instead of recomputing
+    /// `pos.round() as i32` on every IntegerTree internal lookup (locate,
+    /// divide, cull). The cache made integer-mode cull go from ~6× slower
+    /// than the float tree (recomputing each call) to comparable.
+    pub ipos: IPoint,
     pub heading: f64,
+}
+
+impl Critter {
+    pub fn new(id: u32, kind: Kind, pos: VPoint, heading: f64) -> Self {
+        Critter { id, kind, pos, ipos: to_ipoint(pos), heading }
+    }
+    /// Set both float and integer position together. Use this everywhere
+    /// `pos` changes — failing to refresh `ipos` makes the integer tree
+    /// silently drift out of sync.
+    pub fn set_pos(&mut self, p: VPoint) {
+        self.pos = p;
+        self.ipos = to_ipoint(p);
+    }
 }
 
 impl Positioned for Critter {
     fn position(&self) -> VPoint {
         self.pos
     }
+}
+
+/// Integer-side view: cached, just reads `self.ipos` — no rounding at the
+/// hot path.
+impl IPositioned for Critter {
+    fn position(&self) -> IPoint {
+        self.ipos
+    }
+}
+
+#[inline]
+fn to_ipoint(p: VPoint) -> IPoint {
+    IPoint::new(p.x.round() as i32, p.y.round() as i32)
 }
 
 // --------------------------------------------------------------- structures
@@ -130,6 +169,10 @@ pub enum Mode {
     Binary,
     Quad,
     Both,
+    /// Bit-shift / integer-coord binary-split tree. Standalone — does not
+    /// participate in `Both` comparisons because position rounding
+    /// (f64 → i32) creates expected sub-pixel divergences at boundaries.
+    IBinary,
 }
 
 impl Mode {
@@ -137,7 +180,8 @@ impl Mode {
         match self {
             Mode::Binary => Mode::Quad,
             Mode::Quad => Mode::Both,
-            Mode::Both => Mode::Binary,
+            Mode::Both => Mode::IBinary,
+            Mode::IBinary => Mode::Binary,
         }
     }
     pub fn name(self) -> &'static str {
@@ -145,6 +189,7 @@ impl Mode {
             Mode::Binary => "binary tree",
             Mode::Quad => "quadtree",
             Mode::Both => "both (compare)",
+            Mode::IBinary => "integer binary tree",
         }
     }
     pub fn parse(s: &str) -> Option<Mode> {
@@ -152,6 +197,7 @@ impl Mode {
             "binary" | "bin" | "tree" => Some(Mode::Binary),
             "quad" | "quadtree" => Some(Mode::Quad),
             "both" => Some(Mode::Both),
+            "int_binary" | "ibinary" | "itree" => Some(Mode::IBinary),
             _ => None,
         }
     }
@@ -173,9 +219,14 @@ pub struct OpStats {
 pub struct Sims {
     pub tree: Option<Tree<Critter>>,
     pub quad: Option<QuadTree<Critter>>,
+    pub itree: Option<IntegerTree<Critter>>,
     pub t: OpStats,
     pub q: OpStats,
+    pub it: OpStats,
     pub mismatches: u64,
+    /// Strategy used by [`Sims::update_critter`]. Headless bench flips this
+    /// per run; the interactive demo just uses the default.
+    pub update_strategy: UpdateStrategy,
 }
 
 impl Sims {
@@ -183,18 +234,22 @@ impl Sims {
         let mut s = Sims {
             tree: None,
             quad: None,
+            itree: None,
             t: OpStats::default(),
             q: OpStats::default(),
+            it: OpStats::default(),
             mismatches: 0,
+            update_strategy: UpdateStrategy::default(),
         };
         s.apply_mode(mode, world, split, merge, &[]);
         s
     }
 
     pub fn mode(&self) -> Mode {
-        match (&self.tree, &self.quad) {
-            (Some(_), Some(_)) => Mode::Both,
-            (Some(_), None) => Mode::Binary,
+        match (&self.tree, &self.quad, &self.itree) {
+            (Some(_), Some(_), _) => Mode::Both,
+            (Some(_), None, _) => Mode::Binary,
+            (None, None, Some(_)) => Mode::IBinary,
             _ => Mode::Quad,
         }
     }
@@ -214,11 +269,27 @@ impl Sims {
             }
             q
         });
+        self.itree = matches!(mode, Mode::IBinary).then(|| {
+            // World must be square pow-2 for IntegerTree. `MAP_W`/`MAP_H`
+            // are 1024 so this holds for the demo's default world.
+            let iworld = IRect::new(
+                world.x.round() as i32,
+                world.y.round() as i32,
+                world.width.round() as i32,
+                world.height.round() as i32,
+            );
+            let mut t = IntegerTree::with_limits(iworld, split, merge);
+            for c in items {
+                t.insert(c.clone());
+            }
+            t
+        });
     }
 
     pub fn begin_frame(&mut self) {
         self.t = OpStats::default();
         self.q = OpStats::default();
+        self.it = OpStats::default();
     }
 
     pub fn snapshot(&self) -> Vec<(u32, Kind, VPoint, f64)> {
@@ -235,6 +306,12 @@ impl Sims {
                     out.push((c.id, c.kind, c.pos, c.heading));
                 }
             });
+        } else if let Some(t) = &self.itree {
+            t.visit_leaves(|_, leaf| {
+                for c in &leaf.items {
+                    out.push((c.id, c.kind, c.pos, c.heading));
+                }
+            });
         }
         out
     }
@@ -244,6 +321,8 @@ impl Sims {
             t.item_count()
         } else if let Some(q) = &self.quad {
             q.item_count()
+        } else if let Some(t) = &self.itree {
+            t.item_count()
         } else {
             0
         }
@@ -259,6 +338,11 @@ impl Sims {
             let s = Instant::now();
             q.insert(c.clone());
             self.q.rm += s.elapsed().as_secs_f64() * 1e6;
+        }
+        if let Some(t) = &mut self.itree {
+            let s = Instant::now();
+            t.insert(c.clone());
+            self.it.rm += s.elapsed().as_secs_f64() * 1e6;
         }
     }
 
@@ -277,31 +361,53 @@ impl Sims {
                 out = r;
             }
         }
+        if let Some(t) = &mut self.itree {
+            let s = Instant::now();
+            let r = t.remove(to_ipoint(pos), |c| c.id == id);
+            self.it.rm += s.elapsed().as_secs_f64() * 1e6;
+            if out.is_none() {
+                out = r;
+            }
+        }
         out
     }
 
     pub fn update_critter(&mut self, pos: VPoint, id: u32, np: VPoint, nh: f64) {
+        let strategy = self.update_strategy;
         if let Some(t) = &mut self.tree {
             let s = Instant::now();
-            t.update(pos, |c| c.id == id, |c| {
-                c.pos = np;
+            t.update_with(strategy, pos, |c| c.id == id, |c| {
+                c.set_pos(np);
                 c.heading = nh;
             });
             self.t.mv += s.elapsed().as_secs_f64() * 1e6;
         }
         if let Some(q) = &mut self.quad {
             let s = Instant::now();
-            q.update(pos, |c| c.id == id, |c| {
-                c.pos = np;
+            q.update_with(strategy, pos, |c| c.id == id, |c| {
+                c.set_pos(np);
                 c.heading = nh;
             });
             self.q.mv += s.elapsed().as_secs_f64() * 1e6;
+        }
+        if let Some(t) = &mut self.itree {
+            let istrategy = match strategy {
+                UpdateStrategy::Legacy => IUpdateStrategy::Legacy,
+                _ => IUpdateStrategy::Lca,
+            };
+            let s = Instant::now();
+            t.update_with(istrategy, to_ipoint(pos), |c| c.id == id, |c| {
+                c.set_pos(np);
+                c.heading = nh;
+            });
+            self.it.mv += s.elapsed().as_secs_f64() * 1e6;
         }
     }
 
     pub fn cull_attack<Sh: Shape>(&mut self, shape: &Sh) -> Vec<(u32, VPoint)> {
         let mut tree_ids: Option<Vec<(u32, VPoint)>> = None;
         let mut quad_ids: Option<Vec<(u32, VPoint)>> = None;
+        let mut itree_ids: Option<Vec<(u32, VPoint)>> = None;
         if let Some(t) = &self.tree {
             let s = Instant::now();
             let hits = t.cull(shape);
@@ -316,6 +422,13 @@ impl Sims {
             self.q.atk_n += 1;
             quad_ids = Some(hits.iter().map(|c| (c.id, c.pos)).collect());
         }
+        if let Some(t) = &self.itree {
+            let s = Instant::now();
+            let hits = t.cull(shape);
+            self.it.atk += s.elapsed().as_secs_f64() * 1e6;
+            self.it.atk_n += 1;
+            itree_ids = Some(hits.iter().map(|c| (c.id, c.pos)).collect());
+        }
         if let (Some(a), Some(b)) = (&tree_ids, &quad_ids) {
             let sa: HashSet<u32> = a.iter().map(|(id, _)| *id).collect();
             let sb: HashSet<u32> = b.iter().map(|(id, _)| *id).collect();
@@ -323,7 +436,7 @@ impl Sims {
                 self.mismatches += 1;
             }
         }
-        tree_ids.or(quad_ids).unwrap_or_default()
+        tree_ids.or(quad_ids).or(itree_ids).unwrap_or_default()
     }
 
     pub fn vision_prey(&mut self, pos: VPoint, self_id: u32) -> Option<VPoint> {
@@ -340,6 +453,7 @@ impl Sims {
         };
         let mut from_tree = None;
         let mut from_quad = None;
+        let mut from_itree = None;
         if let Some(t) = &self.tree {
             let s = Instant::now();
             from_tree = nearest(t.cull(&vision));
@@ -352,12 +466,18 @@ impl Sims {
             self.q.vis += s.elapsed().as_secs_f64() * 1e6;
             self.q.vis_n += 1;
         }
+        if let Some(t) = &self.itree {
+            let s = Instant::now();
+            from_itree = nearest(t.cull(&vision));
+            self.it.vis += s.elapsed().as_secs_f64() * 1e6;
+            self.it.vis_n += 1;
+        }
         if let (Some((ia, _)), Some((ib, _))) = (from_tree, from_quad) {
             if ia != ib {
                 self.mismatches += 1;
             }
         }
-        from_tree.or(from_quad).map(|(_, p)| p)
+        from_tree.or(from_quad).or(from_itree).map(|(_, p)| p)
     }
 }
 
@@ -394,6 +514,13 @@ pub struct Arsenal {
 }
 
 pub fn build_arsenal() -> Arsenal {
+    build_arsenal_scaled(1.0)
+}
+
+/// Build an arsenal with both figures (drop and circle) uniformly scaled by
+/// `figure_scale`. The bank caches templates keyed by figure dimensions, so
+/// scaled figures create separate entries — no contamination across scales.
+pub fn build_arsenal_scaled(figure_scale: f64) -> Arsenal {
     let start = Instant::now();
     let mut bank = TemplateBank::new();
     let mut figures = HashMap::new();
@@ -403,17 +530,20 @@ pub fn build_arsenal() -> Arsenal {
         .map(|i| i as f64 * ANGLE_STEP_DEG)
         .collect();
 
+    let drop_scale = DROP_SCALE * figure_scale;
+    let circle_radius = CIRCLE_RADIUS * figure_scale;
+
     let shapes: [(u32, Vec<f64>, Polygon, Vec<f64>); 2] = [
         (
             DROP_ID,
-            vec![0.2 * DROP_SCALE, 0.8 * DROP_SCALE],
-            scaled_copy(&create_drop(0.2, 0.8), DROP_SCALE, DROP_SCALE),
+            vec![0.2 * drop_scale, 0.8 * drop_scale],
+            scaled_copy(&create_drop(0.2, 0.8), drop_scale, drop_scale),
             drop_angles,
         ),
         (
             CIRCLE_ID,
-            vec![CIRCLE_RADIUS],
-            scaled_copy(&create_circle(1.0), CIRCLE_RADIUS, CIRCLE_RADIUS),
+            vec![circle_radius],
+            scaled_copy(&create_circle(1.0), circle_radius, circle_radius),
             vec![0.0],
         ),
     ];
@@ -521,11 +651,19 @@ pub struct SimParams {
     pub targets: [usize; 3],
     pub respawn_delay: f64,
     pub fire_rate: f64,
+    /// Skip the entire firing / kill / respawn phase. Used by the headless
+    /// bench to isolate `update` cost from cull / insert / remove churn.
+    pub no_attack: bool,
 }
 
 impl Default for SimParams {
     fn default() -> Self {
-        SimParams { targets: [16, 12, 14], respawn_delay: RESPAWN_DELAY, fire_rate: 1.0 }
+        SimParams {
+            targets: [16, 12, 14],
+            respawn_delay: RESPAWN_DELAY,
+            fire_rate: 1.0,
+            no_attack: false,
+        }
     }
 }
 
@@ -586,7 +724,7 @@ impl Sim {
         self.sims
             .snapshot()
             .into_iter()
-            .map(|(id, kind, pos, heading)| Critter { id, kind, pos, heading })
+            .map(|(id, kind, pos, heading)| Critter::new(id, kind, pos, heading))
             .collect()
     }
 
@@ -601,7 +739,7 @@ impl Sim {
         let id = self.next_id;
         self.next_id += 1;
         let heading = self.rng.range(0.0, std::f64::consts::TAU);
-        let c = Critter { id, kind, pos, heading };
+        let c = Critter::new(id, kind, pos, heading);
         self.sims.insert(&c);
         self.events.push(SimEvent::Spawn { pos, kind, respawn });
     }
@@ -638,7 +776,14 @@ impl Sim {
             self.sims.update_critter(pos, id, np, nh);
         }
 
-        // Firing.
+        // Firing. Skipped entirely when `no_attack` is set — used by the
+        // headless bench to isolate `update` cost from cull / insert /
+        // remove churn.
+        if params.no_attack {
+            // Still run population steering to fill to target initially.
+            self.steer_population(params);
+            return;
+        }
         let snap2 = self.sims.snapshot();
         let kind_of: HashMap<u32, Kind> = snap2.iter().map(|&(id, k, _, _)| (id, k)).collect();
         let mut killed: Vec<(u32, VPoint, Kind, Kind)> = Vec::new();
@@ -711,7 +856,12 @@ impl Sim {
             }
         }
 
-        // Population steering toward targets.
+        self.steer_population(params);
+    }
+
+    /// Spawn until each kind reaches its target, removing surplus (from the
+    /// respawn queue first, then from alive) if over.
+    fn steer_population(&mut self, params: &SimParams) {
         let snap3 = self.sims.snapshot();
         let mut alive: HashMap<Kind, Vec<(u32, VPoint)>> = HashMap::new();
         for &(id, kind, pos, _) in &snap3 {

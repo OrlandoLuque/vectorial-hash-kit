@@ -14,7 +14,25 @@
 
 use std::time::Instant;
 
-use vectorial_hash_demos::sim::{build_arsenal, Mode, Sim, SimParams, ITEM_LIMIT};
+use vectorial_hash::UpdateStrategy;
+use vectorial_hash_demos::sim::{build_arsenal_scaled, Mode, Sim, SimParams, ITEM_LIMIT};
+
+fn parse_strategy(s: &str) -> Option<UpdateStrategy> {
+    match s {
+        "legacy" => Some(UpdateStrategy::Legacy),
+        "lca" => Some(UpdateStrategy::Lca),
+        "lca-ropes" | "ropes" => Some(UpdateStrategy::LcaRopes),
+        _ => None,
+    }
+}
+
+fn strategy_label(s: UpdateStrategy) -> &'static str {
+    match s {
+        UpdateStrategy::Legacy => "legacy",
+        UpdateStrategy::Lca => "lca",
+        UpdateStrategy::LcaRopes => "lca-ropes",
+    }
+}
 
 #[derive(Debug)]
 struct Args {
@@ -29,6 +47,9 @@ struct Args {
     fire: f64,
     respawn: f64,
     csv: Option<String>,
+    strategy: UpdateStrategy,
+    no_attack: bool,
+    figure_scale: f64,
 }
 
 fn parse_args() -> Args {
@@ -44,6 +65,9 @@ fn parse_args() -> Args {
         fire: 1.0,
         respawn: 2.5,
         csv: None,
+        strategy: UpdateStrategy::default(),
+        no_attack: false,
+        figure_scale: 1.0,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -67,6 +91,10 @@ fn parse_args() -> Args {
             "--fire" => a.fire = need(&val).parse().unwrap(),
             "--respawn" => a.respawn = need(&val).parse().unwrap(),
             "--csv" => a.csv = Some(need(&val)),
+            "--update-strategy" | "--strategy" => a.strategy = parse_strategy(&need(&val))
+                .expect("update-strategy: legacy|lca|lca-ropes"),
+            "--no-attack" => { a.no_attack = true; i -= 1; }
+            "--figure-scale" => a.figure_scale = need(&val).parse().unwrap(),
             other => panic!("unknown argument: {other}"),
         }
         i += 2;
@@ -104,7 +132,7 @@ impl SeriesStats {
 fn main() {
     let args = parse_args();
     println!(
-        "headless critters | mode={} | pop target={}+{}+{}={} | frames={} (+{} warmup) | dt={:.4}s | split>{} merge<={} | seed={}",
+        "headless critters | mode={} | pop target={}+{}+{}={} | frames={} (+{} warmup) | dt={:.4}s | split>{} merge<={} | seed={} | update={}",
         args.mode.name(),
         args.targets[0],
         args.targets[1],
@@ -116,10 +144,11 @@ fn main() {
         args.split,
         args.merge,
         args.seed,
+        strategy_label(args.strategy),
     );
 
     let t0 = Instant::now();
-    let arsenal = build_arsenal();
+    let arsenal = build_arsenal_scaled(args.figure_scale);
     println!(
         "bank ready in {:.2}s ({} combos, {} unique grids)",
         arsenal.gen_seconds,
@@ -131,8 +160,10 @@ fn main() {
         targets: args.targets,
         respawn_delay: args.respawn,
         fire_rate: args.fire,
+        no_attack: args.no_attack,
     };
     let mut sim = Sim::new(args.mode, args.split, args.merge, args.seed);
+    sim.sims.update_strategy = args.strategy;
 
     // Warmup: reach the target population and a steady tree shape.
     for _ in 0..args.warmup {
@@ -152,6 +183,7 @@ fn main() {
     let mut stats: Vec<(&str, [SeriesStats; 4])> = vec![
         ("binary", Default::default()),
         ("quad", Default::default()),
+        ("itree", Default::default()),
     ];
     let measure_start = Instant::now();
     for frame in 0..args.frames {
@@ -159,7 +191,11 @@ fn main() {
         sim.step(args.dt, &arsenal, &params);
         sim.events.clear();
 
-        for (name, ops) in [("binary", sim.sims.t), ("quad", sim.sims.q)] {
+        for (name, ops) in [
+            ("binary", sim.sims.t),
+            ("quad", sim.sims.q),
+            ("itree", sim.sims.it),
+        ] {
             let entry = stats.iter_mut().find(|(n, _)| *n == name).unwrap();
             let atk_avg = if ops.atk_n > 0 { ops.atk / ops.atk_n as f64 } else { 0.0 };
             let vis_avg = if ops.vis_n > 0 { ops.vis / ops.vis_n as f64 } else { 0.0 };
@@ -206,6 +242,9 @@ fn main() {
     if let Some(q) = &sim.sims.quad {
         println!("quad:   {} leaves, {} arena nodes", q.leaf_count(), q.node_count());
     }
+    if let Some(t) = &sim.sims.itree {
+        println!("itree:  {} leaves, {} arena nodes", t.leaf_count(), t.node_count());
+    }
 
     println!(
         "\n{:<8} {:<22} {:>10} {:>10} {:>10}",
@@ -219,8 +258,10 @@ fn main() {
     ];
     for (name, series) in &stats {
         let active = match (args.mode, *name) {
-            (Mode::Binary, "quad") | (Mode::Quad, "binary") => false,
-            _ => true,
+            (Mode::Binary, "binary") | (Mode::Both, "binary") => true,
+            (Mode::Quad, "quad")     | (Mode::Both, "quad")    => true,
+            (Mode::IBinary, "itree") => true,
+            _ => false,
         };
         if !active {
             continue;

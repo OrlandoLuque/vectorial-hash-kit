@@ -437,6 +437,7 @@ async fn main() {
                 targets: [drifters_f as usize, hunters_f as usize, pulsars_f as usize],
                 respawn_delay: respawn_f as f64,
                 fire_rate: fire_f as f64,
+                no_attack: false,
             };
             sim.step(dt, &arsenal, &params);
             consume_events(&mut sim, &arsenal, now, &mut effects, &mut rings);
@@ -616,6 +617,7 @@ async fn main() {
                 Mode::Binary => COL_BIN,
                 Mode::Quad => COL_QUAD,
                 Mode::Both => YELLOW,
+                Mode::IBinary => COL_BIN,
             },
             &mut ty,
         );
