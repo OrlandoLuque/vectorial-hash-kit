@@ -5,12 +5,15 @@ reprioritise, or drop freely. Items graduate into the per-crate roadmaps
 (e.g. `crates/vectorial-hash/README.md`) once picked up.
 
 ## Render / demos
-- **Instancing stress test** — push the instanced 3D demo to 100k–1M critters,
+- **Instancing stress test** — GPU instancing + billboards now ship in
+  `critters3d` (`G` toggles immediate / instanced spheres / billboards, raw
+  miniquad in `src/instanced3d.rs`). Still TODO: push to 100k–1M critters and
   profile where it becomes GPU-bound (fill vs vertex vs instance upload).
 - **Colour by leaf depth / structure** — visualise the tree's interior (which
   cells are deep, how the split differs binary vs octree).
-- **Batch the sight-lines** — when many critters are "seen", the per-line
-  immediate `draw_line_3d` calls add up; batch them into a line mesh.
+- **Batch the sight-lines / combat effects** — the per-line `draw_line_3d` and
+  per-attack `draw_sphere_wires` calls are immediate; batch them into meshes
+  when many are on screen at once.
 
 ## Index / algorithms
 - **`Octree3::update` (ascend-to-LCA)** — the octree has insert/remove/cull but
