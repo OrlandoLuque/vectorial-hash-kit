@@ -30,6 +30,9 @@ pub struct QNode<T> {
 
 pub struct QuadTree<T: Positioned> {
     nodes: Vec<QNode<T>>,
+    /// Slots freed by 4-way merge-ups, reused before the arena grows — see
+    /// [`crate::Tree`]'s free-list for the rationale.
+    free: Vec<QNodeId>,
     /// A leaf splits when it holds more than this many items.
     pub item_limit: usize,
     /// Four sibling leaves merge back into their parent when their combined
@@ -50,7 +53,7 @@ impl<T: Positioned> QuadTree<T> {
         assert!(merge_limit <= item_limit, "merge_limit must be <= item_limit");
         let min_cell = bbox.width.max(bbox.height) * 1e-12;
         let root = QNode { bbox, parent: None, children: None, items: Vec::new() };
-        Self { nodes: vec![root], item_limit, merge_limit, min_cell, root: QNodeId(0) }
+        Self { nodes: vec![root], free: Vec::new(), item_limit, merge_limit, min_cell, root: QNodeId(0) }
     }
 
     pub fn get(&self, id: QNodeId) -> &QNode<T> {
@@ -62,9 +65,14 @@ impl<T: Positioned> QuadTree<T> {
     }
 
     fn alloc(&mut self, node: QNode<T>) -> QNodeId {
-        let id = QNodeId(self.nodes.len() as u32);
-        self.nodes.push(node);
-        id
+        if let Some(id) = self.free.pop() {
+            self.nodes[id.0 as usize] = node;
+            id
+        } else {
+            let id = QNodeId(self.nodes.len() as u32);
+            self.nodes.push(node);
+            id
+        }
     }
 
     /// Insert an item. Returns `false` if its position falls outside the root bbox.
@@ -217,6 +225,9 @@ impl<T: Positioned> QuadTree<T> {
             let parent = self.get_mut(parent_id);
             parent.items = merged;
             parent.children = None;
+            for k in kids {
+                self.free.push(k);
+            }
             node = parent_id;
         }
     }
@@ -271,8 +282,14 @@ impl<T: Positioned> QuadTree<T> {
         }
     }
 
+    /// Arena capacity (high-water-mark; bounded under churn by the
+    /// free-list). [`QuadTree::live_node_count`] is the reachable count.
     pub fn node_count(&self) -> usize {
         self.nodes.len()
+    }
+
+    pub fn live_node_count(&self) -> usize {
+        self.nodes.len() - self.free.len()
     }
 
     /// Visit every live leaf reachable from the root, depth-first.

@@ -90,6 +90,9 @@ impl Default for IUpdateStrategy {
 
 pub struct IntegerTree<T: IPositioned> {
     nodes: Vec<INode<T>>,
+    /// Slots freed by merge-ups, reused before the arena grows — see
+    /// [`crate::Tree`]'s free-list for the rationale.
+    free: Vec<INodeId>,
     pub item_limit: usize,
     pub merge_limit: usize,
     /// Smallest non-degenerate cell dimension. With integer coords this is 1.
@@ -112,6 +115,7 @@ impl<T: IPositioned> IntegerTree<T> {
         let root = INode { bbox, parent: None, children: None, items: Vec::new() };
         Self {
             nodes: vec![root],
+            free: Vec::new(),
             item_limit,
             merge_limit,
             min_cell: 1,
@@ -123,12 +127,18 @@ impl<T: IPositioned> IntegerTree<T> {
     fn get_mut(&mut self, id: INodeId) -> &mut INode<T> { &mut self.nodes[id.0 as usize] }
 
     fn alloc(&mut self, node: INode<T>) -> INodeId {
-        let id = INodeId(self.nodes.len() as u32);
-        self.nodes.push(node);
-        id
+        if let Some(id) = self.free.pop() {
+            self.nodes[id.0 as usize] = node;
+            id
+        } else {
+            let id = INodeId(self.nodes.len() as u32);
+            self.nodes.push(node);
+            id
+        }
     }
 
     pub fn node_count(&self) -> usize { self.nodes.len() }
+    pub fn live_node_count(&self) -> usize { self.nodes.len() - self.free.len() }
 
     pub fn item_count(&self) -> usize {
         let mut n = 0;
@@ -324,6 +334,8 @@ impl<T: IPositioned> IntegerTree<T> {
             let parent = self.get_mut(parent_id);
             parent.items = items_a;
             parent.children = None;
+            self.free.push(a);
+            self.free.push(b);
             node = parent_id;
         }
     }

@@ -224,6 +224,9 @@ pub struct Node3<T> {
 
 pub struct Tree3<T: Positioned3> {
     nodes: Vec<Node3<T>>,
+    /// Slots freed by merge-ups, reused before the arena grows — see
+    /// [`crate::Tree`]'s free-list for the rationale.
+    free: Vec<Node3Id>,
     pub item_limit: usize,
     pub merge_limit: usize,
     min_cell: f64,
@@ -236,6 +239,7 @@ impl<T: Positioned3> Tree3<T> {
         let min_cell = bbox.w.max(bbox.h).max(bbox.d) * 1e-12;
         Self {
             nodes: vec![Node3 { bbox, parent: None, children: None, items: Vec::new() }],
+            free: Vec::new(),
             item_limit,
             merge_limit: item_limit,
             min_cell,
@@ -246,11 +250,19 @@ impl<T: Positioned3> Tree3<T> {
     #[inline] pub fn get(&self, id: Node3Id) -> &Node3<T> { &self.nodes[id.0 as usize] }
     #[inline] fn get_mut(&mut self, id: Node3Id) -> &mut Node3<T> { &mut self.nodes[id.0 as usize] }
     fn alloc(&mut self, n: Node3<T>) -> Node3Id {
-        let id = Node3Id(self.nodes.len() as u32);
-        self.nodes.push(n);
-        id
+        if let Some(id) = self.free.pop() {
+            self.nodes[id.0 as usize] = n;
+            id
+        } else {
+            let id = Node3Id(self.nodes.len() as u32);
+            self.nodes.push(n);
+            id
+        }
     }
+    /// Arena capacity (high-water-mark). [`Tree3::live_node_count`] is the
+    /// reachable count.
     pub fn node_count(&self) -> usize { self.nodes.len() }
+    pub fn live_node_count(&self) -> usize { self.nodes.len() - self.free.len() }
 
     pub fn insert(&mut self, item: T) -> bool {
         let p = item.position();
@@ -380,6 +392,8 @@ impl<T: Positioned3> Tree3<T> {
             let pnode = self.get_mut(parent);
             pnode.items = ia;
             pnode.children = None;
+            self.free.push(a);
+            self.free.push(b);
             node = parent;
         }
     }

@@ -103,6 +103,13 @@ impl<T> Node<T> {
 
 pub struct Tree<T: Positioned> {
     nodes: Vec<Node<T>>,
+    /// Slots in `nodes` freed by merge-ups, reused by the next `alloc`
+    /// before the arena grows. Without this, every merge orphaned its two
+    /// child slots forever (unbounded arena growth under churn); with it,
+    /// `nodes.len()` stabilises at the high-water-mark of live nodes.
+    /// `NodeId`s of freed nodes are NOT stable — a freed id may be handed
+    /// to a different node by a later `alloc`.
+    free: Vec<NodeId>,
     /// A leaf splits when it holds more than this many items.
     pub item_limit: usize,
     /// Two sibling leaves merge back into their parent when their combined
@@ -131,7 +138,7 @@ impl<T: Positioned> Tree<T> {
         );
         let min_cell = bbox.width.max(bbox.height) * 1e-12;
         let root = Node::new_leaf(bbox, None);
-        Self { nodes: vec![root], item_limit, merge_limit, min_cell, root: NodeId(0) }
+        Self { nodes: vec![root], free: Vec::new(), item_limit, merge_limit, min_cell, root: NodeId(0) }
     }
 
     pub fn get(&self, id: NodeId) -> &Node<T> {
@@ -143,9 +150,14 @@ impl<T: Positioned> Tree<T> {
     }
 
     fn alloc(&mut self, node: Node<T>) -> NodeId {
-        let id = NodeId(self.nodes.len() as u32);
-        self.nodes.push(node);
-        id
+        if let Some(id) = self.free.pop() {
+            self.nodes[id.0 as usize] = node;
+            id
+        } else {
+            let id = NodeId(self.nodes.len() as u32);
+            self.nodes.push(node);
+            id
+        }
     }
 
     /// Insert an item. Returns `false` if its position falls outside the root bbox.
@@ -364,6 +376,12 @@ impl<T: Positioned> Tree<T> {
             parent.children = None;
             #[cfg(feature = "neighbors")]
             self.update_ropes_on_merge(parent_id, a, b);
+            // The two child slots are now unreachable — return them to the
+            // free-list so the next split reuses them instead of growing the
+            // arena. (Their `items` were taken above; ropes, if any, were
+            // cleared by `update_ropes_on_merge`.)
+            self.free.push(a);
+            self.free.push(b);
             node = parent_id;
         }
     }
@@ -409,7 +427,14 @@ impl<T: Positioned> Tree<T> {
         if self.get(b).items.len() > self.item_limit { self.divide(b); }
     }
 
+    /// Arena capacity: the high-water-mark of simultaneously-live nodes
+    /// (the `Vec` never shrinks). With the free-list this stays bounded
+    /// under churn instead of growing without limit. Use
+    /// [`Tree::live_node_count`] for the currently-reachable count.
     pub fn node_count(&self) -> usize { self.nodes.len() }
+
+    /// Currently-reachable nodes (arena capacity minus free-list slots).
+    pub fn live_node_count(&self) -> usize { self.nodes.len() - self.free.len() }
 
     /// Visit every live leaf reachable from the root, in depth-first order.
     ///
@@ -790,7 +815,33 @@ mod tests {
         // After removing one item we have two left; limit = 1, so the two
         // surviving leaves should NOT merge into their parent.
         assert!(tree.get(tree.root).children.is_some());
-        assert_eq!(tree.node_count(), nodes_before, "no nodes allocated; orphans not reclaimed");
+        assert_eq!(tree.node_count(), nodes_before, "no merge happened, so no nodes allocated or freed");
+    }
+
+    #[test]
+    fn free_list_reuses_orphaned_slots_under_churn() {
+        // Repeatedly split then merge the same region: the arena must NOT
+        // grow each cycle — the merged children's slots get reused.
+        let mut tree = Tree::<Pt>::new(Rect::new(0.0, 0.0, 100.0, 100.0), 2);
+        tree.insert(Pt(Point::new(10.0, 10.0)));
+        tree.insert(Pt(Point::new(20.0, 20.0)));
+        // First split.
+        tree.insert(Pt(Point::new(80.0, 80.0)));
+        assert!(tree.get(tree.root).children.is_some());
+        let cap_after_first_split = tree.node_count();
+        for _ in 0..50 {
+            // Merge: remove the far item → combined fits → collapse.
+            tree.remove(Point::new(80.0, 80.0), |it| it.0.x == 80.0);
+            assert!(tree.get(tree.root).children.is_none());
+            // Split again: reinsert the far item.
+            tree.insert(Pt(Point::new(80.0, 80.0)));
+            assert!(tree.get(tree.root).children.is_some());
+        }
+        // Arena capacity stayed put (slots reused), and the live count is
+        // exactly the 3 reachable nodes (root + 2 leaves).
+        assert_eq!(tree.node_count(), cap_after_first_split, "arena grew despite the free-list");
+        assert_eq!(tree.live_node_count(), 3);
+        assert_eq!(tree.item_count(), 3);
     }
 
     #[test]
