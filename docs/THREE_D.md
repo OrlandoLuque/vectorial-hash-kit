@@ -248,12 +248,32 @@ the 2D 1×1 raster's role for complex polygons. (Reusable pieces:
 `classify_aabb`; `Polyhedron3` is a convex N-face shape with an exact
 `classify_aabb` and an expensive `contains_point`.)
 
+## Octree (8-way) vs binary-3D tree
+
+`Octree3` (`src/octree3.rs`) is the 8-way 2×2×2 split — the 3D analogue of
+the 2D `QuadTree`, where `Tree3` is the analogue of the binary `Tree`. Both
+go through the same `Shape3` machinery, so `tree3d_bench` (now culling both)
+isolates the structure. Sphere queries, r 5–20, 50k points:
+
+| item_limit | binary-3D ns/cull | octree ns/cull | octree vs binary | nodes (bin / oct) |
+| ---: | ---: | ---: | ---: | --- |
+| 8 | 5,622 | 4,842 | **−14%** | 18,043 / 32,945 |
+| 48 | 3,543 | 2,864 | **−19%** | 3,095 / 4,681 |
+
+**The octree is faster on cull (14–19%)**, the same direction as the 2D
+quad-vs-binary result and for the same reason: one 8-way level does the work
+of three binary levels, so the descent walks fewer levels. It costs more
+nodes (an 8-way split allocates more children), so it trades memory for
+descent depth. (The 2D quad-vs-binary gap was only ~2% at a tuned
+item_limit; in 3D the depth advantage compounds — three binary levels per
+octree level vs two quad levels per binary level in 2D — so the gap is
+wider.) Both remain exact vs brute force.
+
 ## Still open
-- **Non-analytic 3D shapes**: the comparison used a sphere (analytic). A
-  general polyhedron needs the N³ voxel template for the 3D tree, and a
-  more expensive narrowphase — the regime where 3-projection's precision
-  starts to pay. Worth a follow-up with, say, an inflated 3D drop.
-- **Octree (8-way) vs binary-3D**: this used the binary split (mirror of
-  the 2D primary `Tree`). The octree is the analogue of `QuadTree`; the 2D
-  lesson was the two are within ~2% at a tuned item_limit, so the binary-3D
-  choice is unlikely to matter much, but unmeasured in 3D.
+- **Non-analytic 3D shapes** in the *projection* comparison: the
+  static bench used a sphere (analytic); the polyhedron crossover above
+  lives in the voxel-raster bench. Running the projection methods against a
+  many-faced polyhedron would show where the 3-projection's tight broadphase
+  finally pays (expensive narrowphase), worth a follow-up.
+- **Exact 3D `item_limit` optimum** and an octree dynamic (`update`) path —
+  `Octree3` has `insert`/`remove`/`cull`; `update` (LCA) is not wired yet.

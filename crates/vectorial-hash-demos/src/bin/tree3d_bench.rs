@@ -29,7 +29,7 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use vectorial_hash::{
-    Aabb, CellState, Point, Point3, Positioned, Positioned3, QuadTree, Rect, Sphere3,
+    Aabb, CellState, Octree3, Point, Point3, Positioned, Positioned3, QuadTree, Rect, Sphere3,
     Tree, Tree3, VoxelRaster,
 };
 
@@ -143,6 +143,11 @@ fn main() {
     for it in &items { tree3.insert(*it); }
     let build3_ms = t_build3.elapsed().as_secs_f64() * 1e3;
 
+    // Octree (8-way) on the same data — the structural alternative to the
+    // binary-3D tree.
+    let mut octree = Octree3::<I3>::new(Aabb::new(0.0, 0.0, 0.0, WORLD, WORLD, WORLD), args.item_limit);
+    for it in &items { octree.insert(*it); }
+
     let t_buildp = Instant::now();
     let mut tree_xy = Tree::<I2>::new(Rect::new(0.0, 0.0, WORLD, WORLD), args.item_limit);
     let mut tree_xz = Tree::<I2>::new(Rect::new(0.0, 0.0, WORLD, WORLD), args.item_limit);
@@ -159,13 +164,15 @@ fn main() {
     for it in &items { quad_xy.insert(I2 { id: it.id, p: Point::new(it.p.x, it.p.y) }); }
     let buildp_ms = t_buildp.elapsed().as_secs_f64() * 1e3;
 
-    println!("build: 3D tree {:.1} ms ({} nodes) | 3×2D trees {:.1} ms ({}+{}+{} nodes)",
-        build3_ms, tree3.node_count(), buildp_ms,
+    println!("build: 3D tree {:.1} ms ({} nodes) | octree ({} nodes) | 3×2D trees {:.1} ms ({}+{}+{} nodes)",
+        build3_ms, tree3.node_count(), octree.node_count(), buildp_ms,
         tree_xy.node_count(), tree_xz.node_count(), tree_yz.node_count());
 
     // --- queries ---
     let mut s_brute = Stats::new();
     let mut s_tree3 = Stats::new();
+    let mut s_octree = Stats::new();
+    let mut mismatches_o = 0u64;
     let mut s_proj = Stats::new();
     let mut s_proj_broad = Stats::new(); // projection broadphase only (before exact filter)
     let mut s_proj1 = Stats::new();      // single-projection + exact filter
@@ -206,6 +213,12 @@ fn main() {
         s_tree3.push(t.elapsed().as_secs_f64() * 1e9);
         let set3: HashSet<u32> = hits3.iter().copied().collect();
         if set3 != brute_set { mismatches3 += 1; }
+
+        // Octree (8-way) on the same sphere.
+        let t = Instant::now();
+        let hits_o: HashSet<u32> = octree.cull(&sphere).iter().map(|it| it.id).collect();
+        s_octree.push(t.elapsed().as_secs_f64() * 1e9);
+        if hits_o != brute_set { mismatches_o += 1; }
 
         // Projection: cull 3 circles, intersect, exact 3D filter.
         let t = Instant::now();
@@ -295,7 +308,7 @@ fn main() {
         args.queries, total_true, total_true as f64 / args.queries as f64);
     println!("broadphase candidate/true ratio: 3-projection {:.2}x | 1-projection {:.2}x",
         fp_ratio, fp_ratio1);
-    let allok = mismatches3 == 0 && mismatchesp == 0 && mismatchesp1 == 0
+    let allok = mismatches3 == 0 && mismatches_o == 0 && mismatchesp == 0 && mismatchesp1 == 0
         && mismatchesp1z == 0 && mismatchesp1r == 0 && mismatchesp1q == 0;
     println!("correctness vs brute: all methods {}", if allok { "EXACT" } else { "MISMATCH!" });
 
@@ -305,7 +318,8 @@ fn main() {
     };
     println!("\n{:<32} {:>11} {:>11} {:>10}", "method", "mean ns/q", "p95 ns/q", "vs brute");
     line("brute force", &s_brute);
-    line("true 3D tree", &s_tree3);
+    line("true 3D tree (binary)", &s_tree3);
+    line("octree (8-way)", &s_octree);
     line("3-projection (intersect+exact)", &s_proj);
     line("1-projection (+exact)", &s_proj1);
     line("1-projection +z-reject +exact", &s_proj1z);
