@@ -1,20 +1,21 @@
-//! Minkowski dilation: geometry verification, the robust distance-based
-//! narrowphase, the precomputed inflated raster (production path), and a
-//! characterization of the `is_inside` ray-casting limitation on many-arc
-//! inflated polygons.
+//! Minkowski dilation: geometry verification, the distance-based
+//! narrowphase, the precomputed inflated raster (production path), and the
+//! `is_inside` agreement gates.
 //!
 //! ## Two ways to ask "is this point within distance r of figure F?"
 //!
-//! 1. **Robust (production):** `F.within_dilation(r, p)` =
-//!    `F.is_inside(p) || F.dist_to_boundary(p) <= r`. Uses the *original*
-//!    polygon's `is_inside` (few segments, reliable) plus pure distance
-//!    math. This is what the runtime narrowphase should use on `Maybe`
+//! 1. **Distance (production narrowphase):** `F.within_dilation(r, p)` =
+//!    `F.is_inside(p) || F.dist_to_boundary(p) <= r`. Pure distance math on
+//!    the *original* polygon — the cheapest exact test, used on `Maybe`
 //!    raster pixels.
-//! 2. **Fragile:** build `inflated_convex(F, r)` and call `is_inside` on
-//!    the *inflated* polygon. The inflated drop has 6 mixed line/arc edges,
-//!    and the winding-number ray-casting miscounts on some rays that graze
-//!    its arcs tangentially. `dilation_is_inside_ray_casting_is_unreliable`
-//!    quantifies this; it is why the production path uses (1).
+//! 2. **Inflated polygon:** build `inflated_convex(F, r)` and call
+//!    `is_inside` on it. The inflated drop has 6 mixed line/arc edges; the
+//!    winding ray-casting used to double-count where a line edge met an arc
+//!    edge and the ray grazed the shared vertex. Fixed 2026-06-23 (signed
+//!    winding + widened degeneracy band); `dilation_is_inside_matches_
+//!    distance_after_fix` and `dilation_matches_distance_ground_truth_via_
+//!    is_inside` now gate it as exact. Production still prefers (1) because
+//!    the distance test is cheaper, not because (2) is unreliable.
 //!
 //! Ground truth throughout is independent distance math (point-segment /
 //! point-arc), never the polygon's own `is_inside`.
@@ -243,18 +244,15 @@ fn inflated_bbox_grows_by_r() {
     }
 }
 
-/// 6. CHARACTERIZATION (not a pass/fail contract): quantify how often the
-///    `is_inside` winding ray-casting on the *inflated* polygon disagrees
-///    with distance ground truth. The disagreements (~tenths of a percent,
-///    clustered along horizontal lines that graze the inflated arcs) are
-///    exactly why the production narrowphase uses `within_dilation`
-///    (distance on the original) instead of `inflated.is_inside`.
-///
-///    This is a measurement, asserted only loosely so it documents the
-///    limitation without becoming a brittle gate. If a future `is_inside`
-///    fix drives the disagreement to zero, tighten the bound.
+/// 6. REGRESSION (was a characterization of the bug; now a pass/fail gate):
+///    `is_inside` ray-casting on the *inflated* polygon must agree with the
+///    distance ground truth everywhere outside the epsilon halo. This grid
+///    used to show ~0.028% disagreement clustered along lines that graze the
+///    inflated arcs — the winding double-count at line/arc vertex junctions.
+///    Since the 2026-06-23 fix (signed-winding rule + wider degeneracy band
+///    so the multi-ray search steps off a grazing ray), it must be exact.
 #[test]
-fn dilation_is_inside_ray_casting_is_unreliable() {
+fn dilation_is_inside_matches_distance_after_fix() {
     let base = scaled_copy(&create_drop(0.2, 0.8), 40.0, 40.0);
     let fig = rotated_copy(&base, angle_to_radians(135.0));
     let r = 3.0;
@@ -272,7 +270,7 @@ fn dilation_is_inside_ray_casting_is_unreliable() {
             let d = dist_to_boundary(&fig, x, y);
             if (d - r).abs() > 1e-2 && d > 1e-2 {
                 let expected = fig.within_dilation(r, x, y); // robust ground truth
-                let raycast = inf.is_inside(x, y); // fragile path under test
+                let raycast = inf.is_inside(x, y); // formerly fragile path
                 total += 1;
                 if raycast != expected {
                     disagree += 1;
@@ -282,17 +280,8 @@ fn dilation_is_inside_ray_casting_is_unreliable() {
         }
         y += step;
     }
-    let rate = disagree as f64 / total as f64;
-    println!(
-        "inflated-drop@135 r=3: is_inside ray-casting disagreed with distance ground truth on \
-         {disagree}/{total} grid points ({:.3}%)",
-        rate * 100.0
-    );
-    // Robust path is exact; ray-casting on the inflated polygon is not.
-    // We assert the ray-casting is *imperfect* (documents the bug) but the
-    // disagreement stays small/local (not a wholesale failure).
-    assert!(disagree > 0, "expected ray-casting to show its known unreliability");
-    assert!(rate < 0.05, "ray-casting disagreement unexpectedly large ({:.2}%)", rate * 100.0);
+    println!("inflated-drop@135 r=3: is_inside vs distance disagreed on {disagree}/{total}");
+    assert_eq!(disagree, 0, "is_inside on the inflated polygon must match distance ground truth");
 }
 
 /// 8. PRECACHING: the production move for agents with body radius. For
@@ -362,17 +351,14 @@ fn precached_dilated_templates_select_by_radius_at_runtime() {
     assert!(interior_hits > 1500, "too few interior probes ({interior_hits})");
 }
 
-/// 7. The old contract test, now `#[ignore]`d: it checked
-///    `inflated.is_inside(p)` directly against distance ground truth, which
-///    exposes the ray-casting limitation characterized in test 6. The
-///    production path does not use `inflated.is_inside`; it uses
-///    `original.within_dilation` (test 2) and the inflated raster (test 3),
-///    both of which pass. Re-enable and tighten once `is_inside`'s
-///    winding-with-arcs is fixed (a focused task — `completely_contains`
-///    feeds template generation through it, so it needs fingerprint review).
+/// 7. Direct contract: `inflated.is_inside(p)` matches distance ground truth
+///    across shapes/angles/radii. This used to be `#[ignore]`d because the
+///    winding ray-casting double-counted at line/arc vertex junctions on the
+///    many-arc inflated polygons; the 2026-06-23 winding fix makes it pass,
+///    so it is now an enabled gate. (The production narrowphase still prefers
+///    `within_dilation` for the cheaper distance test, but the inflated
+///    polygon's own `is_inside` is now correct too.)
 #[test]
-#[ignore = "exposes is_inside ray-casting limitation on many-arc polygons; \
-            production uses within_dilation + inflated raster instead"]
 fn dilation_matches_distance_ground_truth_via_is_inside() {
     let figures = test_figures();
     let mut seed = 1000;

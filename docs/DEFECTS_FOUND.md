@@ -133,6 +133,56 @@ the ray-fix introduces is strictly a correction.
   — focused regression for the specific cell, asserting current and
   legacy agree (because the ray is non-degenerate here).
 
+## D-5 — `is_inside` winding double-counted at line/arc vertex junctions
+
+**Exposed by**: the dilation tests (`tests/dilation.rs`, 2026-06-23), added
+for the Minkowski "index dilation" work. `is_inside` on a *Minkowski-inflated*
+polygon (`inflated_convex`, a many-arc shape: lines offset outward + a joining
+arc at every vertex) disagreed with an independent distance ground truth on
+≈0.028% of a sample grid, clustered along the horizontal lines that graze the
+inflated arcs. These were both false positives (deep-outside points reported
+inside) and false negatives.
+
+**Cause**: the D-2 multi-ray scheme picks a *clean* horizontal ray, but its
+degeneracy test only flagged rays passing within `2 × EPSILON` of a vertex.
+The inflated drop has a line edge meeting an arc edge at every vertex; when
+the ray grazed such a vertex a few ×1e-4 away (well past `2 × EPSILON`, so not
+flagged), **both** edges reported a crossing near the shared vertex and the
+old crossing-count couldn't merge them — a double-count that flipped
+inside/outside. A second face of the same problem: an arc crossing that landed
+on the knife-edge of its angular-span endpoint was included or excluded
+inconsistently under float rounding.
+
+**Fix** (`crates/vectorial-hash-templates/src/polygon.rs`):
+- Replaced the crossing-count heuristic in `winding_is_odd` with a **signed
+  winding** rule using a half-open *side* test (`side = dir × (p − test_point)`,
+  half-open `<= 0 <`): a line edge contributes ±1 when its endpoints straddle
+  the ray line; an arc contributes ±1 per in-span circle crossing, signed by
+  the arc's local crossing direction. For the simple polygons the pipeline
+  uses, the net winding is 0 (outside) or ±1 (inside). The old
+  `vertical_direction` / `is_vertical_vertex` vertex special-cases are gone.
+- Widened the D-2 degeneracy vertex band from `2 × EPSILON` to `0.05` so the
+  multi-ray search steps off any ray that grazes a vertex — the one case
+  (an arc crossing on the angular-span knife-edge) the signed winding would
+  still miscount. Clean (non-grazing) cell corners — what template generation
+  tests — keep using the same ray, so the result is unchanged for them.
+
+**Verification after fix**: the inflated-drop grid disagreement went 46 → **0**;
+templates are **byte-unchanged** (`fingerprint_regression` passes), `verify_88`
+still reports every changed template strictly more correct, and the
+exhaustive culling campaign (`--ignored`, 2,000 scenarios) passes. The
+formerly `#[ignore]`d direct test `dilation_matches_distance_ground_truth_via_is_inside`
+is now enabled and green.
+
+**Pinned by**:
+- `tests/dilation.rs::dilation_is_inside_matches_distance_after_fix` (the
+  exact grid that used to show the 46 disagreements) and
+  `dilation_matches_distance_ground_truth_via_is_inside` (random points over
+  drop / box / rect / circle × angles × radii).
+- The full byte-exact + cell-by-cell + exhaustive battery (fingerprint,
+  verify_88, exhaustive_culling) guards against any template drift the change
+  could have introduced.
+
 ---
 
 ## How regressions are kept out

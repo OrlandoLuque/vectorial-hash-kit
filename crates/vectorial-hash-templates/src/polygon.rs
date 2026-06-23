@@ -235,10 +235,17 @@ impl Polygon {
         self.winding_is_odd(&infinity, &test_point)
     }
 
-    /// A ray is degenerate when it passes within ~EPSILON of any vertex or
-    /// almost tangent to any arc: intersection counts are then unreliable.
+    /// A ray is degenerate when it passes near any vertex or almost tangent
+    /// to any arc: the winding count is then unreliable. The vertex band is
+    /// wider than a bare EPSILON because an arc crossing that lands near an
+    /// arc *endpoint* sits on the knife-edge of the angular span test, and a
+    /// graze a few ×1e-4 from the vertex is enough to flip it (the bug behind
+    /// `tests/dilation.rs`'s former is_inside failures). Widening the band
+    /// makes the multi-ray search in [`Polygon::is_inside`] step to a clean
+    /// ray for those points; clean (non-grazing) cell corners — what template
+    /// generation tests — keep using the same ray and the same result.
     fn ray_is_degenerate(&self, infinity: &Vertex, test_point: &Vertex) -> bool {
-        let tol = 2.0 * intersector::EPSILON;
+        let tol = 0.05;
         for v in &self.vertices {
             if intersector::dist_point_to_line(v, infinity, test_point) <= tol {
                 return true;
@@ -255,124 +262,109 @@ impl Polygon {
         false
     }
 
-    /// Original PHP winding logic, parameterized by the ray start.
+    /// Signed-winding point-in-polygon along the ray from `test_point`
+    /// toward `infinity`. Replaced (2026-06-23) the old crossing-count
+    /// heuristic, which double-counted at a vertex where a line edge met an
+    /// arc edge when the ray *grazed* that vertex — both edges reported a
+    /// crossing near the shared vertex and the old vertex-dedup couldn't
+    /// merge them (the inflated-drop `is_inside` failures in
+    /// `tests/dilation.rs`).
     ///
-    /// KNOWN LIMITATION (root cause traced 2026-06-23): on polygons with
-    /// mixed line/arc edges (e.g. a Minkowski-inflated drop) this miscounts
-    /// when the ray passes *near* (not exactly through) a vertex where a line
-    /// edge meets an arc edge. Both edges then report a crossing close to the
-    /// shared vertex, and the vertex-dedup heuristic below
-    /// (`q_intercepts`/`r_intercepts`/`is_vertical_vertex`) fails to merge
-    /// them because the vertex is > EPSILON off the ray — so the crossing is
-    /// double-counted, flipping the inside/outside result. Repro:
-    /// `tests/dilation.rs::dilation_is_inside_ray_casting_is_unreliable`
-    /// (≈0.028% of a grid, along the horizontal lines that graze the inflated
-    /// arcs). The robust fix is a **half-open crossing rule** (count an edge
-    /// iff exactly one endpoint is strictly above the ray) applied uniformly
-    /// to line and arc edges, so a shared vertex is owned by exactly one
-    /// edge. That rework is fingerprint-critical (`completely_contains` feeds
-    /// template generation through `is_inside`), so it must be validated
-    /// against `fingerprint_regression` + `verify_88_ray_fix_templates`.
-    /// Until then, dilation queries use `Polygon::within_dilation` (distance
-    /// on the *original* polygon), which avoids this path entirely.
+    /// Each boundary point's `side` is the signed cross product
+    /// `dir × (p − test_point)`; `side > 0` / `< 0` are the two half-planes,
+    /// `= 0` is on the ray line. A line edge contributes ±1 when its
+    /// endpoints straddle the line (half-open `<= 0 <` tie-break); an arc
+    /// contributes ±1 per in-span circle crossing, signed by the arc's local
+    /// crossing direction. For the simple polygons the template pipeline
+    /// uses, the net winding is 0 (outside) or ±1 (inside).
+    ///
+    /// This is robust *given a clean ray*: the multi-ray wrapper in
+    /// [`Polygon::is_inside`] uses [`Polygon::ray_is_degenerate`] (widened
+    /// vertex band) to step off any ray that grazes a vertex, which is the
+    /// one case — an arc crossing landing on the knife-edge of its angular
+    /// span endpoint — where this would otherwise miscount.
+    ///
+    /// Validated against `fingerprint_regression` + `verify_88_ray_fix_templates`
+    /// (templates byte-unchanged — `completely_contains` reaches this through
+    /// `is_inside`) and the exhaustive culling campaign.
     pub(crate) fn winding_is_odd(&self, infinity: &Vertex, test_point: &Vertex) -> bool {
         let n = self.vertices.len();
-        let mut winding_number = 0;
+        let (tpx, tpy) = (test_point.x, test_point.y);
+        let dirx = infinity.x - tpx;
+        let diry = infinity.y - tpy;
+        let side = |px: f64, py: f64| dirx * (py - tpy) - diry * (px - tpx);
+        let toward_inf = |px: f64, py: f64| dirx * (px - tpx) + diry * (py - tpy) > 0.0;
+
+        let mut wn: i32 = 0;
         for i in 0..n {
             let j = self.next_idx(i);
             let q = &self.vertices[i];
             let r = &self.vertices[j];
 
-            let int = if q.seg.d == 0 {
-                intersector::intersection(infinity, test_point, q, r)
-            } else {
-                intersector::line_arc_intersection(infinity, test_point, q, r, true)
-            };
-
-            if int.len() == 2 && q.seg.d != 0 {
-                // Arc with 2 intersections: check if endpoints are on the ray
-                let q_intercepts = !intersector::intersection(infinity, test_point, q, q).is_empty();
-                let r_intercepts = !intersector::intersection(infinity, test_point, r, r).is_empty();
-                if q_intercepts ^ r_intercepts {
-                    winding_number += 1;
+            if q.seg.d == 0 {
+                // Line edge q → r. Half-open straddle: up when side goes
+                // from `<= 0` (at q) to `> 0` (at r), down the other way.
+                let sq = side(q.x, q.y);
+                let sr = side(r.x, r.y);
+                let up = sq <= 0.0 && sr > 0.0;
+                let down = sr <= 0.0 && sq > 0.0;
+                if up || down {
+                    let u = sq / (sq - sr);
+                    let cx = q.x + u * (r.x - q.x);
+                    let cy = q.y + u * (r.y - q.y);
+                    if toward_inf(cx, cy) {
+                        wn += if up { 1 } else { -1 };
+                    }
                 }
-            } else if int.len() == 1 {
-                // Single intersection: check vertex cases
-                let q_intercepts = !intersector::intersection(infinity, test_point, q, q).is_empty();
-                let r_intercepts = !intersector::intersection(infinity, test_point, r, r).is_empty();
-                if (!q_intercepts && !r_intercepts)
-                    || (q_intercepts && self.is_vertical_vertex(i))
-                {
-                    winding_number += 1;
+            } else {
+                // Arc edge q → r on circle (xc, yc, R), winding dir d.
+                let (xc, yc) = (q.seg.xc, q.seg.yc);
+                let radius = intersector::dist(xc, yc, q.x, q.y);
+                let centre = Vertex::new(xc, yc);
+                let ints = intersector::line_circle_intersection(infinity, test_point, &centre, radius);
+                let mut a_start = intersector::angle(xc, yc, q.x, q.y);
+                let mut a_end = intersector::angle(xc, yc, r.x, r.y);
+                if q.seg.d == -1 {
+                    std::mem::swap(&mut a_start, &mut a_end);
+                }
+                for ci in &ints {
+                    if !toward_inf(ci.x, ci.y) {
+                        continue;
+                    }
+                    let ang = intersector::angle(xc, yc, ci.x, ci.y);
+                    let in_span = if a_end >= a_start {
+                        ang >= a_start && ang <= a_end
+                    } else {
+                        ang >= a_start || ang <= a_end
+                    };
+                    if !in_span {
+                        continue;
+                    }
+                    // Half-open: the arc's END vertex is owned by the next
+                    // edge's start (never both). Endpoints only coincide with
+                    // the ray for a degenerate ray, which the wrapper avoids.
+                    if ci.roughly_equals(r) {
+                        continue;
+                    }
+                    // Local crossing direction: tangent = d · rot90(ci − c);
+                    // the sign of d(side)/d(param) = dir × tangent gives up/down.
+                    let tx = -(ci.y - yc) * q.seg.d as f64;
+                    let ty = (ci.x - xc) * q.seg.d as f64;
+                    let grad = dirx * ty - diry * tx;
+                    if grad > 0.0 {
+                        wn += 1;
+                    } else if grad < 0.0 {
+                        wn -= 1;
+                    }
                 }
             }
         }
-        winding_number % 2 == 1
+        wn != 0
     }
 
     /// Determine the vertical direction of the edge starting at vertex index t.
     /// Returns 1 (going up), -1 (going down), or 0 (horizontal).
     /// For arcs, uses angle/cosine to determine the direction at the vertex.
-    fn vertical_direction(&self, t: usize, point_for_arc: Option<usize>) -> i32 {
-        let v = &self.vertices[t];
-        let n = self.next_idx(t);
-        let next = &self.vertices[n];
-        if v.seg.d == 0 {
-            // Line segment: compare Y values
-            if v.y < next.y { 1 }
-            else if v.y > next.y { -1 }
-            else { 0 }
-        } else {
-            // Arc segment: use angle/cosine
-            let a = if let Some(pi) = point_for_arc {
-                intersector::angle(v.seg.xc, v.seg.yc, self.vertices[pi].x, self.vertices[pi].y)
-            } else {
-                intersector::angle(v.seg.xc, v.seg.yc, v.x, v.y)
-            };
-            let cos_a = a.cos();
-            let td = v.seg.d as i32;
-            if cos_a.abs() < 1e-10 {
-                let sin_a = a.sin();
-                let effective_cos = if let Some(pi) = point_for_arc {
-                    if self.vertices[n].equals(&self.vertices[pi]) {
-                        sin_a * td as f64
-                    } else {
-                        sin_a * td as f64
-                    }
-                } else {
-                    -sin_a * td as f64
-                };
-                (if effective_cos > 0.0 { 1 } else { -1 }) * td
-            } else {
-                (if cos_a > 0.0 { 1 } else { -1 }) * td
-            }
-        }
-    }
-
-    /// Check if the edge at vertex t is a horizontal line
-    fn is_horizontal_line(&self, t: usize) -> bool {
-        let v = &self.vertices[t];
-        v.seg.d == 0 && v.y == self.vertices[self.next_idx(t)].y
-    }
-
-    /// Check if vertex at index i is a "vertical vertex".
-    /// A vertical vertex is one where the incoming and outgoing edges
-    /// both go in the same vertical direction (both up or both down).
-    /// Horizontal edges are skipped when looking backward.
-    fn is_vertical_vertex(&self, i: usize) -> bool {
-        let n = self.vertices.len();
-        // Walk backward, skipping horizontal lines
-        let mut prev = if i == 0 { n - 1 } else { i - 1 };
-        let mut prev_post = i;
-        while self.is_horizontal_line(prev) {
-            prev_post = prev;
-            prev = if prev == 0 { n - 1 } else { prev - 1 };
-        }
-        let prev_direction = self.vertical_direction(prev, Some(prev_post));
-        let direction = self.vertical_direction(i, None);
-        (prev_direction == 1 && direction == 1) || (prev_direction == -1 && direction == -1)
-    }
-
     /// Check if this polygon completely contains another polygon
     pub fn completely_contains(&self, other: &Polygon) -> bool {
         // Fast bounding box rejection (bounds include arc extents)
@@ -625,13 +617,14 @@ impl Polygon {
     /// (line edges and arcs). Unsigned — interior and exterior points at
     /// the same offset return the same value.
     ///
-    /// This is the robust primitive behind the **dilation narrowphase**:
-    /// a point is within the Minkowski dilation of this polygon by `r` iff
-    /// `self.is_inside(p) || self.dist_to_boundary(p) <= r`. Using the
-    /// *original* polygon's `is_inside` (few segments, reliable) plus a
-    /// distance check sidesteps the ray-casting fragility that
-    /// `is_inside` exhibits on many-arc *inflated* polygons — see
-    /// `inflated_convex` and `tests/dilation.rs`.
+    /// This is the primitive behind the **dilation narrowphase**: a point
+    /// is within the Minkowski dilation of this polygon by `r` iff
+    /// `self.is_inside(p) || self.dist_to_boundary(p) <= r`. Testing the
+    /// *original* polygon's `is_inside` plus a distance check is the cheapest
+    /// exact form — no inflated polygon to build, just distance math — see
+    /// `inflated_convex` and `tests/dilation.rs`. (`is_inside` on the
+    /// inflated polygon is also correct since the 2026-06-23 winding fix, but
+    /// the distance form is cheaper.)
     pub fn dist_to_boundary(&self, px: f64, py: f64) -> f64 {
         let n = self.vertices.len();
         let mut best = f64::MAX;
