@@ -6,10 +6,16 @@
 //!
 //! Run: `cargo run -p vectorial-hash-demos --bin critters3d --release`
 //!
+//! Two simulations, switchable live with `T`: *observe* (a vision-cull
+//! showcase — one sphere from the centre lights the critters it sees) and
+//! *combat* (the red critters become predators that attack nearby prey; each
+//! attack is an index cull, so it is the "many queries per frame" workload).
+//!
 //! Controls:
 //! - drag left mouse: orbit the camera; scroll: zoom
 //! - `+` / `-`: add / remove 200 critters
-//! - `[` / `]`: shrink / grow the vision radius
+//! - `T`: toggle observe / combat
+//! - `[` / `]`: shrink / grow the radius (vision in observe, attack in combat)
 //! - `M`: cycle the index structure — binary-3D `Tree3` / `Octree3` (8-way) /
 //!   projection (one 2D `Tree` on xy + z-reject, the author's variant)
 //! - `G`: cycle the render path — immediate `draw_sphere` / GPU-instanced
@@ -37,6 +43,22 @@ use vectorial_hash_demos::instanced3d::{Instance, InstancedRenderer, Mode as Ren
 const WORLD: f32 = 200.0;
 const MARGIN: f32 = 4.0;
 const ITEM_LIMIT: usize = 16;
+
+// Combat-mode tuning.
+const COOLDOWN: f32 = 0.7; // seconds between a predator's attacks
+const ATTACK_LIFE: f32 = 0.35; // attack-sphere fade time
+const BURST_LIFE: f32 = 0.30; // kill-marker fade time
+const FLASH_LIFE: f32 = 0.25; // freshly respawned critter flash time
+
+/// Which simulation the demo runs. `Observe` is the vision-cull showcase
+/// (one sphere from the centre); `Combat` makes the red critters predators
+/// that attack nearby prey — each attack is an index cull, so this is the
+/// "many queries per frame" workload where the index cost actually shows.
+#[derive(Clone, Copy, PartialEq)]
+enum SimMode { Observe, Combat }
+
+/// A live attack sphere (predator emits one; prey inside are culled & killed).
+struct Attack { center: Vec3, radius: f32, age: f32 }
 
 struct Rng(u64);
 impl Rng {
@@ -110,7 +132,9 @@ impl Structure {
 struct Critter {
     pos: Vec3,
     vel: Vec3,
-    kind: u8, // 0,1,2 — colour only
+    kind: u8,      // 0,1,2 — colour; in combat, kind 1 = predator
+    cooldown: f32, // combat: time until this predator's next attack
+    flash: f32,    // combat: remaining flash time after respawn
 }
 
 fn world_aabb() -> Aabb { Aabb::new(0.0, 0.0, 0.0, WORLD as f64, WORLD as f64, WORLD as f64) }
@@ -152,7 +176,8 @@ async fn main() {
         let z = rng.range(-1.0, 1.0);
         let s = (1.0 - z * z).max(0.0).sqrt();
         let v = vec3(s * a.cos(), s * a.sin(), z) * speed;
-        Critter { pos: p, vel: v, kind }
+        let cooldown = if kind == 1 { rng.range(0.0, COOLDOWN) } else { 0.0 };
+        Critter { pos: p, vel: v, kind, cooldown, flash: 0.0 }
     };
     for i in 0..2400 {
         critters.push(spawn(&mut rng, (i % 3) as u8));
@@ -171,6 +196,13 @@ async fn main() {
     let mut render_mode = RenderMode::from_env();
     let cull_rep_steps = [1usize, 50, 200, 1000];
     let mut cull_rep_idx = 0usize;
+
+    // Combat-mode state.
+    let mut sim_mode = if std::env::var("CRITTERS3D_COMBAT").is_ok() { SimMode::Combat } else { SimMode::Observe };
+    let mut attack_r: f32 = 22.0;
+    let mut attacks: Vec<Attack> = Vec::new();
+    let mut bursts: Vec<(Vec3, f32)> = Vec::new(); // kill markers (pos, age)
+    let mut kills: u64 = 0;
 
     // The instanced renderer owns GPU resources (shaders, base meshes); build
     // it once from the raw miniquad context. Shader compilation happens here,
@@ -191,6 +223,7 @@ async fn main() {
         if is_key_pressed(KeyCode::B) { show_boxes = !show_boxes; }
         if is_key_pressed(KeyCode::M) { structure = structure.next(); }
         if is_key_pressed(KeyCode::G) { render_mode = render_mode.next(); }
+        if is_key_pressed(KeyCode::T) { sim_mode = match sim_mode { SimMode::Observe => SimMode::Combat, SimMode::Combat => SimMode::Observe }; }
         if is_key_pressed(KeyCode::C) { cull_rep_idx = (cull_rep_idx + 1) % cull_rep_steps.len(); }
         if is_key_pressed(KeyCode::Equal) || is_key_pressed(KeyCode::KpAdd) {
             for i in 0..200 { critters.push(spawn(&mut rng, (i % 3) as u8)); }
@@ -198,8 +231,20 @@ async fn main() {
         if is_key_pressed(KeyCode::Minus) || is_key_pressed(KeyCode::KpSubtract) {
             for _ in 0..200 { critters.pop(); }
         }
-        if is_key_down(KeyCode::LeftBracket) { vision_r = (vision_r - 60.0 * dt).max(6.0); }
-        if is_key_down(KeyCode::RightBracket) { vision_r = (vision_r + 60.0 * dt).min(WORLD); }
+        // [ / ] adjusts the vision radius (observe) or attack radius (combat).
+        let radius_step = 60.0 * dt;
+        if is_key_down(KeyCode::LeftBracket) {
+            match sim_mode {
+                SimMode::Observe => vision_r = (vision_r - radius_step).max(6.0),
+                SimMode::Combat => attack_r = (attack_r - radius_step).max(4.0),
+            }
+        }
+        if is_key_down(KeyCode::RightBracket) {
+            match sim_mode {
+                SimMode::Observe => vision_r = (vision_r + radius_step).min(WORLD),
+                SimMode::Combat => attack_r = (attack_r + radius_step).min(WORLD * 0.5),
+            }
+        }
         let mp = mouse_position();
         if is_mouse_button_down(MouseButton::Left) {
             yaw += (mp.0 - last_mouse.0) * 0.01;
@@ -218,7 +263,14 @@ async fn main() {
                     if np[axis] > WORLD - MARGIN { np[axis] = WORLD - MARGIN; c.vel[axis] = -c.vel[axis]; }
                 }
                 c.pos = np;
+                c.cooldown -= dt;
+                c.flash -= dt;
             }
+            // age and retire combat effects
+            for a in attacks.iter_mut() { a.age += dt; }
+            attacks.retain(|a| a.age < ATTACK_LIFE);
+            for b in bursts.iter_mut() { b.1 += dt; }
+            bursts.retain(|b| b.1 < BURST_LIFE);
         }
 
         // --- (re)build the chosen index and run a vision cull from the centre ---
@@ -235,7 +287,9 @@ async fn main() {
         // that isolates the structure from the render cost).
         let t_build_us: f64;
         let t_cull_us: f64;
+        let mut frame_attacks = 0usize; // combat: predators that attacked this frame
 
+        if sim_mode == SimMode::Observe {
         match structure {
             Structure::Binary3 | Structure::Octree => {
                 // Both go through the exact Shape3 sphere cull; pick the type.
@@ -312,6 +366,51 @@ async fn main() {
                 stat_line = format!("{}: {} leaves, {} arena nodes (item_limit {})", structure.label(), t.leaf_count(), t.node_count(), ITEM_LIMIT);
             }
         }
+        } else {
+            // === COMBAT: predators (kind 1) attack nearby prey; each attack is
+            // an index cull. Build the Tree3 once, query it once per attacker —
+            // the natural "many queries per frame" workload for the index.
+            let tb = Instant::now();
+            let mut t = Tree3::<C3>::new(world_aabb(), ITEM_LIMIT);
+            for (i, c) in critters.iter().enumerate() {
+                t.insert(C3 { id: i as u32, p: Point3::new(c.pos.x as f64, c.pos.y as f64, c.pos.z as f64) });
+            }
+            t_build_us = tb.elapsed().as_secs_f64() * 1e6;
+
+            let mut killed = vec![false; critters.len()];
+            let mut cull_us = 0.0f64;
+            if !paused {
+                for i in 0..critters.len() {
+                    if critters[i].kind != 1 || critters[i].cooldown > 0.0 { continue; }
+                    let center = critters[i].pos;
+                    critters[i].cooldown = COOLDOWN + rng.range(0.0, 0.4);
+                    attacks.push(Attack { center, radius: attack_r, age: 0.0 });
+                    frame_attacks += 1;
+                    let s = Sphere3::new(center.x as f64, center.y as f64, center.z as f64, attack_r as f64);
+                    let tc = Instant::now();
+                    let hits = t.cull(&s);
+                    cull_us += tc.elapsed().as_secs_f64() * 1e6;
+                    for h in hits {
+                        let j = h.id as usize;
+                        if j != i && !killed[j] && critters[j].kind != 1 { killed[j] = true; }
+                    }
+                }
+                // apply kills: drop a burst marker, respawn as prey, flash, count
+                for j in 0..critters.len() {
+                    if killed[j] {
+                        bursts.push((critters[j].pos, 0.0));
+                        let k = if rng.unit() < 0.5 { 0u8 } else { 2u8 };
+                        critters[j] = spawn(&mut rng, k);
+                        critters[j].flash = FLASH_LIFE;
+                        kills += 1;
+                    }
+                }
+            }
+            t_cull_us = if frame_attacks > 0 { cull_us / frame_attacks as f64 } else { 0.0 };
+            cand_n = None;
+            let predators = critters.iter().filter(|c| c.kind == 1).count();
+            stat_line = format!("combat (Tree3, item_limit {}): {} predators, {} attacks this frame", ITEM_LIMIT, predators, frame_attacks);
+        }
         let seen_n = lit.iter().filter(|&&b| b).count();
 
         // --- render 3D ---
@@ -340,22 +439,44 @@ async fn main() {
             }
         }
 
-        // vision sphere (translucent wire via a smaller solid + wire cube proxy)
-        draw_sphere_wires(observer, vision_r, None, Color::new(1.0, 0.9, 0.3, 0.5));
+        // vision sphere + observer marker — only meaningful in observe mode
+        if sim_mode == SimMode::Observe {
+            draw_sphere_wires(observer, vision_r, None, Color::new(1.0, 0.9, 0.3, 0.5));
+            draw_sphere(observer, 3.0, None, WHITE);
+        }
+
+        // Per-critter colour & radius for the active mode. Observe lights the
+        // seen critters; combat reds the predators and flashes fresh respawns.
+        let mut cols: Vec<Color> = Vec::with_capacity(critters.len());
+        let mut rads: Vec<f32> = Vec::with_capacity(critters.len());
+        for (i, c) in critters.iter().enumerate() {
+            let (col, rad) = match sim_mode {
+                SimMode::Observe => (kind_color(c.kind, lit[i]), if lit[i] { 2.2 } else { 1.5 }),
+                SimMode::Combat => {
+                    if c.flash > 0.0 {
+                        (Color::new(1.0, 1.0, 1.0, 1.0), 2.6)
+                    } else if c.kind == 1 {
+                        (Color::new(1.0, 0.35, 0.30, 1.0), 2.3)
+                    } else {
+                        (kind_color(c.kind, false), 1.4)
+                    }
+                }
+            };
+            cols.push(col);
+            rads.push(rad);
+        }
 
         // critters — immediate (per-critter draw_sphere) or GPU-instanced.
-        let radius_of = |lit: bool| if lit { 2.2 } else { 1.5 };
         match render_mode {
             RenderMode::Immediate => {
                 for (i, c) in critters.iter().enumerate() {
-                    draw_sphere(c.pos, radius_of(lit[i]), None, kind_color(c.kind, lit[i]));
+                    draw_sphere(c.pos, rads[i], None, cols[i]);
                 }
             }
             RenderMode::InstancedSpheres | RenderMode::Billboards => {
                 let geom = if render_mode == RenderMode::Billboards { RenderGeom::Billboards } else { RenderGeom::Spheres };
                 let instances: Vec<Instance> = critters.iter().enumerate().map(|(i, c)| {
-                    let col = kind_color(c.kind, lit[i]);
-                    Instance::new(c.pos, radius_of(lit[i]), [col.r, col.g, col.b, col.a])
+                    Instance::new(c.pos, rads[i], [cols[i].r, cols[i].g, cols[i].b, cols[i].a])
                 }).collect();
                 // Flush macroquad's batch (renders the world box / wires drawn
                 // above), then issue the instanced draw into the same default
@@ -369,26 +490,45 @@ async fn main() {
             }
         }
 
-        // sight-lines for the seen critters (immediate, all render modes)
-        for (i, c) in critters.iter().enumerate() {
-            if lit[i] { draw_line_3d(c.pos, observer, Color::new(1.0, 0.85, 0.3, 0.25)); }
+        if sim_mode == SimMode::Observe {
+            // sight-lines for the seen critters
+            for (i, c) in critters.iter().enumerate() {
+                if lit[i] { draw_line_3d(c.pos, observer, Color::new(1.0, 0.85, 0.3, 0.25)); }
+            }
+        } else {
+            // combat effects: attack spheres (expand + fade) and kill bursts
+            for a in &attacks {
+                let f = (a.age / ATTACK_LIFE).clamp(0.0, 1.0);
+                let rr = a.radius * (0.7 + 0.5 * f);
+                draw_sphere_wires(a.center, rr, None, Color::new(1.0, 0.7 - 0.5 * f, 0.2, (1.0 - f) * 0.6));
+            }
+            for (p, age) in &bursts {
+                let f = (age / BURST_LIFE).clamp(0.0, 1.0);
+                draw_sphere_wires(*p, 2.0 + 9.0 * f, None, Color::new(1.0, 1.0, 1.0, (1.0 - f) * 0.8));
+            }
         }
-        // observer marker
-        draw_sphere(observer, 3.0, None, WHITE);
 
         // --- HUD (2D overlay) ---
         set_default_camera();
         let hud = |y: f32, s: String| draw_text(&s, 12.0, y, 20.0, Color::new(0.85, 0.9, 1.0, 1.0));
-        hud(24.0, format!("critters 3D  |  pop {}  |  fps {}", critters.len(), get_fps()));
+        let mode_str = if sim_mode == SimMode::Combat { "COMBAT" } else { "observe" };
+        hud(24.0, format!("critters 3D  |  pop {}  |  mode {}  |  fps {}", critters.len(), mode_str, get_fps()));
         hud(46.0, stat_line);
-        let seen_str = match cand_n {
-            Some(nc) => format!("vision r={:.0}  ->  {} candidates -> {} seen", vision_r, nc, seen_n),
-            None => format!("vision r={:.0}  ->  {} seen", vision_r, seen_n),
+        let info_str = match sim_mode {
+            SimMode::Observe => match cand_n {
+                Some(nc) => format!("vision r={:.0}  ->  {} candidates -> {} seen", vision_r, nc, seen_n),
+                None => format!("vision r={:.0}  ->  {} seen", vision_r, seen_n),
+            },
+            SimMode::Combat => format!("attack r={:.0}  |  {} total kills", attack_r, kills),
         };
-        hud(68.0, format!("{}{}", seen_str, if paused { "   [PAUSED]" } else { "" }));
-        hud(90.0, format!("index: build {:.0} us | cull {:.2} us (avg of {})  <- M switches, C reps", t_build_us, t_cull_us, cull_reps));
+        hud(68.0, format!("{}{}", info_str, if paused { "   [PAUSED]" } else { "" }));
+        let cull_note = match sim_mode {
+            SimMode::Observe => format!("cull {:.2} us (avg of {})", t_cull_us, cull_reps),
+            SimMode::Combat => format!("cull {:.2} us (avg per attack)", t_cull_us),
+        };
+        hud(90.0, format!("index: build {:.0} us | {}", t_build_us, cull_note));
         hud(112.0, format!("render: {}  <- G switches", render_mode.label()));
-        hud(screen_height() - 18.0, "drag: orbit | scroll: zoom | +/-: pop | [ ]: vision | M: structure | G: render | C: cull reps | B: boxes | Space: pause | Esc".to_string());
+        hud(screen_height() - 18.0, "drag: orbit | scroll: zoom | +/-: pop | [ ]: radius | T: observe/combat | M: structure | G: render | C: reps | B: boxes | Space | Esc".to_string());
 
         frame += 1;
         if let Some(m) = max_frames { if frame >= m { break; } }
