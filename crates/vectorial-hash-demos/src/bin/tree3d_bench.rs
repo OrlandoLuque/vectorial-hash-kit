@@ -29,7 +29,8 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use vectorial_hash::{
-    Aabb, Point, Point3, Positioned, Positioned3, Rect, Sphere3, Tree, Tree3,
+    Aabb, CellState, Point, Point3, Positioned, Positioned3, QuadTree, Rect, Sphere3,
+    Tree, Tree3, VoxelRaster,
 };
 
 const WORLD: f64 = 512.0;
@@ -41,10 +42,11 @@ struct Args {
     seed: u64,
     rmin: f64,
     rmax: f64,
+    stack: bool,
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { pop: 50000, item_limit: 8, queries: 200, seed: 42, rmin: 10.0, rmax: 80.0 };
+    let mut a = Args { pop: 50000, item_limit: 8, queries: 200, seed: 42, rmin: 10.0, rmax: 80.0, stack: false };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < argv.len() {
@@ -57,6 +59,11 @@ fn parse_args() -> Args {
             "--seed" => a.seed = val().parse().unwrap(),
             "--rmin" => a.rmin = val().parse().unwrap(),
             "--rmax" => a.rmax = val().parse().unwrap(),
+            // Stack points in height: cluster the (x,y) projection (few
+            // columns, many z per column) so the xy-shadow is dense — the
+            // "things stacked in height" regime where the quadtree projection
+            // earns its keep.
+            "--stack" => { a.stack = true; i -= 1; }
             other => panic!("unknown argument: {other}"),
         }
         i += 2;
@@ -112,11 +119,20 @@ fn main() {
     println!("tree3d bench | pop={} | item_limit={} | queries={} | world={}^3 | seed={}",
         args.pop, args.item_limit, args.queries, WORLD, args.seed);
 
+    println!("distribution: {}", if args.stack { "STACKED (dense xy, tall columns)" } else { "uniform 3D" });
     let mut rng = Rng::new(args.seed);
     let mut items: Vec<I3> = Vec::with_capacity(args.pop);
     let mut pos: Vec<Point3> = Vec::with_capacity(args.pop);
     for id in 0..args.pop {
-        let p = Point3::new(rng.range(2.0, WORLD - 2.0), rng.range(2.0, WORLD - 2.0), rng.range(2.0, WORLD - 2.0));
+        let p = if args.stack {
+            // ~64×64 grid of columns; each column holds a tall stack in z.
+            // The xy-projection is dense (many ids share a small xy cell).
+            let gx = (rng.next() % 64) as f64 * (WORLD / 64.0) + rng.range(0.0, WORLD / 64.0);
+            let gy = (rng.next() % 64) as f64 * (WORLD / 64.0) + rng.range(0.0, WORLD / 64.0);
+            Point3::new(gx.clamp(2.0, WORLD - 2.0), gy.clamp(2.0, WORLD - 2.0), rng.range(2.0, WORLD - 2.0))
+        } else {
+            Point3::new(rng.range(2.0, WORLD - 2.0), rng.range(2.0, WORLD - 2.0), rng.range(2.0, WORLD - 2.0))
+        };
         items.push(I3 { id: id as u32, p });
         pos.push(p);
     }
@@ -136,6 +152,11 @@ fn main() {
         tree_xz.insert(I2 { id: it.id, p: Point::new(it.p.x, it.p.z) });
         tree_yz.insert(I2 { id: it.id, p: Point::new(it.p.y, it.p.z) });
     }
+    // QuadTree on the xy-projection — the structure to keep for "stacked in
+    // height" worlds, where the xy-shadow is dense and the quadtree's 4-way
+    // split handles density better than the binary tree (BENCHMARKS Results 6).
+    let mut quad_xy = QuadTree::<I2>::new(Rect::new(0.0, 0.0, WORLD, WORLD), args.item_limit);
+    for it in &items { quad_xy.insert(I2 { id: it.id, p: Point::new(it.p.x, it.p.y) }); }
     let buildp_ms = t_buildp.elapsed().as_secs_f64() * 1e3;
 
     println!("build: 3D tree {:.1} ms ({} nodes) | 3×2D trees {:.1} ms ({}+{}+{} nodes)",
@@ -148,12 +169,18 @@ fn main() {
     let mut s_proj = Stats::new();
     let mut s_proj_broad = Stats::new(); // projection broadphase only (before exact filter)
     let mut s_proj1 = Stats::new();      // single-projection + exact filter
+    let mut s_proj1z = Stats::new();     // single-projection + z-slab reject + exact
+    let mut s_proj1r = Stats::new();     // single-projection + voxel-raster narrowphase
+    let mut s_proj1q = Stats::new();     // single-projection via quadtree + exact
     let mut total_true = 0u64;
     let mut total_cand = 0u64;
     let mut total_cand1 = 0u64;
     let mut mismatches3 = 0u64;
     let mut mismatchesp = 0u64;
     let mut mismatchesp1 = 0u64;
+    let mut mismatchesp1z = 0u64;
+    let mut mismatchesp1r = 0u64;
+    let mut mismatchesp1q = 0u64;
 
     for q in 0..args.queries {
         // Radius spread so some queries are small, some large.
@@ -215,6 +242,50 @@ fn main() {
         if setp1 != brute_set { mismatchesp1 += 1; }
         total_cand1 += cand1.len() as u64;
 
+        // 1-projection + z-slab reject: a cheap 1D bbox reject on z BEFORE
+        // the full distance test (|z - cz| <= r drops candidates outside
+        // the sphere's z-extent — exactly the column points the xy-shadow
+        // dragged in but the index couldn't prune).
+        let t = Instant::now();
+        let cand1z = tree_xy.cull(&Circle2 { cx, cy, r });
+        let proj1zhits: Vec<u32> = cand1z.iter().map(|i| i.id)
+            .filter(|&id| { let p = pos[id as usize]; (p.z - cz).abs() <= r })
+            .filter(|&id| { let p = pos[id as usize]; let dx = p.x-cx; let dy = p.y-cy; let dz = p.z-cz; dx*dx+dy*dy+dz*dz <= r*r })
+            .collect();
+        s_proj1z.push(t.elapsed().as_secs_f64() * 1e9);
+        if proj1zhits.iter().copied().collect::<HashSet<u32>>() != brute_set { mismatchesp1z += 1; }
+
+        // 1-projection + voxel-raster narrowphase: instead of the analytic
+        // distance test, look the candidate up in the sphere's 1×1×1 raster
+        // (In/Out resolve by lookup; Maybe runs exact). For a sphere the
+        // exact test is already trivial so this should NOT help — included
+        // to confirm the raster only pays when contains_point is expensive.
+        let t = Instant::now();
+        let cand1r = tree_xy.cull(&Circle2 { cx, cy, r });
+        let raster = VoxelRaster::for_sphere(cx, cy, cz, r);
+        let proj1rhits: Vec<u32> = cand1r.iter().map(|i| i.id)
+            .filter(|&id| {
+                let p = pos[id as usize];
+                match raster.cell_at_world(p) {
+                    CellState::In => true,
+                    CellState::Out => false,
+                    CellState::Maybe => { let dx=p.x-cx; let dy=p.y-cy; let dz=p.z-cz; dx*dx+dy*dy+dz*dz <= r*r }
+                }
+            })
+            .collect();
+        s_proj1r.push(t.elapsed().as_secs_f64() * 1e9);
+        if proj1rhits.iter().copied().collect::<HashSet<u32>>() != brute_set { mismatchesp1r += 1; }
+
+        // 1-projection via QuadTree + z-reject + exact (the stacking case).
+        let t = Instant::now();
+        let cand1q = quad_xy.cull(&Circle2 { cx, cy, r });
+        let proj1qhits: Vec<u32> = cand1q.iter().map(|i| i.id)
+            .filter(|&id| { let p = pos[id as usize]; (p.z - cz).abs() <= r })
+            .filter(|&id| { let p = pos[id as usize]; let dx = p.x-cx; let dy = p.y-cy; let dz = p.z-cz; dx*dx+dy*dy+dz*dz <= r*r })
+            .collect();
+        s_proj1q.push(t.elapsed().as_secs_f64() * 1e9);
+        if proj1qhits.iter().copied().collect::<HashSet<u32>>() != brute_set { mismatchesp1q += 1; }
+
         let _ = q;
     }
 
@@ -224,20 +295,20 @@ fn main() {
         args.queries, total_true, total_true as f64 / args.queries as f64);
     println!("broadphase candidate/true ratio: 3-projection {:.2}x | 1-projection {:.2}x",
         fp_ratio, fp_ratio1);
-    println!("correctness vs brute: 3D tree {} | 3-projection {} | 1-projection {}",
-        if mismatches3 == 0 { "EXACT" } else { "MISMATCH!" },
-        if mismatchesp == 0 { "EXACT" } else { "MISMATCH!" },
-        if mismatchesp1 == 0 { "EXACT" } else { "MISMATCH!" });
+    let allok = mismatches3 == 0 && mismatchesp == 0 && mismatchesp1 == 0
+        && mismatchesp1z == 0 && mismatchesp1r == 0 && mismatchesp1q == 0;
+    println!("correctness vs brute: all methods {}", if allok { "EXACT" } else { "MISMATCH!" });
 
-    println!("\n{:<28} {:>12} {:>12}", "method", "mean ns/q", "p95 ns/q");
-    println!("{:<28} {:>12.0} {:>12.0}", "brute force", s_brute.mean(), s_brute.p95());
-    println!("{:<28} {:>12.0} {:>12.0}", "true 3D tree", s_tree3.mean(), s_tree3.p95());
-    println!("{:<28} {:>12.0} {:>12.0}", "3-projection (intersect+exact)", s_proj.mean(), s_proj.p95());
-    println!("{:<28} {:>12.0} {:>12.0}", "  ...broadphase only", s_proj_broad.mean(), s_proj_broad.p95());
-    println!("{:<28} {:>12.0} {:>12.0}", "1-projection (+exact)", s_proj1.mean(), s_proj1.p95());
-
-    println!("\nspeedup vs brute: 3D tree {:.1}x | 3-proj {:.2}x | 1-proj {:.2}x",
-        s_brute.mean() / s_tree3.mean().max(1e-9),
-        s_brute.mean() / s_proj.mean().max(1e-9),
-        s_brute.mean() / s_proj1.mean().max(1e-9));
+    let line = |name: &str, s: &Stats| {
+        println!("{:<32} {:>11.0} {:>11.0} {:>9.1}x",
+            name, s.mean(), s.p95(), s_brute.mean() / s.mean().max(1e-9));
+    };
+    println!("\n{:<32} {:>11} {:>11} {:>10}", "method", "mean ns/q", "p95 ns/q", "vs brute");
+    line("brute force", &s_brute);
+    line("true 3D tree", &s_tree3);
+    line("3-projection (intersect+exact)", &s_proj);
+    line("1-projection (+exact)", &s_proj1);
+    line("1-projection +z-reject +exact", &s_proj1z);
+    line("1-projection +raster narrowphase", &s_proj1r);
+    line("1-projection via quadtree +z+exact", &s_proj1q);
 }

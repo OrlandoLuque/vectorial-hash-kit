@@ -100,6 +100,74 @@ set every time.
      pays, because it minimises the number of exact tests. Not our case
      here, but the regime where it wins.
 
+## 1-projection refinements: z-reject, raster, quadtree (2026-06-23)
+
+Three follow-up experiments on the 1-projection path (`tree3d_bench` gained
+`--stack` for a dense-xy "things stacked in height" distribution, plus the
+extra methods). All exact vs brute force.
+
+### A z-slab reject between the cull and the exact test is a clear win
+
+The xy-cull returns the *cylinder* (every point in the query circle's
+column). A cheap 1D reject — `|z - cz| <= r` — drops the column points
+outside the sphere's z-extent *before* the full distance test:
+
+| config | 1-proj (+exact) | 1-proj **+z-reject** +exact | true 3D tree |
+| --- | ---: | ---: | ---: |
+| uniform 50k, r 5–20, il 8 | 7.7× | **9.3×** | 15.7× |
+| stacked 50k, r 5–20, il 48 | 11.3× | **14.9×** | 13.5× |
+
+The z-reject lifts the 1-projection ~20–30%. **At a tuned item_limit
+(48) on the stacked distribution it reaches 14.9× — matching/beating the
+true 3D tree (13.5×)** while reusing the entire 2D stack and carrying no
+N³ memory. This is the strongest case for the projection approach: with
+the cheap z-reject and a tuned 2D index it is competitive with the full
+3D tree on speed, at a fraction of the code and memory.
+
+### The voxel raster does NOT help the narrowphase for a cheap shape
+
+Using `VoxelRaster::cell_at_world` for the 1-projection narrowphase
+instead of the analytic distance test ran at **0.7–0.8×** (slower than
+brute): the lookup (floor + index + bounds) plus rebuilding the raster
+costs more than one `dx²+dy²+dz² ≤ r²`. This confirms the 2D lesson in
+3D — **the raster only pays when `contains_point` is expensive** (a
+complex polyhedron, a heavy predicate). For a sphere, analytic wins.
+
+### Keep the quadtree for "stacked in height" worlds
+
+A `QuadTree` projection (4-way split) is retained as an option for worlds
+that stack many items in height — the xy-shadow is dense there, the regime
+where the quadtree's depth advantage showed up in 2D (BENCHMARKS Results
+6). In these tests the binary-tree projection with z-reject still edged it
+(stacked il 48: binary 14.9× vs quad 9.8×), so the quadtree did not win at
+this density, but it stays available (and likely pulls ahead at far higher
+per-column density). The structure choice is a knob, not a fixed decision.
+
+### The 2.5D sweet spot
+
+Pick the projection plane **perpendicular to the world's thinnest axis**
+so the unpruned column is as short as possible. For a "2.5D" world (large
+in x,y, shallow in z — a great many games), projecting onto x,y makes z
+the thin unpruned axis → short cylinders → near-2D performance with full
+3D correctness, reusing the whole 2D stack. A bonus property: **pure-z
+motion is free in the index** (an item changing only its height doesn't
+move in the xy-tree). For such worlds the 1-projection (+z-reject) is
+likely the best engineering choice, ahead of building a full 3D tree.
+
+## Micro-optimization noted for the 2D exact test (`make_attack`)
+
+Unrelated to 3D but found while tracing the exact-test path: in the 2D
+critters, `make_attack` clones the precomputed rotated polygon and
+`move_by(origin)` to translate it into world space, then tests
+`poly.is_inside(p)`. The rotation is precomputed per (shape, angle) — only
+24 drop rotations — so runtime pays just a clone + O(V) translate per
+attack. That clone+translate can be avoided by testing in the polygon's
+**local frame**: translate the *query point* by `-origin` and test against
+the un-translated precomputed rotated polygon. For an attack that tests N
+points (a cull touching N `Maybe` items) this is O(N) point shifts with no
+polygon clone, vs O(V) + clone per attack. A small, safe win worth taking
+when the dilation / extended-item work touches that path.
+
 ## The 1×1×1 voxel raster
 
 `VoxelRaster::for_sphere` builds the 3D analogue of the 2D 1×1 raster:

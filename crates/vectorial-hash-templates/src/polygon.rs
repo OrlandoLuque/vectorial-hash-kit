@@ -256,6 +256,25 @@ impl Polygon {
     }
 
     /// Original PHP winding logic, parameterized by the ray start.
+    ///
+    /// KNOWN LIMITATION (root cause traced 2026-06-23): on polygons with
+    /// mixed line/arc edges (e.g. a Minkowski-inflated drop) this miscounts
+    /// when the ray passes *near* (not exactly through) a vertex where a line
+    /// edge meets an arc edge. Both edges then report a crossing close to the
+    /// shared vertex, and the vertex-dedup heuristic below
+    /// (`q_intercepts`/`r_intercepts`/`is_vertical_vertex`) fails to merge
+    /// them because the vertex is > EPSILON off the ray — so the crossing is
+    /// double-counted, flipping the inside/outside result. Repro:
+    /// `tests/dilation.rs::dilation_is_inside_ray_casting_is_unreliable`
+    /// (≈0.028% of a grid, along the horizontal lines that graze the inflated
+    /// arcs). The robust fix is a **half-open crossing rule** (count an edge
+    /// iff exactly one endpoint is strictly above the ray) applied uniformly
+    /// to line and arc edges, so a shared vertex is owned by exactly one
+    /// edge. That rework is fingerprint-critical (`completely_contains` feeds
+    /// template generation through `is_inside`), so it must be validated
+    /// against `fingerprint_regression` + `verify_88_ray_fix_templates`.
+    /// Until then, dilation queries use `Polygon::within_dilation` (distance
+    /// on the *original* polygon), which avoids this path entirely.
     pub(crate) fn winding_is_odd(&self, infinity: &Vertex, test_point: &Vertex) -> bool {
         let n = self.vertices.len();
         let mut winding_number = 0;
