@@ -467,7 +467,15 @@ impl Sims {
     }
 
     pub fn vision_prey(&mut self, pos: VPoint, self_id: u32) -> Option<VPoint> {
-        let vision = VisionCircle { center: pos, r: VISION_RADIUS };
+        self.vision_prey_dilated(pos, self_id, 0.0)
+    }
+
+    /// Vision that also accounts for the prey's body radius: prey whose
+    /// centre is within `VISION_RADIUS + agent_radius` are visible (the
+    /// vision circle dilated by the agent radius — a circle dilates to a
+    /// bigger circle, so no inflated template is needed).
+    pub fn vision_prey_dilated(&mut self, pos: VPoint, self_id: u32, agent_radius: f64) -> Option<VPoint> {
+        let vision = VisionCircle { center: pos, r: VISION_RADIUS + agent_radius };
         let nearest = |hits: Vec<&Critter>| {
             hits.into_iter()
                 .filter(|c| c.id != self_id && c.kind != Kind::Hunter)
@@ -603,6 +611,17 @@ pub fn build_arsenal_scaled(figure_scale: f64) -> Arsenal {
 }
 
 /// Attack area applied at its real integer origin.
+///
+/// When `agent_radius > 0` the shape behaves as the figure **dilated by the
+/// agent's body radius** (the Minkowski "index dilation" device): a critter
+/// whose *centre* lies within `agent_radius` of the real figure is a hit.
+/// The bounding box grows by `agent_radius`, the per-point test becomes
+/// `poly.within_dilation(r, p)`, and the precomputed (un-inflated) templates
+/// and 1×1 raster are skipped so the cull falls back to bbox + per-point —
+/// correct, just without the green short-circuit. (Precomputing *inflated*
+/// template sets per radius — `bank` already supports it, see
+/// `tests/dilation.rs::precached_dilated_templates_select_by_radius_at_runtime`
+/// — is the optimisation that restores the short-circuit.)
 pub struct AttackShape<'a> {
     pub bank: &'a TemplateBank,
     pub figure: FigureKey,
@@ -611,18 +630,28 @@ pub struct AttackShape<'a> {
     pub poly: Polygon,
     pub bbox: VRect,
     pub raster: Option<PlacedTemplate>,
+    pub agent_radius: f64,
 }
 
 impl Shape for AttackShape<'_> {
     fn bounding_box(&self) -> VRect {
-        self.bbox
+        if self.agent_radius > 0.0 {
+            let r = self.agent_radius;
+            VRect::new(self.bbox.x - r, self.bbox.y - r, self.bbox.width + 2.0 * r, self.bbox.height + 2.0 * r)
+        } else {
+            self.bbox
+        }
     }
     fn contains_point(&self, p: VPoint) -> bool {
-        self.poly.is_inside(p.x, p.y)
+        if self.agent_radius > 0.0 {
+            self.poly.within_dilation(self.agent_radius, p.x, p.y)
+        } else {
+            self.poly.is_inside(p.x, p.y)
+        }
     }
     fn template_for_cell(&self, cell_w: f64, cell_h: f64) -> Option<PlacedTemplate> {
-        if cell_w.fract() != 0.0 || cell_h.fract() != 0.0 {
-            return None;
+        if self.agent_radius > 0.0 || cell_w.fract() != 0.0 || cell_h.fract() != 0.0 {
+            return None; // dilated → no matching un-inflated template; bbox fallback
         }
         self.bank.placed_for(
             &self.figure,
@@ -633,7 +662,7 @@ impl Shape for AttackShape<'_> {
         )
     }
     fn point_template(&self) -> Option<&PlacedTemplate> {
-        self.raster.as_ref()
+        if self.agent_radius > 0.0 { None } else { self.raster.as_ref() }
     }
 }
 
@@ -642,6 +671,16 @@ pub fn make_attack<'a>(
     shape_id: u32,
     pos: VPoint,
     aim: Option<(f64, f64)>,
+) -> Option<AttackShape<'a>> {
+    make_attack_dilated(arsenal, shape_id, pos, aim, 0.0)
+}
+
+pub fn make_attack_dilated<'a>(
+    arsenal: &'a Arsenal,
+    shape_id: u32,
+    pos: VPoint,
+    aim: Option<(f64, f64)>,
+    agent_radius: f64,
 ) -> Option<AttackShape<'a>> {
     let angle_deg = match aim {
         Some((dx, dy)) => {
@@ -663,7 +702,7 @@ pub fn make_attack<'a>(
     );
     let raster = arsenal.bank.placed_raster(&figure, angle_deg, origin);
 
-    Some(AttackShape { bank: &arsenal.bank, figure, angle_deg, origin, poly, bbox, raster })
+    Some(AttackShape { bank: &arsenal.bank, figure, angle_deg, origin, poly, bbox, raster, agent_radius })
 }
 
 // --------------------------------------------------------------------- sim
@@ -690,6 +729,10 @@ pub struct SimParams {
     /// Skip the entire firing / kill / respawn phase. Used by the headless
     /// bench to isolate `update` cost from cull / insert / remove churn.
     pub no_attack: bool,
+    /// Agent body radius — when > 0, attack and vision culls hit critters
+    /// whose centre is within this distance of the figure (Minkowski index
+    /// dilation). 0 = point agents (the classic behaviour).
+    pub agent_radius: f64,
 }
 
 impl Default for SimParams {
@@ -699,6 +742,7 @@ impl Default for SimParams {
             respawn_delay: RESPAWN_DELAY,
             fire_rate: 1.0,
             no_attack: false,
+            agent_radius: 0.0,
         }
     }
 }
@@ -800,7 +844,7 @@ impl Sim {
         self.sightlines.clear();
         for &(id, kind, pos, heading) in &snap {
             let target = if kind == Kind::Hunter {
-                let prey = self.sims.vision_prey(pos, id);
+                let prey = self.sims.vision_prey_dilated(pos, id, params.agent_radius);
                 if let Some(t) = prey {
                     self.sightlines.push((pos, t));
                 }
@@ -843,15 +887,16 @@ impl Sim {
             let reset = self.rng.range(cd_min, cd_max) / params.fire_rate;
             *self.cooldowns.get_mut(&id).unwrap() = reset;
 
+            let ar = params.agent_radius;
             let attack = match kind {
-                Kind::Hunter => self.sims.vision_prey(pos, id).and_then(|tpos| {
-                    make_attack(arsenal, DROP_ID, pos, Some((tpos.x - pos.x, tpos.y - pos.y)))
+                Kind::Hunter => self.sims.vision_prey_dilated(pos, id, ar).and_then(|tpos| {
+                    make_attack_dilated(arsenal, DROP_ID, pos, Some((tpos.x - pos.x, tpos.y - pos.y)), ar)
                 }),
                 Kind::Drifter => {
                     let a = self.rng.range(0.0, std::f64::consts::TAU);
-                    make_attack(arsenal, DROP_ID, pos, Some((a.cos(), a.sin())))
+                    make_attack_dilated(arsenal, DROP_ID, pos, Some((a.cos(), a.sin())), ar)
                 }
-                Kind::Pulsar => make_attack(arsenal, CIRCLE_ID, pos, None),
+                Kind::Pulsar => make_attack_dilated(arsenal, CIRCLE_ID, pos, None, ar),
             };
             if let Some(atk) = attack {
                 for (vid, vpos) in self.sims.cull_attack(&atk) {

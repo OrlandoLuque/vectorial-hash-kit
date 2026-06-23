@@ -70,6 +70,7 @@ struct Args {
     no_attack: bool,
     figure_scale: f64,
     cull_strategy: CullStrategy,
+    agent_radius: f64,
 }
 
 fn parse_args() -> Args {
@@ -89,6 +90,7 @@ fn parse_args() -> Args {
         no_attack: false,
         figure_scale: 1.0,
         cull_strategy: CullStrategy::default(),
+        agent_radius: 0.0,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -116,6 +118,7 @@ fn parse_args() -> Args {
                 .expect("update-strategy: legacy|lca|lca-ropes"),
             "--no-attack" => { a.no_attack = true; i -= 1; }
             "--figure-scale" => a.figure_scale = need(&val).parse().unwrap(),
+            "--agent-radius" => a.agent_radius = need(&val).parse().unwrap(),
             "--cull-strategy" => a.cull_strategy = parse_cull_strategy(&need(&val))
                 .expect("cull-strategy: descent|walk-samet|walk-probe|walk-ropes"),
             other => panic!("unknown argument: {other}"),
@@ -185,6 +188,7 @@ fn main() {
         respawn_delay: args.respawn,
         fire_rate: args.fire,
         no_attack: args.no_attack,
+        agent_radius: args.agent_radius,
     };
     let mut sim = Sim::new(args.mode, args.split, args.merge, args.seed);
     sim.sims.update_strategy = args.strategy;

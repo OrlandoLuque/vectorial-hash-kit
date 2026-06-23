@@ -15,6 +15,10 @@
 //! - left click (hold to paint) spawns at the cursor, right click removes
 //! - `+`/`-` spawn / remove five critters at random
 //! - `R` cycles region rendering (fill+lines / lines / off)
+//! - `D` toggles agent body radius (Minkowski dilation); the panel
+//!   "agent r" slider tunes it — attacks/vision then hit critters whose
+//!   centre is within the radius of the figure, and each critter draws its
+//!   body ring
 //! - `[` / `]` halve / double simulation speed, `Space` pauses, `Esc` quits
 //! - the "tuning (live)" panel: split/merge thresholds (rebuilds the
 //!   structures), per-kind population targets (up to 1200 each), respawn
@@ -267,6 +271,9 @@ async fn main() {
     let mut respawn_f: f32 = RESPAWN_DELAY as f32;
     let mut speed_f: f32 = 1.0;
     let mut fire_f: f32 = 1.0;
+    // Agent body radius (Minkowski dilation): 0 = point agents. Toggled with
+    // `D` and tuned with the panel slider.
+    let mut agent_radius_f: f32 = 0.0;
 
     let mut effects: Vec<Effect> = Vec::new();
     let mut rings: Vec<Ring> = Vec::new();
@@ -307,6 +314,10 @@ async fn main() {
         }
         if is_key_pressed(KeyCode::R) {
             region_mode = (region_mode + 1) % 3;
+        }
+        if is_key_pressed(KeyCode::D) {
+            // Toggle Minkowski dilation: agents gain / lose a body radius.
+            agent_radius_f = if agent_radius_f > 0.0 { 0.0 } else { 16.0 };
         }
         if is_key_pressed(KeyCode::LeftBracket) {
             speed_f = (speed_f * 0.5).max(0.25);
@@ -406,6 +417,8 @@ async fn main() {
             ui.slider(hash!(), "respawn s", 0.5f32..10f32, &mut respawn_f);
             ui.slider(hash!(), "speed x", 0.25f32..4f32, &mut speed_f);
             ui.slider(hash!(), "fire x", 0.25f32..3f32, &mut fire_f);
+            ui.separator();
+            ui.slider(hash!(), "agent r [D]", 0f32..40f32, &mut agent_radius_f);
         });
 
         split_f = split_f.round().clamp(1.0, 12.0);
@@ -438,6 +451,7 @@ async fn main() {
                 respawn_delay: respawn_f as f64,
                 fire_rate: fire_f as f64,
                 no_attack: false,
+                agent_radius: agent_radius_f as f64,
             };
             sim.step(dt, &arsenal, &params);
             consume_events(&mut sim, &arsenal, now, &mut effects, &mut rings);
@@ -576,6 +590,10 @@ async fn main() {
         let draw_snap = sim.sims.snapshot();
         for &(_, kind, pos, heading) in &draw_snap {
             let (x, y) = (pos.x as f32 * S, pos.y as f32 * S);
+            // Body radius ring (Minkowski dilation active when agent_radius > 0).
+            if agent_radius_f > 0.0 {
+                draw_circle_lines(x, y, agent_radius_f * S, 1.0, Color::new(1.0, 1.0, 1.0, 0.18));
+            }
             draw_circle(x, y, 5.0, kind_color(kind));
             draw_line(
                 x,
