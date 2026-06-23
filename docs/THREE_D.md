@@ -210,9 +210,43 @@ higher than 2D's ~100 — a 3D cube spreads points over more leaves, so each
 boundary leaf holds fewer items at a given item_limit). The exact 3D
 optimum is unmeasured; the monotone trend is the finding.
 
-Note: as in 2D, `Tree3` has no arena free-list, so update churn leaves
-zombie nodes (98k arena nodes vs 3.6k live leaves at il=8). A free-list (or
-the higher item_limit, which churns less) keeps it bounded.
+Note (superseded): `Tree3` originally had no arena free-list and churn
+left zombie nodes (98k arena nodes vs 3.6k live leaves at il=8). The
+free-list now reclaims merged-out slots, so the arena stabilises near the
+live count (~7.3k) — same fix as the 2D trees.
+
+## When the 1×1×1 voxel raster pays — crossover by shape cost
+
+The earlier sphere result (raster 0.7–0.8×, slower than analytic) was the
+*cheap-shape* regime: a sphere's `contains_point` is one distance compare,
+so a memory lookup can't beat it. To find where the raster turns the corner,
+`voxel_raster_bench` culls a **`Polyhedron3::faceted_ball`** — a convex
+polyhedron of N tangent half-spaces, clipped to its bounding cube — whose
+`contains_point` costs one dot product **per face**. Both paths go through
+`Tree3::cull`; the only difference is the leaf narrowphase (raster lookup
+vs analytic). The raster is precomputed once per query shape (the realistic
+model — like the 2D attack templates) and amortised over repeated culls.
+
+60k points, item_limit 64, 150 queries:
+
+| faces | analytic ns/cull | raster ns/cull | speedup |
+| ---: | ---: | ---: | ---: |
+| 8 | 7,675 | 10,773 | 0.71× |
+| 24 | 13,755 | 14,205 | 0.97× |
+| 48 | 15,660 | 12,649 | **1.24×** |
+| 96 | 26,096 | 18,518 | **1.41×** |
+| 192 | 42,697 | 30,208 | **1.41×** |
+
+**The crossover sits around 24–48 faces.** Below it, analytic wins (cheap
+`contains_point`, the lookup's floor + index + memory load is overhead);
+above it, the raster wins because one memory lookup beats N plane
+evaluations. A sphere behaves like the bottom of this curve (≈3-face cost),
+which is exactly why the raster lost for it — and a many-faced or otherwise
+expensive shape is where the 1×1×1 raster earns its keep, the 3D mirror of
+the 2D 1×1 raster's role for complex polygons. (Reusable pieces:
+`VoxelRaster::for_shape::<S: Shape3>` builds the grid from any shape's
+`classify_aabb`; `Polyhedron3` is a convex N-face shape with an exact
+`classify_aabb` and an expensive `contains_point`.)
 
 ## Still open
 - **Non-analytic 3D shapes**: the comparison used a sphere (analytic). A

@@ -167,11 +167,14 @@ impl Polyhedron3 {
     }
 
     /// A ball of radius `r` centred at `c`, approximated by `faces` tangent
-    /// half-spaces with pseudo-evenly-spread normals (Fibonacci sphere). A
-    /// good stand-in for a many-faced non-analytic convex shape.
+    /// half-spaces with pseudo-evenly-spread normals (Fibonacci sphere),
+    /// **clipped to the ball's bounding cube** (6 extra axis-aligned planes)
+    /// so the solid is guaranteed to lie inside its declared `bbox` — needed
+    /// for the voxel raster to cover it. A good stand-in for a many-faced
+    /// non-analytic convex shape.
     pub fn faceted_ball(cx: f64, cy: f64, cz: f64, r: f64, faces: usize) -> Self {
         let golden = std::f64::consts::PI * (3.0 - 5.0_f64.sqrt());
-        let mut planes = Vec::with_capacity(faces);
+        let mut planes = Vec::with_capacity(faces + 6);
         for i in 0..faces {
             let zf = 1.0 - 2.0 * (i as f64 + 0.5) / faces as f64;
             let rad = (1.0 - zf * zf).max(0.0).sqrt();
@@ -180,6 +183,14 @@ impl Polyhedron3 {
             // tangent plane at c + r*n: n·p <= n·c + r
             planes.push((nx, ny, nz, nx * cx + ny * cy + nz * cz + r));
         }
+        // Clip to the bounding cube [c±r]³ (the few-face intersection bulges
+        // past it otherwise, escaping the raster grid).
+        planes.push((1.0, 0.0, 0.0, cx + r));
+        planes.push((-1.0, 0.0, 0.0, -(cx - r)));
+        planes.push((0.0, 1.0, 0.0, cy + r));
+        planes.push((0.0, -1.0, 0.0, -(cy - r)));
+        planes.push((0.0, 0.0, 1.0, cz + r));
+        planes.push((0.0, 0.0, -1.0, -(cz - r)));
         let b = Aabb::new(cx - r, cy - r, cz - r, 2.0 * r, 2.0 * r, 2.0 * r);
         Self { planes, bbox: b, raster: None }
     }
