@@ -146,6 +146,85 @@ impl Shape3 for Sphere3 {
     }
 }
 
+// --------------------------------------------------------------- polyhedron
+
+/// A convex polyhedron = intersection of half-spaces `n·p <= d`. Unlike the
+/// sphere, its `contains_point` is **expensive** — one dot product per face
+/// — which is the regime where the 1×1×1 [`VoxelRaster`] pays for itself
+/// (a single memory lookup beats N plane evaluations). Build one from a set
+/// of planes, or via [`Polyhedron3::faceted_ball`] for an N-face ball-like
+/// solid.
+pub struct Polyhedron3 {
+    /// Each plane is `(nx, ny, nz, d)` meaning the half-space `n·p <= d`.
+    pub planes: Vec<(f64, f64, f64, f64)>,
+    pub bbox: Aabb,
+    pub raster: Option<VoxelRaster>,
+}
+
+impl Polyhedron3 {
+    pub fn new(planes: Vec<(f64, f64, f64, f64)>, bbox: Aabb) -> Self {
+        Self { planes, bbox, raster: None }
+    }
+
+    /// A ball of radius `r` centred at `c`, approximated by `faces` tangent
+    /// half-spaces with pseudo-evenly-spread normals (Fibonacci sphere). A
+    /// good stand-in for a many-faced non-analytic convex shape.
+    pub fn faceted_ball(cx: f64, cy: f64, cz: f64, r: f64, faces: usize) -> Self {
+        let golden = std::f64::consts::PI * (3.0 - 5.0_f64.sqrt());
+        let mut planes = Vec::with_capacity(faces);
+        for i in 0..faces {
+            let zf = 1.0 - 2.0 * (i as f64 + 0.5) / faces as f64;
+            let rad = (1.0 - zf * zf).max(0.0).sqrt();
+            let th = golden * i as f64;
+            let (nx, ny, nz) = (rad * th.cos(), rad * th.sin(), zf);
+            // tangent plane at c + r*n: n·p <= n·c + r
+            planes.push((nx, ny, nz, nx * cx + ny * cy + nz * cz + r));
+        }
+        let b = Aabb::new(cx - r, cy - r, cz - r, 2.0 * r, 2.0 * r, 2.0 * r);
+        Self { planes, bbox: b, raster: None }
+    }
+
+    pub fn with_raster(mut self) -> Self {
+        // Borrow-checker: build against a raster-less copy of self.
+        let probe = Polyhedron3 { planes: self.planes.clone(), bbox: self.bbox, raster: None };
+        self.raster = Some(VoxelRaster::for_shape(&probe));
+        self
+    }
+}
+
+impl Shape3 for Polyhedron3 {
+    fn bounding_box(&self) -> Aabb { self.bbox }
+    fn contains_point(&self, p: Point3) -> bool {
+        for &(nx, ny, nz, d) in &self.planes {
+            if nx * p.x + ny * p.y + nz * p.z > d {
+                return false;
+            }
+        }
+        true
+    }
+    fn classify_aabb(&self, b: &Aabb) -> CellState {
+        let mut all_inside = true;
+        for &(nx, ny, nz, d) in &self.planes {
+            // min / max of n·p over the box corners.
+            let mnx = nx * b.x; let mxx = nx * b.x_max();
+            let mny = ny * b.y; let mxy = ny * b.y_max();
+            let mnz = nz * b.z; let mxz = nz * b.z_max();
+            let lo = mnx.min(mxx) + mny.min(mxy) + mnz.min(mxz);
+            let hi = mnx.max(mxx) + mny.max(mxy) + mnz.max(mxz);
+            if lo > d {
+                return CellState::Out; // whole box violates this face
+            }
+            if hi > d {
+                all_inside = false; // box straddles this face
+            }
+        }
+        if all_inside { CellState::In } else { CellState::Maybe }
+    }
+    fn voxel_raster(&self) -> Option<&VoxelRaster> {
+        self.raster.as_ref()
+    }
+}
+
 // ----------------------------------------------------------- voxel raster
 
 /// A 1×1×1 voxel grid classifying each unit cell as In/Out/Maybe relative
@@ -190,6 +269,36 @@ impl VoxelRaster {
                         else if far2 <= r2 { CellState::In }
                         else { CellState::Maybe };
                     cells[(ix * dy + iy) * dz + iz] = state;
+                }
+            }
+        }
+        Self { origin: (ox, oy, oz), dims: (dx, dy, dz), cells }
+    }
+
+    /// Build the raster for an arbitrary [`Shape3`] by classifying each unit
+    /// voxel of the shape's bounding box with the shape's own
+    /// `classify_aabb` (In/Out/Maybe). This is the general 1×1×1 raster: it
+    /// turns the per-point leaf test into a lookup for *any* shape, which is
+    /// the win when `contains_point` is expensive (a many-faced polyhedron)
+    /// rather than a single distance compare (a sphere).
+    pub fn for_shape<S: Shape3>(shape: &S) -> Self {
+        let b = shape.bounding_box();
+        let ox = b.x.floor() as i64;
+        let oy = b.y.floor() as i64;
+        let oz = b.z.floor() as i64;
+        let ex = b.x_max().ceil() as i64;
+        let ey = b.y_max().ceil() as i64;
+        let ez = b.z_max().ceil() as i64;
+        let (dx, dy, dz) = ((ex - ox) as usize, (ey - oy) as usize, (ez - oz) as usize);
+        let mut cells = vec![CellState::Out; dx * dy * dz];
+        for ix in 0..dx {
+            for iy in 0..dy {
+                for iz in 0..dz {
+                    let voxel = Aabb::new(
+                        (ox + ix as i64) as f64, (oy + iy as i64) as f64, (oz + iz as i64) as f64,
+                        1.0, 1.0, 1.0,
+                    );
+                    cells[(ix * dy + iy) * dz + iz] = shape.classify_aabb(&voxel);
                 }
             }
         }
@@ -572,5 +681,37 @@ mod tests {
         // Centre voxel must be In, a far voxel Out.
         assert_eq!(raster.cell_at_world(Point3::new(10.0, 10.0, 10.0)), CellState::In);
         assert_eq!(raster.cell_at_world(Point3::new(100.0, 100.0, 100.0)), CellState::Out);
+    }
+
+    #[test]
+    fn polyhedron_cull_matches_brute_and_raster_agrees() {
+        // A faceted ball (many-faced convex polyhedron) culled by Tree3 must
+        // match brute force, and its 1×1×1 raster must agree with the
+        // analytic contains_point everywhere off the boundary.
+        let mut x = 0xBEEF1234u64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x >> 11) as f64 / (1u64 << 53) as f64 };
+        let pts: Vec<P> = (0..3000)
+            .map(|_| P(Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0)))
+            .collect();
+        let mut tree = Tree3::<P>::new(Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0), 16);
+        for p in &pts { tree.insert(*p); }
+
+        let poly = Polyhedron3::faceted_ball(120.0, 130.0, 110.0, 55.0, 48).with_raster();
+        let mut want: Vec<(u64, u64, u64)> = pts.iter().filter(|p| poly.contains_point(p.0))
+            .map(|p| (p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits())).collect();
+        let mut got: Vec<(u64, u64, u64)> = tree.cull(&poly).iter()
+            .map(|p| (p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits())).collect();
+        want.sort(); got.sort();
+        assert_eq!(want, got, "polyhedron cull != brute force");
+
+        // Raster vs analytic, away from the voxel-boundary halo.
+        let raster = poly.raster.as_ref().unwrap();
+        for p in &pts {
+            match raster.cell_at_world(p.0) {
+                CellState::In => assert!(poly.contains_point(p.0)),
+                CellState::Out => assert!(!poly.contains_point(p.0)),
+                CellState::Maybe => {} // boundary voxel — either answer allowed
+            }
+        }
     }
 }
