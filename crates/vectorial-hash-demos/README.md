@@ -73,6 +73,24 @@ The **"tuning (live)" panel** adjusts everything while the simulation runs: the 
 
 `CRITTERS_MAX_FRAMES=N` exits after N frames (CI/smoke runs).
 
+### Demo 5 — critters 3D (visual + headless)
+
+```bash
+cargo run -p vectorial-hash-demos --bin critters3d --release            # visual (macroquad 3D)
+cargo run -p vectorial-hash-demos --bin critters3d_headless --release \  # statistics
+    -- --pop 20000 --item-limit 64 --frames 240 --vision 100 --seed 42
+```
+
+The 3D analogue, indexed by `Tree3` (binary-split 3D tree, sphere-vs-Aabb
+classification, 1×1×1 `VoxelRaster`). The **visual** demo drifts critters
+inside a cube; an observer at the centre runs a sphere vision cull each
+frame and the seen critters light up with a sight-line. Controls: drag to
+orbit, scroll to zoom, `+`/`-` population, `[`/`]` vision radius, `B`
+toggles the Tree3 leaf boxes, `Space` pauses, `Esc` quits
+(`CRITTERS3D_MAX_FRAMES=N` for smoke runs). The **headless** version
+measures `update` + sphere-cull cost under churn — see `docs/THREE_D.md`
+for the true-3D-tree vs projection-indexing comparison.
+
 ## Run
 
 ```bash
