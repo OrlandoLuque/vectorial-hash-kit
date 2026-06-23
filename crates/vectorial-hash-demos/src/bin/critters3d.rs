@@ -17,6 +17,8 @@
 //!
 //! Env: CRITTERS3D_MAX_FRAMES=N exits after N frames (smoke testing).
 
+use std::time::Instant;
+
 use macroquad::prelude::*;
 
 use vectorial_hash::{
@@ -127,6 +129,8 @@ async fn main() {
     let mut paused = false;
     let mut show_boxes = false;
     let mut structure = Structure::Binary3;
+    let cull_rep_steps = [1usize, 50, 200, 1000];
+    let mut cull_rep_idx = 0usize;
     let mut frame: u64 = 0;
     let max_frames: Option<u64> = std::env::var("CRITTERS3D_MAX_FRAMES").ok().and_then(|s| s.parse().ok());
 
@@ -138,6 +142,7 @@ async fn main() {
         if is_key_pressed(KeyCode::Space) { paused = !paused; }
         if is_key_pressed(KeyCode::B) { show_boxes = !show_boxes; }
         if is_key_pressed(KeyCode::M) { structure = structure.next(); }
+        if is_key_pressed(KeyCode::C) { cull_rep_idx = (cull_rep_idx + 1) % cull_rep_steps.len(); }
         if is_key_pressed(KeyCode::Equal) || is_key_pressed(KeyCode::KpAdd) {
             for i in 0..200 { critters.push(spawn(&mut rng, (i % 3) as u8)); }
         }
@@ -170,30 +175,52 @@ async fn main() {
         // --- (re)build the chosen index and run a vision cull from the centre ---
         let observer = vec3(WORLD * 0.5, WORLD * 0.5, WORLD * 0.5);
         let (ox, oy, oz, r) = (observer.x as f64, observer.y as f64, observer.z as f64, vision_r as f64);
+        let cull_reps = cull_rep_steps[cull_rep_idx];
         let mut lit = vec![false; critters.len()];
         let mut boxes: Vec<(Vec3, Vec3)> = Vec::new();
         let stat_line: String;
         let cand_n: Option<usize>; // broadphase candidates (projection only)
+        let r2 = r * r;
+        // Build time, and the cull averaged over `cull_reps` (a single sphere
+        // cull is microseconds — repeating it gives a stable, readable number
+        // that isolates the structure from the render cost).
+        let t_build_us: f64;
+        let t_cull_us: f64;
 
         match structure {
             Structure::Binary3 | Structure::Octree => {
                 // Both go through the exact Shape3 sphere cull; pick the type.
                 let octree = matches!(structure, Structure::Octree);
-                let sphere = Sphere3::new(ox, oy, oz, r);
                 let (leaves, arena) = if octree {
+                    let tb = Instant::now();
                     let mut t = Octree3::<C3>::new(world_aabb(), ITEM_LIMIT);
                     for (i, c) in critters.iter().enumerate() {
                         t.insert(C3 { id: i as u32, p: Point3::new(c.pos.x as f64, c.pos.y as f64, c.pos.z as f64) });
                     }
-                    for c in t.cull(&sphere) { lit[c.id as usize] = true; }
+                    t_build_us = tb.elapsed().as_secs_f64() * 1e6;
+                    let tc = Instant::now();
+                    for rep in 0..cull_reps {
+                        let sphere = Sphere3::new(ox + rep as f64 * 0.01, oy, oz, r);
+                        let hits = t.cull(&sphere);
+                        if rep == 0 { for c in hits { lit[c.id as usize] = true; } }
+                    }
+                    t_cull_us = tc.elapsed().as_secs_f64() * 1e6 / cull_reps as f64;
                     if show_boxes { t.visit_leaves(|l| boxes.push(aabb_box(&l.bbox))); }
                     (t.leaf_count(), t.node_count())
                 } else {
+                    let tb = Instant::now();
                     let mut t = Tree3::<C3>::new(world_aabb(), ITEM_LIMIT);
                     for (i, c) in critters.iter().enumerate() {
                         t.insert(C3 { id: i as u32, p: Point3::new(c.pos.x as f64, c.pos.y as f64, c.pos.z as f64) });
                     }
-                    for c in t.cull(&sphere) { lit[c.id as usize] = true; }
+                    t_build_us = tb.elapsed().as_secs_f64() * 1e6;
+                    let tc = Instant::now();
+                    for rep in 0..cull_reps {
+                        let sphere = Sphere3::new(ox + rep as f64 * 0.01, oy, oz, r);
+                        let hits = t.cull(&sphere);
+                        if rep == 0 { for c in hits { lit[c.id as usize] = true; } }
+                    }
+                    t_cull_us = tc.elapsed().as_secs_f64() * 1e6 / cull_reps as f64;
                     if show_boxes { t.visit_leaves(|l| boxes.push(aabb_box(&l.bbox))); }
                     (t.leaf_count(), t.node_count())
                 };
@@ -203,19 +230,27 @@ async fn main() {
             Structure::Projection => {
                 // Author's variant: index the xy projection in a 2D Tree, cull
                 // the sphere's shadow (a disc), then z-reject + exact 3D test.
+                let tb = Instant::now();
                 let mut t = Tree::<P2>::new(Rect::new(0.0, 0.0, WORLD as f64, WORLD as f64), ITEM_LIMIT);
                 for (i, c) in critters.iter().enumerate() {
                     t.insert(P2 { id: i as u32, p: Point::new(c.pos.x as f64, c.pos.y as f64), z: c.pos.z as f64 });
                 }
-                let disc = Disc { cx: ox, cy: oy, r };
-                let cand = t.cull(&disc);
-                let r2 = r * r;
+                t_build_us = tb.elapsed().as_secs_f64() * 1e6;
+                // The query is broadphase (disc cull) + narrowphase (z-reject +
+                // exact 3D) — time the whole thing, that's the variant's cost.
+                let tc = Instant::now();
                 let mut nc = 0;
-                for p2 in &cand {
-                    nc += 1;
-                    let (dx, dy, dz) = (p2.p.x - ox, p2.p.y - oy, p2.z - oz);
-                    if dx * dx + dy * dy + dz * dz <= r2 { lit[p2.id as usize] = true; }
+                for rep in 0..cull_reps {
+                    let disc = Disc { cx: ox + rep as f64 * 0.01, cy: oy, r };
+                    let cand = t.cull(&disc);
+                    if rep == 0 { nc = cand.len(); }
+                    for p2 in &cand {
+                        let (dx, dy, dz) = (p2.p.x - ox, p2.p.y - oy, p2.z - oz);
+                        let inside = dx * dx + dy * dy + dz * dz <= r2;
+                        if rep == 0 && inside { lit[p2.id as usize] = true; }
+                    }
                 }
+                t_cull_us = tc.elapsed().as_secs_f64() * 1e6 / cull_reps as f64;
                 // boxes: the 2D leaf rects, extruded through the full z depth.
                 if show_boxes {
                     t.visit_leaves(|_, l| {
@@ -273,7 +308,8 @@ async fn main() {
             None => format!("vision r={:.0}  ->  {} seen", vision_r, seen_n),
         };
         hud(68.0, format!("{}{}", seen_str, if paused { "   [PAUSED]" } else { "" }));
-        hud(screen_height() - 18.0, "drag: orbit | scroll: zoom | +/-: pop | [ ]: vision | M: structure | B: boxes | Space: pause | Esc".to_string());
+        hud(90.0, format!("index: build {:.0} us | cull {:.2} us (avg of {})  <- M switches, C reps", t_build_us, t_cull_us, cull_reps));
+        hud(screen_height() - 18.0, "drag: orbit | scroll: zoom | +/-: pop | [ ]: vision | M: structure | C: cull reps | B: boxes | Space: pause | Esc".to_string());
 
         frame += 1;
         if let Some(m) = max_frames { if frame >= m { break; } }
