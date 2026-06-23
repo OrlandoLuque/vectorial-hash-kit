@@ -12,18 +12,27 @@
 //! - `[` / `]`: shrink / grow the vision radius
 //! - `M`: cycle the index structure — binary-3D `Tree3` / `Octree3` (8-way) /
 //!   projection (one 2D `Tree` on xy + z-reject, the author's variant)
+//! - `G`: cycle the render path — immediate `draw_sphere` / GPU-instanced
+//!   spheres / GPU-instanced billboards (the last two scale far higher)
+//! - `C`: cycle cull repetitions (1/50/200/1000) — averages the per-cull time
+//!   for a stable, readable µs figure that differs between structures
 //! - `B`: toggle the leaf-box wireframes (extruded columns in projection mode)
 //! - `Space`: pause, `Esc`: quit
 //!
-//! Env: CRITTERS3D_MAX_FRAMES=N exits after N frames (smoke testing).
+//! Env: CRITTERS3D_MAX_FRAMES=N exits after N frames (smoke testing);
+//! CRITTERS3D_RENDER=immediate|instanced|billboards sets the initial render path.
 
 use std::time::Instant;
 
+use macroquad::camera::Camera;
+use macroquad::miniquad::PassAction;
 use macroquad::prelude::*;
+use macroquad::window::get_internal_gl;
 
 use vectorial_hash::{
     Aabb, Octree3, Point, Point3, Positioned, Positioned3, Rect, Shape, Sphere3, Tree, Tree3,
 };
+use vectorial_hash_demos::instanced3d::{Instance, InstancedRenderer, Mode as RenderGeom};
 
 const WORLD: f32 = 200.0;
 const MARGIN: f32 = 4.0;
@@ -54,6 +63,36 @@ impl Shape for Disc {
     fn contains_point(&self, p: Point) -> bool {
         let (dx, dy) = (p.x - self.cx, p.y - self.cy);
         dx * dx + dy * dy <= self.r * self.r
+    }
+}
+
+/// How the critters are drawn. `Immediate` is macroquad's per-critter
+/// `draw_sphere` (geometry rebuilt every frame — the known-good fallback);
+/// the other two are the GPU-instanced path (one draw call, scales far
+/// higher). See [`vectorial_hash_demos::instanced3d`].
+#[derive(Clone, Copy, PartialEq)]
+enum RenderMode { Immediate, InstancedSpheres, Billboards }
+impl RenderMode {
+    fn next(self) -> Self {
+        match self {
+            RenderMode::Immediate => RenderMode::InstancedSpheres,
+            RenderMode::InstancedSpheres => RenderMode::Billboards,
+            RenderMode::Billboards => RenderMode::Immediate,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            RenderMode::Immediate => "immediate spheres (draw_sphere)",
+            RenderMode::InstancedSpheres => "instanced spheres (GPU)",
+            RenderMode::Billboards => "instanced billboards (GPU)",
+        }
+    }
+    fn from_env() -> Self {
+        match std::env::var("CRITTERS3D_RENDER").ok().as_deref() {
+            Some("instanced") => RenderMode::InstancedSpheres,
+            Some("billboards") => RenderMode::Billboards,
+            _ => RenderMode::Immediate,
+        }
     }
 }
 
@@ -129,8 +168,17 @@ async fn main() {
     let mut paused = false;
     let mut show_boxes = false;
     let mut structure = Structure::Binary3;
+    let mut render_mode = RenderMode::from_env();
     let cull_rep_steps = [1usize, 50, 200, 1000];
     let mut cull_rep_idx = 0usize;
+
+    // The instanced renderer owns GPU resources (shaders, base meshes); build
+    // it once from the raw miniquad context. Shader compilation happens here,
+    // so a GLSL error surfaces at startup (and in the headless smoke test).
+    let mut renderer = {
+        let gl = unsafe { get_internal_gl() };
+        InstancedRenderer::new(gl.quad_context)
+    };
     let mut frame: u64 = 0;
     let max_frames: Option<u64> = std::env::var("CRITTERS3D_MAX_FRAMES").ok().and_then(|s| s.parse().ok());
 
@@ -142,6 +190,7 @@ async fn main() {
         if is_key_pressed(KeyCode::Space) { paused = !paused; }
         if is_key_pressed(KeyCode::B) { show_boxes = !show_boxes; }
         if is_key_pressed(KeyCode::M) { structure = structure.next(); }
+        if is_key_pressed(KeyCode::G) { render_mode = render_mode.next(); }
         if is_key_pressed(KeyCode::C) { cull_rep_idx = (cull_rep_idx + 1) % cull_rep_steps.len(); }
         if is_key_pressed(KeyCode::Equal) || is_key_pressed(KeyCode::KpAdd) {
             for i in 0..200 { critters.push(spawn(&mut rng, (i % 3) as u8)); }
@@ -272,7 +321,14 @@ async fn main() {
             dist * pitch.sin(),
             dist * pitch.cos() * yaw.sin(),
         );
-        set_camera(&Camera3D { position: eye, up: vec3(0.0, 1.0, 0.0), target: observer, ..Default::default() });
+        let cam = Camera3D { position: eye, up: vec3(0.0, 1.0, 0.0), target: observer, ..Default::default() };
+        set_camera(&cam);
+        // Camera basis for billboards, and the proj*view matrix the instanced
+        // shader needs (the same one macroquad uses for this camera).
+        let mvp = cam.matrix();
+        let fwd = (observer - eye).normalize();
+        let cam_right = fwd.cross(vec3(0.0, 1.0, 0.0)).normalize();
+        let cam_up = cam_right.cross(fwd).normalize();
 
         // world box
         draw_cube_wires(observer, vec3(WORLD, WORLD, WORLD), Color::new(0.3, 0.35, 0.45, 1.0));
@@ -287,13 +343,35 @@ async fn main() {
         // vision sphere (translucent wire via a smaller solid + wire cube proxy)
         draw_sphere_wires(observer, vision_r, None, Color::new(1.0, 0.9, 0.3, 0.5));
 
-        // critters
-        for (i, c) in critters.iter().enumerate() {
-            let col = kind_color(c.kind, lit[i]);
-            draw_sphere(c.pos, if lit[i] { 2.2 } else { 1.5 }, None, col);
-            if lit[i] {
-                draw_line_3d(c.pos, observer, Color::new(1.0, 0.85, 0.3, 0.25));
+        // critters — immediate (per-critter draw_sphere) or GPU-instanced.
+        let radius_of = |lit: bool| if lit { 2.2 } else { 1.5 };
+        match render_mode {
+            RenderMode::Immediate => {
+                for (i, c) in critters.iter().enumerate() {
+                    draw_sphere(c.pos, radius_of(lit[i]), None, kind_color(c.kind, lit[i]));
+                }
             }
+            RenderMode::InstancedSpheres | RenderMode::Billboards => {
+                let geom = if render_mode == RenderMode::Billboards { RenderGeom::Billboards } else { RenderGeom::Spheres };
+                let instances: Vec<Instance> = critters.iter().enumerate().map(|(i, c)| {
+                    let col = kind_color(c.kind, lit[i]);
+                    Instance::new(c.pos, radius_of(lit[i]), [col.r, col.g, col.b, col.a])
+                }).collect();
+                // Flush macroquad's batch (renders the world box / wires drawn
+                // above), then issue the instanced draw into the same default
+                // pass with depth preserved.
+                let mut gl = unsafe { get_internal_gl() };
+                gl.flush();
+                let ctx = gl.quad_context;
+                ctx.begin_default_pass(PassAction::Nothing);
+                renderer.draw(ctx, geom, &instances, mvp, cam_right, cam_up);
+                ctx.end_render_pass();
+            }
+        }
+
+        // sight-lines for the seen critters (immediate, all render modes)
+        for (i, c) in critters.iter().enumerate() {
+            if lit[i] { draw_line_3d(c.pos, observer, Color::new(1.0, 0.85, 0.3, 0.25)); }
         }
         // observer marker
         draw_sphere(observer, 3.0, None, WHITE);
@@ -309,7 +387,8 @@ async fn main() {
         };
         hud(68.0, format!("{}{}", seen_str, if paused { "   [PAUSED]" } else { "" }));
         hud(90.0, format!("index: build {:.0} us | cull {:.2} us (avg of {})  <- M switches, C reps", t_build_us, t_cull_us, cull_reps));
-        hud(screen_height() - 18.0, "drag: orbit | scroll: zoom | +/-: pop | [ ]: vision | M: structure | C: cull reps | B: boxes | Space: pause | Esc".to_string());
+        hud(112.0, format!("render: {}  <- G switches", render_mode.label()));
+        hud(screen_height() - 18.0, "drag: orbit | scroll: zoom | +/-: pop | [ ]: vision | M: structure | G: render | C: cull reps | B: boxes | Space: pause | Esc".to_string());
 
         frame += 1;
         if let Some(m) = max_frames { if frame >= m { break; } }
