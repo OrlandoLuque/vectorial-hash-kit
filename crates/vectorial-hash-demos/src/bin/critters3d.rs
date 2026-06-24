@@ -401,11 +401,13 @@ fn aabb_box(b: &Aabb) -> (Vec3, Vec3) {
 }
 
 fn kind_color(k: u8, lit: bool) -> Color {
-    if lit { return Color::new(1.0, 0.95, 0.3, 1.0); }
+    // The observe "seen" highlight is white (not yellow) so it doesn't clash
+    // with the GOLD Pulsars. Kind colours match the 2D demo.
+    if lit { return WHITE; }
     match k {
-        0 => Color::new(0.40, 0.75, 1.00, 1.0), // Drifter (blue)
-        1 => Color::new(1.00, 0.45, 0.45, 1.0), // Hunter  (red)
-        _ => Color::new(0.55, 1.00, 0.60, 1.0), // Pulsar  (green)
+        0 => SKYBLUE, // Drifter
+        1 => RED,     // Hunter
+        _ => GOLD,    // Pulsar
     }
 }
 
@@ -667,7 +669,48 @@ async fn main() {
         // --- simulate ---
         let t_sim = Instant::now();
         if !paused {
-            for c in critters.iter_mut() {
+            // Combat steers each kind like the 2D demo: Hunters chase the
+            // nearest critter in vision, Pulsars circle, Drifters wander. First
+            // find the Hunters' targets (a vision cull each, from last frame's
+            // index), then steer + move.
+            let hunter_vision = world * 0.3;
+            let mut targets: Vec<Option<Vec3>> = vec![None; critters.len()];
+            if sim_mode == SimMode::Combat {
+                for i in 0..critters.len() {
+                    if critters[i].kind != 1 { continue; }
+                    let p = critters[i].pos;
+                    let s = Sphere3::new(p.x as f64, p.y as f64, p.z as f64, hunter_vision as f64);
+                    let mut best_d2 = f32::INFINITY;
+                    for h in tree.cull(&s) {
+                        let j = h.id as usize;
+                        if j == i { continue; }
+                        let d2 = (critters[j].pos - p).length_squared();
+                        if d2 < best_d2 { best_d2 = d2; targets[i] = Some(critters[j].pos); }
+                    }
+                }
+            }
+            for i in 0..critters.len() {
+                if sim_mode == SimMode::Combat {
+                    let speed = critters[i].vel.length().max(15.0);
+                    match critters[i].kind {
+                        1 => {
+                            if let Some(t) = targets[i] {
+                                let desired = (t - critters[i].pos).normalize_or_zero() * speed;
+                                critters[i].vel = critters[i].vel.lerp(desired, (3.0 * dt).min(1.0));
+                            }
+                        }
+                        2 => {
+                            let v = critters[i].vel;
+                            let a = 1.6 * dt;
+                            critters[i].vel = vec3(v.x * a.cos() - v.z * a.sin(), v.y, v.x * a.sin() + v.z * a.cos());
+                        }
+                        _ => {
+                            let w = rand_dir(&mut rng) * (speed * 0.5 * dt);
+                            critters[i].vel = (critters[i].vel + w).normalize_or_zero() * speed;
+                        }
+                    }
+                }
+                let c = &mut critters[i];
                 let mut np = c.pos + c.vel * dt;
                 for axis in 0..3 {
                     if np[axis] < MARGIN { np[axis] = MARGIN; c.vel[axis] = -c.vel[axis]; }
@@ -859,22 +902,13 @@ async fn main() {
                             (AttackKind::Sphere, Vec3::ZERO, tree.cull(&s).iter().map(|h| h.id as usize).collect())
                         }
                         _ => {
-                            // Hunter (1): flamer drop aimed at the nearest other
-                            // critter in reach. Drifter (0): random direction.
+                            // Hunter (1): flamer drop along its heading — it has
+                            // already steered toward its target this frame, so
+                            // forward = at the prey. Drifter (0): random.
                             let (off, length, maxr) = flamer_dims(attack_r);
                             let dir = if kind == 1 {
-                                let mut best_d2 = f32::INFINITY;
-                                let mut target = None;
-                                for h in tree.cull(&Sphere3::new(cx, cy, cz, length as f64)) {
-                                    let j = h.id as usize;
-                                    if j == i { continue; }
-                                    let d2 = (critters[j].pos - center).length_squared();
-                                    if d2 < best_d2 { best_d2 = d2; target = Some(critters[j].pos); }
-                                }
-                                match target {
-                                    Some(p) => { let d = p - center; if d.length() > 0.5 { d.normalize() } else { rand_dir(&mut rng) } }
-                                    None => rand_dir(&mut rng),
-                                }
+                                let v = critters[i].vel;
+                                if v.length() > 0.1 { v.normalize() } else { rand_dir(&mut rng) }
                             } else {
                                 rand_dir(&mut rng)
                             };
