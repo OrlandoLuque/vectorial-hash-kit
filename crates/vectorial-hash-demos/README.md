@@ -118,9 +118,41 @@ Env: `CRITTERS3D_MAX_FRAMES=N` (smoke runs),
 cost under churn — see `docs/THREE_D.md` for the true-3D-tree vs
 projection-indexing comparison and the octree-vs-binary result.
 
-## Run
+## Build & run
+
+All from the workspace root. `--release` matters for the visual demos (they
+push a lot of geometry per frame).
+
+**2D critters** — predators/prey on a 1024×1024 map, live tuning panel:
 
 ```bash
-cargo run -p vectorial-hash-demos            # demos 1 + 2 (console)
-cargo run -p vectorial-hash-demos --bin critters --release   # visual demo
+cargo run -p vectorial-hash-demos --bin critters --release
+```
+
+**3D critters** — the cube world, observe/combat, instanced rendering, panel +
+graphs:
+
+```bash
+cargo run -p vectorial-hash-demos --bin critters3d --release
+```
+
+**Console demos** (1 + 2, no window):
+
+```bash
+cargo run -p vectorial-hash-demos
+```
+
+**Headless benches** (statistics, no window):
+
+```bash
+cargo run -p vectorial-hash-demos --bin critters_headless --release
+cargo run -p vectorial-hash-demos --bin critters3d_headless --release -- \
+    --pop 20000 --item-limit 64 --frames 240 --vision 100 --seed 42
+```
+
+Build everything without running:
+
+```bash
+cargo build -p vectorial-hash-demos --release        # all binaries
+cargo build -p vectorial-hash-demos --bin critters3d # just one
 ```
