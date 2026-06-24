@@ -192,7 +192,7 @@ fn kind_color(k: u8, lit: bool) -> Color {
 }
 
 fn window_conf() -> Conf {
-    Conf { window_title: "vectorial-hash critters 3D".to_owned(), window_width: 1100, window_height: 800, ..Default::default() }
+    Conf { window_title: "vectorial-hash critters 3D".to_owned(), window_width: 1600, window_height: 1000, ..Default::default() }
 }
 
 #[macroquad::main(window_conf)]
@@ -218,6 +218,20 @@ async fn main() {
         critters.push(spawn(&mut rng, (i % 3) as u8));
     }
 
+    // Persistent binary-3D index. Instead of rebuilding it every frame, we
+    // keep it across frames and `update` each critter's position in place
+    // (ascend-to-LCA) — most critters stay in their leaf, so this is far
+    // cheaper than a full rebuild. `tree_pos[i]` is where critter i currently
+    // sits in the tree (the `old` position `update` needs to find it).
+    let pt3 = |c: &Critter| Point3::new(c.pos.x as f64, c.pos.y as f64, c.pos.z as f64);
+    let mut tree = Tree3::<C3>::new(world_aabb(), ITEM_LIMIT);
+    let mut tree_pos: Vec<Point3> = Vec::with_capacity(critters.len());
+    for (i, c) in critters.iter().enumerate() {
+        let p = pt3(c);
+        tree.insert(C3 { id: i as u32, p });
+        tree_pos.push(p);
+    }
+
     // Camera orbit state.
     let mut yaw: f32 = 0.7;
     let mut pitch: f32 = 0.5;
@@ -239,6 +253,10 @@ async fn main() {
     let mut attacks: Vec<Attack> = Vec::new();
     let mut bursts: Vec<(Vec3, f32)> = Vec::new(); // kill markers (pos, age)
     let mut kills: u64 = 0;
+    // Latched stats of the last attack wave (so a synchronized burst stays
+    // readable between waves, when most frames have zero attacks).
+    let mut last_wave_attacks = 0usize;
+    let mut last_wave_us = 0.0f64;
 
     // The instanced renderer owns GPU resources (shaders, base meshes); build
     // it once from the raw miniquad context. Shader compilation happens here,
@@ -308,13 +326,30 @@ async fn main() {
             is_key_down(KeyCode::Equal) || is_key_down(KeyCode::KpAdd),
             dt,
         );
-        if add { for i in 0..200 { critters.push(spawn(&mut rng, (i % 3) as u8)); } }
+        if add {
+            for i in 0..200 {
+                let id = critters.len() as u32;
+                let c = spawn(&mut rng, (i % 3) as u8);
+                let p = pt3(&c);
+                tree.insert(C3 { id, p });
+                tree_pos.push(p);
+                critters.push(c);
+            }
+        }
         let sub = sub_rep.fires(
             is_key_pressed(KeyCode::Minus) || is_key_pressed(KeyCode::KpSubtract),
             is_key_down(KeyCode::Minus) || is_key_down(KeyCode::KpSubtract),
             dt,
         );
-        if sub { for _ in 0..200 { critters.pop(); } }
+        if sub {
+            for _ in 0..200 {
+                if critters.pop().is_some() {
+                    let i = critters.len();
+                    tree.remove(tree_pos[i], |c| c.id == i as u32);
+                    tree_pos.pop();
+                }
+            }
+        }
         // [ / ] adjusts the vision radius (observe) or attack radius (combat).
         let radius_step = 60.0 * dt;
         if is_key_down(KeyCode::LeftBracket) {
@@ -362,10 +397,41 @@ async fn main() {
         }
         sim_us = t_sim.elapsed().as_secs_f64() * 1e6;
 
+        // Sync the persistent index to the critters' new positions (move each
+        // in place via ascend-to-LCA). This replaces the per-frame full
+        // rebuild — `sync_us` is what the Binary3 / combat paths report as
+        // "build". Combat respawns (which jump a critter) are picked up by the
+        // next frame's sync.
+        let t_sync = Instant::now();
+        if !paused {
+            for i in 0..critters.len() {
+                let np = pt3(&critters[i]);
+                tree.update(tree_pos[i], |c| c.id == i as u32, |c| c.p = np);
+                tree_pos[i] = np;
+            }
+        }
+        let sync_us = t_sync.elapsed().as_secs_f64() * 1e6;
+
         // --- (re)build the chosen index and run a vision cull from the centre ---
         let observer = vec3(WORLD * 0.5, WORLD * 0.5, WORLD * 0.5);
         let (ox, oy, oz, r) = (observer.x as f64, observer.y as f64, observer.z as f64, vision_r as f64);
         let cull_reps = cull_rep_steps[cull_rep_idx];
+        // Optional self-check: the persistent tree's vision cull must match a
+        // brute-force scan (catches any update/insert/remove bookkeeping bug).
+        if std::env::var("CRITTERS3D_VERIFY").is_ok() {
+            let s = Sphere3::new(ox, oy, oz, r);
+            let mut got: Vec<u32> = tree.cull(&s).iter().map(|c| c.id).collect();
+            let mut want: Vec<u32> = (0..critters.len() as u32).filter(|&i| {
+                let c = &critters[i as usize];
+                let (dx, dy, dz) = (c.pos.x as f64 - ox, c.pos.y as f64 - oy, c.pos.z as f64 - oz);
+                dx * dx + dy * dy + dz * dz <= r * r
+            }).collect();
+            got.sort_unstable();
+            want.sort_unstable();
+            if got != want {
+                eprintln!("VERIFY mismatch frame {frame}: tree {} vs brute {} (pop {})", got.len(), want.len(), critters.len());
+            }
+        }
         let mut lit = vec![false; critters.len()];
         let mut boxes: Vec<(Vec3, Vec3)> = Vec::new();
         let stat_line: String;
@@ -380,44 +446,38 @@ async fn main() {
 
         if sim_mode == SimMode::Observe {
         match structure {
-            Structure::Binary3 | Structure::Octree => {
-                // Both go through the exact Shape3 sphere cull; pick the type.
-                let octree = matches!(structure, Structure::Octree);
-                let (leaves, arena) = if octree {
-                    let tb = Instant::now();
-                    let mut t = Octree3::<C3>::new(world_aabb(), ITEM_LIMIT);
-                    for (i, c) in critters.iter().enumerate() {
-                        t.insert(C3 { id: i as u32, p: Point3::new(c.pos.x as f64, c.pos.y as f64, c.pos.z as f64) });
-                    }
-                    t_build_us = tb.elapsed().as_secs_f64() * 1e6;
-                    let tc = Instant::now();
-                    for rep in 0..cull_reps {
-                        let sphere = Sphere3::new(ox + rep as f64 * 0.01, oy, oz, r);
-                        let hits = t.cull(&sphere);
-                        if rep == 0 { for c in hits { lit[c.id as usize] = true; } }
-                    }
-                    t_cull_us = tc.elapsed().as_secs_f64() * 1e6 / cull_reps as f64;
-                    if show_boxes { t.visit_leaves(|l| boxes.push(aabb_box(&l.bbox))); }
-                    (t.leaf_count(), t.node_count())
-                } else {
-                    let tb = Instant::now();
-                    let mut t = Tree3::<C3>::new(world_aabb(), ITEM_LIMIT);
-                    for (i, c) in critters.iter().enumerate() {
-                        t.insert(C3 { id: i as u32, p: Point3::new(c.pos.x as f64, c.pos.y as f64, c.pos.z as f64) });
-                    }
-                    t_build_us = tb.elapsed().as_secs_f64() * 1e6;
-                    let tc = Instant::now();
-                    for rep in 0..cull_reps {
-                        let sphere = Sphere3::new(ox + rep as f64 * 0.01, oy, oz, r);
-                        let hits = t.cull(&sphere);
-                        if rep == 0 { for c in hits { lit[c.id as usize] = true; } }
-                    }
-                    t_cull_us = tc.elapsed().as_secs_f64() * 1e6 / cull_reps as f64;
-                    if show_boxes { t.visit_leaves(|l| boxes.push(aabb_box(&l.bbox))); }
-                    (t.leaf_count(), t.node_count())
-                };
+            Structure::Binary3 => {
+                // Persistent tree, already synced above — just cull it.
+                t_build_us = sync_us;
+                let tc = Instant::now();
+                for rep in 0..cull_reps {
+                    let sphere = Sphere3::new(ox + rep as f64 * 0.01, oy, oz, r);
+                    let hits = tree.cull(&sphere);
+                    if rep == 0 { for c in hits { lit[c.id as usize] = true; } }
+                }
+                t_cull_us = tc.elapsed().as_secs_f64() * 1e6 / cull_reps as f64;
+                if show_boxes { tree.visit_leaves(|l| boxes.push(aabb_box(&l.bbox))); }
                 cand_n = None;
-                stat_line = format!("{}: {} leaves, {} arena nodes (item_limit {})", structure.label(), leaves, arena, ITEM_LIMIT);
+                stat_line = format!("Tree3 persistent/update: {} leaves, {} arena (item_limit {})", tree.leaf_count(), tree.node_count(), ITEM_LIMIT);
+            }
+            Structure::Octree => {
+                // Comparison structure — rebuilt each frame (no persistent update).
+                let tb = Instant::now();
+                let mut t = Octree3::<C3>::new(world_aabb(), ITEM_LIMIT);
+                for (i, c) in critters.iter().enumerate() {
+                    t.insert(C3 { id: i as u32, p: pt3(c) });
+                }
+                t_build_us = tb.elapsed().as_secs_f64() * 1e6;
+                let tc = Instant::now();
+                for rep in 0..cull_reps {
+                    let sphere = Sphere3::new(ox + rep as f64 * 0.01, oy, oz, r);
+                    let hits = t.cull(&sphere);
+                    if rep == 0 { for c in hits { lit[c.id as usize] = true; } }
+                }
+                t_cull_us = tc.elapsed().as_secs_f64() * 1e6 / cull_reps as f64;
+                if show_boxes { t.visit_leaves(|l| boxes.push(aabb_box(&l.bbox))); }
+                cand_n = None;
+                stat_line = format!("Octree3 rebuilt/frame: {} leaves, {} arena (item_limit {})", t.leaf_count(), t.node_count(), ITEM_LIMIT);
             }
             Structure::Projection => {
                 // Author's variant: index the xy projection in a 2D Tree, cull
@@ -457,17 +517,12 @@ async fn main() {
         }
         } else {
             // === COMBAT: predators (kind 1) attack nearby prey; each attack is
-            // an index cull. Build the Tree3 once, query it once per attacker —
-            // the natural "many queries per frame" workload for the index.
-            let tb = Instant::now();
-            let mut t = Tree3::<C3>::new(world_aabb(), ITEM_LIMIT);
-            for (i, c) in critters.iter().enumerate() {
-                t.insert(C3 { id: i as u32, p: Point3::new(c.pos.x as f64, c.pos.y as f64, c.pos.z as f64) });
-            }
-            t_build_us = tb.elapsed().as_secs_f64() * 1e6;
-
+            // an index cull against the persistent tree (synced above), so this
+            // is the "many queries per frame" workload — no rebuild.
+            t_build_us = sync_us;
             let mut killed = vec![false; critters.len()];
             let mut cull_us = 0.0f64;
+            let t_wave = Instant::now();
             if !paused {
                 for i in 0..critters.len() {
                     if critters[i].kind != 1 || critters[i].cooldown > 0.0 { continue; }
@@ -477,7 +532,7 @@ async fn main() {
                     frame_attacks += 1;
                     let s = Sphere3::new(center.x as f64, center.y as f64, center.z as f64, attack_r as f64);
                     let tc = Instant::now();
-                    let hits = t.cull(&s);
+                    let hits = tree.cull(&s);
                     cull_us += tc.elapsed().as_secs_f64() * 1e6;
                     for h in hits {
                         let j = h.id as usize;
@@ -495,10 +550,16 @@ async fn main() {
                     }
                 }
             }
+            // Latch the last wave that actually fired so a synchronized burst
+            // (a spike every COOLDOWN seconds) stays on screen long enough to read.
+            if frame_attacks > 0 {
+                last_wave_attacks = frame_attacks;
+                last_wave_us = t_wave.elapsed().as_secs_f64() * 1e6;
+            }
             t_cull_us = if frame_attacks > 0 { cull_us / frame_attacks as f64 } else { 0.0 };
             cand_n = None;
             let predators = critters.iter().filter(|c| c.kind == 1).count();
-            stat_line = format!("combat (Tree3, item_limit {}): {} predators, {} attacks this frame", ITEM_LIMIT, predators, frame_attacks);
+            stat_line = format!("combat: {} predators | last wave: {} attacks resolved in {:.0} us", predators, last_wave_attacks, last_wave_us);
         }
         let seen_n = lit.iter().filter(|&&b| b).count();
         // Feed the rolling cull-time average (skip frames with no measurement,
