@@ -32,7 +32,10 @@
 //! - `B`: toggle the leaf-box wireframes (extruded columns in projection mode)
 //! - `Space`: pause, `Esc`: quit
 //!
-//! Env: CRITTERS3D_MAX_FRAMES=N exits after N frames (smoke testing);
+//! Env: CRITTERS3D_MAX_FRAMES=N exits after N frames (smoke testing) and, when
+//! set, prints a one-line STRESS summary (mean fps / frame ms / cpu ms / bound);
+//! CRITTERS3D_POP=N initial population, CRITTERS3D_WORLD=N initial world size
+//! (both for the instancing stress sweep);
 //! CRITTERS3D_RENDER=instanced|billboards|square|none initial render path;
 //! CRITTERS3D_STRUCTURE=binary|octree|projection initial index structure;
 //! CRITTERS3D_COMBAT=1 starts in combat; CRITTERS3D_SEP=1 starts with separation.
@@ -595,10 +598,18 @@ async fn main() {
         let cooldown = rng.range(0.0, cmax); // spread initial cooldowns so they desync
         Critter { pos: p, vel: v, kind, cooldown, flash: 0.0, target: Vec3::ZERO }
     };
-    // World size (a stepped pow-2 slider mutates it; the tree is rebuilt on change).
-    let mut world: f32 = 256.0;
+    // World size (a stepped pow-2 slider mutates it; the tree is rebuilt on
+    // change). `CRITTERS3D_WORLD` sets the initial size (handy with large pops
+    // so the index stays shallow during the stress sweep).
+    let mut world: f32 = std::env::var("CRITTERS3D_WORLD").ok().and_then(|s| s.parse().ok()).unwrap_or(256.0);
     let mut prev_world = world;
-    for i in 0..2400 {
+    // Initial population (total, split across the 3 kinds). `CRITTERS3D_POP`
+    // overrides it for the instancing stress sweep.
+    let init_pop: usize = std::env::var("CRITTERS3D_POP").ok().and_then(|s| s.parse().ok()).unwrap_or(2400);
+    // Per-kind population ceiling (sliders + reconcile). 30k each by default;
+    // raised to fit CRITTERS3D_POP so the stress sweep isn't clamped back down.
+    let pop_cap: f32 = (init_pop as f32 / 3.0).max(30000.0);
+    for i in 0..init_pop {
         critters.push(spawn(&mut rng, (i % 3) as u8, world));
     }
 
@@ -634,7 +645,10 @@ async fn main() {
     let mut last_mouse = mouse_position();
 
     let mut vision_r: f32 = 40.0;
-    let mut paused = false;
+    // Start paused (sim frozen) when CRITTERS3D_FREEZE is set: render-only, so
+    // the stress sweep measures pure GPU throughput with the per-frame index
+    // update removed (the CPU bottleneck that otherwise dominates).
+    let mut paused = std::env::var("CRITTERS3D_FREEZE").is_ok();
     let mut show_boxes = false;
     let mut structure = Structure::from_env();
     let mut render_mode = RenderMode::from_env();
@@ -704,6 +718,12 @@ async fn main() {
     let mut editing: Option<u8> = None;
     let mut edit_buf = String::new();
 
+    // Stress-sweep accumulators (after a short warmup): mean real fps + CPU ms
+    // over the run, printed at exit when CRITTERS3D_MAX_FRAMES is set.
+    let mut stress_secs = 0.0f64;
+    let mut stress_cpu_ms = 0.0f64;
+    let mut stress_n = 0u64;
+
     loop {
         let dt = (get_frame_time()).min(1.0 / 30.0);
 
@@ -738,7 +758,7 @@ async fn main() {
             if is_key_pressed(KeyCode::Enter) || is_key_pressed(KeyCode::KpEnter) {
                 if let Ok(v) = edit_buf.parse::<f32>() {
                     match editing {
-                        Some(k @ 0..=2) => pop_kind[k as usize] = v.clamp(0.0, 30000.0),
+                        Some(k @ 0..=2) => pop_kind[k as usize] = v.clamp(0.0, pop_cap),
                         Some(3) => match sim_mode {
                             SimMode::Observe => vision_r = v.clamp(6.0, world),
                             SimMode::Combat => attack_r = v.clamp(4.0, world * 0.5),
@@ -767,7 +787,7 @@ async fn main() {
         );
         // +/- snap to the next/previous multiple of 200 (so a mouse-dragged
         // slider value like 3455 lands back on a round number).
-        if add { for k in 0..3 { pop_kind[k] = (((pop_kind[k] / 100.0).floor() + 1.0) * 100.0).min(30000.0); } }
+        if add { for k in 0..3 { pop_kind[k] = (((pop_kind[k] / 100.0).floor() + 1.0) * 100.0).min(pop_cap); } }
         let sub = sub_rep.fires(
             is_key_pressed(KeyCode::Minus) || is_key_pressed(KeyCode::KpSubtract),
             is_key_down(KeyCode::Minus) || is_key_down(KeyCode::KpSubtract),
@@ -1365,11 +1385,11 @@ async fn main() {
         if panel.button(&format!("cull reps: {} [C]", cull_reps),
             "Repeat the timed cull N times for a stable\nper-cull microsecond reading (one cull is\ntoo fast to time on its own).") { cull_rep_idx = (cull_rep_idx + 1) % cull_rep_steps.len(); }
         panel.separator();
-        panel.slider("Drifter", 0.0, 30000.0, 100.0, &mut pop_kind[0], 0, &mut editing, &mut edit_buf, Some(kind_color(0, false)),
+        panel.slider("Drifter", 0.0, pop_cap, 100.0, &mut pop_kind[0], 0, &mut editing, &mut edit_buf, Some(kind_color(0, false)),
             "How many Drifters (random-direction drop).\n-/+, drag, or right-click to type.");
-        panel.slider("Hunter", 0.0, 30000.0, 100.0, &mut pop_kind[1], 1, &mut editing, &mut edit_buf, Some(kind_color(1, false)),
+        panel.slider("Hunter", 0.0, pop_cap, 100.0, &mut pop_kind[1], 1, &mut editing, &mut edit_buf, Some(kind_color(1, false)),
             "How many Hunters (chase + aimed drop).");
-        panel.slider("Pulsar", 0.0, 30000.0, 100.0, &mut pop_kind[2], 2, &mut editing, &mut edit_buf, Some(kind_color(2, false)),
+        panel.slider("Pulsar", 0.0, pop_cap, 100.0, &mut pop_kind[2], 2, &mut editing, &mut edit_buf, Some(kind_color(2, false)),
             "How many Pulsars (spin + sphere blast).");
         match sim_mode {
             SimMode::Observe => panel.slider("vision r", 6.0, world, 5.0, &mut vision_r, 3, &mut editing, &mut edit_buf, None,
@@ -1414,7 +1434,7 @@ async fn main() {
         draw_graph(ui_x, gy, UI_W, gh, "cpu ms", &g_cpu, Color::new(1.0, 0.82, 0.35, 1.0));
         gy += gh + 4.0;
         draw_graph(ui_x, gy, UI_W, gh, "cull us", &g_cull, Color::new(0.4, 0.82, 1.0, 1.0));
-        for k in 0..3 { pop_kind[k] = pop_kind[k].round().clamp(0.0, 30000.0); }
+        for k in 0..3 { pop_kind[k] = pop_kind[k].round().clamp(0.0, pop_cap); }
 
         // World resized (stepper): re-bound the critters and rebuild the index
         // with the new cube. Rare and user-driven, so a full rebuild is fine.
@@ -1446,9 +1466,17 @@ async fn main() {
         // End-of-frame CPU wall-clock (includes the HUD + UI panel), rolling
         // averaged. Shown next frame by the HUD above.
         let ema = |avg: f64, x: f64| if avg <= 0.0 { x } else { avg * 0.9 + x * 0.1 };
-        cpu_ms_avg = ema(cpu_ms_avg, frame_t0.elapsed().as_secs_f64() * 1000.0);
+        let frame_cpu_ms = frame_t0.elapsed().as_secs_f64() * 1000.0;
+        cpu_ms_avg = ema(cpu_ms_avg, frame_cpu_ms);
         sim_us_avg = ema(sim_us_avg, sim_us);
         prep_us_avg = ema(prep_us_avg, prep_us);
+
+        // Stress sweep: accumulate true frame time + CPU ms after a warmup.
+        if frame >= 30 {
+            stress_secs += get_frame_time() as f64;
+            stress_cpu_ms += frame_cpu_ms;
+            stress_n += 1;
+        }
 
         // Optional fps cap (V): with vsync off the GPU would otherwise render
         // thousands of fps the monitor can't show. Sleep the bulk of the
@@ -1466,7 +1494,24 @@ async fn main() {
         }
 
         frame += 1;
-        if let Some(m) = max_frames { if frame >= m { break; } }
+        if let Some(m) = max_frames {
+            if frame >= m {
+                if stress_n > 0 {
+                    let mean_fps = stress_n as f64 / stress_secs.max(1e-9);
+                    let mean_frame_ms = 1000.0 / mean_fps.max(1e-9);
+                    let mean_cpu_ms = stress_cpu_ms / stress_n as f64;
+                    let cpu_ceiling = if mean_cpu_ms > 0.0 { 1000.0 / mean_cpu_ms } else { 0.0 };
+                    let bound = if mean_cpu_ms >= 0.85 * mean_frame_ms { "CPU-BOUND" } else { "GPU-BOUND" };
+                    println!(
+                        "STRESS pop={:>7} render={:<16} structure={:<22} mode={} | mean_fps={:>7.1} frame_ms={:>6.2} cpu_ms={:>6.2} cpu_ceiling_fps={:>7.0} -> {}",
+                        critters.len(), render_mode.label(), structure.label(),
+                        if sim_mode == SimMode::Combat { "combat" } else { "observe" },
+                        mean_fps, mean_frame_ms, mean_cpu_ms, cpu_ceiling, bound,
+                    );
+                }
+                break;
+            }
+        }
         next_frame().await;
     }
 }

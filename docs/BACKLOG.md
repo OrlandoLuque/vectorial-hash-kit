@@ -19,11 +19,15 @@ Everything else in this file is **future / not in the night queue** — left her
 to triage later.
 
 ## Render / demos
-- **Instancing stress test** *(queued tonight, #5)* — GPU instancing + billboards
-  now ship in `critters3d` (`G` toggles immediate / instanced spheres /
-  billboards, raw miniquad in `src/instanced3d.rs`). Still TODO: push to
-  100k–1M critters and profile where it becomes GPU-bound (fill vs vertex vs
-  instance upload).
+- ~~**Instancing stress test**~~ — **done.** Swept `critters3d` to 1M critters
+  (`CRITTERS3D_POP`/`WORLD`/`RENDER`/`FREEZE`/`MAX_FRAMES`, one-line `STRESS`
+  summary per run). Finding: the **live** demo is CPU-bound through 200k+ (the
+  per-frame `Tree3::update` is the ceiling; rendering 200k instanced spheres
+  adds only ~3 ms). **Frozen** (render-only), the GPU path is upload/transform
+  bound and linear: square billboards ~14 ns/instance (1M @ 72 fps), spheres
+  +~50% (1M @ 47 fps), not fill-bound. So the renderer has huge headroom; the
+  next win is parallel index maintenance, not the GPU. See `THREE_D.md` §
+  "GPU instancing stress test".
 - ~~**World-size 2D stepper**~~ — **done (visual scaling wants a human glance).**
   `Sim` gained a runtime `world_size` (default `MAP_W`) + `set_world_size`
   (re-bounds critters, rebuilds the index); `random_pos`/movement/`world_rect`

@@ -114,9 +114,13 @@ reports a CPU-bound vs GPU-bound verdict and the CPU-only fps ceiling.
   cull-timing reps · `B` leaf boxes · `+`/`-` population (snaps to 200) ·
   `[`/`]` radius (snaps to 5) · world-size **stepper** (pow-2) · `Space`/`Esc`.
 
-Env: `CRITTERS3D_MAX_FRAMES=N` (smoke runs),
+Env: `CRITTERS3D_MAX_FRAMES=N` (smoke runs; also prints a one-line `STRESS`
+summary — mean fps / frame ms / cpu ms / CPU-vs-GPU-bound),
 `CRITTERS3D_RENDER=instanced|billboards|square|none`,
 `CRITTERS3D_STRUCTURE=binary|octree|projection` (initial index),
+`CRITTERS3D_POP=N` / `CRITTERS3D_WORLD=N` / `CRITTERS3D_FREEZE=1` (the
+instancing stress sweep — see `docs/THREE_D.md`: scales to 1M critters in one
+draw call, GPU upload-bound; the live demo is CPU-bound on the index update),
 `CRITTERS3D_COMBAT=1`, `CRITTERS3D_SEP=1`. The **headless** version measures
 `update` + sphere-cull cost under churn and (`--structure both`) compares the
 dynamic octree head-to-head against the binary tree on one deterministic run

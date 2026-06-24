@@ -215,6 +215,55 @@ left zombie nodes (98k arena nodes vs 3.6k live leaves at il=8). The
 free-list now reclaims merged-out slots, so the arena stabilises near the
 live count (~7.3k) — same fix as the 2D trees.
 
+## GPU instancing stress test (`critters3d` visual)
+
+How far does the raw-miniquad instanced renderer scale, and where does it
+become GPU-bound? Swept via `CRITTERS3D_POP` / `CRITTERS3D_WORLD` /
+`CRITTERS3D_RENDER` / `CRITTERS3D_MAX_FRAMES` (each run prints a one-line
+`STRESS` summary: mean fps, frame ms, cpu ms, bound). World 1024³, observe mode.
+
+**Live (sim running — per-frame `Tree3::update` of every critter):**
+
+| pop | instanced spheres | square billboards | NO RENDER (CPU ceiling) | bound |
+| ---: | ---: | ---: | ---: | --- |
+| 50k | 116 fps (8.5 ms) | 117 fps | 128 fps (7.8 ms) | CPU |
+| 100k | 51 fps (19.4 ms) | 51 fps | 55 fps (18.2 ms) | CPU |
+| 200k | 22 fps (46 ms) | 22 fps | 23 fps (43 ms) | CPU |
+
+**The live demo is CPU-bound through 200k+** — the per-frame index update is the
+ceiling (43 ms at 200k), and *all* the rendering of 200k instanced spheres adds
+only ~3 ms on top. Instancing is never the bottleneck while the sim runs; the
+render mode barely moves the fps (spheres ≈ square ≈ none). So "where does it
+become GPU-bound?" has a surprising answer for a dynamic scene: **it doesn't —
+the index maintenance dominates first.**
+
+**Frozen (`CRITTERS3D_FREEZE=1`, render-only — CPU≈0, pure GPU throughput):**
+
+| pop | spheres fps (ms) | square fps (ms) | none fps (ms) |
+| ---: | ---: | ---: | ---: |
+| 200k | 219 (4.6) | 383 (2.6) | 2791 (0.4) |
+| 500k | 90 (11.2) | 160 (6.2) | 1788 (0.6) |
+| 1M | 47 (21.4) | 72 (13.9) | 1024 (1.0) |
+
+Freezing the sim removes the CPU bottleneck and exposes the GPU breakdown:
+
+1. **Instance upload + transform dominates** (square billboards, 2 tris each, so
+   negligible vertex/fill): cost is **linear in instance count** — 2.6 ms at
+   200k → 13.9 ms at 1M (~5× for 5×), ≈ **14 ns/instance**. A single instanced
+   draw call eats 1M instances at ~72 fps.
+2. **Sphere geometry adds ~50%** on top (spheres vs square): +1.9 ms at 200k →
+   +7.5 ms at 1M, the per-instance vertex processing of the sphere mesh. Still
+   linear, so **vertex-bound, not fill-bound** — the critters are small on
+   screen, so overdraw/fill never becomes the limiter at these sizes.
+3. The `none` baseline (no draw, vsync off) is 1–2.8k fps — loop + present
+   overhead only.
+
+**Takeaway:** the instanced path scales to **1M critters in one draw call** (72
+fps frozen for square, 47 fps for spheres); the GPU is upload/transform bound,
+not fill bound. For the *live* dynamic demo the GPU has enormous headroom — the
+single-thread per-frame `update` is what caps it, so the next win is
+parallelising the index maintenance (rayon `update_many`), not the renderer.
+
 ## When the 1×1×1 voxel raster pays — crossover by shape cost
 
 The earlier sphere result (raster 0.7–0.8×, slower than analytic) was the

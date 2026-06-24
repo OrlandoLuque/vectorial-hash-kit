@@ -937,7 +937,9 @@ mod tests {
         let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
         let world = Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0);
         let mut tree = Tree3::<M>::new(world, 6);
-        let mut live: std::collections::HashMap<u32, Point3> = std::collections::HashMap::new();
+        // BTreeMap (not HashMap) so selection order is deterministic — the test
+        // must not depend on randomized hash iteration order.
+        let mut live: std::collections::BTreeMap<u32, Point3> = std::collections::BTreeMap::new();
         let mut next = 0u32;
         for _ in 0..1500 {
             let p = Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0);
@@ -958,7 +960,15 @@ mod tests {
                 tree.insert(M { id: next, p }); live.insert(next, p); next += 1;
             }
         }
-        assert!(tree.node_count() > tree.live_node_count(), "expected dead slots from churn");
+        // Force dead slots deterministically: remove ~40% (no inserts after, so
+        // the merge-freed slots stay in the free-list) — this guarantees the
+        // serializer's free-list path is exercised regardless of churn outcome.
+        let doomed: Vec<u32> = live.keys().copied().take(live.len() * 2 / 5).collect();
+        for id in doomed {
+            tree.remove(live[&id], |m| m.id == id);
+            live.remove(&id);
+        }
+        assert!(tree.node_count() > tree.live_node_count(), "expected dead slots from churn + removals");
 
         // Serialize → deserialize with a matching item codec (id + x,y,z).
         let mut buf = Vec::new();
