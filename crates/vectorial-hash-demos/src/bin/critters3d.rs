@@ -1002,7 +1002,7 @@ async fn main() {
         let frame_ms = if fps_display > 1.0 { 1000.0 / fps_display as f64 } else { cpu_ms_avg };
         let cpu_ceiling = if cpu_ms_avg > 0.0 { 1000.0 / cpu_ms_avg } else { 0.0 };
         let bound = if frame_ms > 0.0 && cpu_ms_avg >= 0.85 * frame_ms { "CPU-BOUND" } else { "GPU-bound" };
-        hud(134.0, format!("cpu ~{:.2} ms (sim {:.0}+build {:.0}+prep {:.0} us) -> CPU ceiling ~{:.0} fps -> {}", cpu_ms_avg, sim_us_avg, t_build_us, prep_us_avg, cpu_ceiling, bound));
+        hud(134.0, format!("cpu ~{:>6.2} ms (sim {:>6.0}+build {:>6.0}+prep {:>6.0} us) -> CPU ceiling ~{:>6.0} fps -> {}", cpu_ms_avg, sim_us_avg, t_build_us, prep_us_avg, cpu_ceiling, bound));
         hud(screen_height() - 18.0, "drag/zoom | +/-: pop | [ ]: radius | T: combat | R: sync | O: separation | V: fps cap | M: structure | G: render | C: reps | B: boxes | Space | Esc".to_string());
 
         // --- on-screen mouse controls (top-right panel; keys still work too) ---
