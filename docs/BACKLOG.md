@@ -16,9 +16,12 @@ reprioritise, or drop freely. Items graduate into the per-crate roadmaps
   when many are on screen at once.
 
 ## Index / algorithms
-- **`Octree3::update` (ascend-to-LCA)** — the octree has insert/remove/cull but
-  no dynamic relocation. Add `update` and compare the *dynamic* octree vs the
-  binary `Tree3` (mirrors the 2D update-strategy study).
+- ~~**`Octree3::update` (ascend-to-LCA)**~~ — **done.** `Octree3` now has the
+  same ascend-to-LCA `update` as `Tree3` (churn-tested), and
+  `critters3d_headless --structure both` compares the *dynamic* octree vs the
+  binary tree on one deterministic run (octree's update is ~5–15% faster; cull
+  ≈ equal; id sets identical). The live demo's `M` toggle keeps a persistent
+  octree too. See `THREE_D.md` § "Dynamic octree vs binary".
 - **Full 3-projection vs expensive narrowphase** — `THREE_D.md`'s open item:
   run the projection methods (not just 1-proj) against a many-faced
   `Polyhedron3` to find where the tight broadphase finally pays for itself.

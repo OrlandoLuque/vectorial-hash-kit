@@ -269,11 +269,49 @@ item_limit; in 3D the depth advantage compounds — three binary levels per
 octree level vs two quad levels per binary level in 2D — so the gap is
 wider.) Both remain exact vs brute force.
 
+### Dynamic octree vs binary (`update`, ascend-to-LCA)
+
+`Octree3` gained `update` — the same ascend-to-LCA relocation as
+`Tree3::update`, ported to the 8-way split (a churn test,
+`octree_cull_matches_brute_after_churn`, gates it against ground truth the
+way `Tree3`'s does). `critters3d_headless --structure both` now runs the
+**same deterministic simulation** against both indexes, times each
+separately, and cross-checks every vision cull for agreement. 20k critters
+moving in a 512³ cube, 60 vision culls/frame (r=36), seed 42:
+
+| item_limit | update bin / oct (µs/frame) | cull bin / oct (µs/cull) | agreement |
+| ---: | ---: | ---: | --- |
+| 8 | 3,097 / **2,650** (−14%) | 2.6 / 2.5 | 0 mismatches / 10.8k |
+| 16 | 2,628 / **2,474** (−6%) | 2.1 / 2.3 | 0 mismatches / 9k |
+| 64 | 2,060 / **1,833** (−11%) | 1.7 / 1.5 | 0 mismatches / 9k |
+
+**The dynamic octree's `update` is consistently faster than the binary
+tree's (~5–15%)** — same cause as the cull result: the octree is shallower,
+so a relocation ascends/descends fewer levels even though each level touches
+8 children instead of 2. Fewer levels wins. The cull numbers match the
+static bench (octree ≈ binary, within noise at this density), and the two
+structures returned **identical** id sets on every sampled cull across all
+item_limits.
+
+The `both`-mode numbers are not a cache-contention artifact: isolated
+single-structure runs (`--structure binary` and `--structure octree` in
+separate processes) reproduce them within noise — at item_limit 8, isolated
+update is 3,066 µs (binary) vs 2,645 µs (octree), matching the 3,097 / 2,650
+measured in one `both` run. The two index footprints are similar (binary
+~7.3k arena nodes / 3.6k leaves vs octree ~7.0k / 5.7k at il 8), so neither
+thrashes the other's cache enough to skew the comparison. So in 3D the 8-way split is a small, free win on both the cull
+and the dynamic-relocation paths — the binary tree stays the reference (it
+mirrors the primary 2D structure and needs less memory), but the octree is
+the faster option when memory is cheap. The live demo's `M` toggle now keeps
+a **persistent** octree (built on entry, `update` per frame) so this is
+visible interactively, not only headless.
+
 ## Still open
 - **Non-analytic 3D shapes** in the *projection* comparison: the
   static bench used a sphere (analytic); the polyhedron crossover above
   lives in the voxel-raster bench. Running the projection methods against a
   many-faced polyhedron would show where the 3-projection's tight broadphase
   finally pays (expensive narrowphase), worth a follow-up.
-- **Exact 3D `item_limit` optimum** and an octree dynamic (`update`) path —
-  `Octree3` has `insert`/`remove`/`cull`; `update` (LCA) is not wired yet.
+- **Exact 3D `item_limit` optimum** — both the binary and octree update/cull
+  curves keep improving with larger leaves through the range measured; the
+  precise optimum is unmeasured (the monotone trend is the finding).

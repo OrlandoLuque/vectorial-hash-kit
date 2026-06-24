@@ -119,6 +119,56 @@ impl<T: Positioned3> Octree3<T> {
         }
     }
 
+    /// Relocate via ascend-to-LCA — the 3D-binary [`crate::Tree3::update`]
+    /// strategy, ported to the 8-way split so the *dynamic* octree can be
+    /// measured against the binary tree (instead of a full per-frame rebuild).
+    /// Mutate in place; if the item leaves its leaf, ascend to the lowest
+    /// ancestor containing the new position and descend from there. Returns
+    /// `false` if not found or pushed out of the root.
+    pub fn update<F, M>(&mut self, old: Point3, predicate: F, mutator: M) -> bool
+    where F: Fn(&T) -> bool, M: FnOnce(&mut T) {
+        if !self.get(self.root).bbox.contains(old) { return false; }
+        let leaf = self.locate(old);
+        let idx = match self.get(leaf).items.iter().position(|it| predicate(it)) {
+            Some(i) => i, None => return false,
+        };
+        mutator(&mut self.get_mut(leaf).items[idx]);
+        let np = self.get(leaf).items[idx].position();
+        if self.get(leaf).bbox.contains(np) { return true; }
+        // ascend to LCA
+        let mut anc = self.get(leaf).parent;
+        let lca = loop {
+            match anc {
+                Some(a) if self.get(a).bbox.contains(np) => break a,
+                Some(a) => anc = self.get(a).parent,
+                None => { // out of bounds: drop + merge
+                    let _ = self.get_mut(leaf).items.remove(idx);
+                    self.try_merge_up(leaf);
+                    return false;
+                }
+            }
+        };
+        let item = self.get_mut(leaf).items.remove(idx);
+        let dest = self.locate_from(lca, np);
+        self.get_mut(dest).items.push(item);
+        if self.get(dest).items.len() > self.item_limit { self.divide(dest); }
+        self.try_merge_up(leaf);
+        true
+    }
+
+    fn locate_from(&self, start: ONodeId, p: Point3) -> ONodeId {
+        let mut cur = start;
+        loop {
+            match self.get(cur).children {
+                None => return cur,
+                Some(kids) => {
+                    cur = *kids.iter().find(|&&k| self.get(k).bbox.contains(p))
+                        .expect("octants tile the parent");
+                }
+            }
+        }
+    }
+
     pub fn remove<F: Fn(&T) -> bool>(&mut self, p: Point3, predicate: F) -> Option<T> {
         if !self.get(self.root).bbox.contains(p) { return None; }
         let leaf = self.locate(p);
@@ -227,6 +277,69 @@ mod tests {
                 .map(|p| (p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits())).collect();
             want.sort(); got.sort();
             assert_eq!(want, got, "octree cull != brute for sphere ({cx},{cy},{cz}) r={r}");
+        }
+    }
+
+    #[test]
+    fn octree_cull_matches_brute_after_churn() {
+        // Mirror of Tree3's churn test: build, churn with update/remove/insert,
+        // then verify the dynamic octree's cull still equals brute force and the
+        // item count tracks the ground truth. Exercises `update`'s ascend-to-LCA
+        // relocation and merge-up bookkeeping under heavy movement.
+        let mut x = 0x0C7_0EEFu64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+
+        #[derive(Clone, Copy)]
+        struct M { id: u32, p: Point3 }
+        impl Positioned3 for M { fn position(&self) -> Point3 { self.p } }
+
+        let world = Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0);
+        let mut tree = Octree3::<M>::new(world, 6);
+        let mut live: std::collections::HashMap<u32, Point3> = std::collections::HashMap::new();
+        let mut next_id = 0u32;
+
+        let rp = |rng: &mut dyn FnMut() -> f64| Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0);
+
+        for _ in 0..2000 {
+            let p = rp(&mut rng);
+            tree.insert(M { id: next_id, p });
+            live.insert(next_id, p);
+            next_id += 1;
+        }
+
+        for _ in 0..6000 {
+            let roll = rng();
+            if roll < 0.6 && !live.is_empty() {
+                let ids: Vec<u32> = live.keys().copied().collect();
+                let id = ids[(rng() * ids.len() as f64) as usize % ids.len()];
+                let old = live[&id];
+                let np = rp(&mut rng);
+                let ok = tree.update(old, |m| m.id == id, |m| m.p = np);
+                if ok { live.insert(id, np); } else { live.remove(&id); }
+            } else if roll < 0.8 && !live.is_empty() {
+                let ids: Vec<u32> = live.keys().copied().collect();
+                let id = ids[(rng() * ids.len() as f64) as usize % ids.len()];
+                let old = live[&id];
+                tree.remove(old, |m| m.id == id);
+                live.remove(&id);
+            } else {
+                let p = rp(&mut rng);
+                tree.insert(M { id: next_id, p });
+                live.insert(next_id, p);
+                next_id += 1;
+            }
+        }
+
+        assert_eq!(tree.item_count(), live.len(), "octree item count drifted after churn");
+
+        for (cx, cy, cz, r) in [(128.0,128.0,128.0,30.0),(60.0,200.0,90.0,50.0),(10.0,10.0,10.0,80.0)] {
+            let sphere = Sphere3::new(cx, cy, cz, r).with_raster();
+            let mut want: Vec<u32> = live.iter()
+                .filter(|(_, p)| { let dx=p.x-cx; let dy=p.y-cy; let dz=p.z-cz; dx*dx+dy*dy+dz*dz <= r*r })
+                .map(|(id, _)| *id).collect();
+            let mut got: Vec<u32> = tree.cull(&sphere).iter().map(|m| m.id).collect();
+            want.sort(); got.sort();
+            assert_eq!(want, got, "post-churn octree cull != brute for sphere ({cx},{cy},{cz}) r={r}");
         }
     }
 }

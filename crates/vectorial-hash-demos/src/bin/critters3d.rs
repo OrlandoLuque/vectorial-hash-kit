@@ -34,6 +34,7 @@
 //!
 //! Env: CRITTERS3D_MAX_FRAMES=N exits after N frames (smoke testing);
 //! CRITTERS3D_RENDER=instanced|billboards|square|none initial render path;
+//! CRITTERS3D_STRUCTURE=binary|octree|projection initial index structure;
 //! CRITTERS3D_COMBAT=1 starts in combat; CRITTERS3D_SEP=1 starts with separation.
 
 use std::collections::VecDeque;
@@ -227,6 +228,13 @@ impl Structure {
     }
     fn label(self) -> &'static str {
         match self { Structure::Binary3 => "Tree3 (binary-3D)", Structure::Octree => "Octree3 (8-way)", Structure::Projection => "projection (1×2D + z-reject)" }
+    }
+    fn from_env() -> Self {
+        match std::env::var("CRITTERS3D_STRUCTURE").ok().as_deref() {
+            Some("octree") => Structure::Octree,
+            Some("projection") => Structure::Projection,
+            _ => Structure::Binary3,
+        }
     }
 }
 
@@ -608,6 +616,17 @@ async fn main() {
         tree_pos.push(p);
     }
 
+    // Persistent octree, kept only while the `M` toggle is on Octree (the
+    // dynamic-octree-vs-Tree3 comparison). Built lazily on entry, then each
+    // critter is moved in place with `update` (ascend-to-LCA) like the binary
+    // tree — so the HUD shows the octree's *update* cost, not a full rebuild.
+    // Dropped when the mode is left (rebuilds fresh on re-entry); rebuilt when
+    // the population or world changes. `octree_pos` mirrors `tree_pos`.
+    let mut octree: Option<Octree3<C3>> = None;
+    let mut octree_pos: Vec<Point3> = Vec::new();
+    let mut octree_pop: usize = 0;
+    let mut octree_world: f32 = world;
+
     // Camera orbit state.
     let mut yaw: f32 = 0.7;
     let mut pitch: f32 = 0.5;
@@ -617,7 +636,7 @@ async fn main() {
     let mut vision_r: f32 = 40.0;
     let mut paused = false;
     let mut show_boxes = false;
-    let mut structure = Structure::Binary3;
+    let mut structure = Structure::from_env();
     let mut render_mode = RenderMode::from_env();
     let cull_rep_steps = [1usize, 50, 200, 1000];
     let mut cull_rep_idx = 0usize;
@@ -980,6 +999,13 @@ async fn main() {
         let t_cull_us: f64;
         let mut frame_attacks = 0usize; // combat: predators that attacked this frame
 
+        // Drop the persistent octree whenever we're not actively in
+        // Observe+Octree, so re-entering the mode rebuilds it fresh (it would
+        // otherwise hold stale positions from when the mode was last left).
+        if !(sim_mode == SimMode::Observe && structure == Structure::Octree) {
+            octree = None;
+        }
+
         if sim_mode == SimMode::Observe {
         match structure {
             Structure::Binary3 => {
@@ -997,13 +1023,44 @@ async fn main() {
                 stat_line = format!("Tree3 persistent/update: {:>6} leaves, {:>6} arena (item_limit {})", tree.leaf_count(), tree.node_count(), ITEM_LIMIT);
             }
             Structure::Octree => {
-                // Comparison structure — rebuilt each frame (no persistent update).
-                let tb = Instant::now();
-                let mut t = Octree3::<C3>::new(world_aabb(world), ITEM_LIMIT);
-                for (i, c) in critters.iter().enumerate() {
-                    t.insert(C3 { id: i as u32, p: pt3(c) });
+                // Persistent octree with dynamic relocation (ascend-to-LCA),
+                // mirroring the binary Tree3 path: built once on entry, then
+                // each critter moved in place via `update`. Rebuilt only when
+                // the population or world changes (rare, user-driven), so the
+                // steady-state cost reported is the *update* cost — the dynamic
+                // octree the backlog asked to measure against Tree3.
+                let stale = match &octree {
+                    None => true,
+                    Some(_) => octree_pop != critters.len() || (octree_world - world).abs() > 0.5,
+                };
+                if stale {
+                    let tb = Instant::now();
+                    let mut t = Octree3::<C3>::new(world_aabb(world), ITEM_LIMIT);
+                    octree_pos.clear();
+                    for (i, c) in critters.iter().enumerate() {
+                        let p = pt3(c);
+                        t.insert(C3 { id: i as u32, p });
+                        octree_pos.push(p);
+                    }
+                    t_build_us = tb.elapsed().as_secs_f64() * 1e6;
+                    octree = Some(t);
+                    octree_pop = critters.len();
+                    octree_world = world;
+                } else {
+                    // Move each critter in place (only when the sim advanced),
+                    // exactly like the binary tree's per-frame sync.
+                    let ts = Instant::now();
+                    if advance {
+                        let t = octree.as_mut().unwrap();
+                        for i in 0..critters.len() {
+                            let np = pt3(&critters[i]);
+                            t.update(octree_pos[i], |c| c.id == i as u32, |c| c.p = np);
+                            octree_pos[i] = np;
+                        }
+                    }
+                    t_build_us = ts.elapsed().as_secs_f64() * 1e6;
                 }
-                t_build_us = tb.elapsed().as_secs_f64() * 1e6;
+                let t = octree.as_ref().unwrap();
                 let tc = Instant::now();
                 for rep in 0..cull_reps {
                     let sphere = Sphere3::new(ox + rep as f64 * 0.01, oy, oz, r);
@@ -1011,9 +1068,24 @@ async fn main() {
                     if rep == 0 { for c in hits { lit[c.id as usize] = true; } }
                 }
                 t_cull_us = tc.elapsed().as_secs_f64() * 1e6 / cull_reps as f64;
+                // Self-check the dynamic octree's cull against brute force (the
+                // top-level VERIFY only covers the binary tree, synced earlier).
+                if std::env::var("CRITTERS3D_VERIFY").is_ok() {
+                    let s = Sphere3::new(ox, oy, oz, r);
+                    let mut got: Vec<u32> = t.cull(&s).iter().map(|c| c.id).collect();
+                    let mut want: Vec<u32> = (0..critters.len() as u32).filter(|&i| {
+                        let c = &critters[i as usize];
+                        let (dx, dy, dz) = (c.pos.x as f64 - ox, c.pos.y as f64 - oy, c.pos.z as f64 - oz);
+                        dx * dx + dy * dy + dz * dz <= r2
+                    }).collect();
+                    got.sort_unstable(); want.sort_unstable();
+                    if got != want {
+                        eprintln!("VERIFY octree mismatch frame {frame}: octree {} vs brute {} (pop {})", got.len(), want.len(), critters.len());
+                    }
+                }
                 if rec || show_boxes { t.visit_leaves(|l| boxes.push(aabb_box(&l.bbox))); }
                 cand_n = None;
-                stat_line = format!("Octree3 rebuilt/frame: {:>6} leaves, {:>6} arena (item_limit {})", t.leaf_count(), t.node_count(), ITEM_LIMIT);
+                stat_line = format!("Octree3 persistent/update: {:>6} leaves, {:>6} arena (item_limit {})", t.leaf_count(), t.node_count(), ITEM_LIMIT);
             }
             Structure::Projection => {
                 // Author's variant: index the xy projection in a 2D Tree, cull
@@ -1278,7 +1350,7 @@ async fn main() {
             sim_mode = match sim_mode { SimMode::Observe => SimMode::Combat, SimMode::Combat => SimMode::Observe };
         }
         if panel.button(&format!("structure: {} [M]", structure.label()),
-            "Index used for the culls:\nTree3 (binary, persistent + update),\nOctree3 (8-way, rebuilt each frame),\nprojection (one 2D tree on xy + z-reject).") { structure = structure.next(); }
+            "Index used for the culls:\nTree3 (binary, persistent + update),\nOctree3 (8-way, persistent + update),\nprojection (one 2D tree on xy + z-reject).") { structure = structure.next(); }
         if panel.button(&format!("render: {} [G]", render_mode.label()),
             "How critters are drawn:\ninstanced spheres / round billboards /\nsquare billboards (fastest) /\nNO RENDER (CPU only, to read the ceiling).") { render_mode = render_mode.next(); }
         panel.separator();

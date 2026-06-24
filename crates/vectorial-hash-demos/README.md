@@ -78,7 +78,7 @@ The **"tuning (live)" panel** adjusts everything while the simulation runs: the 
 ```bash
 cargo run -p vectorial-hash-demos --bin critters3d --release            # visual (macroquad 3D)
 cargo run -p vectorial-hash-demos --bin critters3d_headless --release \  # statistics
-    -- --pop 20000 --item-limit 64 --frames 240 --vision 100 --seed 42
+    -- --structure both --pop 20000 --item-limit 64 --frames 240 --vision 100 --seed 42
 ```
 
 The 3D analogue. The index is a **persistent** `Tree3` (binary-split 3D tree,
@@ -102,7 +102,9 @@ hover-help box) and shown live in **time-series graphs** (fps / cpu ms / cull
 reports a CPU-bound vs GPU-bound verdict and the CPU-only fps ceiling.
 
 - `M` — **index structure**: persistent `Tree3` (update) / `Octree3` (8-way,
-  rebuilt) / projection (one 2D `Tree` on xy + z-reject). All exact.
+  also persistent + `update`) / projection (one 2D `Tree` on xy + z-reject).
+  All exact. Both trees relocate critters in place each frame (ascend-to-LCA);
+  the octree is built on entry to the mode and updated thereafter.
 - `G` — **render path**: GPU-instanced spheres / round billboards / square
   billboards (fastest) / NO RENDER (CPU only, to read the CPU's fps ceiling).
   The instanced paths (raw miniquad, `src/instanced3d.rs`) draw all critters
@@ -113,10 +115,13 @@ reports a CPU-bound vs GPU-bound verdict and the CPU-only fps ceiling.
   `[`/`]` radius (snaps to 5) · world-size **stepper** (pow-2) · `Space`/`Esc`.
 
 Env: `CRITTERS3D_MAX_FRAMES=N` (smoke runs),
-`CRITTERS3D_RENDER=instanced|billboards|square|none`, `CRITTERS3D_COMBAT=1`,
-`CRITTERS3D_SEP=1`. The **headless** version measures `update` + sphere-cull
-cost under churn — see `docs/THREE_D.md` for the true-3D-tree vs
-projection-indexing comparison and the octree-vs-binary result.
+`CRITTERS3D_RENDER=instanced|billboards|square|none`,
+`CRITTERS3D_STRUCTURE=binary|octree|projection` (initial index),
+`CRITTERS3D_COMBAT=1`, `CRITTERS3D_SEP=1`. The **headless** version measures
+`update` + sphere-cull cost under churn and (`--structure both`) compares the
+dynamic octree head-to-head against the binary tree on one deterministic run
+— see `docs/THREE_D.md` for the true-3D-tree vs projection-indexing comparison
+and the octree-vs-binary result (static cull + dynamic `update`).
 
 ## Build & run
 
