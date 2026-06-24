@@ -282,7 +282,7 @@ impl Panel {
     /// `[-] label: value bar [+]` — `step` snaps to multiples, drag the bar to
     /// set, **right-click to type the value** (`id` identifies this slider; the
     /// main loop captures the keystrokes into `edit_buf` and applies on Enter).
-    fn slider(&mut self, label: &str, min: f32, max: f32, step: f32, val: &mut f32, id: u8, editing: &mut Option<u8>, edit_buf: &mut String, help: &'static str) {
+    fn slider(&mut self, label: &str, min: f32, max: f32, step: f32, val: &mut f32, id: u8, editing: &mut Option<u8>, edit_buf: &mut String, icon: Option<Color>, help: &'static str) {
         let (ry, rh, bw) = (self.cur, self.row - 5.0, 22.0);
         let (mx0, px0) = (self.x + 6.0, self.x + self.w - 6.0 - bw);
         let bx = mx0 + bw + 4.0;
@@ -296,8 +296,15 @@ impl Panel {
         Self::cell(mx0, ry, bw, rh, hov_m && !is_editing, "-", 8.0);
         Self::cell(px0, ry, bw, rh, hov_p && !is_editing, "+", 7.0);
         draw_rectangle(bx, ry, bar_w, rh, Color::new(0.14, 0.16, 0.22, 0.9));
+        // Optional kind icon (a coloured dot) + left text offset for it.
+        let tx = if let Some(c) = icon {
+            draw_circle(bx + 9.0, ry + rh * 0.5, 5.0, c);
+            18.0
+        } else {
+            6.0
+        };
         if is_editing {
-            draw_text(&format!("{}: {}_", label, edit_buf), bx + 6.0, ry + rh * 0.72, 16.0, Color::new(1.0, 0.9, 0.4, 1.0));
+            draw_text(&format!("{}: {}_", label, edit_buf), bx + tx, ry + rh * 0.72, 16.0, Color::new(1.0, 0.9, 0.4, 1.0));
         } else {
             if hov_m && self.pressed { *val = (((*val / step).ceil() - 1.0) * step).max(min); }
             if hov_p && self.pressed { *val = (((*val / step).floor() + 1.0) * step).min(max); }
@@ -305,7 +312,7 @@ impl Panel {
             if hov_b && self.rpressed { *editing = Some(id); *edit_buf = format!("{:.0}", *val); } // start keyboard edit
             let frac = ((*val - min) / (max - min)).clamp(0.0, 1.0);
             draw_rectangle(bx, ry, bar_w * frac, rh, Color::new(0.28, 0.5, 0.7, 0.9));
-            draw_text(&format!("{}: {:.0}", label, *val), bx + 6.0, ry + rh * 0.72, 16.0, Color::new(0.92, 0.95, 1.0, 1.0));
+            draw_text(&format!("{}: {:.0}", label, *val), bx + tx, ry + rh * 0.72, 16.0, Color::new(0.92, 0.95, 1.0, 1.0));
         }
         if hov_m || hov_p || hov_b { self.help = Some(help); }
         self.cur += self.row;
@@ -557,7 +564,10 @@ async fn main() {
     let mut prev_random = random_attacks; // to reseed cooldowns when this flips
     let mut separation = std::env::var("CRITTERS3D_SEP").is_ok(); // push critters apart (heavy)
     let mut fps_cap = false; // V: cap to the monitor refresh so the GPU isn't pegged
-    let mut pop_f = critters.len() as f32; // target population (driven by +/- and the slider)
+    // Target population per kind (Drifter / Hunter / Pulsar), driven by +/- and
+    // the per-kind panel sliders. The reconcile matches the total and rebalances
+    // kinds to these counts.
+    let mut pop_kind: [f32; 3] = { let n = (critters.len() / 3) as f32; [n, n, n] };
     let mut attack_r: f32 = 22.0;
     let mut attacks: Vec<Attack> = Vec::new();
     let mut bursts: Vec<(Vec3, f32)> = Vec::new(); // kill markers (pos, age)
@@ -643,8 +653,8 @@ async fn main() {
             if is_key_pressed(KeyCode::Enter) || is_key_pressed(KeyCode::KpEnter) {
                 if let Ok(v) = edit_buf.parse::<f32>() {
                     match editing {
-                        Some(0) => pop_f = v.clamp(0.0, 80000.0),
-                        Some(1) => match sim_mode {
+                        Some(k @ 0..=2) => pop_kind[k as usize] = v.clamp(0.0, 30000.0),
+                        Some(3) => match sim_mode {
                             SimMode::Observe => vision_r = v.clamp(6.0, world),
                             SimMode::Combat => attack_r = v.clamp(4.0, world * 0.5),
                         },
@@ -676,13 +686,13 @@ async fn main() {
         );
         // +/- snap to the next/previous multiple of 200 (so a mouse-dragged
         // slider value like 3455 lands back on a round number).
-        if add { pop_f = (((pop_f / 200.0).floor() + 1.0) * 200.0).min(80000.0); }
+        if add { for k in 0..3 { pop_kind[k] = (((pop_kind[k] / 100.0).floor() + 1.0) * 100.0).min(30000.0); } }
         let sub = sub_rep.fires(
             is_key_pressed(KeyCode::Minus) || is_key_pressed(KeyCode::KpSubtract),
             is_key_down(KeyCode::Minus) || is_key_down(KeyCode::KpSubtract),
             dt,
         );
-        if sub { pop_f = (((pop_f / 200.0).ceil() - 1.0) * 200.0).max(0.0); }
+        if sub { for k in 0..3 { pop_kind[k] = (((pop_kind[k] / 100.0).ceil() - 1.0) * 100.0).max(0.0); } }
         // [ / ] step the radius (vision in observe, attack in combat) in
         // multiples of 5 (snapping off-grid slider values), hold to repeat.
         const R_STEP: f32 = 5.0;
@@ -716,11 +726,18 @@ async fn main() {
         step_request = false;
         let advance = scrub == 0 && (!paused || step_now);
 
-        // Reconcile population (and the index) to the target — only while the sim
-        // advances (frozen during pause / replay).
-        let target = pop_f.round().max(0.0) as usize;
+        // Reconcile population to the per-kind targets — only while the sim
+        // advances (frozen during pause / replay). Match the TOTAL by
+        // spawning/removing at the end (keeps id == index), then rebalance kinds
+        // by reassigning surplus kinds to deficient ones (no index churn).
+        let want = [
+            pop_kind[0].round().max(0.0) as usize,
+            pop_kind[1].round().max(0.0) as usize,
+            pop_kind[2].round().max(0.0) as usize,
+        ];
+        let total: usize = want.iter().sum();
         if advance {
-            while critters.len() < target {
+            while critters.len() < total {
                 let id = critters.len() as u32;
                 let c = spawn(&mut rng, (id % 3) as u8, world);
                 let p = pt3(&c);
@@ -728,11 +745,23 @@ async fn main() {
                 tree_pos.push(p);
                 critters.push(c);
             }
-            while critters.len() > target {
+            while critters.len() > total {
                 critters.pop();
                 let i = critters.len();
                 tree.remove(tree_pos[i], |c| c.id == i as u32);
                 tree_pos.pop();
+            }
+            let mut have = [0usize; 3];
+            for c in &critters { have[c.kind as usize] += 1; }
+            for c in critters.iter_mut() {
+                let k = c.kind as usize;
+                if have[k] > want[k] {
+                    if let Some(u) = (0..3).find(|&u| have[u] < want[u]) {
+                        have[k] -= 1;
+                        have[u] += 1;
+                        c.kind = u as u8;
+                    }
+                }
             }
         }
 
@@ -1192,12 +1221,16 @@ async fn main() {
         if panel.button(&format!("cull reps: {} [C]", cull_reps),
             "Repeat the timed cull N times for a stable\nper-cull microsecond reading (one cull is\ntoo fast to time on its own).") { cull_rep_idx = (cull_rep_idx + 1) % cull_rep_steps.len(); }
         panel.separator();
-        panel.slider("population", 0.0, 80000.0, 200.0, &mut pop_f, 0, &mut editing, &mut edit_buf,
-            "Number of critters. -/+ step by 200, drag\nto set, right-click to type a number.");
+        panel.slider("Drifter", 0.0, 30000.0, 100.0, &mut pop_kind[0], 0, &mut editing, &mut edit_buf, Some(kind_color(0, false)),
+            "How many Drifters (random-direction drop).\n-/+, drag, or right-click to type.");
+        panel.slider("Hunter", 0.0, 30000.0, 100.0, &mut pop_kind[1], 1, &mut editing, &mut edit_buf, Some(kind_color(1, false)),
+            "How many Hunters (chase + aimed drop).");
+        panel.slider("Pulsar", 0.0, 30000.0, 100.0, &mut pop_kind[2], 2, &mut editing, &mut edit_buf, Some(kind_color(2, false)),
+            "How many Pulsars (spin + sphere blast).");
         match sim_mode {
-            SimMode::Observe => panel.slider("vision r", 6.0, world, 5.0, &mut vision_r, 1, &mut editing, &mut edit_buf,
+            SimMode::Observe => panel.slider("vision r", 6.0, world, 5.0, &mut vision_r, 3, &mut editing, &mut edit_buf, None,
                 "Radius of the centre vision sphere.\nRight-click to type a number."),
-            SimMode::Combat => panel.slider("attack r", 4.0, world * 0.5, 5.0, &mut attack_r, 1, &mut editing, &mut edit_buf,
+            SimMode::Combat => panel.slider("attack r", 4.0, world * 0.5, 5.0, &mut attack_r, 3, &mut editing, &mut edit_buf, None,
                 "Base size of the attacks.\nRight-click to type a number."),
         }
         panel.stepper("world size", &SIZE_STEPS, &mut world,
@@ -1229,7 +1262,7 @@ async fn main() {
         draw_graph(ui_x, gy, UI_W, gh, "cpu ms", &g_cpu, Color::new(1.0, 0.82, 0.35, 1.0));
         gy += gh + 4.0;
         draw_graph(ui_x, gy, UI_W, gh, "cull us", &g_cull, Color::new(0.4, 0.82, 1.0, 1.0));
-        pop_f = pop_f.round().clamp(0.0, 80000.0);
+        for k in 0..3 { pop_kind[k] = pop_kind[k].round().clamp(0.0, 30000.0); }
 
         // World resized (stepper): re-bound the critters and rebuild the index
         // with the new cube. Rare and user-driven, so a full rebuild is fine.
