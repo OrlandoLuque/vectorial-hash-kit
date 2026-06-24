@@ -306,6 +306,48 @@ the faster option when memory is cheap. The live demo's `M` toggle now keeps
 a **persistent** octree (built on entry, `update` per frame) so this is
 visible interactively, not only headless.
 
+## Morton / Z-order linear grid (the pointer-free fourth structure)
+
+`MortonGrid3` (`src/morton3.rs`) drops the pointers entirely. Quantise each
+point to an integer cell `(ix,iy,iz)`, interleave the cell's bits into a single
+64-bit **Morton code** (the Z-order curve), and bucket points by code in a hash
+map. The spatial hierarchy is implicit in the bit layout — no nodes, no splits,
+no merges, no rebalancing. A cull visits only the cells overlapping the query
+bbox, with the same green/white/yellow short-circuit per cell. One **fixed
+resolution** (`2^levels` cells/axis), so the cell size is the only knob; the
+bench sets it ≈ the mean query radius (`levels_for_cell_size`).
+
+50k points in 512³, 300 queries, all methods EXACT vs brute force:
+
+| distribution / query | binary | octree | **morton grid** | 1-proj +z |
+| --- | ---: | ---: | ---: | ---: |
+| uniform, r 5–20 (cell 16, il 8) | 11.4× | 12.6× | **14.5×** | 9.1× |
+| uniform, r 10–80 (cell 64, il 8) | 1.4× | 1.3× | **2.1×** | 1.3× |
+| stacked, r 5–20 (cell 16, il 48) | 13.3× | **17.4×** | 15.5× | 16.0× |
+
+(× = speedup over brute force; higher is better.)
+
+**On uniform data the pointer-free grid is the fastest index** — 14.5× at
+realistic small-sphere selectivity, beating both trees — *and* has the cheapest
+build (4 ms vs the binary tree's 11 ms: bucket-and-go, no rebalancing). The win
+is structural: when the cell is sized to the query radius, a query touches a
+handful of cells via O(1) hash lookups, each holding ~2 points — no descent
+through ~15 tree levels of pointer-chasing. The trees' adaptivity is wasted
+effort on uniform data where one resolution already fits.
+
+**The single fixed resolution is the catch.** On the *stacked* distribution
+(dense columns — non-uniform density) the adaptive octree retakes the lead
+(17.4× vs the grid's 15.5×): the grid can't subdivide the hot columns the way
+the trees do. And a query much larger or smaller than the chosen cell degrades
+it (too-fine → many empty cells visited; too-coarse → many points per cell to
+test). So: **grid for uniform-ish data with a known query scale (fastest, cheap
+build, trivial code); a tree when density varies or query sizes span a wide
+range (adaptive depth earns its keep).** A multi-level linear octree (codes at
+mixed depths) would recover the adaptivity, at the cost of the grid's
+simplicity — noted as a possible follow-up. `MortonGrid3` is build-and-cull
+only (no `update`); for the dynamic critters workload it would be rebuilt or
+need an `update`, unmeasured here.
+
 ## Still open
 - **Non-analytic 3D shapes** in the *projection* comparison: the
   static bench used a sphere (analytic); the polyhedron crossover above

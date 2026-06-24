@@ -47,9 +47,14 @@ to triage later.
 - **Full 3-projection vs expensive narrowphase** — `THREE_D.md`'s open item:
   run the projection methods (not just 1-proj) against a many-faced
   `Polyhedron3` to find where the tight broadphase finally pays for itself.
-- **Morton / Z-order keys (linear octree)** *(queued tonight, #1)* — a fourth
-  structure to compare against `Tree3` / `Octree3` / projection: hashed/sorted
-  Morton codes. Added to `tree3d_bench`, gated against brute force.
+- ~~**Morton / Z-order keys (linear octree)**~~ — **done.** `MortonGrid3`
+  (pointer-free Z-order hash grid) added + churn-free brute-force test, wired
+  into `tree3d_bench` as the fourth structure. Fastest index on uniform data
+  (14.5× vs brute, beating both trees) with the cheapest build; single fixed
+  resolution is the catch (octree wins on stacked/non-uniform). See `THREE_D.md`
+  § "Morton / Z-order linear grid". Follow-up ideas: a *multi-level* linear
+  octree (mixed-depth codes) to recover adaptivity, and an `update` path for
+  the dynamic workload.
 - **Multi-query cull + multithreading** — cull many spheres at once; parallel
   build/cull (rayon) for large N.
 - **k-NN queries** *(queued tonight, #2)* — nearest-neighbour (best-first with a

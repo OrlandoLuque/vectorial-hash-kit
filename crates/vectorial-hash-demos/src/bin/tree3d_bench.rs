@@ -6,31 +6,40 @@
 //!     --pop 50000 --item-limit 8 --queries 200 --seed 42
 //! ```
 //!
-//! Two ways to answer "which 3D points lie inside this sphere?":
+//! Four families to answer "which 3D points lie inside this sphere?":
 //!
 //! 1. **True 3D tree** (`Tree3`): binary split in 3D, sphere classified
 //!    against each node box (green/white/yellow), 1×1×1 voxel raster at
 //!    leaves. Exact, but a real 3D template bank would be N³ in memory
 //!    (here the sphere is analytic, so no bank is needed — best case for
 //!    the 3D tree).
-//! 2. **Projection indexing** (author's idea): three 2D trees on the (x,y),
+//! 2. **Octree** (`Octree3`): the 8-way 2×2×2 split — the same Shape3
+//!    machinery, one level doing the work of three binary levels.
+//! 3. **Morton / Z-order grid** (`MortonGrid3`): pointer-free. Quantise each
+//!    point to an integer cell, pack the cell's bits into a Z-order code,
+//!    bucket by code in a hash. A cull visits only the cells overlapping the
+//!    query bbox (green/white/yellow per cell). One fixed resolution, no
+//!    adaptive depth — the cell size is the whole knob (set here ≈ the mean
+//!    query radius).
+//! 4. **Projection indexing** (author's idea): three 2D trees on the (x,y),
 //!    (x,z), (y,z) projections. Cull each with the sphere's circular
 //!    shadow, intersect the candidate id sets, then run the exact 3D test
 //!    on survivors. Reuses the 2D machinery, no N³ memory — but the
 //!    intersection is a *broadphase* (a superset; the corners of the
 //!    three-cylinder intersection that stick out of the sphere are false
-//!    positives that the exact test drops).
+//!    positives that the exact test drops). A 1-projection variant culls one
+//!    plane and exact-tests its shadow.
 //!
 //! Reports: ns/query for each, and the projection's false-positive ratio
 //! (candidates after intersection ÷ true hits) which drives its exact-test
-//! cost. Correctness of both is gated against brute force.
+//! cost. Correctness of every method is gated against brute force.
 
 use std::collections::HashSet;
 use std::time::Instant;
 
 use vectorial_hash::{
-    Aabb, CellState, Octree3, Point, Point3, Positioned, Positioned3, QuadTree, Rect, Sphere3,
-    Tree, Tree3, VoxelRaster,
+    Aabb, CellState, MortonGrid3, Octree3, Point, Point3, Positioned, Positioned3, QuadTree, Rect,
+    Sphere3, Tree, Tree3, VoxelRaster,
 };
 
 const WORLD: f64 = 512.0;
@@ -148,6 +157,18 @@ fn main() {
     let mut octree = Octree3::<I3>::new(Aabb::new(0.0, 0.0, 0.0, WORLD, WORLD, WORLD), args.item_limit);
     for it in &items { octree.insert(*it); }
 
+    // Morton / Z-order linear grid (the pointer-free fourth structure). Pick the
+    // cell ≈ the mean query radius — coarse enough that a query touches few
+    // cells, fine enough that each cell holds few points. The grid has no
+    // adaptive depth, so this single resolution is the whole knob.
+    let world_aabb = Aabb::new(0.0, 0.0, 0.0, WORLD, WORLD, WORLD);
+    let morton_target = (args.rmin + args.rmax) * 0.5;
+    let morton_levels = MortonGrid3::<I3>::levels_for_cell_size(world_aabb, morton_target);
+    let t_buildm = Instant::now();
+    let mut morton = MortonGrid3::<I3>::new(world_aabb, morton_levels);
+    for it in &items { morton.insert(*it); }
+    let buildm_ms = t_buildm.elapsed().as_secs_f64() * 1e3;
+
     let t_buildp = Instant::now();
     let mut tree_xy = Tree::<I2>::new(Rect::new(0.0, 0.0, WORLD, WORLD), args.item_limit);
     let mut tree_xz = Tree::<I2>::new(Rect::new(0.0, 0.0, WORLD, WORLD), args.item_limit);
@@ -167,12 +188,17 @@ fn main() {
     println!("build: 3D tree {:.1} ms ({} nodes) | octree ({} nodes) | 3×2D trees {:.1} ms ({}+{}+{} nodes)",
         build3_ms, tree3.node_count(), octree.node_count(), buildp_ms,
         tree_xy.node_count(), tree_xz.node_count(), tree_yz.node_count());
+    println!("morton grid: {:.1} ms | levels {} ({} cells/axis, cell {:.1}) | {} non-empty cells, {:.2} items/cell",
+        buildm_ms, morton_levels, 1u32 << morton_levels, WORLD / (1u64 << morton_levels) as f64,
+        morton.cell_count(), morton.item_count() as f64 / morton.cell_count().max(1) as f64);
 
     // --- queries ---
     let mut s_brute = Stats::new();
     let mut s_tree3 = Stats::new();
     let mut s_octree = Stats::new();
     let mut mismatches_o = 0u64;
+    let mut s_morton = Stats::new();
+    let mut mismatches_m = 0u64;
     let mut s_proj = Stats::new();
     let mut s_proj_broad = Stats::new(); // projection broadphase only (before exact filter)
     let mut s_proj1 = Stats::new();      // single-projection + exact filter
@@ -219,6 +245,12 @@ fn main() {
         let hits_o: HashSet<u32> = octree.cull(&sphere).iter().map(|it| it.id).collect();
         s_octree.push(t.elapsed().as_secs_f64() * 1e9);
         if hits_o != brute_set { mismatches_o += 1; }
+
+        // Morton / Z-order linear grid on the same sphere.
+        let t = Instant::now();
+        let hits_m: HashSet<u32> = morton.cull(&sphere).iter().map(|it| it.id).collect();
+        s_morton.push(t.elapsed().as_secs_f64() * 1e9);
+        if hits_m != brute_set { mismatches_m += 1; }
 
         // Projection: cull 3 circles, intersect, exact 3D filter.
         let t = Instant::now();
@@ -308,8 +340,8 @@ fn main() {
         args.queries, total_true, total_true as f64 / args.queries as f64);
     println!("broadphase candidate/true ratio: 3-projection {:.2}x | 1-projection {:.2}x",
         fp_ratio, fp_ratio1);
-    let allok = mismatches3 == 0 && mismatches_o == 0 && mismatchesp == 0 && mismatchesp1 == 0
-        && mismatchesp1z == 0 && mismatchesp1r == 0 && mismatchesp1q == 0;
+    let allok = mismatches3 == 0 && mismatches_o == 0 && mismatches_m == 0 && mismatchesp == 0
+        && mismatchesp1 == 0 && mismatchesp1z == 0 && mismatchesp1r == 0 && mismatchesp1q == 0;
     println!("correctness vs brute: all methods {}", if allok { "EXACT" } else { "MISMATCH!" });
 
     let line = |name: &str, s: &Stats| {
@@ -320,6 +352,7 @@ fn main() {
     line("brute force", &s_brute);
     line("true 3D tree (binary)", &s_tree3);
     line("octree (8-way)", &s_octree);
+    line("morton grid (Z-order hash)", &s_morton);
     line("3-projection (intersect+exact)", &s_proj);
     line("1-projection (+exact)", &s_proj1);
     line("1-projection +z-reject +exact", &s_proj1z);
