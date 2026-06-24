@@ -261,6 +261,10 @@ async fn main() {
     // Rolling average of the per-cull time (a single frame's measurement is
     // noisy — this smooths it into a real average without rounding to ~1 µs).
     let mut cull_us_avg = 0.0f64;
+    // Rolling CPU-phase timings (ms total, µs for sim/prep) for the bound check.
+    let mut cpu_ms_avg = 0.0f64;
+    let mut sim_us_avg = 0.0f64;
+    let mut prep_us_avg = 0.0f64;
 
     loop {
         let dt = (get_frame_time()).min(1.0 / 30.0);
@@ -273,6 +277,11 @@ async fn main() {
             fps_accum_t = 0.0;
             fps_accum_n = 0;
         }
+        // CPU wall-clock for this frame's work (everything up to the vsync
+        // wait) — to tell whether we're CPU-bound vs GPU-bound / vsync-capped.
+        let frame_t0 = Instant::now();
+        let sim_us;
+        let prep_us;
 
         // --- input ---
         if is_key_pressed(KeyCode::Escape) { break; }
@@ -330,6 +339,7 @@ async fn main() {
         if scroll != 0.0 { dist = (dist * (1.0 - scroll.signum() * 0.1)).clamp(WORLD * 0.6, WORLD * 6.0); }
 
         // --- simulate ---
+        let t_sim = Instant::now();
         if !paused {
             for c in critters.iter_mut() {
                 let mut np = c.pos + c.vel * dt;
@@ -350,6 +360,7 @@ async fn main() {
             for b in bursts.iter_mut() { b.1 += dt; }
             bursts.retain(|b| b.1 < BURST_LIFE);
         }
+        sim_us = t_sim.elapsed().as_secs_f64() * 1e6;
 
         // --- (re)build the chosen index and run a vision cull from the centre ---
         let observer = vec3(WORLD * 0.5, WORLD * 0.5, WORLD * 0.5);
@@ -530,6 +541,7 @@ async fn main() {
 
         // Per-critter colour & radius for the active mode. Observe lights the
         // seen critters; combat reds the predators and flashes fresh respawns.
+        let t_prep = Instant::now();
         let mut cols: Vec<Color> = Vec::with_capacity(critters.len());
         let mut rads: Vec<f32> = Vec::with_capacity(critters.len());
         for (i, c) in critters.iter().enumerate() {
@@ -555,6 +567,7 @@ async fn main() {
             let instances: Vec<Instance> = critters.iter().enumerate().map(|(i, c)| {
                 Instance::new(c.pos, rads[i], [cols[i].r, cols[i].g, cols[i].b, cols[i].a])
             }).collect();
+            prep_us = t_prep.elapsed().as_secs_f64() * 1e6;
             // Flush macroquad's batch (renders the world box / wires drawn
             // above), then issue the instanced draw into the same default pass
             // with depth preserved.
@@ -584,6 +597,15 @@ async fn main() {
             }
         }
 
+        // CPU phases this frame → rolling averages. frame_t0 was taken at the
+        // top of the loop, so cpu_us covers all CPU work (sim, index build,
+        // cull, render prep, draw submission) but not the vsync wait.
+        let cpu_us = frame_t0.elapsed().as_secs_f64() * 1e6;
+        let ema = |avg: f64, x: f64| if avg <= 0.0 { x } else { avg * 0.9 + x * 0.1 };
+        cpu_ms_avg = ema(cpu_ms_avg, cpu_us / 1000.0);
+        sim_us_avg = ema(sim_us_avg, sim_us);
+        prep_us_avg = ema(prep_us_avg, prep_us);
+
         // --- HUD (2D overlay) ---
         set_default_camera();
         let hud = |y: f32, s: String| draw_text(&s, 12.0, y, 20.0, Color::new(0.85, 0.9, 1.0, 1.0));
@@ -610,6 +632,11 @@ async fn main() {
             format!("{}  |  2 tris/critter", render_mode.label())
         };
         hud(112.0, format!("render: {}  <- G switches", render_note));
+        // CPU vs frame budget: if CPU fills most of the frame, FPS is bounded by
+        // the CPU, not the GPU/vsync — so changing render mode won't move it.
+        let frame_ms = if fps_display > 1.0 { 1000.0 / fps_display as f64 } else { cpu_ms_avg };
+        let bound = if frame_ms > 0.0 && cpu_ms_avg > 0.7 * frame_ms { "CPU-BOUND" } else { "GPU/vsync headroom" };
+        hud(134.0, format!("cpu ~{:.2} ms/frame (sim {:.0} + build {:.0} + prep {:.0} us) -> {}", cpu_ms_avg, sim_us_avg, t_build_us, prep_us_avg, bound));
         hud(screen_height() - 18.0, "drag: orbit | scroll/zoom | +/-: pop | [ ]: radius | T: observe/combat | R: sync | M: structure | G: render | C: reps | B: boxes | Space | Esc".to_string());
 
         frame += 1;
