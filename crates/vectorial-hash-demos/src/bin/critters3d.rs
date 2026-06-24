@@ -613,7 +613,7 @@ async fn main() {
     let mut rec = false;
     let mut hist: VecDeque<Frame> = VecDeque::new();
     let mut scrub: usize = 0;
-    let mut cur_frame = Frame::default();
+    let mut cur_frame: Frame; // (re)built every frame before it's drawn
     let mut step_request = false;
     // Keyboard editing of a slider value: which slider (0=pop, 1=radius) + buffer.
     let mut editing: Option<u8> = None;
