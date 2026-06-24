@@ -57,8 +57,11 @@ to triage later.
   the dynamic workload.
 - **Multi-query cull + multithreading** — cull many spheres at once; parallel
   build/cull (rayon) for large N.
-- **k-NN queries** *(queued tonight, #2)* — nearest-neighbour (best-first with a
-  bounded heap), not only range cull. Gated against brute-force k-NN.
+- ~~**k-NN queries**~~ — **done.** `Tree3::knn` and `Octree3::knn` (best-first
+  descent, bounded max-heap, bbox pruning, nearest-child-first), brute-force
+  gated. 2–13 µs/query at 50k for k=1..50; octree ≈ binary. `tree3d_bench --knn
+  K`. See `THREE_D.md` § "k-nearest-neighbour". Follow-up: `MortonGrid3::knn`
+  (ring-by-ring outward from the query cell).
 - **Index serialization** *(queued tonight, #3)* — save/load a built tree.
   Round-trip test (serialize → deserialize → `cull` identical).
 

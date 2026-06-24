@@ -348,6 +348,42 @@ simplicity — noted as a possible follow-up. `MortonGrid3` is build-and-cull
 only (no `update`); for the dynamic critters workload it would be rebuilt or
 need an `update`, unmeasured here.
 
+## k-nearest-neighbour (`knn`) — a different query than range cull
+
+Range cull answers "which points are inside this volume?" (you supply the
+volume). **k-NN** answers "what are the `k` closest points to `q`?" — no radius,
+just the k nearest whatever the distance ("nearest enemy", "5 neighbours for a
+cohesion force"). `Tree3::knn` and `Octree3::knn` implement the classic
+**best-first descent with bounding-box pruning**:
+
+- a bounded **max-heap** holds the current k best, so its top is the k-th
+  nearest found so far — the pruning bound;
+- at each node, descend the **nearer child first** (by box nearest-point
+  distance) to tighten that bound early;
+- **skip any subtree** whose box's nearest point is already farther than the
+  current k-th nearest. The octree orders its 8 octants nearest-box-first.
+
+Both are gated against a brute-force sort (`knn_matches_brute_force`): the k
+smallest distances must match (unique even under boundary ties). 50k uniform
+points in 512³, 300 queries:
+
+| k | binary knn | octree knn | vs brute (full sort) |
+| ---: | ---: | ---: | ---: |
+| 1 | 2.3 µs | 2.4 µs | ~370× |
+| 10 | 6.2 µs | 5.6 µs | ~140× |
+| 50 | 13.4 µs | 14.3 µs | ~60× |
+
+**The tree visits a tiny fraction of nodes** — a k=1 query is ~2 µs because the
+pruning kills almost everything after the first leaf tightens the bound. Cost
+grows sub-linearly in k (the heap stays small and the bound stays tight).
+Octree ≈ binary again, the same near-tie as the cull/update paths. Caveat on the
+headline ratio: the brute baseline is a *full sort* (~850 µs); an O(n)
+bounded-heap brute would be faster but still scans all 50k points (tens of µs),
+so the tree is still ~10–20× ahead even against an optimised brute — the real
+story is the **absolute** 2–13 µs, not the inflated ×. (`tree3d_bench --knn K`.)
+`MortonGrid3` has no `knn` yet — a grid would spiral outward ring-by-ring from
+`q`'s cell; noted as a follow-up.
+
 ## Still open
 - **Non-analytic 3D shapes** in the *projection* comparison: the
   static bench used a sphere (analytic); the polyhedron crossover above

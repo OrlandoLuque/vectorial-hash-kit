@@ -579,6 +579,85 @@ impl<T: Positioned3> Tree3<T> {
             }
         }
     }
+
+    /// The `k` nearest items to `q`, sorted ascending by distance (returns
+    /// `(distance, &item)`). Best-first descent with bounding-box pruning: a
+    /// bounded max-heap holds the current k best (its top is the k-th nearest
+    /// so far), the nearer child is visited first to tighten the bound, and a
+    /// subtree is skipped when its box's nearest point is already farther than
+    /// the current k-th. Fewer than `k` items → all of them. `k == 0` → empty.
+    pub fn knn(&self, q: Point3, k: usize) -> Vec<(f64, &T)> {
+        if k == 0 { return Vec::new(); }
+        let mut heap: std::collections::BinaryHeap<KnnEntry<T>> = std::collections::BinaryHeap::new();
+        self.knn_recurse(self.root, q, k, &mut heap);
+        let mut v: Vec<(f64, &T)> = heap.into_iter().map(|e| (e.d2.sqrt(), e.item)).collect();
+        v.sort_by(|a, b| a.0.total_cmp(&b.0));
+        v
+    }
+
+    fn knn_recurse<'a>(&'a self, id: Node3Id, q: Point3, k: usize, heap: &mut std::collections::BinaryHeap<KnnEntry<'a, T>>) {
+        let node = self.get(id);
+        match node.children {
+            None => {
+                for it in &node.items {
+                    knn_offer(heap, k, it, q);
+                }
+            }
+            Some([a, b]) => {
+                let da = aabb_min_dist2(&self.get(a).bbox, q);
+                let db = aabb_min_dist2(&self.get(b).bbox, q);
+                let (first, dfirst, second, dsecond) = if da <= db { (a, da, b, db) } else { (b, db, a, da) };
+                if dfirst < knn_worst(heap, k) { self.knn_recurse(first, q, k, heap); }
+                if dsecond < knn_worst(heap, k) { self.knn_recurse(second, q, k, heap); }
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------ k-NN helpers
+// Shared by Tree3 and Octree3 (best-first nearest-neighbour search).
+
+/// A heap entry keyed only by squared distance (items need no `Ord`). Max-heap
+/// ordering so [`std::collections::BinaryHeap::peek`] is the current worst of
+/// the k best — the one to evict when a closer point arrives.
+pub(crate) struct KnnEntry<'a, T> {
+    pub(crate) d2: f64,
+    pub(crate) item: &'a T,
+}
+impl<T> PartialEq for KnnEntry<'_, T> { fn eq(&self, o: &Self) -> bool { self.d2 == o.d2 } }
+impl<T> Eq for KnnEntry<'_, T> {}
+impl<T> PartialOrd for KnnEntry<'_, T> { fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(o)) } }
+impl<T> Ord for KnnEntry<'_, T> { fn cmp(&self, o: &Self) -> std::cmp::Ordering { self.d2.total_cmp(&o.d2) } }
+
+/// Current k-th-nearest squared distance (the pruning bound); `+∞` until the
+/// heap is full.
+#[inline]
+pub(crate) fn knn_worst<T>(heap: &std::collections::BinaryHeap<KnnEntry<T>>, k: usize) -> f64 {
+    if heap.len() < k { f64::INFINITY } else { heap.peek().unwrap().d2 }
+}
+
+/// Offer one item to the bounded heap: keep it if the heap isn't full yet, or
+/// if it's closer than the current worst (evicting that worst).
+#[inline]
+pub(crate) fn knn_offer<'a, T: Positioned3>(heap: &mut std::collections::BinaryHeap<KnnEntry<'a, T>>, k: usize, it: &'a T, q: Point3) {
+    let p = it.position();
+    let (dx, dy, dz) = (p.x - q.x, p.y - q.y, p.z - q.z);
+    let d2 = dx * dx + dy * dy + dz * dz;
+    if heap.len() < k {
+        heap.push(KnnEntry { d2, item: it });
+    } else if d2 < heap.peek().unwrap().d2 {
+        heap.pop();
+        heap.push(KnnEntry { d2, item: it });
+    }
+}
+
+/// Squared distance from `q` to the nearest point of box `b` (0 if inside).
+#[inline]
+pub(crate) fn aabb_min_dist2(b: &Aabb, q: Point3) -> f64 {
+    let dx = if q.x < b.x { b.x - q.x } else if q.x > b.x_max() { q.x - b.x_max() } else { 0.0 };
+    let dy = if q.y < b.y { b.y - q.y } else if q.y > b.y_max() { q.y - b.y_max() } else { 0.0 };
+    let dz = if q.z < b.z { b.z - q.z } else if q.z > b.z_max() { q.z - b.z_max() } else { 0.0 };
+    dx * dx + dy * dy + dz * dz
 }
 
 #[cfg(test)]
@@ -724,5 +803,36 @@ mod tests {
                 CellState::Maybe => {} // boundary voxel — either answer allowed
             }
         }
+    }
+
+    #[test]
+    fn knn_matches_brute_force() {
+        // The k nearest by Tree3::knn must have the same k smallest distances as
+        // a full brute-force sort, for varied query points and k. (The set of
+        // distances is unique even if two items tie at the k-boundary.)
+        let mut x = 0x7E57_C0DEu64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        let pts: Vec<P> = (0..4000).map(|_| P(Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0))).collect();
+        let mut tree = Tree3::<P>::new(Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0), 8);
+        for p in &pts { tree.insert(*p); }
+
+        let d2 = |a: Point3, q: Point3| { let (dx, dy, dz) = (a.x - q.x, a.y - q.y, a.z - q.z); dx * dx + dy * dy + dz * dz };
+        for _ in 0..40 {
+            let q = Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0);
+            for k in [1usize, 5, 17] {
+                let got = tree.knn(q, k);
+                assert_eq!(got.len(), k.min(pts.len()));
+                assert!(got.windows(2).all(|w| w[0].0 <= w[1].0), "knn result not sorted ascending");
+                let mut bf: Vec<f64> = pts.iter().map(|p| d2(p.0, q)).collect();
+                bf.sort_by(|a, b| a.total_cmp(b));
+                for (i, (dist, _)) in got.iter().enumerate() {
+                    assert!((dist * dist - bf[i]).abs() <= 1e-6 * (1.0 + bf[i]),
+                        "knn dist #{i} mismatch: got {} vs brute {}", dist * dist, bf[i]);
+                }
+            }
+        }
+        // k == 0 → empty; k > n → all.
+        assert!(tree.knn(Point3::new(1.0, 1.0, 1.0), 0).is_empty());
+        assert_eq!(tree.knn(Point3::new(1.0, 1.0, 1.0), pts.len() + 10).len(), pts.len());
     }
 }

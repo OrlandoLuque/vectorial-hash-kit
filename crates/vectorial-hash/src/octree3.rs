@@ -10,7 +10,7 @@
 //! reclaims merged-out slots.
 
 use crate::template::CellState;
-use crate::tree3::{Aabb, Point3, Positioned3, Shape3};
+use crate::tree3::{aabb_min_dist2, knn_offer, knn_worst, Aabb, KnnEntry, Point3, Positioned3, Shape3};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ONodeId(pub u32);
@@ -250,6 +250,43 @@ impl<T: Positioned3> Octree3<T> {
             }
         }
     }
+
+    /// The `k` nearest items to `q`, sorted ascending by distance — the same
+    /// best-first, bbox-pruned search as [`crate::Tree3::knn`], over the 8-way
+    /// split. The eight children are visited nearest-box-first so the pruning
+    /// bound tightens as early as possible.
+    pub fn knn(&self, q: Point3, k: usize) -> Vec<(f64, &T)> {
+        if k == 0 { return Vec::new(); }
+        let mut heap: std::collections::BinaryHeap<KnnEntry<T>> = std::collections::BinaryHeap::new();
+        self.knn_recurse(self.root, q, k, &mut heap);
+        let mut v: Vec<(f64, &T)> = heap.into_iter().map(|e| (e.d2.sqrt(), e.item)).collect();
+        v.sort_by(|a, b| a.0.total_cmp(&b.0));
+        v
+    }
+
+    fn knn_recurse<'a>(&'a self, id: ONodeId, q: Point3, k: usize, heap: &mut std::collections::BinaryHeap<KnnEntry<'a, T>>) {
+        match self.get(id).children {
+            None => {
+                for it in &self.get(id).items {
+                    knn_offer(heap, k, it, q);
+                }
+            }
+            Some(kids) => {
+                // Order the 8 octants by their box's nearest-point distance,
+                // then descend nearest-first, pruning by the current k-th.
+                let mut order: [(f64, ONodeId); 8] = [(0.0, ONodeId(0)); 8];
+                for (i, &kid) in kids.iter().enumerate() {
+                    order[i] = (aabb_min_dist2(&self.get(kid).bbox, q), kid);
+                }
+                order.sort_by(|a, b| a.0.total_cmp(&b.0));
+                for (d, kid) in order {
+                    if d < knn_worst(heap, k) {
+                        self.knn_recurse(kid, q, k, heap);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -260,6 +297,31 @@ mod tests {
     #[derive(Clone, Copy)]
     struct P(Point3);
     impl Positioned3 for P { fn position(&self) -> Point3 { self.0 } }
+
+    #[test]
+    fn octree_knn_matches_brute_force() {
+        // Octree3::knn must return the same k smallest distances as a brute sort.
+        let mut x = 0x0C73_E33Du64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        let pts: Vec<P> = (0..4000).map(|_| P(Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0))).collect();
+        let mut tree = Octree3::<P>::new(Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0), 8);
+        for p in &pts { tree.insert(*p); }
+        let d2 = |a: Point3, q: Point3| { let (dx, dy, dz) = (a.x - q.x, a.y - q.y, a.z - q.z); dx * dx + dy * dy + dz * dz };
+        for _ in 0..40 {
+            let q = Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0);
+            for k in [1usize, 5, 17] {
+                let got = tree.knn(q, k);
+                assert_eq!(got.len(), k.min(pts.len()));
+                assert!(got.windows(2).all(|w| w[0].0 <= w[1].0), "octree knn not sorted");
+                let mut bf: Vec<f64> = pts.iter().map(|p| d2(p.0, q)).collect();
+                bf.sort_by(|a, b| a.total_cmp(b));
+                for (i, (dist, _)) in got.iter().enumerate() {
+                    assert!((dist * dist - bf[i]).abs() <= 1e-6 * (1.0 + bf[i]),
+                        "octree knn dist #{i} mismatch: {} vs {}", dist * dist, bf[i]);
+                }
+            }
+        }
+    }
 
     #[test]
     fn octree_cull_matches_brute() {

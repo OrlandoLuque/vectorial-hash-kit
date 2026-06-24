@@ -52,10 +52,11 @@ struct Args {
     rmin: f64,
     rmax: f64,
     stack: bool,
+    knn: usize,
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { pop: 50000, item_limit: 8, queries: 200, seed: 42, rmin: 10.0, rmax: 80.0, stack: false };
+    let mut a = Args { pop: 50000, item_limit: 8, queries: 200, seed: 42, rmin: 10.0, rmax: 80.0, stack: false, knn: 0 };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < argv.len() {
@@ -73,6 +74,9 @@ fn parse_args() -> Args {
             // "things stacked in height" regime where the quadtree projection
             // earns its keep.
             "--stack" => { a.stack = true; i -= 1; }
+            // Also run a k-nearest-neighbour comparison (Tree3 / Octree3 vs
+            // brute) with this k. 0 = skip (sphere culls only).
+            "--knn" => a.knn = val().parse().unwrap(),
             other => panic!("unknown argument: {other}"),
         }
         i += 2;
@@ -358,4 +362,51 @@ fn main() {
     line("1-projection +z-reject +exact", &s_proj1z);
     line("1-projection +raster narrowphase", &s_proj1r);
     line("1-projection via quadtree +z+exact", &s_proj1q);
+
+    // --- optional k-nearest-neighbour comparison ---
+    if args.knn > 0 {
+        let k = args.knn;
+        let mut s_kbrute = Stats::new();
+        let mut s_ktree3 = Stats::new();
+        let mut s_koct = Stats::new();
+        let mut kmism3 = 0u64;
+        let mut kmismo = 0u64;
+        // Distances of `got` (sqrt'd) squared back, compared to the brute k
+        // smallest squared distances (unique set even under boundary ties).
+        let dmatch = |got: &[(f64, &I3)], bf: &[f64]| -> bool {
+            got.len() == bf.len()
+                && got.iter().zip(bf).all(|((d, _), b)| (d * d - b).abs() <= 1e-6 * (1.0 + b.abs()))
+        };
+        for _ in 0..args.queries {
+            let q = Point3::new(rng.range(0.0, WORLD), rng.range(0.0, WORLD), rng.range(0.0, WORLD));
+            // Brute: every squared distance, sorted, k smallest.
+            let t = Instant::now();
+            let mut all: Vec<f64> = pos.iter()
+                .map(|p| { let dx = p.x - q.x; let dy = p.y - q.y; let dz = p.z - q.z; dx * dx + dy * dy + dz * dz })
+                .collect();
+            all.sort_by(|a, b| a.total_cmp(b));
+            let bf: Vec<f64> = all.into_iter().take(k).collect();
+            s_kbrute.push(t.elapsed().as_secs_f64() * 1e9);
+
+            let t = Instant::now();
+            let g3 = tree3.knn(q, k);
+            s_ktree3.push(t.elapsed().as_secs_f64() * 1e9);
+            if !dmatch(&g3, &bf) { kmism3 += 1; }
+
+            let t = Instant::now();
+            let go = octree.knn(q, k);
+            s_koct.push(t.elapsed().as_secs_f64() * 1e9);
+            if !dmatch(&go, &bf) { kmismo += 1; }
+        }
+        println!("\nk-NN (k={}) over {} queries | correctness vs brute: {}",
+            k, args.queries, if kmism3 == 0 && kmismo == 0 { "EXACT" } else { "MISMATCH!" });
+        let kline = |name: &str, s: &Stats| {
+            println!("{:<32} {:>11.0} {:>11.0} {:>9.1}x",
+                name, s.mean(), s.p95(), s_kbrute.mean() / s.mean().max(1e-9));
+        };
+        println!("{:<32} {:>11} {:>11} {:>10}", "method", "mean ns/q", "p95 ns/q", "vs brute");
+        kline("brute force (full sort)", &s_kbrute);
+        kline("true 3D tree (binary) knn", &s_ktree3);
+        kline("octree (8-way) knn", &s_koct);
+    }
 }
