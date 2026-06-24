@@ -8,8 +8,10 @@
 //!
 //! Two simulations, switchable live with `T`: *observe* (a vision-cull
 //! showcase — one sphere from the centre lights the critters it sees) and
-//! *combat* (the red critters become predators that attack nearby prey; each
-//! attack is an index cull, so it is the "many queries per frame" workload).
+//! *combat* (every critter attacks by its kind — Drifter: random-direction
+//! flamer drop; Hunter: drop aimed at the nearest critter; Pulsar:
+//! omnidirectional sphere blast — and anyone caught dies & respawns; each
+//! attack is an index cull, the "many queries per frame" workload).
 //!
 //! Most controls are also clickable in the top-right on-screen panel. vsync is
 //! off, so the fps counter shows the real ceiling, not the monitor refresh.
@@ -56,8 +58,7 @@ const UI_W: f32 = 300.0;
 const UI_H: f32 = 430.0;
 
 // Combat-mode tuning.
-const COOLDOWN: f32 = 0.7; // minimum seconds between a predator's attacks
-const COOLDOWN_JITTER: f32 = 0.8; // + up to this much random, so attacks desync
+// Per-kind attack cooldown ranges (seconds) — see `kind_cooldown`.
 const ATTACK_LIFE: f32 = 0.35; // attack-sphere fade time
 const BURST_LIFE: f32 = 0.30; // kill-marker fade time
 const FLASH_LIFE: f32 = 0.25; // freshly respawned critter flash time
@@ -80,10 +81,6 @@ enum SimMode { Observe, Combat }
 /// Warhammer 40k flamer template. Each gets its own colour so they read apart.
 #[derive(Clone, Copy, PartialEq)]
 enum AttackKind { Sphere, Drop }
-impl AttackKind {
-    /// Half of the predators throw drops (by id parity) so both appear.
-    fn for_predator(id: u32) -> Self { if id % 2 == 0 { AttackKind::Sphere } else { AttackKind::Drop } }
-}
 
 /// Flamer-cone dimensions for base radius `r`: (tip offset from the predator
 /// centre so it doesn't hit itself, cone length, cone radius at the far end).
@@ -424,10 +421,30 @@ fn aabb_box(b: &Aabb) -> (Vec3, Vec3) {
 fn kind_color(k: u8, lit: bool) -> Color {
     if lit { return Color::new(1.0, 0.95, 0.3, 1.0); }
     match k {
-        0 => Color::new(0.40, 0.75, 1.00, 1.0),
-        1 => Color::new(1.00, 0.45, 0.45, 1.0),
-        _ => Color::new(0.55, 1.00, 0.60, 1.0),
+        0 => Color::new(0.40, 0.75, 1.00, 1.0), // Drifter (blue)
+        1 => Color::new(1.00, 0.45, 0.45, 1.0), // Hunter  (red)
+        _ => Color::new(0.55, 1.00, 0.60, 1.0), // Pulsar  (green)
     }
+}
+
+/// Per-kind combat behaviour, mirroring the 2D demo's three kinds:
+/// 0 = Drifter (random-direction drop), 1 = Hunter (drop aimed at the nearest
+/// other critter), 2 = Pulsar (omnidirectional sphere blast). Cooldown ranges
+/// match the 2D values; all kinds attack and any of them can be killed.
+fn kind_cooldown(kind: u8) -> (f32, f32) {
+    match kind {
+        1 => (1.8, 3.5), // Hunter — aims, so the fastest
+        2 => (3.0, 5.0), // Pulsar — omnidirectional
+        _ => (2.5, 4.5), // Drifter — random drop
+    }
+}
+
+/// A uniformly random unit vector on the sphere.
+fn rand_dir(rng: &mut Rng) -> Vec3 {
+    let a = rng.range(0.0, std::f32::consts::TAU);
+    let z = rng.range(-1.0, 1.0);
+    let s = (1.0 - z * z).max(0.0).sqrt();
+    vec3(s * a.cos(), s * a.sin(), z)
 }
 
 fn window_conf() -> Conf {
@@ -459,7 +476,8 @@ async fn main() {
         let z = rng.range(-1.0, 1.0);
         let s = (1.0 - z * z).max(0.0).sqrt();
         let v = vec3(s * a.cos(), s * a.sin(), z) * speed;
-        let cooldown = if kind == 1 { rng.range(0.0, COOLDOWN + COOLDOWN_JITTER) } else { 0.0 };
+        let (_cmin, cmax) = kind_cooldown(kind);
+        let cooldown = rng.range(0.0, cmax); // spread initial cooldowns so they desync
         Critter { pos: p, vel: v, kind, cooldown, flash: 0.0 }
     };
     // World size (a stepped pow-2 slider mutates it; the tree is rebuilt on change).
@@ -817,35 +835,39 @@ async fn main() {
             let t_wave = Instant::now();
             if !paused {
                 for i in 0..critters.len() {
-                    if critters[i].kind != 1 || critters[i].cooldown > 0.0 { continue; }
+                    if critters[i].cooldown > 0.0 { continue; } // every kind attacks
+                    let kind = critters[i].kind;
                     let center = critters[i].pos;
-                    critters[i].cooldown = COOLDOWN + if random_attacks { rng.range(0.0, COOLDOWN_JITTER) } else { 0.0 };
-                    let akind = AttackKind::for_predator(i as u32);
+                    let (cmin, cmax) = kind_cooldown(kind);
+                    critters[i].cooldown = if random_attacks { rng.range(cmin, cmax) } else { cmin };
                     let (cx, cy, cz) = (center.x as f64, center.y as f64, center.z as f64);
-                    let vel_dir = { let v = critters[i].vel; if v.length() > 0.1 { v.normalize() } else { vec3(0.0, 1.0, 0.0) } };
                     frame_attacks += 1;
                     let tc = Instant::now();
-                    let (adir, hit_ids): (Vec3, Vec<usize>) = match akind {
-                        AttackKind::Sphere => {
-                            // Omnidirectional blast (like the 2D pulsar's circle).
+                    let (akind, adir, hit_ids): (AttackKind, Vec3, Vec<usize>) = match kind {
+                        2 => {
+                            // Pulsar: omnidirectional sphere blast (the 2D circle).
                             let s = Sphere3::new(cx, cy, cz, attack_r as f64);
-                            (Vec3::ZERO, tree.cull(&s).iter().map(|h| h.id as usize).collect())
+                            (AttackKind::Sphere, Vec3::ZERO, tree.cull(&s).iter().map(|h| h.id as usize).collect())
                         }
-                        AttackKind::Drop => {
-                            // Aimed flamer cone (like the 2D hunter's drop): find
-                            // the nearest prey within reach, point the cone at it.
+                        _ => {
+                            // Hunter (1): flamer drop aimed at the nearest other
+                            // critter in reach. Drifter (0): random direction.
                             let (off, length, maxr) = flamer_dims(attack_r);
-                            let mut best_d2 = f32::INFINITY;
-                            let mut target = None;
-                            for h in tree.cull(&Sphere3::new(cx, cy, cz, length as f64)) {
-                                let j = h.id as usize;
-                                if j == i || critters[j].kind == 1 { continue; }
-                                let d2 = (critters[j].pos - center).length_squared();
-                                if d2 < best_d2 { best_d2 = d2; target = Some(critters[j].pos); }
-                            }
-                            let dir = match target {
-                                Some(p) => { let d = p - center; if d.length() > 0.5 { d.normalize() } else { vel_dir } }
-                                None => vel_dir, // nothing in range → spray ahead
+                            let dir = if kind == 1 {
+                                let mut best_d2 = f32::INFINITY;
+                                let mut target = None;
+                                for h in tree.cull(&Sphere3::new(cx, cy, cz, length as f64)) {
+                                    let j = h.id as usize;
+                                    if j == i { continue; }
+                                    let d2 = (critters[j].pos - center).length_squared();
+                                    if d2 < best_d2 { best_d2 = d2; target = Some(critters[j].pos); }
+                                }
+                                match target {
+                                    Some(p) => { let d = p - center; if d.length() > 0.5 { d.normalize() } else { rand_dir(&mut rng) } }
+                                    None => rand_dir(&mut rng),
+                                }
+                            } else {
+                                rand_dir(&mut rng)
                             };
                             let tip = center + dir * off;
                             let s = DropShape {
@@ -854,20 +876,20 @@ async fn main() {
                                 length: length as f64,
                                 max_r: maxr as f64,
                             };
-                            (dir, tree.cull(&s).iter().map(|h| h.id as usize).collect())
+                            (AttackKind::Drop, dir, tree.cull(&s).iter().map(|h| h.id as usize).collect())
                         }
                     };
                     cull_us += tc.elapsed().as_secs_f64() * 1e6;
                     attacks.push(Attack { center, radius: attack_r, age: 0.0, kind: akind, dir: adir });
                     for j in hit_ids {
-                        if j != i && !killed[j] && critters[j].kind != 1 { killed[j] = true; }
+                        if j != i && !killed[j] { killed[j] = true; } // anyone but the attacker
                     }
                 }
-                // apply kills: drop a burst marker, respawn as prey, flash, count
+                // apply kills: burst marker, respawn keeping the kind, flash, count
                 for j in 0..critters.len() {
                     if killed[j] {
                         bursts.push((critters[j].pos, 0.0));
-                        let k = if rng.unit() < 0.5 { 0u8 } else { 2u8 };
+                        let k = critters[j].kind;
                         critters[j] = spawn(&mut rng, k, world);
                         critters[j].flash = FLASH_LIFE;
                         kills += 1;
@@ -882,8 +904,10 @@ async fn main() {
             }
             t_cull_us = if frame_attacks > 0 { cull_us / frame_attacks as f64 } else { 0.0 };
             cand_n = None;
-            let predators = critters.iter().filter(|c| c.kind == 1).count();
-            stat_line = format!("combat: {:>5} predators | last wave: {:>4} attacks resolved in {:>7.0} us", predators, last_wave_attacks, last_wave_us);
+            let drifters = critters.iter().filter(|c| c.kind == 0).count();
+            let hunters = critters.iter().filter(|c| c.kind == 1).count();
+            let pulsars = critters.iter().filter(|c| c.kind == 2).count();
+            stat_line = format!("combat: Drift {:>5} / Hunt {:>5} / Puls {:>5} | last wave {:>4} in {:>7.0} us", drifters, hunters, pulsars, last_wave_attacks, last_wave_us);
         }
         let seen_n = lit.iter().filter(|&&b| b).count();
         // Feed the rolling cull-time average (skip frames with no measurement,
@@ -929,7 +953,8 @@ async fn main() {
         let t_prep = Instant::now();
         if let Some(geom) = render_mode.geom() {
             // Per-critter colour & radius. Observe lights the seen critters;
-            // combat reds the predators and flashes fresh respawns.
+            // combat colours by kind (Drifter/Hunter/Pulsar) and flashes fresh
+            // respawns white.
             let mut cols: Vec<Color> = Vec::with_capacity(critters.len());
             let mut rads: Vec<f32> = Vec::with_capacity(critters.len());
             for (i, c) in critters.iter().enumerate() {
@@ -937,11 +962,9 @@ async fn main() {
                     SimMode::Observe => (kind_color(c.kind, lit[i]), if lit[i] { 2.2 } else { 1.5 }),
                     SimMode::Combat => {
                         if c.flash > 0.0 {
-                            (Color::new(1.0, 1.0, 1.0, 1.0), 2.6)
-                        } else if c.kind == 1 {
-                            (Color::new(1.0, 0.35, 0.30, 1.0), 2.3)
+                            (Color::new(1.0, 1.0, 1.0, 1.0), 2.2)
                         } else {
-                            (kind_color(c.kind, false), 1.4)
+                            (kind_color(c.kind, false), 1.8)
                         }
                     }
                 };
@@ -965,6 +988,8 @@ async fn main() {
             prep_us = 0.0;
         }
 
+        // sight-lines / combat effects — skipped in NO RENDER (CPU-only) mode.
+        if render_mode != RenderMode::None {
         if sim_mode == SimMode::Observe {
             // sight-lines for the seen critters
             for (i, c) in critters.iter().enumerate() {
@@ -993,6 +1018,7 @@ async fn main() {
                 let f = (age / BURST_LIFE).clamp(0.0, 1.0);
                 draw_sphere_wires(*p, 2.0 + 9.0 * f, None, Color::new(1.0, 1.0, 1.0, (1.0 - f) * 0.8));
             }
+        }
         }
 
         // (CPU timing is taken at the very end of the frame — see below — so it
@@ -1102,13 +1128,12 @@ async fn main() {
             prev_world = world;
         }
 
-        // Reseed predator cooldowns when the desync toggle flips (key or panel),
-        // so the change is visible immediately (spread out vs lockstep).
+        // Reseed cooldowns when the desync toggle flips (key or panel), so the
+        // change is visible immediately (spread out vs each kind in lockstep).
         if random_attacks != prev_random {
             for c in critters.iter_mut() {
-                if c.kind == 1 {
-                    c.cooldown = if random_attacks { rng.range(0.0, COOLDOWN + COOLDOWN_JITTER) } else { COOLDOWN };
-                }
+                let (cmin, cmax) = kind_cooldown(c.kind);
+                c.cooldown = if random_attacks { rng.range(0.0, cmax) } else { cmin };
             }
             prev_random = random_attacks;
         }
