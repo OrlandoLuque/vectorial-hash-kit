@@ -733,35 +733,44 @@ async fn main() {
                     let center = critters[i].pos;
                     critters[i].cooldown = COOLDOWN + if random_attacks { rng.range(0.0, COOLDOWN_JITTER) } else { 0.0 };
                     let akind = AttackKind::for_predator(i as u32);
-                    // Drops aim along the predator's heading (its velocity).
-                    let adir = if akind == AttackKind::Drop {
-                        let v = critters[i].vel;
-                        if v.length() > 0.1 { v.normalize() } else { vec3(0.0, 1.0, 0.0) }
-                    } else {
-                        Vec3::ZERO
-                    };
-                    attacks.push(Attack { center, radius: attack_r, age: 0.0, kind: akind, dir: adir });
+                    let (cx, cy, cz) = (center.x as f64, center.y as f64, center.z as f64);
+                    let vel_dir = { let v = critters[i].vel; if v.length() > 0.1 { v.normalize() } else { vec3(0.0, 1.0, 0.0) } };
                     frame_attacks += 1;
                     let tc = Instant::now();
-                    let hit_ids: Vec<usize> = match akind {
+                    let (adir, hit_ids): (Vec3, Vec<usize>) = match akind {
                         AttackKind::Sphere => {
-                            let s = Sphere3::new(center.x as f64, center.y as f64, center.z as f64, attack_r as f64);
-                            tree.cull(&s).iter().map(|h| h.id as usize).collect()
+                            // Omnidirectional blast (like the 2D pulsar's circle).
+                            let s = Sphere3::new(cx, cy, cz, attack_r as f64);
+                            (Vec3::ZERO, tree.cull(&s).iter().map(|h| h.id as usize).collect())
                         }
                         AttackKind::Drop => {
-                            // Flamer cone from the predator's edge, along `adir`.
+                            // Aimed flamer cone (like the 2D hunter's drop): find
+                            // the nearest prey within reach, point the cone at it.
                             let (off, length, maxr) = flamer_dims(attack_r);
-                            let tip = center + adir * off;
+                            let mut best_d2 = f32::INFINITY;
+                            let mut target = None;
+                            for h in tree.cull(&Sphere3::new(cx, cy, cz, length as f64)) {
+                                let j = h.id as usize;
+                                if j == i || critters[j].kind == 1 { continue; }
+                                let d2 = (critters[j].pos - center).length_squared();
+                                if d2 < best_d2 { best_d2 = d2; target = Some(critters[j].pos); }
+                            }
+                            let dir = match target {
+                                Some(p) => { let d = p - center; if d.length() > 0.5 { d.normalize() } else { vel_dir } }
+                                None => vel_dir, // nothing in range → spray ahead
+                            };
+                            let tip = center + dir * off;
                             let s = DropShape {
                                 tip: Point3::new(tip.x as f64, tip.y as f64, tip.z as f64),
-                                dir: [adir.x as f64, adir.y as f64, adir.z as f64],
+                                dir: [dir.x as f64, dir.y as f64, dir.z as f64],
                                 length: length as f64,
                                 max_r: maxr as f64,
                             };
-                            tree.cull(&s).iter().map(|h| h.id as usize).collect()
+                            (dir, tree.cull(&s).iter().map(|h| h.id as usize).collect())
                         }
                     };
                     cull_us += tc.elapsed().as_secs_f64() * 1e6;
+                    attacks.push(Attack { center, radius: attack_r, age: 0.0, kind: akind, dir: adir });
                     for j in hit_ids {
                         if j != i && !killed[j] && critters[j].kind != 1 { killed[j] = true; }
                     }
