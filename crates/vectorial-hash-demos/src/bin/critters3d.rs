@@ -36,6 +36,7 @@
 //! CRITTERS3D_RENDER=instanced|billboards|square|none initial render path;
 //! CRITTERS3D_COMBAT=1 starts in combat; CRITTERS3D_SEP=1 starts with separation.
 
+use std::collections::VecDeque;
 use std::time::Instant;
 
 use macroquad::camera::Camera;
@@ -54,10 +55,11 @@ const MARGIN: f32 = 4.0;
 const ITEM_LIMIT: usize = 16;
 // World size is a runtime value now (a stepped pow-2 slider) — see `world` in main.
 const SIZE_STEPS: [f32; 5] = [64.0, 128.0, 256.0, 512.0, 1024.0];
+const HIST_MAX: usize = 90; // frames kept in the replay history ring
 
 // On-screen control panel (top-right) size.
 const UI_W: f32 = 300.0;
-const UI_H: f32 = 430.0;
+const UI_H: f32 = 560.0;
 
 // Combat-mode tuning.
 // Per-kind attack cooldown ranges (seconds) — see `kind_cooldown`.
@@ -393,6 +395,55 @@ fn draw_graph(x: f32, y: f32, w: f32, h: f32, label: &str, data: &[f32], color: 
     }
 }
 
+/// One frame's drawable state — recorded into the history ring so a past frame
+/// can be redrawn without re-simulating. Holds exactly the render inputs:
+/// the critter instances, the effect instances, and the index's leaf boxes.
+#[derive(Clone, Default)]
+struct Frame {
+    instances: Vec<Instance>,
+    sphere_fx: Vec<EffectInstance>,
+    drop_fx: Vec<EffectInstance>,
+    boxes: Vec<(Vec3, Vec3)>,
+}
+
+/// Draw a `Frame`'s world: the cube, the leaf boxes (if shown), the instanced
+/// critters, and the instanced effects. Shared by the live path and replay.
+fn draw_world_visuals(
+    renderer: &mut InstancedRenderer,
+    geom: Option<RenderGeom>,
+    frame: &Frame,
+    mvp: Mat4,
+    cam_right: Vec3,
+    cam_up: Vec3,
+    show_boxes: bool,
+    world: f32,
+    observer: Vec3,
+) {
+    draw_cube_wires(observer, vec3(world, world, world), Color::new(0.3, 0.35, 0.45, 1.0));
+    if show_boxes {
+        for (c, sz) in &frame.boxes {
+            draw_cube_wires(*c, *sz, Color::new(0.18, 0.22, 0.3, 1.0));
+        }
+    }
+    if let Some(geom) = geom {
+        let mut gl = unsafe { get_internal_gl() };
+        gl.flush();
+        let ctx = gl.quad_context;
+        ctx.begin_default_pass(PassAction::Nothing);
+        renderer.draw(ctx, geom, &frame.instances, mvp, cam_right, cam_up);
+        ctx.end_render_pass();
+    }
+    if !frame.sphere_fx.is_empty() || !frame.drop_fx.is_empty() {
+        let mut gl = unsafe { get_internal_gl() };
+        gl.flush();
+        let ctx = gl.quad_context;
+        ctx.begin_default_pass(PassAction::Nothing);
+        renderer.draw_effects(ctx, EffectMesh::Sphere, &frame.sphere_fx, mvp);
+        renderer.draw_effects(ctx, EffectMesh::Drop, &frame.drop_fx, mvp);
+        ctx.end_render_pass();
+    }
+}
+
 /// A 3D AABB → (centre, size) pair for `draw_cube_wires`.
 fn aabb_box(b: &Aabb) -> (Vec3, Vec3) {
     (
@@ -547,6 +598,13 @@ async fn main() {
     let mut g_fps: Vec<f32> = Vec::new();
     let mut g_cpu: Vec<f32> = Vec::new();
     let mut g_cull: Vec<f32> = Vec::new();
+    // Frame history / replay: ring of drawable frames, REC toggle, scrub offset
+    // (0 = live, N = N frames back), and a one-shot manual step request.
+    let mut rec = false;
+    let mut hist: VecDeque<Frame> = VecDeque::new();
+    let mut scrub: usize = 0;
+    let mut cur_frame = Frame::default();
+    let mut step_request = false;
     // Keyboard editing of a slider value: which slider (0=pop, 1=radius) + buffer.
     let mut editing: Option<u8> = None;
     let mut edit_buf = String::new();
@@ -607,6 +665,9 @@ async fn main() {
         if is_key_pressed(KeyCode::C) { cull_rep_idx = (cull_rep_idx + 1) % cull_rep_steps.len(); }
         if is_key_pressed(KeyCode::O) { separation = !separation; }
         if is_key_pressed(KeyCode::V) { fps_cap = !fps_cap; }
+        if is_key_pressed(KeyCode::K) { rec = !rec; } // toggle frame recording
+        if is_key_pressed(KeyCode::Comma) { scrub = (scrub + 1).min(hist.len().saturating_sub(1)); } // step back
+        if is_key_pressed(KeyCode::Period) { if scrub > 0 { scrub -= 1; } else { step_request = true; } } // step fwd / advance
         // +/- ramp the population: one step per press, or hold to auto-repeat.
         let add = add_rep.fires(
             is_key_pressed(KeyCode::Equal) || is_key_pressed(KeyCode::KpAdd),
@@ -649,27 +710,35 @@ async fn main() {
         let scroll = mouse_wheel().1;
         if scroll != 0.0 && !over_ui { dist = (dist * (1.0 - scroll.signum() * 0.1)).clamp(world * 0.6, world * 6.0); }
 
-        // Reconcile population (and the index) to the target — drives both the
-        // +/- keys and the panel slider through one path.
+        // Does the sim advance this frame? Not while scrubbing the history, and
+        // when live only if running (or a single manual step was requested).
+        let step_now = step_request;
+        step_request = false;
+        let advance = scrub == 0 && (!paused || step_now);
+
+        // Reconcile population (and the index) to the target — only while the sim
+        // advances (frozen during pause / replay).
         let target = pop_f.round().max(0.0) as usize;
-        while critters.len() < target {
-            let id = critters.len() as u32;
-            let c = spawn(&mut rng, (id % 3) as u8, world);
-            let p = pt3(&c);
-            tree.insert(C3 { id, p });
-            tree_pos.push(p);
-            critters.push(c);
-        }
-        while critters.len() > target {
-            critters.pop();
-            let i = critters.len();
-            tree.remove(tree_pos[i], |c| c.id == i as u32);
-            tree_pos.pop();
+        if advance {
+            while critters.len() < target {
+                let id = critters.len() as u32;
+                let c = spawn(&mut rng, (id % 3) as u8, world);
+                let p = pt3(&c);
+                tree.insert(C3 { id, p });
+                tree_pos.push(p);
+                critters.push(c);
+            }
+            while critters.len() > target {
+                critters.pop();
+                let i = critters.len();
+                tree.remove(tree_pos[i], |c| c.id == i as u32);
+                tree_pos.pop();
+            }
         }
 
         // --- simulate ---
         let t_sim = Instant::now();
-        if !paused {
+        if advance {
             // Combat steers each kind like the 2D demo: Hunters chase the
             // nearest critter in vision, Pulsars circle, Drifters wander. First
             // find the Hunters' targets (a vision cull each, from last frame's
@@ -769,7 +838,7 @@ async fn main() {
         // "build". Combat respawns (which jump a critter) are picked up by the
         // next frame's sync.
         let t_sync = Instant::now();
-        if !paused {
+        if advance {
             for i in 0..critters.len() {
                 let np = pt3(&critters[i]);
                 tree.update(tree_pos[i], |c| c.id == i as u32, |c| c.p = np);
@@ -822,7 +891,7 @@ async fn main() {
                     if rep == 0 { for c in hits { lit[c.id as usize] = true; } }
                 }
                 t_cull_us = tc.elapsed().as_secs_f64() * 1e6 / cull_reps as f64;
-                if show_boxes { tree.visit_leaves(|l| boxes.push(aabb_box(&l.bbox))); }
+                if rec || show_boxes { tree.visit_leaves(|l| boxes.push(aabb_box(&l.bbox))); }
                 cand_n = None;
                 stat_line = format!("Tree3 persistent/update: {:>6} leaves, {:>6} arena (item_limit {})", tree.leaf_count(), tree.node_count(), ITEM_LIMIT);
             }
@@ -841,7 +910,7 @@ async fn main() {
                     if rep == 0 { for c in hits { lit[c.id as usize] = true; } }
                 }
                 t_cull_us = tc.elapsed().as_secs_f64() * 1e6 / cull_reps as f64;
-                if show_boxes { t.visit_leaves(|l| boxes.push(aabb_box(&l.bbox))); }
+                if rec || show_boxes { t.visit_leaves(|l| boxes.push(aabb_box(&l.bbox))); }
                 cand_n = None;
                 stat_line = format!("Octree3 rebuilt/frame: {:>6} leaves, {:>6} arena (item_limit {})", t.leaf_count(), t.node_count(), ITEM_LIMIT);
             }
@@ -870,7 +939,7 @@ async fn main() {
                 }
                 t_cull_us = tc.elapsed().as_secs_f64() * 1e6 / cull_reps as f64;
                 // boxes: the 2D leaf rects, extruded through the full z depth.
-                if show_boxes {
+                if rec || show_boxes {
                     t.visit_leaves(|_, l| {
                         let b = l.bbox;
                         let c = vec3((b.x + b.width * 0.5) as f32, (b.y + b.height * 0.5) as f32, world * 0.5);
@@ -889,7 +958,7 @@ async fn main() {
             let mut killed = vec![false; critters.len()];
             let mut cull_us = 0.0f64;
             let t_wave = Instant::now();
-            if !paused {
+            if advance {
                 for i in 0..critters.len() {
                     if critters[i].cooldown > 0.0 { continue; } // every kind attacks
                     let kind = critters[i].kind;
@@ -957,6 +1026,8 @@ async fn main() {
                 last_wave_us = t_wave.elapsed().as_secs_f64() * 1e6;
             }
             t_cull_us = if frame_attacks > 0 { cull_us / frame_attacks as f64 } else { 0.0 };
+            // record/show the persistent tree's leaf cells (combat uses Tree3)
+            if rec || show_boxes { tree.visit_leaves(|l| boxes.push(aabb_box(&l.bbox))); }
             cand_n = None;
             let drifters = critters.iter().filter(|c| c.kind == 0).count();
             let hunters = critters.iter().filter(|c| c.kind == 1).count();
@@ -986,75 +1057,21 @@ async fn main() {
         let cam_right = fwd.cross(vec3(0.0, 1.0, 0.0)).normalize();
         let cam_up = cam_right.cross(fwd).normalize();
 
-        // world box
-        draw_cube_wires(observer, vec3(world, world, world), Color::new(0.3, 0.35, 0.45, 1.0));
-
-        // optional leaf-box wireframes (collected during the cull above)
-        if show_boxes {
-            for (c, sz) in &boxes {
-                draw_cube_wires(*c, *sz, Color::new(0.18, 0.22, 0.3, 1.0));
-            }
-        }
-
-        // vision sphere + observer marker — only meaningful in observe mode
-        if sim_mode == SimMode::Observe {
-            draw_sphere_wires(observer, vision_r, None, Color::new(1.0, 0.9, 0.3, 0.5));
-            draw_sphere(observer, 3.0, None, WHITE);
-        }
-
-        // critters — GPU-instanced (spheres/billboards), or skipped entirely in
-        // NO RENDER mode (so the frame is pure CPU: sim + index + cull).
+        // --- build this frame's drawable state (critters + effects + boxes) ---
         let t_prep = Instant::now();
-        if let Some(geom) = render_mode.geom() {
-            // Per-critter colour & radius. Observe lights the seen critters;
-            // combat colours by kind (Drifter/Hunter/Pulsar) and flashes fresh
-            // respawns white.
-            let mut cols: Vec<Color> = Vec::with_capacity(critters.len());
-            let mut rads: Vec<f32> = Vec::with_capacity(critters.len());
+        let mut cur = Frame { boxes, ..Default::default() };
+        if render_mode.geom().is_some() {
             for (i, c) in critters.iter().enumerate() {
                 let (col, rad) = match sim_mode {
                     SimMode::Observe => (kind_color(c.kind, lit[i]), if lit[i] { 2.2 } else { 1.5 }),
                     SimMode::Combat => {
-                        if c.flash > 0.0 {
-                            (Color::new(1.0, 1.0, 1.0, 1.0), 2.2)
-                        } else {
-                            (kind_color(c.kind, false), 1.8)
-                        }
+                        if c.flash > 0.0 { (Color::new(1.0, 1.0, 1.0, 1.0), 2.2) } else { (kind_color(c.kind, false), 1.8) }
                     }
                 };
-                cols.push(col);
-                rads.push(rad);
+                cur.instances.push(Instance::new(c.pos, rad, [col.r, col.g, col.b, col.a]));
             }
-            let instances: Vec<Instance> = critters.iter().enumerate().map(|(i, c)| {
-                Instance::new(c.pos, rads[i], [cols[i].r, cols[i].g, cols[i].b, cols[i].a])
-            }).collect();
-            prep_us = t_prep.elapsed().as_secs_f64() * 1e6;
-            // Flush macroquad's batch (renders the world box / wires drawn
-            // above), then issue the instanced draw into the same default pass
-            // with depth preserved.
-            let mut gl = unsafe { get_internal_gl() };
-            gl.flush();
-            let ctx = gl.quad_context;
-            ctx.begin_default_pass(PassAction::Nothing);
-            renderer.draw(ctx, geom, &instances, mvp, cam_right, cam_up);
-            ctx.end_render_pass();
-        } else {
-            prep_us = 0.0;
         }
-
-        // sight-lines / combat effects — skipped in NO RENDER (CPU-only) mode.
-        if render_mode != RenderMode::None {
-        if sim_mode == SimMode::Observe {
-            // sight-lines for the seen critters
-            for (i, c) in critters.iter().enumerate() {
-                if lit[i] { draw_line_3d(c.pos, observer, Color::new(1.0, 0.85, 0.3, 0.25)); }
-            }
-        } else {
-            // Combat effects, GPU-instanced through our own wireframe pipeline
-            // (not macroquad's immediate line batch). Sphere blasts orange,
-            // flamer drops cyan teardrops, kill bursts white — all fade out.
-            let mut sphere_fx: Vec<EffectInstance> = Vec::new();
-            let mut drop_fx: Vec<EffectInstance> = Vec::new();
+        if render_mode != RenderMode::None && sim_mode == SimMode::Combat {
             for a in &attacks {
                 let f = (a.age / ATTACK_LIFE).clamp(0.0, 1.0);
                 let alpha = (1.0 - f) * 0.6;
@@ -1062,31 +1079,47 @@ async fn main() {
                     AttackKind::Sphere => {
                         let grow = 0.7 + 0.5 * f;
                         let model = Mat4::from_scale_rotation_translation(Vec3::splat(a.radius * grow), Quat::IDENTITY, a.center);
-                        sphere_fx.push(EffectInstance::new(model, [1.0, 0.7 - 0.5 * f, 0.2, alpha]));
+                        cur.sphere_fx.push(EffectInstance::new(model, [1.0, 0.7 - 0.5 * f, 0.2, alpha]));
                     }
                     AttackKind::Drop => {
                         let (off, _, _) = flamer_dims(a.radius);
                         let tip = a.center + a.dir * off;
                         let model = Mat4::from_scale_rotation_translation(Vec3::splat(a.radius), Quat::from_rotation_arc(Vec3::Y, a.dir), tip);
-                        drop_fx.push(EffectInstance::new(model, [0.25, 0.85, 1.0, alpha]));
+                        cur.drop_fx.push(EffectInstance::new(model, [0.25, 0.85, 1.0, alpha]));
                     }
                 }
             }
             for (p, age) in &bursts {
                 let f = (age / BURST_LIFE).clamp(0.0, 1.0);
                 let model = Mat4::from_scale_rotation_translation(Vec3::splat(2.0 + 9.0 * f), Quat::IDENTITY, *p);
-                sphere_fx.push(EffectInstance::new(model, [1.0, 1.0, 1.0, (1.0 - f) * 0.8]));
-            }
-            if !sphere_fx.is_empty() || !drop_fx.is_empty() {
-                let mut gl = unsafe { get_internal_gl() };
-                gl.flush();
-                let ctx = gl.quad_context;
-                ctx.begin_default_pass(PassAction::Nothing);
-                renderer.draw_effects(ctx, EffectMesh::Sphere, &sphere_fx, mvp);
-                renderer.draw_effects(ctx, EffectMesh::Drop, &drop_fx, mvp);
-                ctx.end_render_pass();
+                cur.sphere_fx.push(EffectInstance::new(model, [1.0, 1.0, 1.0, (1.0 - f) * 0.8]));
             }
         }
+        prep_us = t_prep.elapsed().as_secs_f64() * 1e6;
+
+        // Record into the history ring when the sim actually advanced with REC on.
+        if rec && advance {
+            hist.push_back(cur.clone());
+            while hist.len() > HIST_MAX { hist.pop_front(); }
+        }
+        cur_frame = cur;
+
+        // Draw the live frame, or a recorded one while scrubbing (`scrub` frames
+        // back). Same draw path for both, so replay looks identical to live.
+        let view_frame: &Frame = if scrub > 0 && !hist.is_empty() {
+            &hist[hist.len().saturating_sub(scrub).min(hist.len() - 1)]
+        } else {
+            &cur_frame
+        };
+        draw_world_visuals(&mut renderer, render_mode.geom(), view_frame, mvp, cam_right, cam_up, show_boxes, world, observer);
+
+        // observe-only live extras (vision sphere + sight-lines) — not recorded.
+        if scrub == 0 && sim_mode == SimMode::Observe && render_mode != RenderMode::None {
+            draw_sphere_wires(observer, vision_r, None, Color::new(1.0, 0.9, 0.3, 0.5));
+            draw_sphere(observer, 3.0, None, WHITE);
+            for (i, c) in critters.iter().enumerate() {
+                if lit[i] { draw_line_3d(c.pos, observer, Color::new(1.0, 0.85, 0.3, 0.25)); }
+            }
         }
 
         // (CPU timing is taken at the very end of the frame — see below — so it
@@ -1098,7 +1131,11 @@ async fn main() {
         // Numbers are right-aligned in fixed-width fields so they don't shift
         // the text sideways as they change (which made it jitter illegibly).
         let mode_str = if sim_mode == SimMode::Combat { "COMBAT " } else { "observe" };
-        hud(24.0, format!("critters 3D  |  pop {:>6}  |  mode {}  |  fps {:>6.0}{}", critters.len(), mode_str, fps_display, if fps_cap { "  [capped 165]" } else { "" }));
+        let play_str = if scrub > 0 { format!("  [REPLAY -{}/{}]", scrub, hist.len()) }
+            else if paused { "  [PAUSED]".to_string() }
+            else if rec { format!("  [REC {} frames]", hist.len()) }
+            else { String::new() };
+        hud(24.0, format!("critters 3D  |  pop {:>6}  |  mode {}  |  fps {:>6.0}{}{}", critters.len(), mode_str, fps_display, if fps_cap { " cap" } else { "" }, play_str));
         hud(46.0, stat_line);
         let info_str = match sim_mode {
             SimMode::Observe => match cand_n {
@@ -1129,7 +1166,7 @@ async fn main() {
         let cpu_ceiling = if cpu_ms_avg > 0.0 { 1000.0 / cpu_ms_avg } else { 0.0 };
         let bound = if frame_ms > 0.0 && cpu_ms_avg >= 0.85 * frame_ms { "CPU-BOUND" } else { "GPU-bound" };
         hud(134.0, format!("cpu ~{:>6.2} ms (sim {:>6.0}+build {:>6.0}+prep {:>6.0} us) -> CPU ceiling ~{:>6.0} fps -> {}", cpu_ms_avg, sim_us_avg, t_build_us, prep_us_avg, cpu_ceiling, bound));
-        hud(screen_height() - 18.0, "drag/zoom | +/-: pop | [ ]: radius | T: combat | R: sync | O: separation | V: fps cap | M: structure | G: render | C: reps | B: boxes | Space | Esc".to_string());
+        hud(screen_height() - 18.0, "drag/zoom | +/-: pop | [ ]: radius | T R O V M G C B | Space: pause | . , : step fwd/back | K: rec | Esc".to_string());
 
         // --- on-screen mouse controls (top-right panel; keys still work too) ---
         let mut panel = Panel::new(ui_x, ui_y, UI_W, mp_now.0, mp_now.1,
@@ -1165,6 +1202,20 @@ async fn main() {
         }
         panel.stepper("world size", &SIZE_STEPS, &mut world,
             "Side of the cube the action lives in.\nStepped powers of 2 -- changing it rebuilds\nthe index and re-bounds the critters.");
+        panel.separator();
+        // Playback: pause + step work without REC; REC enables stepping back.
+        if panel.button(if paused { "|> resume [Space]" } else { "|| pause [Space]" },
+            "Pause / resume the simulation. Stepping\nworks while paused (or running).") { paused = !paused; }
+        if panel.button("step forward |> [.]",
+            "Advance one frame; at the newest frame it\ngenerates a new real frame.") {
+            if scrub > 0 { scrub -= 1; } else { step_request = true; }
+        }
+        if panel.button(&format!("step back <| [,]  (-{})", scrub),
+            "Go back a frame through the recorded\nhistory (needs REC on).") {
+            scrub = (scrub + 1).min(hist.len().saturating_sub(1));
+        }
+        if panel.button(&format!("REC: {}  ({} frames) [K]", if rec { "ON" } else { "off" }, hist.len()),
+            "Record each frame (critters + effects +\ntree cells) into a 90-frame ring, even cells\nthat aren't currently shown.") { rec = !rec; }
         panel.finish(ui_y);
 
         // Time-series graphs below the control panel.
