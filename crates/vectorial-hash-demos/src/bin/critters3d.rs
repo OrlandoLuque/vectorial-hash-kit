@@ -314,6 +314,7 @@ async fn main() {
     let mut random_attacks = true; // desync cooldowns; off = synchronized saturation
     let mut prev_random = random_attacks; // to reseed cooldowns when this flips
     let mut separation = std::env::var("CRITTERS3D_SEP").is_ok(); // push critters apart (heavy)
+    let mut fps_cap = false; // V: cap to the monitor refresh so the GPU isn't pegged
     let mut pop_f = critters.len() as f32; // target population (driven by +/- and the slider)
     let mut attack_r: f32 = 22.0;
     let mut attacks: Vec<Attack> = Vec::new();
@@ -334,9 +335,11 @@ async fn main() {
     let mut frame: u64 = 0;
     let max_frames: Option<u64> = std::env::var("CRITTERS3D_MAX_FRAMES").ok().and_then(|s| s.parse().ok());
 
-    // Hold-to-repeat state for the +/- population keys.
+    // Hold-to-repeat state for the +/- population and [ ] radius keys.
     let mut add_rep = KeyRepeat::new();
     let mut sub_rep = KeyRepeat::new();
+    let mut dec_rep = KeyRepeat::new();
+    let mut inc_rep = KeyRepeat::new();
     // Averaged FPS (raw get_fps() is the instantaneous 1/frame_time and jitters);
     // accumulate real frame time and refresh the shown value once per second.
     let mut fps_accum_t = 0.0f32;
@@ -382,31 +385,37 @@ async fn main() {
         if is_key_pressed(KeyCode::R) { random_attacks = !random_attacks; }
         if is_key_pressed(KeyCode::C) { cull_rep_idx = (cull_rep_idx + 1) % cull_rep_steps.len(); }
         if is_key_pressed(KeyCode::O) { separation = !separation; }
+        if is_key_pressed(KeyCode::V) { fps_cap = !fps_cap; }
         // +/- ramp the population: one step per press, or hold to auto-repeat.
         let add = add_rep.fires(
             is_key_pressed(KeyCode::Equal) || is_key_pressed(KeyCode::KpAdd),
             is_key_down(KeyCode::Equal) || is_key_down(KeyCode::KpAdd),
             dt,
         );
-        if add { pop_f = (pop_f + 200.0).min(80000.0); }
+        // +/- snap to the next/previous multiple of 200 (so a mouse-dragged
+        // slider value like 3455 lands back on a round number).
+        if add { pop_f = (((pop_f / 200.0).floor() + 1.0) * 200.0).min(80000.0); }
         let sub = sub_rep.fires(
             is_key_pressed(KeyCode::Minus) || is_key_pressed(KeyCode::KpSubtract),
             is_key_down(KeyCode::Minus) || is_key_down(KeyCode::KpSubtract),
             dt,
         );
-        if sub { pop_f = (pop_f - 200.0).max(0.0); }
-        // [ / ] adjusts the vision radius (observe) or attack radius (combat).
-        let radius_step = 60.0 * dt;
-        if is_key_down(KeyCode::LeftBracket) {
+        if sub { pop_f = (((pop_f / 200.0).ceil() - 1.0) * 200.0).max(0.0); }
+        // [ / ] step the radius (vision in observe, attack in combat) in
+        // multiples of 5 (snapping off-grid slider values), hold to repeat.
+        const R_STEP: f32 = 5.0;
+        let dec = dec_rep.fires(is_key_pressed(KeyCode::LeftBracket), is_key_down(KeyCode::LeftBracket), dt);
+        let inc = inc_rep.fires(is_key_pressed(KeyCode::RightBracket), is_key_down(KeyCode::RightBracket), dt);
+        if dec {
             match sim_mode {
-                SimMode::Observe => vision_r = (vision_r - radius_step).max(6.0),
-                SimMode::Combat => attack_r = (attack_r - radius_step).max(4.0),
+                SimMode::Observe => vision_r = (((vision_r / R_STEP).ceil() - 1.0) * R_STEP).max(R_STEP),
+                SimMode::Combat => attack_r = (((attack_r / R_STEP).ceil() - 1.0) * R_STEP).max(R_STEP),
             }
         }
-        if is_key_down(KeyCode::RightBracket) {
+        if inc {
             match sim_mode {
-                SimMode::Observe => vision_r = (vision_r + radius_step).min(WORLD),
-                SimMode::Combat => attack_r = (attack_r + radius_step).min(WORLD * 0.5),
+                SimMode::Observe => vision_r = (((vision_r / R_STEP).floor() + 1.0) * R_STEP).min(WORLD),
+                SimMode::Combat => attack_r = (((attack_r / R_STEP).floor() + 1.0) * R_STEP).min(WORLD * 0.5),
             }
         }
         let mp = mouse_position();
@@ -549,7 +558,7 @@ async fn main() {
                 t_cull_us = tc.elapsed().as_secs_f64() * 1e6 / cull_reps as f64;
                 if show_boxes { tree.visit_leaves(|l| boxes.push(aabb_box(&l.bbox))); }
                 cand_n = None;
-                stat_line = format!("Tree3 persistent/update: {} leaves, {} arena (item_limit {})", tree.leaf_count(), tree.node_count(), ITEM_LIMIT);
+                stat_line = format!("Tree3 persistent/update: {:>6} leaves, {:>6} arena (item_limit {})", tree.leaf_count(), tree.node_count(), ITEM_LIMIT);
             }
             Structure::Octree => {
                 // Comparison structure — rebuilt each frame (no persistent update).
@@ -568,7 +577,7 @@ async fn main() {
                 t_cull_us = tc.elapsed().as_secs_f64() * 1e6 / cull_reps as f64;
                 if show_boxes { t.visit_leaves(|l| boxes.push(aabb_box(&l.bbox))); }
                 cand_n = None;
-                stat_line = format!("Octree3 rebuilt/frame: {} leaves, {} arena (item_limit {})", t.leaf_count(), t.node_count(), ITEM_LIMIT);
+                stat_line = format!("Octree3 rebuilt/frame: {:>6} leaves, {:>6} arena (item_limit {})", t.leaf_count(), t.node_count(), ITEM_LIMIT);
             }
             Structure::Projection => {
                 // Author's variant: index the xy projection in a 2D Tree, cull
@@ -603,7 +612,7 @@ async fn main() {
                     });
                 }
                 cand_n = Some(nc);
-                stat_line = format!("{}: {} leaves, {} arena nodes (item_limit {})", structure.label(), t.leaf_count(), t.node_count(), ITEM_LIMIT);
+                stat_line = format!("{}: {:>6} leaves, {:>6} arena (item_limit {})", structure.label(), t.leaf_count(), t.node_count(), ITEM_LIMIT);
             }
         }
         } else {
@@ -660,7 +669,7 @@ async fn main() {
             t_cull_us = if frame_attacks > 0 { cull_us / frame_attacks as f64 } else { 0.0 };
             cand_n = None;
             let predators = critters.iter().filter(|c| c.kind == 1).count();
-            stat_line = format!("combat: {} predators | last wave: {} attacks resolved in {:.0} us", predators, last_wave_attacks, last_wave_us);
+            stat_line = format!("combat: {:>5} predators | last wave: {:>4} attacks resolved in {:>7.0} us", predators, last_wave_attacks, last_wave_us);
         }
         let seen_n = lit.iter().filter(|&&b| b).count();
         // Feed the rolling cull-time average (skip frames with no measurement,
@@ -784,26 +793,28 @@ async fn main() {
         // --- HUD (2D overlay) ---
         set_default_camera();
         let hud = |y: f32, s: String| draw_text(&s, 12.0, y, 20.0, Color::new(0.85, 0.9, 1.0, 1.0));
-        let mode_str = if sim_mode == SimMode::Combat { "COMBAT" } else { "observe" };
-        hud(24.0, format!("critters 3D  |  pop {}  |  mode {}  |  fps {:.0}", critters.len(), mode_str, fps_display));
+        // Numbers are right-aligned in fixed-width fields so they don't shift
+        // the text sideways as they change (which made it jitter illegibly).
+        let mode_str = if sim_mode == SimMode::Combat { "COMBAT " } else { "observe" };
+        hud(24.0, format!("critters 3D  |  pop {:>6}  |  mode {}  |  fps {:>6.0}{}", critters.len(), mode_str, fps_display, if fps_cap { "  [capped 165]" } else { "" }));
         hud(46.0, stat_line);
         let info_str = match sim_mode {
             SimMode::Observe => match cand_n {
-                Some(nc) => format!("vision r={:.0}  ->  {} candidates -> {} seen", vision_r, nc, seen_n),
-                None => format!("vision r={:.0}  ->  {} seen", vision_r, seen_n),
+                Some(nc) => format!("vision r={:>3.0}  ->  {:>6} candidates -> {:>6} seen", vision_r, nc, seen_n),
+                None => format!("vision r={:>3.0}  ->  {:>6} seen", vision_r, seen_n),
             },
-            SimMode::Combat => format!("attack r={:.0}  |  {} kills  |  {} [R]", attack_r, kills, if random_attacks { "desynced" } else { "SYNCED (saturation)" }),
+            SimMode::Combat => format!("attack r={:>3.0}  |  {:>7} kills  |  {} [R]", attack_r, kills, if random_attacks { "desynced" } else { "SYNCED (saturation)" }),
         };
         hud(68.0, format!("{}{}", info_str, if paused { "   [PAUSED]" } else { "" }));
         let cull_note = match sim_mode {
-            SimMode::Observe => format!("cull {:.3} us (rolling avg, x{} reps)", cull_us_avg, cull_reps),
-            SimMode::Combat => format!("cull {:.3} us (rolling avg, per attack)", cull_us_avg),
+            SimMode::Observe => format!("cull {:>8.3} us (rolling avg, x{:>4} reps)", cull_us_avg, cull_reps),
+            SimMode::Combat => format!("cull {:>8.3} us (rolling avg, per attack)", cull_us_avg),
         };
-        hud(90.0, format!("index: build {:.0} us | {}", t_build_us, cull_note));
+        hud(90.0, format!("index: build {:>6.0} us | {}", t_build_us, cull_note));
         let render_note = match render_mode {
             RenderMode::InstancedSpheres => {
                 let tris = renderer.sphere_triangles() as i64 * critters.len() as i64;
-                format!("{}  |  {} tris/sphere -> {:.2}M tris", render_mode.label(), renderer.sphere_triangles(), tris as f64 / 1e6)
+                format!("{}  |  {:>3} tris/sphere -> {:>5.2}M tris", render_mode.label(), renderer.sphere_triangles(), tris as f64 / 1e6)
             }
             RenderMode::None => render_mode.label().to_string(),
             _ => format!("{}  |  2 tris/critter", render_mode.label()),
@@ -816,7 +827,7 @@ async fn main() {
         let cpu_ceiling = if cpu_ms_avg > 0.0 { 1000.0 / cpu_ms_avg } else { 0.0 };
         let bound = if frame_ms > 0.0 && cpu_ms_avg >= 0.85 * frame_ms { "CPU-BOUND" } else { "GPU-bound" };
         hud(134.0, format!("cpu ~{:.2} ms (sim {:.0}+build {:.0}+prep {:.0} us) -> CPU ceiling ~{:.0} fps -> {}", cpu_ms_avg, sim_us_avg, t_build_us, prep_us_avg, cpu_ceiling, bound));
-        hud(screen_height() - 18.0, "drag/zoom | +/-: pop | [ ]: radius | T: combat | R: sync | O: separation | M: structure | G: render | C: reps | B: boxes | Space | Esc".to_string());
+        hud(screen_height() - 18.0, "drag/zoom | +/-: pop | [ ]: radius | T: combat | R: sync | O: separation | V: fps cap | M: structure | G: render | C: reps | B: boxes | Space | Esc".to_string());
 
         // --- on-screen mouse controls (top-right panel; keys still work too) ---
         widgets::Window::new(hash!(), vec2(ui_x, ui_y), vec2(UI_W, UI_H))
@@ -832,6 +843,7 @@ async fn main() {
                 ui.separator();
                 if ui.button(None, format!("attacks: {} [R]", if random_attacks { "desynced" } else { "SYNCED" })) { random_attacks = !random_attacks; }
                 if ui.button(None, format!("separation: {} [O]", if separation { "ON" } else { "off" })) { separation = !separation; }
+                if ui.button(None, format!("fps cap: {} [V]", if fps_cap { "165" } else { "OFF" })) { fps_cap = !fps_cap; }
                 if ui.button(None, format!("leaf boxes: {} [B]", if show_boxes { "ON" } else { "off" })) { show_boxes = !show_boxes; }
                 if ui.button(None, format!("cull reps: {} [C]", cull_reps)) { cull_rep_idx = (cull_rep_idx + 1) % cull_rep_steps.len(); }
                 ui.separator();
@@ -860,6 +872,21 @@ async fn main() {
         cpu_ms_avg = ema(cpu_ms_avg, frame_t0.elapsed().as_secs_f64() * 1000.0);
         sim_us_avg = ema(sim_us_avg, sim_us);
         prep_us_avg = ema(prep_us_avg, prep_us);
+
+        // Optional fps cap (V): with vsync off the GPU would otherwise render
+        // thousands of fps the monitor can't show. Sleep the bulk of the
+        // remaining frame budget, then spin the last ~2 ms for a precise cap.
+        if fps_cap {
+            let target = std::time::Duration::from_secs_f64(1.0 / 165.0);
+            loop {
+                let spent = frame_t0.elapsed();
+                if spent >= target { break; }
+                let remain = target - spent;
+                if remain > std::time::Duration::from_millis(2) {
+                    std::thread::sleep(remain - std::time::Duration::from_millis(1));
+                }
+            }
+        }
 
         frame += 1;
         if let Some(m) = max_frames { if frame >= m { break; } }
