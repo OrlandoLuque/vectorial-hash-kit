@@ -4,11 +4,33 @@ Future work queued for review. Nothing here is committed scope — prune,
 reprioritise, or drop freely. Items graduate into the per-crate roadmaps
 (e.g. `crates/vectorial-hash/README.md`) once picked up.
 
+## Overnight queue (set 2026-06-25)
+
+Autonomous session, in order (prioritised by what can be finished + self-verified
+without the user — brute-force / round-trip gated first; visual-feedback last):
+
+1. **Morton / Z-order (linear octree)** — Index/algorithms below.
+2. **k-NN queries** — Index/algorithms below.
+3. **Index serialization** — Index/algorithms below.
+4. **World-size 2D stepper** — Render/demos below (visual scaling needs review).
+5. **Instancing stress test** — Render/demos below (GPU profiling semi-manual).
+
+Everything else in this file is **future / not in the night queue** — left here
+to triage later.
+
 ## Render / demos
-- **Instancing stress test** — GPU instancing + billboards now ship in
-  `critters3d` (`G` toggles immediate / instanced spheres / billboards, raw
-  miniquad in `src/instanced3d.rs`). Still TODO: push to 100k–1M critters and
-  profile where it becomes GPU-bound (fill vs vertex vs instance upload).
+- **Instancing stress test** *(queued tonight, #5)* — GPU instancing + billboards
+  now ship in `critters3d` (`G` toggles immediate / instanced spheres /
+  billboards, raw miniquad in `src/instanced3d.rs`). Still TODO: push to
+  100k–1M critters and profile where it becomes GPU-bound (fill vs vertex vs
+  instance upload).
+- **World-size 2D stepper** *(queued tonight, #4)* — the 2D `critters` demo has a
+  fixed 1024×1024 world (`MAP_W`/`MAP_H` consts in `sim.rs`); give it the same
+  stepped pow-2 world-size control the 3D demo has. Refactor of the shared sim
+  core: const → runtime field, render scale follows, `IntegerTree` re-bound to
+  the new pow-2 size, index rebuilt on change. Largest/riskiest of the queue —
+  the headless path (`critters_headless`) verifies determinism/correctness, but
+  the on-screen scaling wants a human glance.
 - **Colour by leaf depth / structure** — visualise the tree's interior (which
   cells are deep, how the split differs binary vs octree).
 - **Batch the sight-lines / combat effects** — the per-line `draw_line_3d` and
@@ -25,12 +47,15 @@ reprioritise, or drop freely. Items graduate into the per-crate roadmaps
 - **Full 3-projection vs expensive narrowphase** — `THREE_D.md`'s open item:
   run the projection methods (not just 1-proj) against a many-faced
   `Polyhedron3` to find where the tight broadphase finally pays for itself.
-- **Morton / Z-order keys (linear octree)** — a fourth structure to compare
-  against `Tree3` / `Octree3` / projection: hashed/sorted Morton codes.
+- **Morton / Z-order keys (linear octree)** *(queued tonight, #1)* — a fourth
+  structure to compare against `Tree3` / `Octree3` / projection: hashed/sorted
+  Morton codes. Added to `tree3d_bench`, gated against brute force.
 - **Multi-query cull + multithreading** — cull many spheres at once; parallel
   build/cull (rayon) for large N.
-- **k-NN queries** — nearest-neighbour, not only range cull.
-- **Index serialization** — save/load a built tree.
+- **k-NN queries** *(queued tonight, #2)* — nearest-neighbour (best-first with a
+  bounded heap), not only range cull. Gated against brute-force k-NN.
+- **Index serialization** *(queued tonight, #3)* — save/load a built tree.
+  Round-trip test (serialize → deserialize → `cull` identical).
 
 ## Dilation
 - **3D dilation (Minkowski)** — agent body radius for the 3D critters, the way
