@@ -43,8 +43,7 @@ use macroquad::ui::{hash, root_ui, widgets};
 use macroquad::window::get_internal_gl;
 
 use vectorial_hash::{
-    Aabb, CellState, Octree3, Point, Point3, Positioned, Positioned3, Rect, Shape, Shape3, Sphere3,
-    Tree, Tree3,
+    Aabb, Octree3, Point, Point3, Positioned, Positioned3, Rect, Shape, Shape3, Sphere3, Tree, Tree3,
 };
 use vectorial_hash_demos::instanced3d::{Instance, InstancedRenderer, Mode as RenderGeom};
 
@@ -75,8 +74,10 @@ const SEP_MAX: f32 = 2.0; // clamp per-frame displacement (avoids jitter blowups
 #[derive(Clone, Copy, PartialEq)]
 enum SimMode { Observe, Combat }
 
-/// The two attack shapes a predator can throw — a round sphere or a tall
-/// "drop" (vertical ellipsoid). Each gets its own colour so they read apart.
+/// The two attack shapes a predator can throw — a round sphere (a blast,
+/// centred on the predator) or a "drop": a flamethrower **cone** that starts at
+/// the predator's edge and fans out along its facing (any 3D direction), like a
+/// Warhammer 40k flamer template. Each gets its own colour so they read apart.
 #[derive(Clone, Copy, PartialEq)]
 enum AttackKind { Sphere, Drop }
 impl AttackKind {
@@ -84,34 +85,37 @@ impl AttackKind {
     fn for_predator(id: u32) -> Self { if id % 2 == 0 { AttackKind::Sphere } else { AttackKind::Drop } }
 }
 
-/// Ellipsoid radii for a drop of base radius `r` — narrower in x/z, taller in y.
-fn drop_radii(r: f32) -> (f32, f32, f32) { (r * 0.7, r * 1.5, r * 0.7) }
+/// Flamer-cone dimensions for base radius `r`: (tip offset from the predator
+/// centre so it doesn't hit itself, cone length, cone radius at the far end).
+fn flamer_dims(r: f32) -> (f32, f32, f32) { (3.0, r * 3.0, r * 0.85) }
 
-/// A vertical-ellipsoid attack volume (the "drop"). Reduces to a unit sphere
-/// under per-axis scaling, so the sphere-vs-AABB classify carries straight over.
-struct DropShape { cx: f64, cy: f64, cz: f64, rx: f64, ry: f64, rz: f64 }
+/// A flamethrower-cone attack volume (the "drop"): apex `tip`, unit axis `dir`,
+/// reaching `length`, widening linearly to `max_r` at the far end. A point is
+/// inside if its axial distance is in `[0, length]` and its perpendicular
+/// distance is within the cone radius at that depth.
+struct DropShape { tip: Point3, dir: [f64; 3], length: f64, max_r: f64 }
 impl Shape3 for DropShape {
     fn bounding_box(&self) -> Aabb {
-        Aabb::new(self.cx - self.rx, self.cy - self.ry, self.cz - self.rz, 2.0 * self.rx, 2.0 * self.ry, 2.0 * self.rz)
+        // Conservative: the tip→far-centre segment, expanded by max_r each way.
+        let far = [self.tip.x + self.dir[0] * self.length, self.tip.y + self.dir[1] * self.length, self.tip.z + self.dir[2] * self.length];
+        let lo = |a: f64, b: f64| a.min(b) - self.max_r;
+        let hi = |a: f64, b: f64| a.max(b) + self.max_r;
+        let (x0, y0, z0) = (lo(self.tip.x, far[0]), lo(self.tip.y, far[1]), lo(self.tip.z, far[2]));
+        Aabb::new(x0, y0, z0, hi(self.tip.x, far[0]) - x0, hi(self.tip.y, far[1]) - y0, hi(self.tip.z, far[2]) - z0)
     }
     fn contains_point(&self, p: Point3) -> bool {
-        let (dx, dy, dz) = ((p.x - self.cx) / self.rx, (p.y - self.cy) / self.ry, (p.z - self.cz) / self.rz);
-        dx * dx + dy * dy + dz * dz <= 1.0
-    }
-    fn classify_aabb(&self, b: &Aabb) -> CellState {
-        let nx = (self.cx.clamp(b.x, b.x_max()) - self.cx) / self.rx;
-        let ny = (self.cy.clamp(b.y, b.y_max()) - self.cy) / self.ry;
-        let nz = (self.cz.clamp(b.z, b.z_max()) - self.cz) / self.rz;
-        if nx * nx + ny * ny + nz * nz > 1.0 { return CellState::Out; }
-        let fx = (if (self.cx - b.x).abs() > (self.cx - b.x_max()).abs() { b.x } else { b.x_max() } - self.cx) / self.rx;
-        let fy = (if (self.cy - b.y).abs() > (self.cy - b.y_max()).abs() { b.y } else { b.y_max() } - self.cy) / self.ry;
-        let fz = (if (self.cz - b.z).abs() > (self.cz - b.z_max()).abs() { b.z } else { b.z_max() } - self.cz) / self.rz;
-        if fx * fx + fy * fy + fz * fz <= 1.0 { CellState::In } else { CellState::Maybe }
+        let v = [p.x - self.tip.x, p.y - self.tip.y, p.z - self.tip.z];
+        let t = v[0] * self.dir[0] + v[1] * self.dir[1] + v[2] * self.dir[2]; // axial distance
+        if t < 0.0 || t > self.length { return false; }
+        let perp2 = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) - t * t; // |v|^2 - (v·dir)^2
+        let r_at = (t / self.length) * self.max_r; // cone widens with depth
+        perp2 <= r_at * r_at
     }
 }
 
 /// A live attack volume (predator emits one; prey inside are culled & killed).
-struct Attack { center: Vec3, radius: f32, age: f32, kind: AttackKind }
+/// `dir` is the flamer axis for drops (zero for spheres).
+struct Attack { center: Vec3, radius: f32, age: f32, kind: AttackKind, dir: Vec3 }
 
 /// Hold-to-repeat for a key (OS-style): fires once on the press edge, then —
 /// after `DELAY` held — repeats every `RATE` while the key stays down. Used
@@ -227,6 +231,25 @@ struct Critter {
 }
 
 fn world_aabb() -> Aabb { Aabb::new(0.0, 0.0, 0.0, WORLD as f64, WORLD as f64, WORLD as f64) }
+
+/// Draw a cone wireframe (apex `tip`, axis `dir`, given length/radius): a ring
+/// at the far cap plus edges from the apex — used to show the flamer attacks.
+fn draw_cone_wires(tip: Vec3, dir: Vec3, length: f32, radius: f32, color: Color) {
+    let far = tip + dir * length;
+    // A perpendicular basis to `dir` for the far ring.
+    let up = if dir.y.abs() < 0.9 { vec3(0.0, 1.0, 0.0) } else { vec3(1.0, 0.0, 0.0) };
+    let u = dir.cross(up).normalize();
+    let w = dir.cross(u).normalize();
+    let n = 12;
+    let mut prev = far + u * radius;
+    for k in 1..=n {
+        let ang = std::f32::consts::TAU * k as f32 / n as f32;
+        let pt = far + (u * ang.cos() + w * ang.sin()) * radius;
+        draw_line_3d(prev, pt, color); // ring segment
+        draw_line_3d(tip, pt, color); // edge from the apex
+        prev = pt;
+    }
+}
 
 /// A 3D AABB → (centre, size) pair for `draw_cube_wires`.
 fn aabb_box(b: &Aabb) -> (Vec3, Vec3) {
@@ -629,18 +652,31 @@ async fn main() {
                     let center = critters[i].pos;
                     critters[i].cooldown = COOLDOWN + if random_attacks { rng.range(0.0, COOLDOWN_JITTER) } else { 0.0 };
                     let akind = AttackKind::for_predator(i as u32);
-                    attacks.push(Attack { center, radius: attack_r, age: 0.0, kind: akind });
+                    // Drops aim along the predator's heading (its velocity).
+                    let adir = if akind == AttackKind::Drop {
+                        let v = critters[i].vel;
+                        if v.length() > 0.1 { v.normalize() } else { vec3(0.0, 1.0, 0.0) }
+                    } else {
+                        Vec3::ZERO
+                    };
+                    attacks.push(Attack { center, radius: attack_r, age: 0.0, kind: akind, dir: adir });
                     frame_attacks += 1;
-                    let (cx, cy, cz) = (center.x as f64, center.y as f64, center.z as f64);
                     let tc = Instant::now();
                     let hit_ids: Vec<usize> = match akind {
                         AttackKind::Sphere => {
-                            let s = Sphere3::new(cx, cy, cz, attack_r as f64);
+                            let s = Sphere3::new(center.x as f64, center.y as f64, center.z as f64, attack_r as f64);
                             tree.cull(&s).iter().map(|h| h.id as usize).collect()
                         }
                         AttackKind::Drop => {
-                            let (rx, ry, rz) = drop_radii(attack_r);
-                            let s = DropShape { cx, cy, cz, rx: rx as f64, ry: ry as f64, rz: rz as f64 };
+                            // Flamer cone from the predator's edge, along `adir`.
+                            let (off, length, maxr) = flamer_dims(attack_r);
+                            let tip = center + adir * off;
+                            let s = DropShape {
+                                tip: Point3::new(tip.x as f64, tip.y as f64, tip.z as f64),
+                                dir: [adir.x as f64, adir.y as f64, adir.z as f64],
+                                length: length as f64,
+                                max_r: maxr as f64,
+                            };
                             tree.cull(&s).iter().map(|h| h.id as usize).collect()
                         }
                     };
@@ -768,16 +804,10 @@ async fn main() {
                         draw_sphere_wires(a.center, a.radius * grow, None, Color::new(1.0, 0.7 - 0.5 * f, 0.2, alpha));
                     }
                     AttackKind::Drop => {
-                        let (rx, ry, _rz) = drop_radii(a.radius);
-                        let col = Color::new(0.25, 0.85, 1.0, alpha); // cyan
-                        let bulb = a.center + vec3(0.0, -ry * 0.25 * grow, 0.0);
-                        draw_sphere_wires(bulb, rx * grow, None, col);
-                        let tip = a.center + vec3(0.0, ry * grow, 0.0);
-                        for k in 0..6 {
-                            let ang = std::f32::consts::TAU * k as f32 / 6.0;
-                            let edge = bulb + vec3(ang.cos() * rx * grow, ry * 0.2 * grow, ang.sin() * rx * grow);
-                            draw_line_3d(edge, tip, col);
-                        }
+                        // Flamer cone from the predator's edge along its heading.
+                        let (off, length, maxr) = flamer_dims(a.radius);
+                        let tip = a.center + a.dir * off;
+                        draw_cone_wires(tip, a.dir, length, maxr, Color::new(0.25, 0.85, 1.0, alpha));
                     }
                 }
             }
