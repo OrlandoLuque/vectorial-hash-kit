@@ -105,10 +105,17 @@ impl Shape3 for DropShape {
     fn contains_point(&self, p: Point3) -> bool {
         let v = [p.x - self.tip.x, p.y - self.tip.y, p.z - self.tip.z];
         let t = v[0] * self.dir[0] + v[1] * self.dir[1] + v[2] * self.dir[2]; // axial distance
-        if t < 0.0 || t > self.length { return false; }
+        if t < 0.0 { return false; } // behind the apex
         let perp2 = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) - t * t; // |v|^2 - (v·dir)^2
-        let r_at = (t / self.length) * self.max_r; // cone widens with depth
-        perp2 <= r_at * r_at
+        if t <= self.length {
+            let r_at = (t / self.length) * self.max_r; // cone widens with depth
+            perp2 <= r_at * r_at
+        } else {
+            // rounded cap: a hemisphere of radius max_r at the far centre, so the
+            // drop ends like a teardrop instead of a flat disc.
+            let dt = t - self.length;
+            dt * dt + perp2 <= self.max_r * self.max_r
+        }
     }
 }
 
@@ -231,22 +238,33 @@ struct Critter {
 
 fn world_aabb() -> Aabb { Aabb::new(0.0, 0.0, 0.0, WORLD as f64, WORLD as f64, WORLD as f64) }
 
-/// Draw a cone wireframe (apex `tip`, axis `dir`, given length/radius): a ring
-/// at the far cap plus edges from the apex — used to show the flamer attacks.
-fn draw_cone_wires(tip: Vec3, dir: Vec3, length: f32, radius: f32, color: Color) {
+/// Draw a flamer/teardrop wireframe (apex `tip`, axis `dir`): straight cone
+/// edges from the apex to the widest ring, then a rounded hemisphere cap
+/// (radius `radius`) so it ends like a drop, not a flat disc.
+fn draw_flamer_wires(tip: Vec3, dir: Vec3, length: f32, radius: f32, color: Color) {
     let far = tip + dir * length;
-    // A perpendicular basis to `dir` for the far ring.
+    // A perpendicular basis to `dir` for the far ring + cap meridians.
     let up = if dir.y.abs() < 0.9 { vec3(0.0, 1.0, 0.0) } else { vec3(1.0, 0.0, 0.0) };
     let u = dir.cross(up).normalize();
     let w = dir.cross(u).normalize();
-    let n = 12;
-    let mut prev = far + u * radius;
+    let n = 12; // meridians
+    let m = 3; // cap arc segments per meridian
+    let mut prev_ring = far + u * radius;
     for k in 1..=n {
         let ang = std::f32::consts::TAU * k as f32 / n as f32;
-        let pt = far + (u * ang.cos() + w * ang.sin()) * radius;
-        draw_line_3d(prev, pt, color); // ring segment
-        draw_line_3d(tip, pt, color); // edge from the apex
-        prev = pt;
+        let radial = u * ang.cos() + w * ang.sin();
+        let ring = far + radial * radius;
+        draw_line_3d(prev_ring, ring, color); // widest ring
+        draw_line_3d(tip, ring, color); // cone edge from the apex
+        // rounded cap: a meridian arc from the ring out to the far pole
+        let mut prev_arc = ring;
+        for s in 1..=m {
+            let beta = std::f32::consts::FRAC_PI_2 * s as f32 / m as f32;
+            let arc = far + dir * (radius * beta.sin()) + radial * (radius * beta.cos());
+            draw_line_3d(prev_arc, arc, color);
+            prev_arc = arc;
+        }
+        prev_ring = ring;
     }
 }
 
@@ -897,7 +915,7 @@ async fn main() {
                         // Flamer cone from the predator's edge along its heading.
                         let (off, length, maxr) = flamer_dims(a.radius);
                         let tip = a.center + a.dir * off;
-                        draw_cone_wires(tip, a.dir, length, maxr, Color::new(0.25, 0.85, 1.0, alpha));
+                        draw_flamer_wires(tip, a.dir, length, maxr, Color::new(0.25, 0.85, 1.0, alpha));
                     }
                 }
             }
