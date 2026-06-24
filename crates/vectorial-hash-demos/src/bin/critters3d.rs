@@ -276,16 +276,17 @@ struct Panel {
     row: f32,    // row height
     mx: f32,
     my: f32,
-    pressed: bool, // left mouse pressed this frame (buttons / +/-)
-    down: bool,    // left mouse held (slider drag)
+    pressed: bool,  // left mouse pressed this frame (buttons / +/-)
+    down: bool,     // left mouse held (slider drag)
+    rpressed: bool, // right mouse pressed (start keyboard edit on a slider)
     help: Option<&'static str>,
 }
 impl Panel {
-    fn new(x: f32, y: f32, w: f32, mx: f32, my: f32, pressed: bool, down: bool) -> Self {
+    fn new(x: f32, y: f32, w: f32, mx: f32, my: f32, pressed: bool, down: bool, rpressed: bool) -> Self {
         draw_rectangle(x, y, w, UI_H, Color::new(0.06, 0.07, 0.10, 0.92));
         draw_rectangle(x, y, w, 22.0, Color::new(0.12, 0.14, 0.20, 0.95));
         draw_text("controls", x + 8.0, y + 16.0, 18.0, Color::new(0.8, 0.9, 1.0, 1.0));
-        Panel { x, w, cur: y + 26.0, row: 26.0, mx, my, pressed, down, help: None }
+        Panel { x, w, cur: y + 26.0, row: 26.0, mx, my, pressed, down, rpressed, help: None }
     }
     fn over(&self, rx: f32, ry: f32, rw: f32, rh: f32) -> bool {
         self.mx >= rx && self.mx <= rx + rw && self.my >= ry && self.my <= ry + rh
@@ -302,8 +303,10 @@ impl Panel {
         self.cur += self.row;
         hov && self.pressed
     }
-    /// `[-] label: value bar [+]` — `step` snaps to multiples; drag the bar to set.
-    fn slider(&mut self, label: &str, min: f32, max: f32, step: f32, val: &mut f32, help: &'static str) {
+    /// `[-] label: value bar [+]` — `step` snaps to multiples, drag the bar to
+    /// set, **right-click to type the value** (`id` identifies this slider; the
+    /// main loop captures the keystrokes into `edit_buf` and applies on Enter).
+    fn slider(&mut self, label: &str, min: f32, max: f32, step: f32, val: &mut f32, id: u8, editing: &mut Option<u8>, edit_buf: &mut String, help: &'static str) {
         let (ry, rh, bw) = (self.cur, self.row - 5.0, 22.0);
         let (mx0, px0) = (self.x + 6.0, self.x + self.w - 6.0 - bw);
         let bx = mx0 + bw + 4.0;
@@ -313,15 +316,21 @@ impl Panel {
             self.over(px0, ry, bw, rh),
             self.over(bx, ry, bar_w, rh),
         );
-        Self::cell(mx0, ry, bw, rh, hov_m, "-", 8.0);
-        Self::cell(px0, ry, bw, rh, hov_p, "+", 7.0);
-        if hov_m && self.pressed { *val = (((*val / step).ceil() - 1.0) * step).max(min); }
-        if hov_p && self.pressed { *val = (((*val / step).floor() + 1.0) * step).min(max); }
+        let is_editing = *editing == Some(id);
+        Self::cell(mx0, ry, bw, rh, hov_m && !is_editing, "-", 8.0);
+        Self::cell(px0, ry, bw, rh, hov_p && !is_editing, "+", 7.0);
         draw_rectangle(bx, ry, bar_w, rh, Color::new(0.14, 0.16, 0.22, 0.9));
-        let frac = ((*val - min) / (max - min)).clamp(0.0, 1.0);
-        draw_rectangle(bx, ry, bar_w * frac, rh, Color::new(0.28, 0.5, 0.7, 0.9));
-        draw_text(&format!("{}: {:.0}", label, *val), bx + 6.0, ry + rh * 0.72, 16.0, Color::new(0.92, 0.95, 1.0, 1.0));
-        if hov_b && self.down { *val = (min + ((self.mx - bx) / bar_w) * (max - min)).clamp(min, max); }
+        if is_editing {
+            draw_text(&format!("{}: {}_", label, edit_buf), bx + 6.0, ry + rh * 0.72, 16.0, Color::new(1.0, 0.9, 0.4, 1.0));
+        } else {
+            if hov_m && self.pressed { *val = (((*val / step).ceil() - 1.0) * step).max(min); }
+            if hov_p && self.pressed { *val = (((*val / step).floor() + 1.0) * step).min(max); }
+            if hov_b && self.down { *val = (min + ((self.mx - bx) / bar_w) * (max - min)).clamp(min, max); }
+            if hov_b && self.rpressed { *editing = Some(id); *edit_buf = format!("{:.0}", *val); } // start keyboard edit
+            let frac = ((*val - min) / (max - min)).clamp(0.0, 1.0);
+            draw_rectangle(bx, ry, bar_w * frac, rh, Color::new(0.28, 0.5, 0.7, 0.9));
+            draw_text(&format!("{}: {:.0}", label, *val), bx + 6.0, ry + rh * 0.72, 16.0, Color::new(0.92, 0.95, 1.0, 1.0));
+        }
         if hov_m || hov_p || hov_b { self.help = Some(help); }
         self.cur += self.row;
     }
@@ -562,6 +571,9 @@ async fn main() {
     let mut g_fps: Vec<f32> = Vec::new();
     let mut g_cpu: Vec<f32> = Vec::new();
     let mut g_cull: Vec<f32> = Vec::new();
+    // Keyboard editing of a slider value: which slider (0=pop, 1=radius) + buffer.
+    let mut editing: Option<u8> = None;
+    let mut edit_buf = String::new();
 
     loop {
         let dt = (get_frame_time()).min(1.0 / 30.0);
@@ -586,6 +598,29 @@ async fn main() {
         let over_ui = mp_now.0 >= ui_x && mp_now.0 <= ui_x + UI_W && mp_now.1 >= ui_y && mp_now.1 <= ui_y + UI_H;
 
         // --- input ---
+        // Typing a value into a slider (started with a right-click in the panel)
+        // grabs the keyboard; the shortcuts below are suspended until Enter/Esc.
+        if editing.is_some() {
+            while let Some(ch) = get_char_pressed() {
+                if ch.is_ascii_digit() || ch == '.' { edit_buf.push(ch); }
+            }
+            if is_key_pressed(KeyCode::Backspace) { edit_buf.pop(); }
+            if is_key_pressed(KeyCode::Escape) { editing = None; }
+            if is_key_pressed(KeyCode::Enter) || is_key_pressed(KeyCode::KpEnter) {
+                if let Ok(v) = edit_buf.parse::<f32>() {
+                    match editing {
+                        Some(0) => pop_f = v.clamp(0.0, 80000.0),
+                        Some(1) => match sim_mode {
+                            SimMode::Observe => vision_r = v.clamp(6.0, world),
+                            SimMode::Combat => attack_r = v.clamp(4.0, world * 0.5),
+                        },
+                        _ => {}
+                    }
+                }
+                editing = None;
+            }
+        }
+        if editing.is_none() {
         if is_key_pressed(KeyCode::Escape) { break; }
         if is_key_pressed(KeyCode::Space) { paused = !paused; }
         if is_key_pressed(KeyCode::B) { show_boxes = !show_boxes; }
@@ -628,6 +663,7 @@ async fn main() {
                 SimMode::Combat => attack_r = (((attack_r / R_STEP).floor() + 1.0) * R_STEP).min(world * 0.5),
             }
         }
+        } // end keyboard shortcuts (suspended while editing a value)
         let mp = mouse_position();
         if is_mouse_button_down(MouseButton::Left) && !over_ui {
             yaw += (mp.0 - last_mouse.0) * 0.01;
@@ -1065,7 +1101,8 @@ async fn main() {
 
         // --- on-screen mouse controls (top-right panel; keys still work too) ---
         let mut panel = Panel::new(ui_x, ui_y, UI_W, mp_now.0, mp_now.1,
-            is_mouse_button_pressed(MouseButton::Left), is_mouse_button_down(MouseButton::Left));
+            is_mouse_button_pressed(MouseButton::Left), is_mouse_button_down(MouseButton::Left),
+            is_mouse_button_pressed(MouseButton::Right));
         if panel.button(&format!("mode: {} [T]", if sim_mode == SimMode::Combat { "COMBAT" } else { "observe" }),
             "Observe: one vision sphere from the centre\nlights the critters it sees.\nCombat: red critters become predators\nthat attack nearby prey (each attack is\nan index cull).") {
             sim_mode = match sim_mode { SimMode::Observe => SimMode::Combat, SimMode::Combat => SimMode::Observe };
@@ -1086,13 +1123,13 @@ async fn main() {
         if panel.button(&format!("cull reps: {} [C]", cull_reps),
             "Repeat the timed cull N times for a stable\nper-cull microsecond reading (one cull is\ntoo fast to time on its own).") { cull_rep_idx = (cull_rep_idx + 1) % cull_rep_steps.len(); }
         panel.separator();
-        panel.slider("population", 0.0, 80000.0, 200.0, &mut pop_f,
-            "Number of critters. - / + step by 200,\ndrag the bar to set any value.");
+        panel.slider("population", 0.0, 80000.0, 200.0, &mut pop_f, 0, &mut editing, &mut edit_buf,
+            "Number of critters. -/+ step by 200, drag\nto set, right-click to type a number.");
         match sim_mode {
-            SimMode::Observe => panel.slider("vision r", 6.0, world, 5.0, &mut vision_r,
-                "Radius of the centre vision sphere."),
-            SimMode::Combat => panel.slider("attack r", 4.0, world * 0.5, 5.0, &mut attack_r,
-                "Base size of the predators' attacks."),
+            SimMode::Observe => panel.slider("vision r", 6.0, world, 5.0, &mut vision_r, 1, &mut editing, &mut edit_buf,
+                "Radius of the centre vision sphere.\nRight-click to type a number."),
+            SimMode::Combat => panel.slider("attack r", 4.0, world * 0.5, 5.0, &mut attack_r, 1, &mut editing, &mut edit_buf,
+                "Base size of the attacks.\nRight-click to type a number."),
         }
         panel.stepper("world size", &SIZE_STEPS, &mut world,
             "Side of the cube the action lives in.\nStepped powers of 2 -- changing it rebuilds\nthe index and re-bounds the critters.");
