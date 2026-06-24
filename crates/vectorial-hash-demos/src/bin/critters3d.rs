@@ -11,31 +11,35 @@
 //! *combat* (the red critters become predators that attack nearby prey; each
 //! attack is an index cull, so it is the "many queries per frame" workload).
 //!
+//! Most controls are also clickable in the top-right on-screen panel. vsync is
+//! off, so the fps counter shows the real ceiling, not the monitor refresh.
+//!
 //! Controls:
 //! - drag left mouse: orbit the camera; scroll: zoom
-//! - `+` / `-`: add / remove 200 critters
+//! - `+` / `-`: add / remove 200 critters (hold to repeat); panel has a slider
 //! - `T`: toggle observe / combat
 //! - `R`: toggle attack desync (combat) — on = min+random cooldowns, off =
 //!   all predators in lockstep (a synchronized saturation spike to stress-test)
+//! - `O`: toggle separation (no two critters share a space; one cull/critter)
 //! - `[` / `]`: shrink / grow the radius (vision in observe, attack in combat)
 //! - `M`: cycle the index structure — binary-3D `Tree3` / `Octree3` (8-way) /
 //!   projection (one 2D `Tree` on xy + z-reject, the author's variant)
 //! - `G`: cycle the render path — GPU-instanced spheres / round billboards /
-//!   square billboards (all one draw call, raw miniquad). Round billboards
-//!   use a `discard` (fill-bound under overdraw); square ones don't (fastest).
+//!   square billboards / NO RENDER (CPU only, to read the CPU's fps ceiling)
 //! - `C`: cycle cull repetitions (1/50/200/1000) — averages the per-cull time
-//!   for a stable, readable µs figure that differs between structures
 //! - `B`: toggle the leaf-box wireframes (extruded columns in projection mode)
 //! - `Space`: pause, `Esc`: quit
 //!
 //! Env: CRITTERS3D_MAX_FRAMES=N exits after N frames (smoke testing);
-//! CRITTERS3D_RENDER=immediate|instanced|billboards sets the initial render path.
+//! CRITTERS3D_RENDER=instanced|billboards|square|none initial render path;
+//! CRITTERS3D_COMBAT=1 starts in combat; CRITTERS3D_SEP=1 starts with separation.
 
 use std::time::Instant;
 
 use macroquad::camera::Camera;
 use macroquad::miniquad::PassAction;
 use macroquad::prelude::*;
+use macroquad::ui::{hash, root_ui, widgets};
 use macroquad::window::get_internal_gl;
 
 use vectorial_hash::{
@@ -47,6 +51,10 @@ use vectorial_hash_demos::instanced3d::{Instance, InstancedRenderer, Mode as Ren
 const WORLD: f32 = 200.0;
 const MARGIN: f32 = 4.0;
 const ITEM_LIMIT: usize = 16;
+
+// On-screen control panel (top-right) size.
+const UI_W: f32 = 290.0;
+const UI_H: f32 = 360.0;
 
 // Combat-mode tuning.
 const COOLDOWN: f32 = 0.7; // minimum seconds between a predator's attacks
@@ -162,13 +170,14 @@ impl Shape for Disc {
 /// immediate `draw_sphere` mode was dropped once instancing was confirmed
 /// working; it pinned the demo to ~10 fps at a few thousand critters.
 #[derive(Clone, Copy, PartialEq)]
-enum RenderMode { InstancedSpheres, Billboards, SquareBillboards }
+enum RenderMode { InstancedSpheres, Billboards, SquareBillboards, None }
 impl RenderMode {
     fn next(self) -> Self {
         match self {
             RenderMode::InstancedSpheres => RenderMode::Billboards,
             RenderMode::Billboards => RenderMode::SquareBillboards,
-            RenderMode::SquareBillboards => RenderMode::InstancedSpheres,
+            RenderMode::SquareBillboards => RenderMode::None,
+            RenderMode::None => RenderMode::InstancedSpheres,
         }
     }
     fn label(self) -> &'static str {
@@ -176,19 +185,23 @@ impl RenderMode {
             RenderMode::InstancedSpheres => "instanced spheres (GPU)",
             RenderMode::Billboards => "instanced billboards, round (GPU)",
             RenderMode::SquareBillboards => "instanced billboards, square/fast (GPU)",
+            RenderMode::None => "NO RENDER (CPU only)",
         }
     }
-    fn geom(self) -> RenderGeom {
+    /// `None` when the critters aren't drawn (isolates CPU); else the geometry.
+    fn geom(self) -> Option<RenderGeom> {
         match self {
-            RenderMode::InstancedSpheres => RenderGeom::Spheres,
-            RenderMode::Billboards => RenderGeom::Billboards,
-            RenderMode::SquareBillboards => RenderGeom::BillboardsSquare,
+            RenderMode::InstancedSpheres => Some(RenderGeom::Spheres),
+            RenderMode::Billboards => Some(RenderGeom::Billboards),
+            RenderMode::SquareBillboards => Some(RenderGeom::BillboardsSquare),
+            RenderMode::None => Option::None,
         }
     }
     fn from_env() -> Self {
         match std::env::var("CRITTERS3D_RENDER").ok().as_deref() {
             Some("billboards") => RenderMode::Billboards,
             Some("square") => RenderMode::SquareBillboards,
+            Some("none") => RenderMode::None,
             _ => RenderMode::InstancedSpheres,
         }
     }
@@ -233,7 +246,16 @@ fn kind_color(k: u8, lit: bool) -> Color {
 }
 
 fn window_conf() -> Conf {
-    Conf { window_title: "vectorial-hash critters 3D".to_owned(), window_width: 1600, window_height: 1000, ..Default::default() }
+    Conf {
+        window_title: "vectorial-hash critters 3D".to_owned(),
+        window_width: 1600,
+        window_height: 1000,
+        // vsync off: the FPS counter shows the real ceiling (CPU and/or GPU)
+        // instead of being pinned to the monitor refresh — needed to see what
+        // "NO RENDER (CPU only)" actually reaches.
+        platform: macroquad::miniquad::conf::Platform { swap_interval: Some(0), ..Default::default() },
+        ..Default::default()
+    }
 }
 
 #[macroquad::main(window_conf)]
@@ -290,7 +312,9 @@ async fn main() {
     // Combat-mode state.
     let mut sim_mode = if std::env::var("CRITTERS3D_COMBAT").is_ok() { SimMode::Combat } else { SimMode::Observe };
     let mut random_attacks = true; // desync cooldowns; off = synchronized saturation
+    let mut prev_random = random_attacks; // to reseed cooldowns when this flips
     let mut separation = std::env::var("CRITTERS3D_SEP").is_ok(); // push critters apart (heavy)
+    let mut pop_f = critters.len() as f32; // target population (driven by +/- and the slider)
     let mut attack_r: f32 = 22.0;
     let mut attacks: Vec<Attack> = Vec::new();
     let mut bursts: Vec<(Vec3, f32)> = Vec::new(); // kill markers (pos, age)
@@ -343,6 +367,11 @@ async fn main() {
         let sim_us;
         let prep_us;
 
+        // Control panel rect (top-right); the camera ignores the mouse over it.
+        let (ui_x, ui_y) = (screen_width() - UI_W - 8.0, 8.0);
+        let mp_now = mouse_position();
+        let over_ui = mp_now.0 >= ui_x && mp_now.0 <= ui_x + UI_W && mp_now.1 >= ui_y && mp_now.1 <= ui_y + UI_H;
+
         // --- input ---
         if is_key_pressed(KeyCode::Escape) { break; }
         if is_key_pressed(KeyCode::Space) { paused = !paused; }
@@ -350,17 +379,7 @@ async fn main() {
         if is_key_pressed(KeyCode::M) { structure = structure.next(); }
         if is_key_pressed(KeyCode::G) { render_mode = render_mode.next(); }
         if is_key_pressed(KeyCode::T) { sim_mode = match sim_mode { SimMode::Observe => SimMode::Combat, SimMode::Combat => SimMode::Observe }; }
-        if is_key_pressed(KeyCode::R) {
-            // Toggle attack desync. Re-seed live predator cooldowns so the
-            // change is immediate: random -> spread out; synced -> all in
-            // lockstep (every COOLDOWN seconds → a saturation spike).
-            random_attacks = !random_attacks;
-            for c in critters.iter_mut() {
-                if c.kind == 1 {
-                    c.cooldown = if random_attacks { rng.range(0.0, COOLDOWN + COOLDOWN_JITTER) } else { COOLDOWN };
-                }
-            }
-        }
+        if is_key_pressed(KeyCode::R) { random_attacks = !random_attacks; }
         if is_key_pressed(KeyCode::C) { cull_rep_idx = (cull_rep_idx + 1) % cull_rep_steps.len(); }
         if is_key_pressed(KeyCode::O) { separation = !separation; }
         // +/- ramp the population: one step per press, or hold to auto-repeat.
@@ -369,30 +388,13 @@ async fn main() {
             is_key_down(KeyCode::Equal) || is_key_down(KeyCode::KpAdd),
             dt,
         );
-        if add {
-            for i in 0..200 {
-                let id = critters.len() as u32;
-                let c = spawn(&mut rng, (i % 3) as u8);
-                let p = pt3(&c);
-                tree.insert(C3 { id, p });
-                tree_pos.push(p);
-                critters.push(c);
-            }
-        }
+        if add { pop_f = (pop_f + 200.0).min(80000.0); }
         let sub = sub_rep.fires(
             is_key_pressed(KeyCode::Minus) || is_key_pressed(KeyCode::KpSubtract),
             is_key_down(KeyCode::Minus) || is_key_down(KeyCode::KpSubtract),
             dt,
         );
-        if sub {
-            for _ in 0..200 {
-                if critters.pop().is_some() {
-                    let i = critters.len();
-                    tree.remove(tree_pos[i], |c| c.id == i as u32);
-                    tree_pos.pop();
-                }
-            }
-        }
+        if sub { pop_f = (pop_f - 200.0).max(0.0); }
         // [ / ] adjusts the vision radius (observe) or attack radius (combat).
         let radius_step = 60.0 * dt;
         if is_key_down(KeyCode::LeftBracket) {
@@ -408,13 +410,31 @@ async fn main() {
             }
         }
         let mp = mouse_position();
-        if is_mouse_button_down(MouseButton::Left) {
+        if is_mouse_button_down(MouseButton::Left) && !over_ui {
             yaw += (mp.0 - last_mouse.0) * 0.01;
             pitch = (pitch + (mp.1 - last_mouse.1) * 0.01).clamp(-1.4, 1.4);
         }
         last_mouse = mp;
         let scroll = mouse_wheel().1;
-        if scroll != 0.0 { dist = (dist * (1.0 - scroll.signum() * 0.1)).clamp(WORLD * 0.6, WORLD * 6.0); }
+        if scroll != 0.0 && !over_ui { dist = (dist * (1.0 - scroll.signum() * 0.1)).clamp(WORLD * 0.6, WORLD * 6.0); }
+
+        // Reconcile population (and the index) to the target — drives both the
+        // +/- keys and the panel slider through one path.
+        let target = pop_f.round().max(0.0) as usize;
+        while critters.len() < target {
+            let id = critters.len() as u32;
+            let c = spawn(&mut rng, (id % 3) as u8);
+            let p = pt3(&c);
+            tree.insert(C3 { id, p });
+            tree_pos.push(p);
+            critters.push(c);
+        }
+        while critters.len() > target {
+            critters.pop();
+            let i = critters.len();
+            tree.remove(tree_pos[i], |c| c.id == i as u32);
+            tree_pos.pop();
+        }
 
         // --- simulate ---
         let t_sim = Instant::now();
@@ -681,31 +701,30 @@ async fn main() {
             draw_sphere(observer, 3.0, None, WHITE);
         }
 
-        // Per-critter colour & radius for the active mode. Observe lights the
-        // seen critters; combat reds the predators and flashes fresh respawns.
+        // critters — GPU-instanced (spheres/billboards), or skipped entirely in
+        // NO RENDER mode (so the frame is pure CPU: sim + index + cull).
         let t_prep = Instant::now();
-        let mut cols: Vec<Color> = Vec::with_capacity(critters.len());
-        let mut rads: Vec<f32> = Vec::with_capacity(critters.len());
-        for (i, c) in critters.iter().enumerate() {
-            let (col, rad) = match sim_mode {
-                SimMode::Observe => (kind_color(c.kind, lit[i]), if lit[i] { 2.2 } else { 1.5 }),
-                SimMode::Combat => {
-                    if c.flash > 0.0 {
-                        (Color::new(1.0, 1.0, 1.0, 1.0), 2.6)
-                    } else if c.kind == 1 {
-                        (Color::new(1.0, 0.35, 0.30, 1.0), 2.3)
-                    } else {
-                        (kind_color(c.kind, false), 1.4)
+        if let Some(geom) = render_mode.geom() {
+            // Per-critter colour & radius. Observe lights the seen critters;
+            // combat reds the predators and flashes fresh respawns.
+            let mut cols: Vec<Color> = Vec::with_capacity(critters.len());
+            let mut rads: Vec<f32> = Vec::with_capacity(critters.len());
+            for (i, c) in critters.iter().enumerate() {
+                let (col, rad) = match sim_mode {
+                    SimMode::Observe => (kind_color(c.kind, lit[i]), if lit[i] { 2.2 } else { 1.5 }),
+                    SimMode::Combat => {
+                        if c.flash > 0.0 {
+                            (Color::new(1.0, 1.0, 1.0, 1.0), 2.6)
+                        } else if c.kind == 1 {
+                            (Color::new(1.0, 0.35, 0.30, 1.0), 2.3)
+                        } else {
+                            (kind_color(c.kind, false), 1.4)
+                        }
                     }
-                }
-            };
-            cols.push(col);
-            rads.push(rad);
-        }
-
-        // critters — GPU-instanced (spheres or billboards), one draw call.
-        {
-            let geom = render_mode.geom();
+                };
+                cols.push(col);
+                rads.push(rad);
+            }
             let instances: Vec<Instance> = critters.iter().enumerate().map(|(i, c)| {
                 Instance::new(c.pos, rads[i], [cols[i].r, cols[i].g, cols[i].b, cols[i].a])
             }).collect();
@@ -719,6 +738,8 @@ async fn main() {
             ctx.begin_default_pass(PassAction::Nothing);
             renderer.draw(ctx, geom, &instances, mvp, cam_right, cam_up);
             ctx.end_render_pass();
+        } else {
+            prep_us = 0.0;
         }
 
         if sim_mode == SimMode::Observe {
@@ -757,14 +778,8 @@ async fn main() {
             }
         }
 
-        // CPU phases this frame → rolling averages. frame_t0 was taken at the
-        // top of the loop, so cpu_us covers all CPU work (sim, index build,
-        // cull, render prep, draw submission) but not the vsync wait.
-        let cpu_us = frame_t0.elapsed().as_secs_f64() * 1e6;
-        let ema = |avg: f64, x: f64| if avg <= 0.0 { x } else { avg * 0.9 + x * 0.1 };
-        cpu_ms_avg = ema(cpu_ms_avg, cpu_us / 1000.0);
-        sim_us_avg = ema(sim_us_avg, sim_us);
-        prep_us_avg = ema(prep_us_avg, prep_us);
+        // (CPU timing is taken at the very end of the frame — see below — so it
+        // includes the HUD/UI; the HUD shows the previous frame's rolling value.)
 
         // --- HUD (2D overlay) ---
         set_default_camera();
@@ -785,19 +800,66 @@ async fn main() {
             SimMode::Combat => format!("cull {:.3} us (rolling avg, per attack)", cull_us_avg),
         };
         hud(90.0, format!("index: build {:.0} us | {}", t_build_us, cull_note));
-        let render_note = if render_mode == RenderMode::InstancedSpheres {
-            let tris = renderer.sphere_triangles() as i64 * critters.len() as i64;
-            format!("{}  |  {} tris/sphere -> {:.2}M tris", render_mode.label(), renderer.sphere_triangles(), tris as f64 / 1e6)
-        } else {
-            format!("{}  |  2 tris/critter", render_mode.label())
+        let render_note = match render_mode {
+            RenderMode::InstancedSpheres => {
+                let tris = renderer.sphere_triangles() as i64 * critters.len() as i64;
+                format!("{}  |  {} tris/sphere -> {:.2}M tris", render_mode.label(), renderer.sphere_triangles(), tris as f64 / 1e6)
+            }
+            RenderMode::None => render_mode.label().to_string(),
+            _ => format!("{}  |  2 tris/critter", render_mode.label()),
         };
         hud(112.0, format!("render: {}  <- G switches", render_note));
-        // CPU vs frame budget: if CPU fills most of the frame, FPS is bounded by
-        // the CPU, not the GPU/vsync — so changing render mode won't move it.
+        // With vsync off, the frame time ~= max(CPU, GPU). If the CPU fills
+        // ~all of it, we're CPU-bound; if the frame is longer than the CPU work,
+        // the GPU is the limit. "CPU ceiling" = the fps the CPU alone sustains.
         let frame_ms = if fps_display > 1.0 { 1000.0 / fps_display as f64 } else { cpu_ms_avg };
-        let bound = if frame_ms > 0.0 && cpu_ms_avg > 0.7 * frame_ms { "CPU-BOUND" } else { "GPU/vsync headroom" };
-        hud(134.0, format!("cpu ~{:.2} ms/frame (sim {:.0} + build {:.0} + prep {:.0} us) -> {}", cpu_ms_avg, sim_us_avg, t_build_us, prep_us_avg, bound));
+        let cpu_ceiling = if cpu_ms_avg > 0.0 { 1000.0 / cpu_ms_avg } else { 0.0 };
+        let bound = if frame_ms > 0.0 && cpu_ms_avg >= 0.85 * frame_ms { "CPU-BOUND" } else { "GPU-bound" };
+        hud(134.0, format!("cpu ~{:.2} ms (sim {:.0}+build {:.0}+prep {:.0} us) -> CPU ceiling ~{:.0} fps -> {}", cpu_ms_avg, sim_us_avg, t_build_us, prep_us_avg, cpu_ceiling, bound));
         hud(screen_height() - 18.0, "drag/zoom | +/-: pop | [ ]: radius | T: combat | R: sync | O: separation | M: structure | G: render | C: reps | B: boxes | Space | Esc".to_string());
+
+        // --- on-screen mouse controls (top-right panel; keys still work too) ---
+        widgets::Window::new(hash!(), vec2(ui_x, ui_y), vec2(UI_W, UI_H))
+            .label("controls (click / drag)")
+            .titlebar(true)
+            .movable(false)
+            .ui(&mut root_ui(), |ui| {
+                if ui.button(None, format!("mode: {} [T]", if sim_mode == SimMode::Combat { "COMBAT" } else { "observe" })) {
+                    sim_mode = match sim_mode { SimMode::Observe => SimMode::Combat, SimMode::Combat => SimMode::Observe };
+                }
+                if ui.button(None, format!("structure: {} [M]", structure.label())) { structure = structure.next(); }
+                if ui.button(None, format!("render: {} [G]", render_mode.label())) { render_mode = render_mode.next(); }
+                ui.separator();
+                if ui.button(None, format!("attacks: {} [R]", if random_attacks { "desynced" } else { "SYNCED" })) { random_attacks = !random_attacks; }
+                if ui.button(None, format!("separation: {} [O]", if separation { "ON" } else { "off" })) { separation = !separation; }
+                if ui.button(None, format!("leaf boxes: {} [B]", if show_boxes { "ON" } else { "off" })) { show_boxes = !show_boxes; }
+                if ui.button(None, format!("cull reps: {} [C]", cull_reps)) { cull_rep_idx = (cull_rep_idx + 1) % cull_rep_steps.len(); }
+                ui.separator();
+                ui.slider(hash!(), "population", 0f32..80000f32, &mut pop_f);
+                match sim_mode {
+                    SimMode::Observe => ui.slider(hash!(), "vision r", 6f32..WORLD, &mut vision_r),
+                    SimMode::Combat => ui.slider(hash!(), "attack r", 4f32..(WORLD * 0.5), &mut attack_r),
+                }
+            });
+        pop_f = pop_f.round().clamp(0.0, 80000.0);
+
+        // Reseed predator cooldowns when the desync toggle flips (key or panel),
+        // so the change is visible immediately (spread out vs lockstep).
+        if random_attacks != prev_random {
+            for c in critters.iter_mut() {
+                if c.kind == 1 {
+                    c.cooldown = if random_attacks { rng.range(0.0, COOLDOWN + COOLDOWN_JITTER) } else { COOLDOWN };
+                }
+            }
+            prev_random = random_attacks;
+        }
+
+        // End-of-frame CPU wall-clock (includes the HUD + UI panel), rolling
+        // averaged. Shown next frame by the HUD above.
+        let ema = |avg: f64, x: f64| if avg <= 0.0 { x } else { avg * 0.9 + x * 0.1 };
+        cpu_ms_avg = ema(cpu_ms_avg, frame_t0.elapsed().as_secs_f64() * 1000.0);
+        sim_us_avg = ema(sim_us_avg, sim_us);
+        prep_us_avg = ema(prep_us_avg, prep_us);
 
         frame += 1;
         if let Some(m) = max_frames { if frame >= m { break; } }
