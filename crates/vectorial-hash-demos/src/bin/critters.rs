@@ -27,7 +27,8 @@
 //! The whole simulation runs on ONE thread (only the startup bank
 //! generation parallelizes); the graphs show where that thread's time goes.
 //!
-//! Env: CRITTERS_MAX_FRAMES=N exits after N frames (smoke testing).
+//! Env: CRITTERS_MAX_FRAMES=N exits after N frames (smoke testing);
+//! CRITTERS_WORLD=N starts at world size N (the panel's "world" button steps it).
 
 use std::collections::HashMap;
 
@@ -36,13 +37,16 @@ use macroquad::ui::{hash, root_ui, widgets};
 
 use vectorial_hash::{CellState, Point as VPoint, TemplateGrid};
 use vectorial_hash_demos::sim::{
-    build_arsenal, Arsenal, Kind, Mode, Sim, SimEvent, SimParams, ITEM_LIMIT, MAP_H, MAP_W,
-    MAX_CRITTERS, RESPAWN_DELAY,
+    build_arsenal, Arsenal, Kind, Mode, Sim, SimEvent, SimParams, ITEM_LIMIT, MAX_CRITTERS,
+    RESPAWN_DELAY, WORLD_STEPS,
 };
 use vectorial_hash_templates::polygon::Polygon;
 
-/// Render scale: world 1024 drawn at 768 px.
-const S: f32 = 0.75;
+/// The on-screen map square, in pixels (fixed; the window is built for it).
+/// Historically the world was 1024 drawn at 0.75× = 768 px; now the world size
+/// is a live stepper, so the per-frame scale is `MAP_PX / world_size` (see the
+/// loop) and the world always fills this same square regardless of its size.
+const MAP_PX: f32 = 768.0;
 const PANEL_W: f32 = 320.0;
 const GRAPH_W: f32 = 310.0;
 const EFFECT_TTL: f64 = 0.45;
@@ -232,8 +236,8 @@ fn draw_graph(
 fn window_conf() -> Conf {
     Conf {
         window_title: "vectorial-hash critters".to_owned(),
-        window_width: (MAP_W as f32 * S) as i32 + PANEL_W as i32 + GRAPH_W as i32,
-        window_height: (MAP_H as f32 * S) as i32,
+        window_width: MAP_PX as i32 + PANEL_W as i32 + GRAPH_W as i32,
+        window_height: MAP_PX as i32,
         ..Default::default()
     }
 }
@@ -261,6 +265,10 @@ async fn main() {
     );
 
     let mut sim = Sim::new(Mode::Binary, ITEM_LIMIT, ITEM_LIMIT, 42);
+    // Optional initial world size (the panel's "world" button steps it live).
+    if let Some(w) = std::env::var("CRITTERS_WORLD").ok().and_then(|v| v.parse::<f64>().ok()) {
+        sim.set_world_size(w, ITEM_LIMIT, ITEM_LIMIT);
+    }
 
     // Live-tunable settings.
     let mut split_f: f32 = ITEM_LIMIT as f32;
@@ -329,10 +337,18 @@ async fn main() {
         let now = get_time();
         let dt = (get_frame_time() as f64).min(0.05) * speed_f as f64;
 
+        // Live render scale: the world (any stepper size) always fills the same
+        // fixed on-screen map square, so the scale follows the world size. `S`
+        // shadows the default const for the rest of the loop; the world stepper
+        // below updates it in place so the resize shows the same frame.
+        let world_size = sim.world_size();
+        #[allow(non_snake_case)]
+        let mut S = MAP_PX / world_size as f32;
+
         // --- interactive add / remove ---
         let (mx, my) = mouse_position();
         let (wx, wy) = ((mx / S) as f64, (my / S) as f64);
-        let mouse_in_map = wx >= 0.0 && wx < MAP_W && wy >= 0.0 && wy < MAP_H && mx < MAP_W as f32 * S;
+        let mouse_in_map = wx >= 0.0 && wx < world_size && wy >= 0.0 && wy < world_size && mx < MAP_PX;
         if is_mouse_button_down(MouseButton::Left)
             && mouse_in_map
             && sim.sims.item_count() < MAX_CRITTERS
@@ -394,10 +410,11 @@ async fn main() {
         }
 
         // --- tuning panel ---
+        let mut want_world_step = false;
         widgets::Window::new(
             hash!(),
-            vec2(MAP_W as f32 * S + 10.0, 446.0),
-            vec2(PANEL_W - 20.0, 280.0),
+            vec2(MAP_PX + 10.0, 446.0),
+            vec2(PANEL_W - 20.0, 308.0),
         )
         .label("tuning (live)")
         .titlebar(true)
@@ -405,6 +422,9 @@ async fn main() {
         .ui(&mut *root_ui(), |ui| {
             if ui.button(None, format!("structure: {}  [click or M]", sim.sims.mode().name())) {
                 want_mode_switch = true;
+            }
+            if ui.button(None, format!("world: {}^2  [click]", world_size as i32)) {
+                want_world_step = true;
             }
             ui.separator();
             ui.slider(hash!(), "split >", 1f32..12f32, &mut split_f);
@@ -432,6 +452,16 @@ async fn main() {
         if want_mode_switch {
             let next = sim.sims.mode().next();
             sim.set_mode(next, want_split, want_merge);
+        }
+        if want_world_step {
+            // Cycle to the next stepped world size; re-bounds critters and
+            // rebuilds the index. Update the live scale so the new size draws
+            // this same frame (no one-frame glitch at the old scale).
+            let cur = sim.world_size();
+            let idx = WORLD_STEPS.iter().position(|&w| (w - cur).abs() < 0.5).unwrap_or(2);
+            let next = WORLD_STEPS[(idx + 1) % WORLD_STEPS.len()];
+            sim.set_world_size(next, want_split, want_merge);
+            S = MAP_PX / next as f32;
         }
         let current_limits = sim
             .sims
@@ -616,8 +646,8 @@ async fn main() {
         }
 
         // ---------- side panel ----------
-        let map_px = MAP_W as f32 * S;
-        let map_py = MAP_H as f32 * S;
+        let map_px = MAP_PX;
+        let map_py = MAP_PX;
         draw_rectangle_lines(0.0, 0.0, map_px, map_py, 2.0, GRAY);
         let px = map_px + 14.0;
         draw_rectangle(map_px, 0.0, PANEL_W, map_py, Color::new(0.04, 0.04, 0.06, 1.0));

@@ -759,11 +759,55 @@ pub struct Sim {
     cooldowns: HashMap<u32, f64>,
     respawns: Vec<(f64, Kind)>,
     next_id: u32,
+    /// Side of the square world. Runtime (stepper) rather than the `MAP_W`
+    /// const so the demo can resize the world live; defaults to `MAP_W`. Kept
+    /// square and (for the `IntegerTree` mode) a power of two — see
+    /// [`WORLD_STEPS`].
+    world_size: f64,
 }
 
+/// Selectable world sizes for the live stepper. All powers of two (square),
+/// so every mode — including the `IntegerTree`, which requires a square pow-2
+/// world — stays valid. 1024 is the historical default and the middle step.
+pub const WORLD_STEPS: [f64; 5] = [256.0, 512.0, 1024.0, 2048.0, 4096.0];
+
 impl Sim {
+    /// The default world rect (`MAP_W` square). Prefer [`Sim::world_rect`] for
+    /// the live size; this stays for callers that just want the default.
     pub fn world() -> VRect {
         VRect::new(0.0, 0.0, MAP_W, MAP_H)
+    }
+
+    /// The current world rect (square, side [`Sim::world_size`]).
+    pub fn world_rect(&self) -> VRect {
+        VRect::new(0.0, 0.0, self.world_size, self.world_size)
+    }
+
+    /// The current world side length.
+    pub fn world_size(&self) -> f64 {
+        self.world_size
+    }
+
+    /// Resize the (square) world: clamp every critter into the new bounds and
+    /// rebuild the index for the new rect. Rare and user-driven, so a full
+    /// rebuild is fine (mirrors the 3D demo's world stepper). `split`/`merge`
+    /// are the current thresholds the index should keep.
+    pub fn set_world_size(&mut self, size: f64, split: usize, merge: usize) {
+        let mode = self.sims.mode();
+        let items: Vec<Critter> = self
+            .sims
+            .snapshot()
+            .into_iter()
+            .map(|(id, kind, pos, heading)| {
+                let p = VPoint::new(
+                    pos.x.clamp(MARGIN, size - MARGIN),
+                    pos.y.clamp(MARGIN, size - MARGIN),
+                );
+                Critter::new(id, kind, p, heading)
+            })
+            .collect();
+        self.world_size = size;
+        self.sims.apply_mode(mode, self.world_rect(), split, merge, &items);
     }
 
     pub fn new(mode: Mode, split: usize, merge: usize, seed: u64) -> Self {
@@ -778,6 +822,7 @@ impl Sim {
             cooldowns: HashMap::new(),
             respawns: Vec::new(),
             next_id: 0,
+            world_size: MAP_W,
         }
     }
 
@@ -791,13 +836,13 @@ impl Sim {
 
     pub fn set_mode(&mut self, mode: Mode, split: usize, merge: usize) {
         let items = self.items();
-        self.sims.apply_mode(mode, Self::world(), split, merge, &items);
+        self.sims.apply_mode(mode, self.world_rect(), split, merge, &items);
     }
 
     pub fn set_limits(&mut self, split: usize, merge: usize) {
         let mode = self.sims.mode();
         let items = self.items();
-        self.sims.apply_mode(mode, Self::world(), split, merge, &items);
+        self.sims.apply_mode(mode, self.world_rect(), split, merge, &items);
     }
 
     fn items(&self) -> Vec<Critter> {
@@ -809,9 +854,10 @@ impl Sim {
     }
 
     pub fn random_pos(&mut self) -> VPoint {
+        let w = self.world_size;
         VPoint::new(
-            self.rng.range(20.0, MAP_W - 20.0),
-            self.rng.range(20.0, MAP_H - 20.0),
+            self.rng.range(20.0, w - 20.0),
+            self.rng.range(20.0, w - 20.0),
         )
     }
 
@@ -1005,15 +1051,16 @@ impl Sim {
             },
         }
         let speed = kind.speed();
+        let w = self.world_size;
         let mut nx = pos.x + h.cos() * speed * dt;
         let mut ny = pos.y + h.sin() * speed * dt;
-        if nx < MARGIN || nx > MAP_W - MARGIN {
+        if nx < MARGIN || nx > w - MARGIN {
             h = std::f64::consts::PI - h;
-            nx = nx.clamp(MARGIN, MAP_W - MARGIN);
+            nx = nx.clamp(MARGIN, w - MARGIN);
         }
-        if ny < MARGIN || ny > MAP_H - MARGIN {
+        if ny < MARGIN || ny > w - MARGIN {
             h = -h;
-            ny = ny.clamp(MARGIN, MAP_H - MARGIN);
+            ny = ny.clamp(MARGIN, w - MARGIN);
         }
         (VPoint::new(nx, ny), h.rem_euclid(std::f64::consts::TAU))
     }

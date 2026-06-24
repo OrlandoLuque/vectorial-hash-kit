@@ -24,13 +24,17 @@ to triage later.
   billboards, raw miniquad in `src/instanced3d.rs`). Still TODO: push to
   100k–1M critters and profile where it becomes GPU-bound (fill vs vertex vs
   instance upload).
-- **World-size 2D stepper** *(queued tonight, #4)* — the 2D `critters` demo has a
-  fixed 1024×1024 world (`MAP_W`/`MAP_H` consts in `sim.rs`); give it the same
-  stepped pow-2 world-size control the 3D demo has. Refactor of the shared sim
-  core: const → runtime field, render scale follows, `IntegerTree` re-bound to
-  the new pow-2 size, index rebuilt on change. Largest/riskiest of the queue —
-  the headless path (`critters_headless`) verifies determinism/correctness, but
-  the on-screen scaling wants a human glance.
+- ~~**World-size 2D stepper**~~ — **done (visual scaling wants a human glance).**
+  `Sim` gained a runtime `world_size` (default `MAP_W`) + `set_world_size`
+  (re-bounds critters, rebuilds the index); `random_pos`/movement/`world_rect`
+  use it. The `critters` panel has a **world** button stepping pow-2 256→4096
+  (`WORLD_STEPS`), with the render scale = `MAP_PX / world_size` so the map fills
+  the same on-screen square at any size. Headless `--world N` + `CRITTERS_WORLD=N`
+  env. **Verified headlessly**: cull agreement holds at 256/512/1024/2048 and
+  the visual runs clean at each. **TODO (human):** eyeball the on-screen scaling
+  at the extremes (256 zoomed-in, 4096 zoomed-out) — sprite/figure sizes are in
+  world units, so attack templates shrink/grow with the world; confirm it reads
+  well or cap the scale.
 - **Colour by leaf depth / structure** — visualise the tree's interior (which
   cells are deep, how the split differs binary vs octree).
 - **Batch the sight-lines / combat effects** — the per-line `draw_line_3d` and

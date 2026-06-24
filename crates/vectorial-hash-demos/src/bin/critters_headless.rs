@@ -15,7 +15,7 @@
 use std::time::Instant;
 
 use vectorial_hash::UpdateStrategy;
-use vectorial_hash_demos::sim::{build_arsenal_scaled, CullStrategy, Mode, Sim, SimParams, ITEM_LIMIT};
+use vectorial_hash_demos::sim::{build_arsenal_scaled, CullStrategy, Mode, Sim, SimParams, ITEM_LIMIT, MAP_W};
 
 fn parse_strategy(s: &str) -> Option<UpdateStrategy> {
     match s {
@@ -71,6 +71,7 @@ struct Args {
     figure_scale: f64,
     cull_strategy: CullStrategy,
     agent_radius: f64,
+    world: f64,
 }
 
 fn parse_args() -> Args {
@@ -91,6 +92,7 @@ fn parse_args() -> Args {
         figure_scale: 1.0,
         cull_strategy: CullStrategy::default(),
         agent_radius: 0.0,
+        world: MAP_W,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -119,6 +121,7 @@ fn parse_args() -> Args {
             "--no-attack" => { a.no_attack = true; i -= 1; }
             "--figure-scale" => a.figure_scale = need(&val).parse().unwrap(),
             "--agent-radius" => a.agent_radius = need(&val).parse().unwrap(),
+            "--world" => a.world = need(&val).parse().unwrap(),
             "--cull-strategy" => a.cull_strategy = parse_cull_strategy(&need(&val))
                 .expect("cull-strategy: descent|walk-samet|walk-probe|walk-ropes"),
             other => panic!("unknown argument: {other}"),
@@ -158,8 +161,9 @@ impl SeriesStats {
 fn main() {
     let args = parse_args();
     println!(
-        "headless critters | mode={} | pop target={}+{}+{}={} | frames={} (+{} warmup) | dt={:.4}s | split>{} merge<={} | seed={} | update={} | cull={}",
+        "headless critters | mode={} | world={}^2 | pop target={}+{}+{}={} | frames={} (+{} warmup) | dt={:.4}s | split>{} merge<={} | seed={} | update={} | cull={}",
         args.mode.name(),
+        args.world,
         args.targets[0],
         args.targets[1],
         args.targets[2],
@@ -191,6 +195,9 @@ fn main() {
         agent_radius: args.agent_radius,
     };
     let mut sim = Sim::new(args.mode, args.split, args.merge, args.seed);
+    if (args.world - sim.world_size()).abs() > 0.5 {
+        sim.set_world_size(args.world, args.split, args.merge);
+    }
     sim.sims.update_strategy = args.strategy;
     sim.sims.cull_strategy = args.cull_strategy;
 

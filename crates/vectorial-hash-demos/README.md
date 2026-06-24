@@ -62,16 +62,16 @@ A live 2D map (1024×1024 world, drawn at 0.75×) indexed by a `vectorial_hash::
 ```bash
 cargo run -p vectorial-hash-demos --bin critters_headless --release -- \
     --mode both --frames 600 --drifters 400 --hunters 400 --pulsars 400 \
-    [--split 3 --merge 3 --dt 0.0167 --seed 42 --fire 1.0 --respawn 2.5 --csv out.csv]
+    [--world 1024 --split 3 --merge 3 --dt 0.0167 --seed 42 --fire 1.0 --respawn 2.5 --csv out.csv]
 ```
 
-The exact same simulation core (shared `sim` module, fully deterministic for a given seed) without a window or vsync: it runs at CPU speed and reports per-structure statistics — mean/p50/p95 of per-frame movement+update, attack-cull and vision-cull averages, and insert+remove cost — plus steps/s, final tree shapes and the live cull-agreement counter in `both` mode. `--csv` dumps per-frame rows for plotting. Determinism means a `binary` run and the binary half of a `both` run produce identical simulations (same kills, same final tree), so cross-structure numbers are directly comparable.
+The exact same simulation core (shared `sim` module, fully deterministic for a given seed) without a window or vsync: it runs at CPU speed and reports per-structure statistics — mean/p50/p95 of per-frame movement+update, attack-cull and vision-cull averages, and insert+remove cost — plus steps/s, final tree shapes and the live cull-agreement counter in `both` mode. `--csv` dumps per-frame rows for plotting. Determinism means a `binary` run and the binary half of a `both` run produce identical simulations (same kills, same final tree), so cross-structure numbers are directly comparable. `--world N` sets the (square) world size — a power of two; cull agreement holds at every size (256–4096 verified).
 
 Controls: `1`/`2`/`3` select the spawn brush · left click (or hold-drag to paint) spawns at the cursor · right click removes · `+`/`-` add/remove five at random · `R` cycles region rendering · `[` `]` change simulation speed · `Space` pauses · `Esc` quits.
 
-The **"tuning (live)" panel** adjusts everything while the simulation runs: the tree's **split threshold** (a leaf divides above it) and **merge threshold** (siblings collapse at/below it — set it lower than split for hysteresis; the tree is rebuilt on change), per-kind **population targets** (spawns/removes to match), respawn delay, simulation speed and fire rate. Manual spawns/removals (clicks, `+`/`-`) update the population sliders so both mechanisms cooperate.
+The **"tuning (live)" panel** adjusts everything while the simulation runs: the tree's **split threshold** (a leaf divides above it) and **merge threshold** (siblings collapse at/below it — set it lower than split for hysteresis; the tree is rebuilt on change), per-kind **population targets** (spawns/removes to match), respawn delay, simulation speed and fire rate. A **world button** steps the (square, power-of-two) world size 256→4096 live — it re-bounds the critters and rebuilds the index, and the map always fills the same on-screen square (the render scale follows the world size). Manual spawns/removals (clicks, `+`/`-`) update the population sliders so both mechanisms cooperate.
 
-`CRITTERS_MAX_FRAMES=N` exits after N frames (CI/smoke runs).
+`CRITTERS_MAX_FRAMES=N` exits after N frames (CI/smoke runs); `CRITTERS_WORLD=N` starts at world size N.
 
 ### Demo 5 — critters 3D (visual + headless)
 
