@@ -81,36 +81,42 @@ cargo run -p vectorial-hash-demos --bin critters3d_headless --release \  # stati
     -- --pop 20000 --item-limit 64 --frames 240 --vision 100 --seed 42
 ```
 
-The 3D analogue, indexed by `Tree3` (binary-split 3D tree, sphere-vs-Aabb
-classification, 1×1×1 `VoxelRaster`). The **visual** demo drifts critters
-inside a cube and is two demos in one, switchable live:
+The 3D analogue. The index is a **persistent** `Tree3` (binary-split 3D tree,
+sphere-vs-Aabb classification): built once, then each frame every critter is
+moved in place with `update` (ascend-to-LCA) instead of rebuilding — the HUD's
+`build µs` shows that win. The **visual** demo drifts critters inside a cube
+and is two demos in one, switchable live (`T`):
 
-- **observe** (`T`): an observer at the centre runs a sphere vision cull each
-  frame; the seen critters light up with a sight-line.
-- **combat** (`T`): the red critters become predators that attack nearby prey
-  — every off-cooldown predator emits an attack sphere and the prey inside it
-  (found by an *index cull*) burst, respawn, and flash. This is the
-  "many queries per frame" workload (one cull per attacking predator).
+- **observe**: an observer at the centre runs a sphere vision cull each frame;
+  the seen critters light up with a sight-line.
+- **combat**: the red critters become predators that attack nearby prey. Half
+  throw an omnidirectional **sphere blast** (orange), half an **aimed flamer
+  drop** — a teardrop cone pointed at the nearest prey, in any 3D direction
+  (like a 40k flamer template). Prey inside (found by an *index cull*) burst,
+  respawn, and flash. This is the "many queries per frame" workload (a cull
+  per attacking predator, plus a targeting cull per flamer).
 
-It also exposes the structure and rendering choices side by side:
+Most controls are clickable in the **on-screen panel** (top-right, with a
+hover-help box) and shown live in **time-series graphs** (fps / cpu ms / cull
+µs) below it. vsync is off so the fps counter is the real ceiling; the HUD
+reports a CPU-bound vs GPU-bound verdict and the CPU-only fps ceiling.
 
-- `M` — cycle the **index structure**: binary `Tree3` / `Octree3` (8-way) /
-  projection (one 2D `Tree` on xy + z-reject, the author's variant). All
-  exact; the HUD shows leaf/arena counts and a stable per-cull µs (averaged
-  over `C`-selected repetitions, since one cull is microseconds).
-- `G` — cycle the **render path**: immediate `draw_sphere` (the known-good
-  fallback) / GPU-instanced spheres / GPU-instanced billboards. The instanced
-  paths (raw miniquad, `src/instanced3d.rs`) draw all critters in one
-  instanced call and scale far past the immediate path, which rebuilds and
-  re-uploads geometry every frame.
+- `M` — **index structure**: persistent `Tree3` (update) / `Octree3` (8-way,
+  rebuilt) / projection (one 2D `Tree` on xy + z-reject). All exact.
+- `G` — **render path**: GPU-instanced spheres / round billboards / square
+  billboards (fastest) / NO RENDER (CPU only, to read the CPU's fps ceiling).
+  The instanced paths (raw miniquad, `src/instanced3d.rs`) draw all critters
+  in one call; the old per-frame `draw_sphere` path was dropped.
+- `T` observe/combat · `R` attack desync vs synchronized-saturation · `O`
+  separation (no overlap; one neighbour cull per critter) · `V` fps cap · `C`
+  cull-timing reps · `B` leaf boxes · `+`/`-` population (snaps to 200) ·
+  `[`/`]` radius (snaps to 5) · world-size **stepper** (pow-2) · `Space`/`Esc`.
 
-Other controls: drag to orbit, scroll to zoom, `+`/`-` population, `[`/`]`
-radius (vision or attack), `B` toggles the leaf boxes, `Space` pauses, `Esc`
-quits. Env: `CRITTERS3D_MAX_FRAMES=N` (smoke runs),
-`CRITTERS3D_RENDER=immediate|instanced|billboards`, `CRITTERS3D_COMBAT=1`.
-The **headless** version measures `update` + sphere-cull cost under churn —
-see `docs/THREE_D.md` for the true-3D-tree vs projection-indexing comparison
-and the octree-vs-binary result.
+Env: `CRITTERS3D_MAX_FRAMES=N` (smoke runs),
+`CRITTERS3D_RENDER=instanced|billboards|square|none`, `CRITTERS3D_COMBAT=1`,
+`CRITTERS3D_SEP=1`. The **headless** version measures `update` + sphere-cull
+cost under churn — see `docs/THREE_D.md` for the true-3D-tree vs
+projection-indexing comparison and the octree-vs-binary result.
 
 ## Run
 
