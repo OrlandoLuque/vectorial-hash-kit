@@ -59,7 +59,7 @@ const HIST_MAX: usize = 90; // frames kept in the replay history ring
 
 // On-screen control panel (top-right) size.
 const UI_W: f32 = 300.0;
-const UI_H: f32 = 560.0;
+const UI_H: f32 = 490.0;
 
 // Combat-mode tuning.
 // Per-kind attack cooldown ranges (seconds) — see `kind_cooldown`.
@@ -245,6 +245,18 @@ fn world_aabb(world: f32) -> Aabb { Aabb::new(0.0, 0.0, 0.0, world as f64, world
 /// A tiny immediate-mode control panel drawn in screen space: stacked rows of
 /// buttons and `[-] bar [+]` sliders with manual mouse hit-testing, plus a help
 /// box at the bottom that describes whatever row the mouse is hovering.
+/// Which media-player buttons fired this frame (step buttons also report `held`
+/// so the caller can drive hold-to-repeat).
+#[derive(Default)]
+struct PlayerActions {
+    rec: bool,
+    play: bool,
+    back_click: bool,
+    back_held: bool,
+    fwd_click: bool,
+    fwd_held: bool,
+}
+
 struct Panel {
     x: f32,
     w: f32,
@@ -350,6 +362,58 @@ impl Panel {
         draw_text(&format!("{}: {:.0}", label, *cur), bx + 6.0, ry + rh * 0.72, 16.0, Color::new(0.92, 0.95, 1.0, 1.0));
         if hov_m || hov_p || hov_b { self.help = Some(help); }
         self.cur += self.row;
+    }
+    /// A media-player row: REC ● | step-back ◀ | play/pause | step-forward ▶.
+    /// Icons drawn with primitives; returns each button's click + (for the step
+    /// buttons) held state so the caller can add hold-to-repeat.
+    fn player(&mut self, rec_on: bool, live_paused: bool) -> PlayerActions {
+        let (ry, rh) = (self.cur, self.row - 5.0);
+        let gap = 4.0;
+        let bw = (self.w - 12.0 - gap * 3.0) / 4.0;
+        let icon = Color::new(0.92, 0.95, 1.0, 1.0);
+        let mut out = PlayerActions::default();
+        for slot in 0..4 {
+            let rx = self.x + 6.0 + (bw + gap) * slot as f32;
+            let hov = self.over(rx, ry, bw, rh);
+            draw_rectangle(rx, ry, bw, rh, if hov { Color::new(0.30, 0.36, 0.5, 0.95) } else { Color::new(0.18, 0.21, 0.30, 0.9) });
+            let (cx, cy) = (rx + bw * 0.5, ry + rh * 0.5);
+            let help = match slot {
+                0 => { // REC
+                    draw_circle(cx, cy, 6.0, if rec_on { RED } else { Color::new(0.5, 0.25, 0.25, 1.0) });
+                    "REC [K]: record frames into the history\nring (so you can step back)."
+                }
+                1 => { // step back
+                    draw_rectangle(cx - 9.0, cy - 7.0, 3.0, 14.0, icon);
+                    draw_triangle(vec2(cx - 4.0, cy), vec2(cx + 6.0, cy - 7.0), vec2(cx + 6.0, cy + 7.0), icon);
+                    "Step back [Left] -- a frame back through the\nrecorded history (hold to rewind)."
+                }
+                2 => { // play / pause
+                    if live_paused {
+                        draw_triangle(vec2(cx - 5.0, cy - 7.0), vec2(cx - 5.0, cy + 7.0), vec2(cx + 7.0, cy), icon);
+                    } else {
+                        draw_rectangle(cx - 6.0, cy - 7.0, 4.0, 14.0, icon);
+                        draw_rectangle(cx + 2.0, cy - 7.0, 4.0, 14.0, icon);
+                    }
+                    "Play / pause [Space]. From the history it\njumps back to the live view."
+                }
+                _ => { // step forward
+                    draw_triangle(vec2(cx - 6.0, cy - 7.0), vec2(cx - 6.0, cy + 7.0), vec2(cx + 4.0, cy), icon);
+                    draw_rectangle(cx + 6.0, cy - 7.0, 3.0, 14.0, icon);
+                    "Step forward [Right] -- a frame on; at the\nnewest it generates a new one (hold to play)."
+                }
+            };
+            if hov { self.help = Some(help); }
+            let clicked = hov && self.pressed;
+            let held = hov && self.down;
+            match slot {
+                0 => out.rec = clicked,
+                1 => { out.back_click = clicked; out.back_held = held; }
+                2 => out.play = clicked,
+                _ => { out.fwd_click = clicked; out.fwd_held = held; }
+            }
+        }
+        self.cur += self.row;
+        out
     }
     fn separator(&mut self) {
         draw_rectangle(self.x + 6.0, self.cur + 2.0, self.w - 12.0, 1.0, Color::new(0.3, 0.34, 0.42, 0.8));
@@ -592,6 +656,8 @@ async fn main() {
     let mut sub_rep = KeyRepeat::new();
     let mut dec_rep = KeyRepeat::new();
     let mut inc_rep = KeyRepeat::new();
+    let mut back_rep = KeyRepeat::new(); // history step back (◀ / Left)
+    let mut fwd_rep = KeyRepeat::new(); // history step forward (▶ / Right)
     // Averaged FPS (raw get_fps() is the instantaneous 1/frame_time and jitters);
     // accumulate real frame time and refresh the shown value once per second.
     let mut fps_accum_t = 0.0f32;
@@ -666,7 +732,6 @@ async fn main() {
         }
         if editing.is_none() {
         if is_key_pressed(KeyCode::Escape) { break; }
-        if is_key_pressed(KeyCode::Space) { paused = !paused; }
         if is_key_pressed(KeyCode::B) { show_boxes = !show_boxes; }
         if is_key_pressed(KeyCode::M) { structure = structure.next(); }
         if is_key_pressed(KeyCode::G) { render_mode = render_mode.next(); }
@@ -675,9 +740,6 @@ async fn main() {
         if is_key_pressed(KeyCode::C) { cull_rep_idx = (cull_rep_idx + 1) % cull_rep_steps.len(); }
         if is_key_pressed(KeyCode::O) { separation = !separation; }
         if is_key_pressed(KeyCode::V) { fps_cap = !fps_cap; }
-        if is_key_pressed(KeyCode::K) { rec = !rec; } // toggle frame recording
-        if is_key_pressed(KeyCode::Comma) { scrub = (scrub + 1).min(hist.len().saturating_sub(1)); } // step back
-        if is_key_pressed(KeyCode::Period) { if scrub > 0 { scrub -= 1; } else { step_request = true; } } // step fwd / advance
         // +/- ramp the population: one step per press, or hold to auto-repeat.
         let add = add_rep.fires(
             is_key_pressed(KeyCode::Equal) || is_key_pressed(KeyCode::KpAdd),
@@ -794,11 +856,15 @@ async fn main() {
                     match critters[i].kind {
                         1 => {
                             // Hunter: remember the target (for accurate aiming)
-                            // and steer toward it.
+                            // and steer toward it — but only when it's not right
+                            // on top of us, or the velocity would shrink to zero.
                             critters[i].target = targets[i].unwrap_or(Vec3::ZERO);
                             if let Some(t) = targets[i] {
-                                let desired = (t - critters[i].pos).normalize_or_zero() * speed;
-                                critters[i].vel = critters[i].vel.lerp(desired, (3.0 * dt).min(1.0));
+                                let to = t - critters[i].pos;
+                                if to.length() > 1.0 {
+                                    let desired = to.normalize() * speed;
+                                    critters[i].vel = critters[i].vel.lerp(desired, (3.0 * dt).min(1.0));
+                                }
                             }
                         }
                         2 => {
@@ -810,6 +876,12 @@ async fn main() {
                             let w = rand_dir(&mut rng) * (speed * 0.5 * dt);
                             critters[i].vel = (critters[i].vel + w).normalize_or_zero() * speed;
                         }
+                    }
+                    // Never let a critter freeze (e.g. a hunter that reached its
+                    // prey, or one left stationary when switching modes).
+                    let s = critters[i].vel.length();
+                    if s < 8.0 {
+                        critters[i].vel = if s > 0.01 { critters[i].vel / s * 12.0 } else { rand_dir(&mut rng) * 12.0 };
                     }
                 }
                 let c = &mut critters[i];
@@ -1195,7 +1267,7 @@ async fn main() {
         let cpu_ceiling = if cpu_ms_avg > 0.0 { 1000.0 / cpu_ms_avg } else { 0.0 };
         let bound = if frame_ms > 0.0 && cpu_ms_avg >= 0.85 * frame_ms { "CPU-BOUND" } else { "GPU-bound" };
         hud(134.0, format!("cpu ~{:>6.2} ms (sim {:>6.0}+build {:>6.0}+prep {:>6.0} us) -> CPU ceiling ~{:>6.0} fps -> {}", cpu_ms_avg, sim_us_avg, t_build_us, prep_us_avg, cpu_ceiling, bound));
-        hud(screen_height() - 18.0, "drag/zoom | +/-: pop | [ ]: radius | T R O V M G C B | Space: pause | . , : step fwd/back | K: rec | Esc".to_string());
+        hud(screen_height() - 18.0, "drag/zoom | +/-: pop | [ ]: radius | T R O V M G C B | Space: play/pause | <- ->: step (hold to scrub) | K: rec | Esc".to_string());
 
         // --- on-screen mouse controls (top-right panel; keys still work too) ---
         let mut panel = Panel::new(ui_x, ui_y, UI_W, mp_now.0, mp_now.1,
@@ -1236,20 +1308,28 @@ async fn main() {
         panel.stepper("world size", &SIZE_STEPS, &mut world,
             "Side of the cube the action lives in.\nStepped powers of 2 -- changing it rebuilds\nthe index and re-bounds the critters.");
         panel.separator();
-        // Playback: pause + step work without REC; REC enables stepping back.
-        if panel.button(if paused { "|> resume [Space]" } else { "|| pause [Space]" },
-            "Pause / resume the simulation. Stepping\nworks while paused (or running).") { paused = !paused; }
-        if panel.button("step forward |> [.]",
-            "Advance one frame; at the newest frame it\ngenerates a new real frame.") {
-            if scrub > 0 { scrub -= 1; } else { step_request = true; }
-        }
-        if panel.button(&format!("step back <| [,]  (-{})", scrub),
-            "Go back a frame through the recorded\nhistory (needs REC on).") {
-            scrub = (scrub + 1).min(hist.len().saturating_sub(1));
-        }
-        if panel.button(&format!("REC: {}  ({} frames) [K]", if rec { "ON" } else { "off" }, hist.len()),
-            "Record each frame (critters + effects +\ntree cells) into a 90-frame ring, even cells\nthat aren't currently shown.") { rec = !rec; }
+        // Media-player controls: REC | step back | play/pause | step forward.
+        let pa = panel.player(rec, paused || scrub > 0);
         panel.finish(ui_y);
+
+        // Apply playback actions (panel buttons + keys), with hold-to-repeat on
+        // the step controls. Play/pause from the history jumps back to live.
+        if is_key_pressed(KeyCode::K) || pa.rec { rec = !rec; }
+        if is_key_pressed(KeyCode::Space) || pa.play {
+            if paused || scrub > 0 { paused = false; scrub = 0; } else { paused = true; }
+        }
+        let back = back_rep.fires(
+            is_key_pressed(KeyCode::Left) || pa.back_click,
+            is_key_down(KeyCode::Left) || pa.back_held,
+            dt,
+        );
+        if back { scrub = (scrub + 1).min(hist.len().saturating_sub(1)); }
+        let fwd = fwd_rep.fires(
+            is_key_pressed(KeyCode::Right) || pa.fwd_click,
+            is_key_down(KeyCode::Right) || pa.fwd_held,
+            dt,
+        );
+        if fwd { if scrub > 0 { scrub -= 1; } else { step_request = true; } }
 
         // Time-series graphs below the control panel.
         push_hist(&mut g_fps, fps_display);
