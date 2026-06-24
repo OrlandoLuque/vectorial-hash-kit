@@ -46,9 +46,10 @@ use vectorial_hash::{
 };
 use vectorial_hash_demos::instanced3d::{Instance, InstancedRenderer, Mode as RenderGeom};
 
-const WORLD: f32 = 200.0;
 const MARGIN: f32 = 4.0;
 const ITEM_LIMIT: usize = 16;
+// World size is a runtime value now (a stepped pow-2 slider) — see `world` in main.
+const SIZE_STEPS: [f32; 5] = [64.0, 128.0, 256.0, 512.0, 1024.0];
 
 // On-screen control panel (top-right) size.
 const UI_W: f32 = 300.0;
@@ -236,7 +237,7 @@ struct Critter {
     flash: f32,    // combat: remaining flash time after respawn
 }
 
-fn world_aabb() -> Aabb { Aabb::new(0.0, 0.0, 0.0, WORLD as f64, WORLD as f64, WORLD as f64) }
+fn world_aabb(world: f32) -> Aabb { Aabb::new(0.0, 0.0, 0.0, world as f64, world as f64, world as f64) }
 
 /// Draw a flamer/teardrop wireframe (apex `tip`, axis `dir`): straight cone
 /// edges from the apex to the widest ring, then a rounded hemisphere cap
@@ -327,6 +328,40 @@ impl Panel {
         if hov_m || hov_p || hov_b { self.help = Some(help); }
         self.cur += self.row;
     }
+    /// Like `slider`, but the value steps through a discrete list (e.g. powers
+    /// of 2) — `[-]`/`[+]` move one entry, the bar snaps to the nearest.
+    fn stepper(&mut self, label: &str, values: &[f32], cur: &mut f32, help: &'static str) {
+        let (ry, rh, bw) = (self.cur, self.row - 5.0, 22.0);
+        let (mx0, px0) = (self.x + 6.0, self.x + self.w - 6.0 - bw);
+        let bx = mx0 + bw + 4.0;
+        let bar_w = px0 - bx - 4.0;
+        let mut idx = 0;
+        let mut best = f32::INFINITY;
+        for (i, &v) in values.iter().enumerate() {
+            let d = (v - *cur).abs();
+            if d < best { best = d; idx = i; }
+        }
+        let (hov_m, hov_p, hov_b) = (
+            self.over(mx0, ry, bw, rh),
+            self.over(px0, ry, bw, rh),
+            self.over(bx, ry, bar_w, rh),
+        );
+        Self::cell(mx0, ry, bw, rh, hov_m, "-", 8.0);
+        Self::cell(px0, ry, bw, rh, hov_p, "+", 7.0);
+        if hov_m && self.pressed && idx > 0 { idx -= 1; }
+        if hov_p && self.pressed && idx + 1 < values.len() { idx += 1; }
+        if hov_b && self.down {
+            let frac = ((self.mx - bx) / bar_w).clamp(0.0, 1.0);
+            idx = (frac * (values.len() - 1) as f32).round() as usize;
+        }
+        *cur = values[idx.min(values.len() - 1)];
+        draw_rectangle(bx, ry, bar_w, rh, Color::new(0.14, 0.16, 0.22, 0.9));
+        let frac = idx as f32 / (values.len() - 1).max(1) as f32;
+        draw_rectangle(bx, ry, bar_w * frac, rh, Color::new(0.28, 0.5, 0.7, 0.9));
+        draw_text(&format!("{}: {:.0}", label, *cur), bx + 6.0, ry + rh * 0.72, 16.0, Color::new(0.92, 0.95, 1.0, 1.0));
+        if hov_m || hov_p || hov_b { self.help = Some(help); }
+        self.cur += self.row;
+    }
     fn separator(&mut self) {
         draw_rectangle(self.x + 6.0, self.cur + 2.0, self.w - 12.0, 1.0, Color::new(0.3, 0.34, 0.42, 0.8));
         self.cur += 8.0;
@@ -384,11 +419,11 @@ fn window_conf() -> Conf {
 async fn main() {
     let mut rng = Rng::new(42);
     let mut critters: Vec<Critter> = Vec::new();
-    let spawn = |rng: &mut Rng, kind: u8| -> Critter {
+    let spawn = |rng: &mut Rng, kind: u8, world: f32| -> Critter {
         let p = vec3(
-            rng.range(MARGIN, WORLD - MARGIN),
-            rng.range(MARGIN, WORLD - MARGIN),
-            rng.range(MARGIN, WORLD - MARGIN),
+            rng.range(MARGIN, world - MARGIN),
+            rng.range(MARGIN, world - MARGIN),
+            rng.range(MARGIN, world - MARGIN),
         );
         let speed = rng.range(20.0, 55.0);
         // random unit direction
@@ -399,8 +434,11 @@ async fn main() {
         let cooldown = if kind == 1 { rng.range(0.0, COOLDOWN + COOLDOWN_JITTER) } else { 0.0 };
         Critter { pos: p, vel: v, kind, cooldown, flash: 0.0 }
     };
+    // World size (a stepped pow-2 slider mutates it; the tree is rebuilt on change).
+    let mut world: f32 = 256.0;
+    let mut prev_world = world;
     for i in 0..2400 {
-        critters.push(spawn(&mut rng, (i % 3) as u8));
+        critters.push(spawn(&mut rng, (i % 3) as u8, world));
     }
 
     // Persistent binary-3D index. Instead of rebuilding it every frame, we
@@ -409,7 +447,7 @@ async fn main() {
     // cheaper than a full rebuild. `tree_pos[i]` is where critter i currently
     // sits in the tree (the `old` position `update` needs to find it).
     let pt3 = |c: &Critter| Point3::new(c.pos.x as f64, c.pos.y as f64, c.pos.z as f64);
-    let mut tree = Tree3::<C3>::new(world_aabb(), ITEM_LIMIT);
+    let mut tree = Tree3::<C3>::new(world_aabb(world), ITEM_LIMIT);
     let mut tree_pos: Vec<Point3> = Vec::with_capacity(critters.len());
     for (i, c) in critters.iter().enumerate() {
         let p = pt3(c);
@@ -420,7 +458,7 @@ async fn main() {
     // Camera orbit state.
     let mut yaw: f32 = 0.7;
     let mut pitch: f32 = 0.5;
-    let mut dist: f32 = WORLD * 2.2;
+    let mut dist: f32 = world * 2.2;
     let mut last_mouse = mouse_position();
 
     let mut vision_r: f32 = 40.0;
@@ -536,8 +574,8 @@ async fn main() {
         }
         if inc {
             match sim_mode {
-                SimMode::Observe => vision_r = (((vision_r / R_STEP).floor() + 1.0) * R_STEP).min(WORLD),
-                SimMode::Combat => attack_r = (((attack_r / R_STEP).floor() + 1.0) * R_STEP).min(WORLD * 0.5),
+                SimMode::Observe => vision_r = (((vision_r / R_STEP).floor() + 1.0) * R_STEP).min(world),
+                SimMode::Combat => attack_r = (((attack_r / R_STEP).floor() + 1.0) * R_STEP).min(world * 0.5),
             }
         }
         let mp = mouse_position();
@@ -547,14 +585,14 @@ async fn main() {
         }
         last_mouse = mp;
         let scroll = mouse_wheel().1;
-        if scroll != 0.0 && !over_ui { dist = (dist * (1.0 - scroll.signum() * 0.1)).clamp(WORLD * 0.6, WORLD * 6.0); }
+        if scroll != 0.0 && !over_ui { dist = (dist * (1.0 - scroll.signum() * 0.1)).clamp(world * 0.6, world * 6.0); }
 
         // Reconcile population (and the index) to the target — drives both the
         // +/- keys and the panel slider through one path.
         let target = pop_f.round().max(0.0) as usize;
         while critters.len() < target {
             let id = critters.len() as u32;
-            let c = spawn(&mut rng, (id % 3) as u8);
+            let c = spawn(&mut rng, (id % 3) as u8, world);
             let p = pt3(&c);
             tree.insert(C3 { id, p });
             tree_pos.push(p);
@@ -574,7 +612,7 @@ async fn main() {
                 let mut np = c.pos + c.vel * dt;
                 for axis in 0..3 {
                     if np[axis] < MARGIN { np[axis] = MARGIN; c.vel[axis] = -c.vel[axis]; }
-                    if np[axis] > WORLD - MARGIN { np[axis] = WORLD - MARGIN; c.vel[axis] = -c.vel[axis]; }
+                    if np[axis] > world - MARGIN { np[axis] = world - MARGIN; c.vel[axis] = -c.vel[axis]; }
                 }
                 c.pos = np;
                 // Cooldown only ticks in combat — otherwise time spent in
@@ -607,7 +645,7 @@ async fn main() {
                     let l = mv.length();
                     if l > SEP_MAX { mv = mv / l * SEP_MAX; }
                     let mut np = critters[i].pos + mv;
-                    for axis in 0..3 { np[axis] = np[axis].clamp(MARGIN, WORLD - MARGIN); }
+                    for axis in 0..3 { np[axis] = np[axis].clamp(MARGIN, world - MARGIN); }
                     critters[i].pos = np;
                 }
             }
@@ -635,7 +673,7 @@ async fn main() {
         let sync_us = t_sync.elapsed().as_secs_f64() * 1e6;
 
         // --- (re)build the chosen index and run a vision cull from the centre ---
-        let observer = vec3(WORLD * 0.5, WORLD * 0.5, WORLD * 0.5);
+        let observer = vec3(world * 0.5, world * 0.5, world * 0.5);
         let (ox, oy, oz, r) = (observer.x as f64, observer.y as f64, observer.z as f64, vision_r as f64);
         let cull_reps = cull_rep_steps[cull_rep_idx];
         // Optional self-check: the persistent tree's vision cull must match a
@@ -685,7 +723,7 @@ async fn main() {
             Structure::Octree => {
                 // Comparison structure — rebuilt each frame (no persistent update).
                 let tb = Instant::now();
-                let mut t = Octree3::<C3>::new(world_aabb(), ITEM_LIMIT);
+                let mut t = Octree3::<C3>::new(world_aabb(world), ITEM_LIMIT);
                 for (i, c) in critters.iter().enumerate() {
                     t.insert(C3 { id: i as u32, p: pt3(c) });
                 }
@@ -705,7 +743,7 @@ async fn main() {
                 // Author's variant: index the xy projection in a 2D Tree, cull
                 // the sphere's shadow (a disc), then z-reject + exact 3D test.
                 let tb = Instant::now();
-                let mut t = Tree::<P2>::new(Rect::new(0.0, 0.0, WORLD as f64, WORLD as f64), ITEM_LIMIT);
+                let mut t = Tree::<P2>::new(Rect::new(0.0, 0.0, world as f64, world as f64), ITEM_LIMIT);
                 for (i, c) in critters.iter().enumerate() {
                     t.insert(P2 { id: i as u32, p: Point::new(c.pos.x as f64, c.pos.y as f64), z: c.pos.z as f64 });
                 }
@@ -729,8 +767,8 @@ async fn main() {
                 if show_boxes {
                     t.visit_leaves(|_, l| {
                         let b = l.bbox;
-                        let c = vec3((b.x + b.width * 0.5) as f32, (b.y + b.height * 0.5) as f32, WORLD * 0.5);
-                        boxes.push((c, vec3(b.width as f32, b.height as f32, WORLD)));
+                        let c = vec3((b.x + b.width * 0.5) as f32, (b.y + b.height * 0.5) as f32, world * 0.5);
+                        boxes.push((c, vec3(b.width as f32, b.height as f32, world)));
                     });
                 }
                 cand_n = Some(nc);
@@ -798,7 +836,7 @@ async fn main() {
                     if killed[j] {
                         bursts.push((critters[j].pos, 0.0));
                         let k = if rng.unit() < 0.5 { 0u8 } else { 2u8 };
-                        critters[j] = spawn(&mut rng, k);
+                        critters[j] = spawn(&mut rng, k, world);
                         critters[j].flash = FLASH_LIFE;
                         kills += 1;
                     }
@@ -839,7 +877,7 @@ async fn main() {
         let cam_up = cam_right.cross(fwd).normalize();
 
         // world box
-        draw_cube_wires(observer, vec3(WORLD, WORLD, WORLD), Color::new(0.3, 0.35, 0.45, 1.0));
+        draw_cube_wires(observer, vec3(world, world, world), Color::new(0.3, 0.35, 0.45, 1.0));
 
         // optional leaf-box wireframes (collected during the cull above)
         if show_boxes {
@@ -993,13 +1031,32 @@ async fn main() {
         panel.slider("population", 0.0, 80000.0, 200.0, &mut pop_f,
             "Number of critters. - / + step by 200,\ndrag the bar to set any value.");
         match sim_mode {
-            SimMode::Observe => panel.slider("vision r", 6.0, WORLD, 5.0, &mut vision_r,
+            SimMode::Observe => panel.slider("vision r", 6.0, world, 5.0, &mut vision_r,
                 "Radius of the centre vision sphere."),
-            SimMode::Combat => panel.slider("attack r", 4.0, WORLD * 0.5, 5.0, &mut attack_r,
+            SimMode::Combat => panel.slider("attack r", 4.0, world * 0.5, 5.0, &mut attack_r,
                 "Base size of the predators' attacks."),
         }
+        panel.stepper("world size", &SIZE_STEPS, &mut world,
+            "Side of the cube the action lives in.\nStepped powers of 2 -- changing it rebuilds\nthe index and re-bounds the critters.");
         panel.finish(ui_y);
         pop_f = pop_f.round().clamp(0.0, 80000.0);
+
+        // World resized (stepper): re-bound the critters and rebuild the index
+        // with the new cube. Rare and user-driven, so a full rebuild is fine.
+        if (world - prev_world).abs() > 0.5 {
+            dist = (dist * world / prev_world).clamp(world * 0.6, world * 6.0);
+            for c in critters.iter_mut() {
+                for axis in 0..3 { c.pos[axis] = c.pos[axis].clamp(MARGIN, world - MARGIN); }
+            }
+            tree = Tree3::<C3>::new(world_aabb(world), ITEM_LIMIT);
+            tree_pos.clear();
+            for (i, c) in critters.iter().enumerate() {
+                let p = pt3(c);
+                tree.insert(C3 { id: i as u32, p });
+                tree_pos.push(p);
+            }
+            prev_world = world;
+        }
 
         // Reseed predator cooldowns when the desync toggle flips (key or panel),
         // so the change is visible immediately (spread out vs lockstep).
