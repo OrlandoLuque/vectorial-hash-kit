@@ -385,6 +385,34 @@ impl Panel {
     }
 }
 
+/// Push a sample into a rolling history (newest at the end), capped at `GRAPH_N`.
+const GRAPH_N: usize = 240;
+fn push_hist(v: &mut Vec<f32>, x: f32) {
+    v.push(x);
+    if v.len() > GRAPH_N { v.remove(0); }
+}
+
+/// Draw a time-series line graph (screen space): auto-scaled to the data's max,
+/// newest on the right, with a label + current/peak values.
+fn draw_graph(x: f32, y: f32, w: f32, h: f32, label: &str, data: &[f32], color: Color) {
+    draw_rectangle(x, y, w, h, Color::new(0.06, 0.07, 0.10, 0.92));
+    let maxv = data.iter().cloned().fold(1e-6, f32::max);
+    if data.len() >= 2 {
+        let plot_h = h - 16.0;
+        let n = data.len();
+        for i in 1..n {
+            let x0 = x + (i - 1) as f32 / (n - 1) as f32 * w;
+            let x1 = x + i as f32 / (n - 1) as f32 * w;
+            let y0 = y + h - (data[i - 1] / maxv) * plot_h;
+            let y1 = y + h - (data[i] / maxv) * plot_h;
+            draw_line(x0, y0, x1, y1, 1.5, color);
+        }
+        draw_text(&format!("{}: {:.0}  (peak {:.0})", label, data[n - 1], maxv), x + 5.0, y + 13.0, 15.0, color);
+    } else {
+        draw_text(label, x + 5.0, y + 13.0, 15.0, color);
+    }
+}
+
 /// A 3D AABB → (centre, size) pair for `draw_cube_wires`.
 fn aabb_box(b: &Aabb) -> (Vec3, Vec3) {
     (
@@ -512,6 +540,10 @@ async fn main() {
     let mut cpu_ms_avg = 0.0f64;
     let mut sim_us_avg = 0.0f64;
     let mut prep_us_avg = 0.0f64;
+    // Rolling histories for the time-series graphs below the panel.
+    let mut g_fps: Vec<f32> = Vec::new();
+    let mut g_cpu: Vec<f32> = Vec::new();
+    let mut g_cull: Vec<f32> = Vec::new();
 
     loop {
         let dt = (get_frame_time()).min(1.0 / 30.0);
@@ -1039,6 +1071,18 @@ async fn main() {
         panel.stepper("world size", &SIZE_STEPS, &mut world,
             "Side of the cube the action lives in.\nStepped powers of 2 -- changing it rebuilds\nthe index and re-bounds the critters.");
         panel.finish(ui_y);
+
+        // Time-series graphs below the control panel.
+        push_hist(&mut g_fps, fps_display);
+        push_hist(&mut g_cpu, cpu_ms_avg as f32);
+        push_hist(&mut g_cull, cull_us_avg as f32);
+        let gh = 64.0;
+        let mut gy = ui_y + UI_H + 8.0;
+        draw_graph(ui_x, gy, UI_W, gh, "fps", &g_fps, Color::new(0.45, 0.9, 0.55, 1.0));
+        gy += gh + 4.0;
+        draw_graph(ui_x, gy, UI_W, gh, "cpu ms", &g_cpu, Color::new(1.0, 0.82, 0.35, 1.0));
+        gy += gh + 4.0;
+        draw_graph(ui_x, gy, UI_W, gh, "cull us", &g_cull, Color::new(0.4, 0.82, 1.0, 1.0));
         pop_f = pop_f.round().clamp(0.0, 80000.0);
 
         // World resized (stepper): re-bound the critters and rebuild the index
