@@ -231,9 +231,10 @@ impl Structure {
 struct Critter {
     pos: Vec3,
     vel: Vec3,
-    kind: u8,      // 0,1,2 — colour; in combat, kind 1 = predator
-    cooldown: f32, // combat: time until this predator's next attack
-    flash: f32,    // combat: remaining flash time after respawn
+    kind: u8,       // 0=Drifter, 1=Hunter, 2=Pulsar (colour + combat behaviour)
+    cooldown: f32,  // combat: time until this critter's next attack
+    flash: f32,     // combat: remaining flash time after respawn
+    target: Vec3,   // combat (Hunter): chased prey position; ZERO = none
 }
 
 fn world_aabb(world: f32) -> Aabb { Aabb::new(0.0, 0.0, 0.0, world as f64, world as f64, world as f64) }
@@ -462,7 +463,7 @@ async fn main() {
         let v = vec3(s * a.cos(), s * a.sin(), z) * speed;
         let (_cmin, cmax) = kind_cooldown(kind);
         let cooldown = rng.range(0.0, cmax); // spread initial cooldowns so they desync
-        Critter { pos: p, vel: v, kind, cooldown, flash: 0.0 }
+        Critter { pos: p, vel: v, kind, cooldown, flash: 0.0, target: Vec3::ZERO }
     };
     // World size (a stepped pow-2 slider mutates it; the tree is rebuilt on change).
     let mut world: f32 = 256.0;
@@ -694,6 +695,9 @@ async fn main() {
                     let speed = critters[i].vel.length().max(15.0);
                     match critters[i].kind {
                         1 => {
+                            // Hunter: remember the target (for accurate aiming)
+                            // and steer toward it.
+                            critters[i].target = targets[i].unwrap_or(Vec3::ZERO);
                             if let Some(t) = targets[i] {
                                 let desired = (t - critters[i].pos).normalize_or_zero() * speed;
                                 critters[i].vel = critters[i].vel.lerp(desired, (3.0 * dt).min(1.0));
@@ -907,8 +911,15 @@ async fn main() {
                             // forward = at the prey. Drifter (0): random.
                             let (off, length, maxr) = flamer_dims(attack_r);
                             let dir = if kind == 1 {
-                                let v = critters[i].vel;
-                                if v.length() > 0.1 { v.normalize() } else { rand_dir(&mut rng) }
+                                // Aim straight at the stored target (accurate even
+                                // when adjacent, unlike aiming along the velocity).
+                                let d = critters[i].target - center;
+                                if critters[i].target != Vec3::ZERO && d.length() > 1e-3 {
+                                    d.normalize()
+                                } else {
+                                    let v = critters[i].vel;
+                                    if v.length() > 0.1 { v.normalize() } else { rand_dir(&mut rng) }
+                                }
                             } else {
                                 rand_dir(&mut rng)
                             };
