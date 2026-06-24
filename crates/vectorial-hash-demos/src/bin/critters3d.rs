@@ -39,7 +39,8 @@ use macroquad::prelude::*;
 use macroquad::window::get_internal_gl;
 
 use vectorial_hash::{
-    Aabb, Octree3, Point, Point3, Positioned, Positioned3, Rect, Shape, Sphere3, Tree, Tree3,
+    Aabb, CellState, Octree3, Point, Point3, Positioned, Positioned3, Rect, Shape, Shape3, Sphere3,
+    Tree, Tree3,
 };
 use vectorial_hash_demos::instanced3d::{Instance, InstancedRenderer, Mode as RenderGeom};
 
@@ -61,8 +62,43 @@ const FLASH_LIFE: f32 = 0.25; // freshly respawned critter flash time
 #[derive(Clone, Copy, PartialEq)]
 enum SimMode { Observe, Combat }
 
-/// A live attack sphere (predator emits one; prey inside are culled & killed).
-struct Attack { center: Vec3, radius: f32, age: f32 }
+/// The two attack shapes a predator can throw — a round sphere or a tall
+/// "drop" (vertical ellipsoid). Each gets its own colour so they read apart.
+#[derive(Clone, Copy, PartialEq)]
+enum AttackKind { Sphere, Drop }
+impl AttackKind {
+    /// Half of the predators throw drops (by id parity) so both appear.
+    fn for_predator(id: u32) -> Self { if id % 2 == 0 { AttackKind::Sphere } else { AttackKind::Drop } }
+}
+
+/// Ellipsoid radii for a drop of base radius `r` — narrower in x/z, taller in y.
+fn drop_radii(r: f32) -> (f32, f32, f32) { (r * 0.7, r * 1.5, r * 0.7) }
+
+/// A vertical-ellipsoid attack volume (the "drop"). Reduces to a unit sphere
+/// under per-axis scaling, so the sphere-vs-AABB classify carries straight over.
+struct DropShape { cx: f64, cy: f64, cz: f64, rx: f64, ry: f64, rz: f64 }
+impl Shape3 for DropShape {
+    fn bounding_box(&self) -> Aabb {
+        Aabb::new(self.cx - self.rx, self.cy - self.ry, self.cz - self.rz, 2.0 * self.rx, 2.0 * self.ry, 2.0 * self.rz)
+    }
+    fn contains_point(&self, p: Point3) -> bool {
+        let (dx, dy, dz) = ((p.x - self.cx) / self.rx, (p.y - self.cy) / self.ry, (p.z - self.cz) / self.rz);
+        dx * dx + dy * dy + dz * dz <= 1.0
+    }
+    fn classify_aabb(&self, b: &Aabb) -> CellState {
+        let nx = (self.cx.clamp(b.x, b.x_max()) - self.cx) / self.rx;
+        let ny = (self.cy.clamp(b.y, b.y_max()) - self.cy) / self.ry;
+        let nz = (self.cz.clamp(b.z, b.z_max()) - self.cz) / self.rz;
+        if nx * nx + ny * ny + nz * nz > 1.0 { return CellState::Out; }
+        let fx = (if (self.cx - b.x).abs() > (self.cx - b.x_max()).abs() { b.x } else { b.x_max() } - self.cx) / self.rx;
+        let fy = (if (self.cy - b.y).abs() > (self.cy - b.y_max()).abs() { b.y } else { b.y_max() } - self.cy) / self.ry;
+        let fz = (if (self.cz - b.z).abs() > (self.cz - b.z_max()).abs() { b.z } else { b.z_max() } - self.cz) / self.rz;
+        if fx * fx + fy * fy + fz * fz <= 1.0 { CellState::In } else { CellState::Maybe }
+    }
+}
+
+/// A live attack volume (predator emits one; prey inside are culled & killed).
+struct Attack { center: Vec3, radius: f32, age: f32, kind: AttackKind }
 
 /// Hold-to-repeat for a key (OS-style): fires once on the press edge, then —
 /// after `DELAY` held — repeats every `RATE` while the key stays down. Used
@@ -528,14 +564,24 @@ async fn main() {
                     if critters[i].kind != 1 || critters[i].cooldown > 0.0 { continue; }
                     let center = critters[i].pos;
                     critters[i].cooldown = COOLDOWN + if random_attacks { rng.range(0.0, COOLDOWN_JITTER) } else { 0.0 };
-                    attacks.push(Attack { center, radius: attack_r, age: 0.0 });
+                    let akind = AttackKind::for_predator(i as u32);
+                    attacks.push(Attack { center, radius: attack_r, age: 0.0, kind: akind });
                     frame_attacks += 1;
-                    let s = Sphere3::new(center.x as f64, center.y as f64, center.z as f64, attack_r as f64);
+                    let (cx, cy, cz) = (center.x as f64, center.y as f64, center.z as f64);
                     let tc = Instant::now();
-                    let hits = tree.cull(&s);
+                    let hit_ids: Vec<usize> = match akind {
+                        AttackKind::Sphere => {
+                            let s = Sphere3::new(cx, cy, cz, attack_r as f64);
+                            tree.cull(&s).iter().map(|h| h.id as usize).collect()
+                        }
+                        AttackKind::Drop => {
+                            let (rx, ry, rz) = drop_radii(attack_r);
+                            let s = DropShape { cx, cy, cz, rx: rx as f64, ry: ry as f64, rz: rz as f64 };
+                            tree.cull(&s).iter().map(|h| h.id as usize).collect()
+                        }
+                    };
                     cull_us += tc.elapsed().as_secs_f64() * 1e6;
-                    for h in hits {
-                        let j = h.id as usize;
+                    for j in hit_ids {
                         if j != i && !killed[j] && critters[j].kind != 1 { killed[j] = true; }
                     }
                 }
@@ -646,11 +692,29 @@ async fn main() {
                 if lit[i] { draw_line_3d(c.pos, observer, Color::new(1.0, 0.85, 0.3, 0.25)); }
             }
         } else {
-            // combat effects: attack spheres (expand + fade) and kill bursts
+            // combat effects: attack volumes (expand + fade) and kill bursts.
+            // Sphere attacks are orange, drop attacks cyan + teardrop-shaped.
             for a in &attacks {
                 let f = (a.age / ATTACK_LIFE).clamp(0.0, 1.0);
-                let rr = a.radius * (0.7 + 0.5 * f);
-                draw_sphere_wires(a.center, rr, None, Color::new(1.0, 0.7 - 0.5 * f, 0.2, (1.0 - f) * 0.6));
+                let grow = 0.7 + 0.5 * f;
+                let alpha = (1.0 - f) * 0.6;
+                match a.kind {
+                    AttackKind::Sphere => {
+                        draw_sphere_wires(a.center, a.radius * grow, None, Color::new(1.0, 0.7 - 0.5 * f, 0.2, alpha));
+                    }
+                    AttackKind::Drop => {
+                        let (rx, ry, _rz) = drop_radii(a.radius);
+                        let col = Color::new(0.25, 0.85, 1.0, alpha); // cyan
+                        let bulb = a.center + vec3(0.0, -ry * 0.25 * grow, 0.0);
+                        draw_sphere_wires(bulb, rx * grow, None, col);
+                        let tip = a.center + vec3(0.0, ry * grow, 0.0);
+                        for k in 0..6 {
+                            let ang = std::f32::consts::TAU * k as f32 / 6.0;
+                            let edge = bulb + vec3(ang.cos() * rx * grow, ry * 0.2 * grow, ang.sin() * rx * grow);
+                            draw_line_3d(edge, tip, col);
+                        }
+                    }
+                }
             }
             for (p, age) in &bursts {
                 let f = (age / BURST_LIFE).clamp(0.0, 1.0);
