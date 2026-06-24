@@ -46,7 +46,9 @@ use macroquad::window::get_internal_gl;
 use vectorial_hash::{
     Aabb, Octree3, Point, Point3, Positioned, Positioned3, Rect, Shape, Shape3, Sphere3, Tree, Tree3,
 };
-use vectorial_hash_demos::instanced3d::{Instance, InstancedRenderer, Mode as RenderGeom};
+use vectorial_hash_demos::instanced3d::{
+    EffectInstance, EffectMesh, Instance, InstancedRenderer, Mode as RenderGeom,
+};
 
 const MARGIN: f32 = 4.0;
 const ITEM_LIMIT: usize = 16;
@@ -236,35 +238,6 @@ struct Critter {
 
 fn world_aabb(world: f32) -> Aabb { Aabb::new(0.0, 0.0, 0.0, world as f64, world as f64, world as f64) }
 
-/// Draw a flamer/teardrop wireframe (apex `tip`, axis `dir`): straight cone
-/// edges from the apex to the widest ring, then a rounded hemisphere cap
-/// (radius `radius`) so it ends like a drop, not a flat disc.
-fn draw_flamer_wires(tip: Vec3, dir: Vec3, length: f32, radius: f32, color: Color) {
-    let far = tip + dir * length;
-    // A perpendicular basis to `dir` for the far ring + cap meridians.
-    let up = if dir.y.abs() < 0.9 { vec3(0.0, 1.0, 0.0) } else { vec3(1.0, 0.0, 0.0) };
-    let u = dir.cross(up).normalize();
-    let w = dir.cross(u).normalize();
-    let n = 12; // meridians
-    let m = 3; // cap arc segments per meridian
-    let mut prev_ring = far + u * radius;
-    for k in 1..=n {
-        let ang = std::f32::consts::TAU * k as f32 / n as f32;
-        let radial = u * ang.cos() + w * ang.sin();
-        let ring = far + radial * radius;
-        draw_line_3d(prev_ring, ring, color); // widest ring
-        draw_line_3d(tip, ring, color); // cone edge from the apex
-        // rounded cap: a meridian arc from the ring out to the far pole
-        let mut prev_arc = ring;
-        for s in 1..=m {
-            let beta = std::f32::consts::FRAC_PI_2 * s as f32 / m as f32;
-            let arc = far + dir * (radius * beta.sin()) + radial * (radius * beta.cos());
-            draw_line_3d(prev_arc, arc, color);
-            prev_arc = arc;
-        }
-        prev_ring = ring;
-    }
-}
 
 /// A tiny immediate-mode control panel drawn in screen space: stacked rows of
 /// buttons and `[-] bar [+]` sliders with manual mouse hit-testing, plus a help
@@ -1032,27 +1005,41 @@ async fn main() {
                 if lit[i] { draw_line_3d(c.pos, observer, Color::new(1.0, 0.85, 0.3, 0.25)); }
             }
         } else {
-            // combat effects: attack volumes (expand + fade) and kill bursts.
-            // Sphere attacks are orange, drop attacks cyan + teardrop-shaped.
+            // Combat effects, GPU-instanced through our own wireframe pipeline
+            // (not macroquad's immediate line batch). Sphere blasts orange,
+            // flamer drops cyan teardrops, kill bursts white — all fade out.
+            let mut sphere_fx: Vec<EffectInstance> = Vec::new();
+            let mut drop_fx: Vec<EffectInstance> = Vec::new();
             for a in &attacks {
                 let f = (a.age / ATTACK_LIFE).clamp(0.0, 1.0);
-                let grow = 0.7 + 0.5 * f;
                 let alpha = (1.0 - f) * 0.6;
                 match a.kind {
                     AttackKind::Sphere => {
-                        draw_sphere_wires(a.center, a.radius * grow, None, Color::new(1.0, 0.7 - 0.5 * f, 0.2, alpha));
+                        let grow = 0.7 + 0.5 * f;
+                        let model = Mat4::from_scale_rotation_translation(Vec3::splat(a.radius * grow), Quat::IDENTITY, a.center);
+                        sphere_fx.push(EffectInstance::new(model, [1.0, 0.7 - 0.5 * f, 0.2, alpha]));
                     }
                     AttackKind::Drop => {
-                        // Flamer cone from the predator's edge along its heading.
-                        let (off, length, maxr) = flamer_dims(a.radius);
+                        let (off, _, _) = flamer_dims(a.radius);
                         let tip = a.center + a.dir * off;
-                        draw_flamer_wires(tip, a.dir, length, maxr, Color::new(0.25, 0.85, 1.0, alpha));
+                        let model = Mat4::from_scale_rotation_translation(Vec3::splat(a.radius), Quat::from_rotation_arc(Vec3::Y, a.dir), tip);
+                        drop_fx.push(EffectInstance::new(model, [0.25, 0.85, 1.0, alpha]));
                     }
                 }
             }
             for (p, age) in &bursts {
                 let f = (age / BURST_LIFE).clamp(0.0, 1.0);
-                draw_sphere_wires(*p, 2.0 + 9.0 * f, None, Color::new(1.0, 1.0, 1.0, (1.0 - f) * 0.8));
+                let model = Mat4::from_scale_rotation_translation(Vec3::splat(2.0 + 9.0 * f), Quat::IDENTITY, *p);
+                sphere_fx.push(EffectInstance::new(model, [1.0, 1.0, 1.0, (1.0 - f) * 0.8]));
+            }
+            if !sphere_fx.is_empty() || !drop_fx.is_empty() {
+                let mut gl = unsafe { get_internal_gl() };
+                gl.flush();
+                let ctx = gl.quad_context;
+                ctx.begin_default_pass(PassAction::Nothing);
+                renderer.draw_effects(ctx, EffectMesh::Sphere, &sphere_fx, mvp);
+                renderer.draw_effects(ctx, EffectMesh::Drop, &drop_fx, mvp);
+                ctx.end_render_pass();
             }
         }
         }

@@ -14,9 +14,10 @@
 //! against the world box). See `bin/critters3d.rs` for the call site.
 
 use macroquad::miniquad::{
-    Bindings, BufferId, BufferLayout, BufferSource, BufferType, BufferUsage, Comparison, CullFace,
-    Pipeline, PipelineParams, RenderingBackend, ShaderMeta, ShaderSource, UniformBlockLayout,
-    UniformDesc, UniformType, UniformsSource, VertexAttribute, VertexFormat, VertexStep,
+    BlendFactor, BlendState, BlendValue, Bindings, BufferId, BufferLayout, BufferSource, BufferType,
+    BufferUsage, Comparison, CullFace, Equation, Pipeline, PipelineParams, PrimitiveType,
+    RenderingBackend, ShaderMeta, ShaderSource, UniformBlockLayout, UniformDesc, UniformType,
+    UniformsSource, VertexAttribute, VertexFormat, VertexStep,
 };
 use macroquad::prelude::{Mat4, Vec3};
 
@@ -60,6 +61,36 @@ struct BillboardUniforms {
     cam_right: [f32; 3],
     cam_up: [f32; 3],
 }
+#[repr(C)]
+struct EffectUniforms {
+    mvp: [f32; 16],
+}
+
+/// Which base wireframe to instance for the combat effects.
+#[derive(Clone, Copy, PartialEq)]
+pub enum EffectMesh {
+    Sphere, // attack blasts + death bursts
+    Drop,   // flamer teardrops
+}
+
+/// Per-effect instance: a full model transform (columns of a `Mat4`, so the
+/// canonical wireframe is positioned/rotated/scaled per effect) plus a colour.
+/// `repr(C)`; the four columns map to attributes `in_m0..in_m3` and `in_color`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct EffectInstance {
+    pub m0: [f32; 4],
+    pub m1: [f32; 4],
+    pub m2: [f32; 4],
+    pub m3: [f32; 4],
+    pub color: [f32; 4],
+}
+impl EffectInstance {
+    pub fn new(model: Mat4, color: [f32; 4]) -> Self {
+        let c = model.to_cols_array_2d();
+        EffectInstance { m0: c[0], m1: c[1], m2: c[2], m3: c[3], color }
+    }
+}
 
 pub struct InstancedRenderer {
     sphere_pipe: Pipeline,
@@ -73,6 +104,16 @@ pub struct InstancedRenderer {
     quad_nidx: i32,
     inst_buf: BufferId,
     inst_cap: usize,
+    // Combat effects: a line-list pipeline + two base wireframes, instanced.
+    effect_pipe: Pipeline,
+    sphere_wire_vbuf: BufferId,
+    sphere_wire_ibuf: BufferId,
+    sphere_wire_nidx: i32,
+    drop_wire_vbuf: BufferId,
+    drop_wire_ibuf: BufferId,
+    drop_wire_nidx: i32,
+    effect_inst_buf: BufferId,
+    effect_inst_cap: usize,
 }
 
 impl InstancedRenderer {
@@ -155,6 +196,42 @@ impl InstancedRenderer {
             .expect("square billboard instanced shader compiles");
         let square_pipe = ctx.new_pipeline(&layouts, &quad_attrs, square_shader, params);
 
+        // --- combat effects: line-list wireframes, instanced, alpha-blended ---
+        let (swv, swi) = wire_to_buffers(unit_sphere_wire());
+        let sphere_wire_vbuf = ctx.new_buffer(BufferType::VertexBuffer, BufferUsage::Immutable, BufferSource::slice(&swv));
+        let sphere_wire_ibuf = ctx.new_buffer(BufferType::IndexBuffer, BufferUsage::Immutable, BufferSource::slice(&swi));
+        let sphere_wire_nidx = swi.len() as i32;
+        let (dwv, dwi) = wire_to_buffers(unit_drop_wire());
+        let drop_wire_vbuf = ctx.new_buffer(BufferType::VertexBuffer, BufferUsage::Immutable, BufferSource::slice(&dwv));
+        let drop_wire_ibuf = ctx.new_buffer(BufferType::IndexBuffer, BufferUsage::Immutable, BufferSource::slice(&dwi));
+        let drop_wire_nidx = dwi.len() as i32;
+        let effect_inst_cap = 1024usize;
+        let effect_inst_buf = ctx.new_buffer(BufferType::VertexBuffer, BufferUsage::Stream, BufferSource::empty::<EffectInstance>(effect_inst_cap));
+
+        let effect_shader = ctx
+            .new_shader(ShaderSource::Glsl { vertex: EFFECT_VS, fragment: EFFECT_FS }, effect_meta())
+            .expect("effect instanced shader compiles");
+        let effect_pipe = ctx.new_pipeline(
+            &layouts,
+            &[
+                VertexAttribute::with_buffer("in_pos", VertexFormat::Float3, 0),
+                VertexAttribute::with_buffer("in_m0", VertexFormat::Float4, 1),
+                VertexAttribute::with_buffer("in_m1", VertexFormat::Float4, 1),
+                VertexAttribute::with_buffer("in_m2", VertexFormat::Float4, 1),
+                VertexAttribute::with_buffer("in_m3", VertexFormat::Float4, 1),
+                VertexAttribute::with_buffer("in_color", VertexFormat::Float4, 1),
+            ],
+            effect_shader,
+            PipelineParams {
+                primitive_type: PrimitiveType::Lines,
+                depth_test: Comparison::LessOrEqual,
+                depth_write: false, // effects don't occlude each other
+                cull_face: CullFace::Nothing,
+                color_blend: Some(BlendState::new(Equation::Add, BlendFactor::Value(BlendValue::SourceAlpha), BlendFactor::OneMinusValue(BlendValue::SourceAlpha))),
+                ..Default::default()
+            },
+        );
+
         Self {
             sphere_pipe,
             sphere_vbuf,
@@ -167,6 +244,15 @@ impl InstancedRenderer {
             quad_nidx,
             inst_buf,
             inst_cap,
+            effect_pipe,
+            sphere_wire_vbuf,
+            sphere_wire_ibuf,
+            sphere_wire_nidx,
+            drop_wire_vbuf,
+            drop_wire_ibuf,
+            drop_wire_nidx,
+            effect_inst_buf,
+            effect_inst_cap,
         }
     }
 
@@ -233,6 +319,35 @@ impl InstancedRenderer {
             }
         }
     }
+
+    /// Draw combat effects (attack/burst spheres, or flamer drops) instanced as
+    /// wireframes through our own line pipeline — so they bypass macroquad's
+    /// shared immediate-line batch. Each `EffectInstance` carries a model
+    /// transform that places/orients/scales the canonical base wireframe.
+    pub fn draw_effects(&mut self, ctx: &mut dyn RenderingBackend, mesh: EffectMesh, instances: &[EffectInstance], mvp: Mat4) {
+        if instances.is_empty() {
+            return;
+        }
+        if instances.len() > self.effect_inst_cap {
+            ctx.delete_buffer(self.effect_inst_buf);
+            self.effect_inst_cap = (instances.len() * 2).next_power_of_two();
+            self.effect_inst_buf = ctx.new_buffer(BufferType::VertexBuffer, BufferUsage::Stream, BufferSource::empty::<EffectInstance>(self.effect_inst_cap));
+        }
+        ctx.buffer_update(self.effect_inst_buf, BufferSource::slice(instances));
+        let (vbuf, ibuf, nidx) = match mesh {
+            EffectMesh::Sphere => (self.sphere_wire_vbuf, self.sphere_wire_ibuf, self.sphere_wire_nidx),
+            EffectMesh::Drop => (self.drop_wire_vbuf, self.drop_wire_ibuf, self.drop_wire_nidx),
+        };
+        ctx.apply_pipeline(&self.effect_pipe);
+        ctx.apply_bindings(&Bindings {
+            vertex_buffers: vec![vbuf, self.effect_inst_buf],
+            index_buffer: ibuf,
+            images: vec![],
+        });
+        let u = EffectUniforms { mvp: mvp.to_cols_array() };
+        ctx.apply_uniforms(UniformsSource::table(&u));
+        ctx.draw(0, nidx, instances.len() as i32);
+    }
 }
 
 /// Low-poly UV sphere centred at the origin, unit radius. Returns flat
@@ -264,6 +379,69 @@ fn unit_sphere(rings: u16, sectors: u16) -> (Vec<f32>, Vec<u16>) {
     (verts, idx)
 }
 
+/// Convert flat wireframe positions (segment endpoints, in pairs) into a
+/// `(vertices, indices)` pair for a Lines draw — indices are just `0..n`.
+fn wire_to_buffers(verts: Vec<f32>) -> (Vec<f32>, Vec<u16>) {
+    let nverts = (verts.len() / 3) as u16;
+    let indices: Vec<u16> = (0..nverts).collect();
+    (verts, indices)
+}
+
+/// Unit sphere wireframe (latitude rings + meridians) as line segments.
+fn unit_sphere_wire() -> Vec<f32> {
+    use std::f32::consts::PI;
+    let (rings, seg, merid) = (4usize, 16usize, 8usize);
+    let mut v = Vec::new();
+    for ri in 1..rings {
+        let phi = PI * ri as f32 / rings as f32;
+        let (sp, cp) = phi.sin_cos();
+        for s in 0..seg {
+            let a0 = 2.0 * PI * s as f32 / seg as f32;
+            let a1 = 2.0 * PI * (s + 1) as f32 / seg as f32;
+            v.extend_from_slice(&[sp * a0.cos(), cp, sp * a0.sin(), sp * a1.cos(), cp, sp * a1.sin()]);
+        }
+    }
+    for mi in 0..merid {
+        let theta = 2.0 * PI * mi as f32 / merid as f32;
+        let (st, ct) = theta.sin_cos();
+        let rs = rings * 2;
+        for ri in 0..rs {
+            let p0 = PI * ri as f32 / rs as f32;
+            let p1 = PI * (ri + 1) as f32 / rs as f32;
+            v.extend_from_slice(&[p0.sin() * ct, p0.cos(), p0.sin() * st, p1.sin() * ct, p1.cos(), p1.sin() * st]);
+        }
+    }
+    v
+}
+
+/// Canonical flamer/teardrop wireframe: apex at the origin, axis +Y, length 3,
+/// radius 0.85 (matching `flamer_dims(1.0)` so a uniform scale maps it to any
+/// attack size without distorting the rounded cap). Cone edges + far ring +
+/// hemisphere cap meridians, as line segments.
+fn unit_drop_wire() -> Vec<f32> {
+    use std::f32::consts::{FRAC_PI_2, TAU};
+    let (length, radius) = (3.0f32, 0.85f32);
+    let (n, m) = (12usize, 3usize);
+    let mut v = Vec::new();
+    let mut prev = (radius, length, 0.0f32); // ring point at angle 0
+    for k in 1..=n {
+        let a = TAU * k as f32 / n as f32;
+        let (rx, rz) = (a.cos() * radius, a.sin() * radius);
+        let ring = (rx, length, rz);
+        v.extend_from_slice(&[prev.0, prev.1, prev.2, ring.0, ring.1, ring.2]); // ring segment
+        v.extend_from_slice(&[0.0, 0.0, 0.0, ring.0, ring.1, ring.2]); // cone edge from apex
+        let mut pa = ring;
+        for s in 1..=m {
+            let beta = FRAC_PI_2 * s as f32 / m as f32;
+            let arc = (a.cos() * radius * beta.cos(), length + radius * beta.sin(), a.sin() * radius * beta.cos());
+            v.extend_from_slice(&[pa.0, pa.1, pa.2, arc.0, arc.1, arc.2]);
+            pa = arc;
+        }
+        prev = ring;
+    }
+    v
+}
+
 fn sphere_meta() -> ShaderMeta {
     ShaderMeta {
         images: vec![],
@@ -273,6 +451,13 @@ fn sphere_meta() -> ShaderMeta {
                 UniformDesc::new("light_dir", UniformType::Float3),
             ],
         },
+    }
+}
+
+fn effect_meta() -> ShaderMeta {
+    ShaderMeta {
+        images: vec![],
+        uniforms: UniformBlockLayout { uniforms: vec![UniformDesc::new("mvp", UniformType::Mat4)] },
     }
 }
 
@@ -359,5 +544,31 @@ varying lowp vec2 v_local;
 void main() {
     float sh = 1.0 - 0.25 * dot(v_local, v_local);
     gl_FragColor = vec4(v_color.rgb * sh, v_color.a);
+}
+"#;
+
+// Combat-effect wireframes: a per-instance model matrix (its four columns come
+// in as in_m0..in_m3) places/orients/scales the canonical line mesh.
+const EFFECT_VS: &str = r#"#version 100
+attribute vec3 in_pos;
+attribute vec4 in_m0;
+attribute vec4 in_m1;
+attribute vec4 in_m2;
+attribute vec4 in_m3;
+attribute vec4 in_color;
+uniform mat4 mvp;
+varying lowp vec4 v_color;
+void main() {
+    mat4 model = mat4(in_m0, in_m1, in_m2, in_m3);
+    gl_Position = mvp * model * vec4(in_pos, 1.0);
+    v_color = in_color;
+}
+"#;
+
+const EFFECT_FS: &str = r#"#version 100
+precision mediump float;
+varying lowp vec4 v_color;
+void main() {
+    gl_FragColor = v_color;
 }
 "#;
