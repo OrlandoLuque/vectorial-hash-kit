@@ -55,6 +55,11 @@ const ATTACK_LIFE: f32 = 0.35; // attack-sphere fade time
 const BURST_LIFE: f32 = 0.30; // kill-marker fade time
 const FLASH_LIFE: f32 = 0.25; // freshly respawned critter flash time
 
+// Separation ("no two critters in the same space") tuning.
+const SEP_R: f32 = 5.0; // neighbours within this radius push apart
+const SEP_STRENGTH: f32 = 0.25; // push scale per frame
+const SEP_MAX: f32 = 2.0; // clamp per-frame displacement (avoids jitter blowups)
+
 /// Which simulation the demo runs. `Observe` is the vision-cull showcase
 /// (one sphere from the centre); `Combat` makes the red critters predators
 /// that attack nearby prey — each attack is an index cull, so this is the
@@ -285,6 +290,7 @@ async fn main() {
     // Combat-mode state.
     let mut sim_mode = if std::env::var("CRITTERS3D_COMBAT").is_ok() { SimMode::Combat } else { SimMode::Observe };
     let mut random_attacks = true; // desync cooldowns; off = synchronized saturation
+    let mut separation = std::env::var("CRITTERS3D_SEP").is_ok(); // push critters apart (heavy)
     let mut attack_r: f32 = 22.0;
     let mut attacks: Vec<Attack> = Vec::new();
     let mut bursts: Vec<(Vec3, f32)> = Vec::new(); // kill markers (pos, age)
@@ -356,6 +362,7 @@ async fn main() {
             }
         }
         if is_key_pressed(KeyCode::C) { cull_rep_idx = (cull_rep_idx + 1) % cull_rep_steps.len(); }
+        if is_key_pressed(KeyCode::O) { separation = !separation; }
         // +/- ramp the population: one step per press, or hold to auto-repeat.
         let add = add_rep.fires(
             is_key_pressed(KeyCode::Equal) || is_key_pressed(KeyCode::KpAdd),
@@ -424,6 +431,34 @@ async fn main() {
                 // together the instant you switch to combat.
                 if sim_mode == SimMode::Combat { c.cooldown -= dt; }
                 c.flash -= dt;
+            }
+            // Separation: no two critters share the same space. For each one,
+            // cull its neighbourhood from the (last-frame) index and push away
+            // from anyone closer than SEP_R. One cull per critter -> heavy at
+            // high counts, hence the toggle. Pushes are gathered then applied.
+            if separation {
+                let mut push = vec![Vec3::ZERO; critters.len()];
+                for i in 0..critters.len() {
+                    let p = critters[i].pos;
+                    let s = Sphere3::new(p.x as f64, p.y as f64, p.z as f64, SEP_R as f64);
+                    for h in tree.cull(&s) {
+                        let j = h.id as usize;
+                        if j == i { continue; }
+                        let d = p - critters[j].pos;
+                        let dist = d.length();
+                        if dist > 1e-4 && dist < SEP_R {
+                            push[i] += d / dist * (SEP_R - dist);
+                        }
+                    }
+                }
+                for i in 0..critters.len() {
+                    let mut mv = push[i] * SEP_STRENGTH;
+                    let l = mv.length();
+                    if l > SEP_MAX { mv = mv / l * SEP_MAX; }
+                    let mut np = critters[i].pos + mv;
+                    for axis in 0..3 { np[axis] = np[axis].clamp(MARGIN, WORLD - MARGIN); }
+                    critters[i].pos = np;
+                }
             }
             // age and retire combat effects
             for a in attacks.iter_mut() { a.age += dt; }
@@ -762,7 +797,7 @@ async fn main() {
         let frame_ms = if fps_display > 1.0 { 1000.0 / fps_display as f64 } else { cpu_ms_avg };
         let bound = if frame_ms > 0.0 && cpu_ms_avg > 0.7 * frame_ms { "CPU-BOUND" } else { "GPU/vsync headroom" };
         hud(134.0, format!("cpu ~{:.2} ms/frame (sim {:.0} + build {:.0} + prep {:.0} us) -> {}", cpu_ms_avg, sim_us_avg, t_build_us, prep_us_avg, bound));
-        hud(screen_height() - 18.0, "drag: orbit | scroll/zoom | +/-: pop | [ ]: radius | T: observe/combat | R: sync | M: structure | G: render | C: reps | B: boxes | Space | Esc".to_string());
+        hud(screen_height() - 18.0, "drag/zoom | +/-: pop | [ ]: radius | T: combat | R: sync | O: separation | M: structure | G: render | C: reps | B: boxes | Space | Esc".to_string());
 
         frame += 1;
         if let Some(m) = max_frames { if frame >= m { break; } }
