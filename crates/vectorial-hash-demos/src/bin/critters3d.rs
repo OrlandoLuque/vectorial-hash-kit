@@ -15,11 +15,13 @@
 //! - drag left mouse: orbit the camera; scroll: zoom
 //! - `+` / `-`: add / remove 200 critters
 //! - `T`: toggle observe / combat
+//! - `R`: toggle attack desync (combat) — on = min+random cooldowns, off =
+//!   all predators in lockstep (a synchronized saturation spike to stress-test)
 //! - `[` / `]`: shrink / grow the radius (vision in observe, attack in combat)
 //! - `M`: cycle the index structure — binary-3D `Tree3` / `Octree3` (8-way) /
 //!   projection (one 2D `Tree` on xy + z-reject, the author's variant)
-//! - `G`: cycle the render path — immediate `draw_sphere` / GPU-instanced
-//!   spheres / GPU-instanced billboards (the last two scale far higher)
+//! - `G`: cycle the render path — GPU-instanced spheres / GPU-instanced
+//!   billboards (both one draw call; raw miniquad)
 //! - `C`: cycle cull repetitions (1/50/200/1000) — averages the per-cull time
 //!   for a stable, readable µs figure that differs between structures
 //! - `B`: toggle the leaf-box wireframes (extruded columns in projection mode)
@@ -45,7 +47,8 @@ const MARGIN: f32 = 4.0;
 const ITEM_LIMIT: usize = 16;
 
 // Combat-mode tuning.
-const COOLDOWN: f32 = 0.7; // seconds between a predator's attacks
+const COOLDOWN: f32 = 0.7; // minimum seconds between a predator's attacks
+const COOLDOWN_JITTER: f32 = 0.8; // + up to this much random, so attacks desync
 const ATTACK_LIFE: f32 = 0.35; // attack-sphere fade time
 const BURST_LIFE: f32 = 0.30; // kill-marker fade time
 const FLASH_LIFE: f32 = 0.25; // freshly respawned critter flash time
@@ -59,6 +62,30 @@ enum SimMode { Observe, Combat }
 
 /// A live attack sphere (predator emits one; prey inside are culled & killed).
 struct Attack { center: Vec3, radius: f32, age: f32 }
+
+/// Hold-to-repeat for a key (OS-style): fires once on the press edge, then —
+/// after `DELAY` held — repeats every `RATE` while the key stays down. Used
+/// for the `+`/`-` population keys so you can hold to ramp the count.
+struct KeyRepeat { held: f32, acc: f32 }
+impl KeyRepeat {
+    fn new() -> Self { KeyRepeat { held: 0.0, acc: 0.0 } }
+    fn fires(&mut self, pressed: bool, down: bool, dt: f32) -> bool {
+        const DELAY: f32 = 0.5;
+        const RATE: f32 = 0.05;
+        if !down {
+            self.held = 0.0;
+            self.acc = 0.0;
+            return pressed;
+        }
+        self.held += dt;
+        let mut fire = pressed;
+        if self.held > DELAY {
+            self.acc += dt;
+            if self.acc >= RATE { self.acc -= RATE; fire = true; }
+        }
+        fire
+    }
+}
 
 struct Rng(u64);
 impl Rng {
@@ -88,32 +115,29 @@ impl Shape for Disc {
     }
 }
 
-/// How the critters are drawn. `Immediate` is macroquad's per-critter
-/// `draw_sphere` (geometry rebuilt every frame — the known-good fallback);
-/// the other two are the GPU-instanced path (one draw call, scales far
-/// higher). See [`vectorial_hash_demos::instanced3d`].
+/// How the critters are drawn — both are the GPU-instanced path (one draw
+/// call, see [`vectorial_hash_demos::instanced3d`]). The old per-critter
+/// immediate `draw_sphere` mode was dropped once instancing was confirmed
+/// working; it pinned the demo to ~10 fps at a few thousand critters.
 #[derive(Clone, Copy, PartialEq)]
-enum RenderMode { Immediate, InstancedSpheres, Billboards }
+enum RenderMode { InstancedSpheres, Billboards }
 impl RenderMode {
     fn next(self) -> Self {
         match self {
-            RenderMode::Immediate => RenderMode::InstancedSpheres,
             RenderMode::InstancedSpheres => RenderMode::Billboards,
-            RenderMode::Billboards => RenderMode::Immediate,
+            RenderMode::Billboards => RenderMode::InstancedSpheres,
         }
     }
     fn label(self) -> &'static str {
         match self {
-            RenderMode::Immediate => "immediate spheres (draw_sphere)",
             RenderMode::InstancedSpheres => "instanced spheres (GPU)",
             RenderMode::Billboards => "instanced billboards (GPU)",
         }
     }
     fn from_env() -> Self {
         match std::env::var("CRITTERS3D_RENDER").ok().as_deref() {
-            Some("instanced") => RenderMode::InstancedSpheres,
             Some("billboards") => RenderMode::Billboards,
-            _ => RenderMode::Immediate,
+            _ => RenderMode::InstancedSpheres,
         }
     }
 }
@@ -176,7 +200,7 @@ async fn main() {
         let z = rng.range(-1.0, 1.0);
         let s = (1.0 - z * z).max(0.0).sqrt();
         let v = vec3(s * a.cos(), s * a.sin(), z) * speed;
-        let cooldown = if kind == 1 { rng.range(0.0, COOLDOWN) } else { 0.0 };
+        let cooldown = if kind == 1 { rng.range(0.0, COOLDOWN + COOLDOWN_JITTER) } else { 0.0 };
         Critter { pos: p, vel: v, kind, cooldown, flash: 0.0 }
     };
     for i in 0..2400 {
@@ -199,6 +223,7 @@ async fn main() {
 
     // Combat-mode state.
     let mut sim_mode = if std::env::var("CRITTERS3D_COMBAT").is_ok() { SimMode::Combat } else { SimMode::Observe };
+    let mut random_attacks = true; // desync cooldowns; off = synchronized saturation
     let mut attack_r: f32 = 22.0;
     let mut attacks: Vec<Attack> = Vec::new();
     let mut bursts: Vec<(Vec3, f32)> = Vec::new(); // kill markers (pos, age)
@@ -214,8 +239,26 @@ async fn main() {
     let mut frame: u64 = 0;
     let max_frames: Option<u64> = std::env::var("CRITTERS3D_MAX_FRAMES").ok().and_then(|s| s.parse().ok());
 
+    // Hold-to-repeat state for the +/- population keys.
+    let mut add_rep = KeyRepeat::new();
+    let mut sub_rep = KeyRepeat::new();
+    // Averaged FPS (raw get_fps() is the instantaneous 1/frame_time and jitters);
+    // accumulate real frame time and refresh the shown value once per second.
+    let mut fps_accum_t = 0.0f32;
+    let mut fps_accum_n = 0u32;
+    let mut fps_display = 0.0f32;
+
     loop {
         let dt = (get_frame_time()).min(1.0 / 30.0);
+
+        // Averaged FPS over ~1 s (uses the real, unclamped frame time).
+        fps_accum_t += get_frame_time();
+        fps_accum_n += 1;
+        if fps_accum_t >= 1.0 {
+            fps_display = fps_accum_n as f32 / fps_accum_t;
+            fps_accum_t = 0.0;
+            fps_accum_n = 0;
+        }
 
         // --- input ---
         if is_key_pressed(KeyCode::Escape) { break; }
@@ -224,13 +267,31 @@ async fn main() {
         if is_key_pressed(KeyCode::M) { structure = structure.next(); }
         if is_key_pressed(KeyCode::G) { render_mode = render_mode.next(); }
         if is_key_pressed(KeyCode::T) { sim_mode = match sim_mode { SimMode::Observe => SimMode::Combat, SimMode::Combat => SimMode::Observe }; }
+        if is_key_pressed(KeyCode::R) {
+            // Toggle attack desync. Re-seed live predator cooldowns so the
+            // change is immediate: random -> spread out; synced -> all in
+            // lockstep (every COOLDOWN seconds → a saturation spike).
+            random_attacks = !random_attacks;
+            for c in critters.iter_mut() {
+                if c.kind == 1 {
+                    c.cooldown = if random_attacks { rng.range(0.0, COOLDOWN + COOLDOWN_JITTER) } else { COOLDOWN };
+                }
+            }
+        }
         if is_key_pressed(KeyCode::C) { cull_rep_idx = (cull_rep_idx + 1) % cull_rep_steps.len(); }
-        if is_key_pressed(KeyCode::Equal) || is_key_pressed(KeyCode::KpAdd) {
-            for i in 0..200 { critters.push(spawn(&mut rng, (i % 3) as u8)); }
-        }
-        if is_key_pressed(KeyCode::Minus) || is_key_pressed(KeyCode::KpSubtract) {
-            for _ in 0..200 { critters.pop(); }
-        }
+        // +/- ramp the population: one step per press, or hold to auto-repeat.
+        let add = add_rep.fires(
+            is_key_pressed(KeyCode::Equal) || is_key_pressed(KeyCode::KpAdd),
+            is_key_down(KeyCode::Equal) || is_key_down(KeyCode::KpAdd),
+            dt,
+        );
+        if add { for i in 0..200 { critters.push(spawn(&mut rng, (i % 3) as u8)); } }
+        let sub = sub_rep.fires(
+            is_key_pressed(KeyCode::Minus) || is_key_pressed(KeyCode::KpSubtract),
+            is_key_down(KeyCode::Minus) || is_key_down(KeyCode::KpSubtract),
+            dt,
+        );
+        if sub { for _ in 0..200 { critters.pop(); } }
         // [ / ] adjusts the vision radius (observe) or attack radius (combat).
         let radius_step = 60.0 * dt;
         if is_key_down(KeyCode::LeftBracket) {
@@ -263,7 +324,10 @@ async fn main() {
                     if np[axis] > WORLD - MARGIN { np[axis] = WORLD - MARGIN; c.vel[axis] = -c.vel[axis]; }
                 }
                 c.pos = np;
-                c.cooldown -= dt;
+                // Cooldown only ticks in combat — otherwise time spent in
+                // observe would drain every predator to 0 and they'd all fire
+                // together the instant you switch to combat.
+                if sim_mode == SimMode::Combat { c.cooldown -= dt; }
                 c.flash -= dt;
             }
             // age and retire combat effects
@@ -383,7 +447,7 @@ async fn main() {
                 for i in 0..critters.len() {
                     if critters[i].kind != 1 || critters[i].cooldown > 0.0 { continue; }
                     let center = critters[i].pos;
-                    critters[i].cooldown = COOLDOWN + rng.range(0.0, 0.4);
+                    critters[i].cooldown = COOLDOWN + if random_attacks { rng.range(0.0, COOLDOWN_JITTER) } else { 0.0 };
                     attacks.push(Attack { center, radius: attack_r, age: 0.0 });
                     frame_attacks += 1;
                     let s = Sphere3::new(center.x as f64, center.y as f64, center.z as f64, attack_r as f64);
@@ -466,28 +530,21 @@ async fn main() {
             rads.push(rad);
         }
 
-        // critters — immediate (per-critter draw_sphere) or GPU-instanced.
-        match render_mode {
-            RenderMode::Immediate => {
-                for (i, c) in critters.iter().enumerate() {
-                    draw_sphere(c.pos, rads[i], None, cols[i]);
-                }
-            }
-            RenderMode::InstancedSpheres | RenderMode::Billboards => {
-                let geom = if render_mode == RenderMode::Billboards { RenderGeom::Billboards } else { RenderGeom::Spheres };
-                let instances: Vec<Instance> = critters.iter().enumerate().map(|(i, c)| {
-                    Instance::new(c.pos, rads[i], [cols[i].r, cols[i].g, cols[i].b, cols[i].a])
-                }).collect();
-                // Flush macroquad's batch (renders the world box / wires drawn
-                // above), then issue the instanced draw into the same default
-                // pass with depth preserved.
-                let mut gl = unsafe { get_internal_gl() };
-                gl.flush();
-                let ctx = gl.quad_context;
-                ctx.begin_default_pass(PassAction::Nothing);
-                renderer.draw(ctx, geom, &instances, mvp, cam_right, cam_up);
-                ctx.end_render_pass();
-            }
+        // critters — GPU-instanced (spheres or billboards), one draw call.
+        {
+            let geom = if render_mode == RenderMode::Billboards { RenderGeom::Billboards } else { RenderGeom::Spheres };
+            let instances: Vec<Instance> = critters.iter().enumerate().map(|(i, c)| {
+                Instance::new(c.pos, rads[i], [cols[i].r, cols[i].g, cols[i].b, cols[i].a])
+            }).collect();
+            // Flush macroquad's batch (renders the world box / wires drawn
+            // above), then issue the instanced draw into the same default pass
+            // with depth preserved.
+            let mut gl = unsafe { get_internal_gl() };
+            gl.flush();
+            let ctx = gl.quad_context;
+            ctx.begin_default_pass(PassAction::Nothing);
+            renderer.draw(ctx, geom, &instances, mvp, cam_right, cam_up);
+            ctx.end_render_pass();
         }
 
         if sim_mode == SimMode::Observe {
@@ -512,14 +569,14 @@ async fn main() {
         set_default_camera();
         let hud = |y: f32, s: String| draw_text(&s, 12.0, y, 20.0, Color::new(0.85, 0.9, 1.0, 1.0));
         let mode_str = if sim_mode == SimMode::Combat { "COMBAT" } else { "observe" };
-        hud(24.0, format!("critters 3D  |  pop {}  |  mode {}  |  fps {}", critters.len(), mode_str, get_fps()));
+        hud(24.0, format!("critters 3D  |  pop {}  |  mode {}  |  fps {:.0}", critters.len(), mode_str, fps_display));
         hud(46.0, stat_line);
         let info_str = match sim_mode {
             SimMode::Observe => match cand_n {
                 Some(nc) => format!("vision r={:.0}  ->  {} candidates -> {} seen", vision_r, nc, seen_n),
                 None => format!("vision r={:.0}  ->  {} seen", vision_r, seen_n),
             },
-            SimMode::Combat => format!("attack r={:.0}  |  {} total kills", attack_r, kills),
+            SimMode::Combat => format!("attack r={:.0}  |  {} kills  |  {} [R]", attack_r, kills, if random_attacks { "desynced" } else { "SYNCED (saturation)" }),
         };
         hud(68.0, format!("{}{}", info_str, if paused { "   [PAUSED]" } else { "" }));
         let cull_note = match sim_mode {
@@ -528,7 +585,7 @@ async fn main() {
         };
         hud(90.0, format!("index: build {:.0} us | {}", t_build_us, cull_note));
         hud(112.0, format!("render: {}  <- G switches", render_mode.label()));
-        hud(screen_height() - 18.0, "drag: orbit | scroll: zoom | +/-: pop | [ ]: radius | T: observe/combat | M: structure | G: render | C: reps | B: boxes | Space | Esc".to_string());
+        hud(screen_height() - 18.0, "drag: orbit | scroll/zoom | +/-: pop | [ ]: radius | T: observe/combat | R: sync | M: structure | G: render | C: reps | B: boxes | Space | Esc".to_string());
 
         frame += 1;
         if let Some(m) = max_frames { if frame >= m { break; } }
