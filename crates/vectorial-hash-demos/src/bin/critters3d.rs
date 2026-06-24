@@ -20,8 +20,9 @@
 //! - `[` / `]`: shrink / grow the radius (vision in observe, attack in combat)
 //! - `M`: cycle the index structure — binary-3D `Tree3` / `Octree3` (8-way) /
 //!   projection (one 2D `Tree` on xy + z-reject, the author's variant)
-//! - `G`: cycle the render path — GPU-instanced spheres / GPU-instanced
-//!   billboards (both one draw call; raw miniquad)
+//! - `G`: cycle the render path — GPU-instanced spheres / round billboards /
+//!   square billboards (all one draw call, raw miniquad). Round billboards
+//!   use a `discard` (fill-bound under overdraw); square ones don't (fastest).
 //! - `C`: cycle cull repetitions (1/50/200/1000) — averages the per-cull time
 //!   for a stable, readable µs figure that differs between structures
 //! - `B`: toggle the leaf-box wireframes (extruded columns in projection mode)
@@ -120,23 +121,33 @@ impl Shape for Disc {
 /// immediate `draw_sphere` mode was dropped once instancing was confirmed
 /// working; it pinned the demo to ~10 fps at a few thousand critters.
 #[derive(Clone, Copy, PartialEq)]
-enum RenderMode { InstancedSpheres, Billboards }
+enum RenderMode { InstancedSpheres, Billboards, SquareBillboards }
 impl RenderMode {
     fn next(self) -> Self {
         match self {
             RenderMode::InstancedSpheres => RenderMode::Billboards,
-            RenderMode::Billboards => RenderMode::InstancedSpheres,
+            RenderMode::Billboards => RenderMode::SquareBillboards,
+            RenderMode::SquareBillboards => RenderMode::InstancedSpheres,
         }
     }
     fn label(self) -> &'static str {
         match self {
             RenderMode::InstancedSpheres => "instanced spheres (GPU)",
-            RenderMode::Billboards => "instanced billboards (GPU)",
+            RenderMode::Billboards => "instanced billboards, round (GPU)",
+            RenderMode::SquareBillboards => "instanced billboards, square/fast (GPU)",
+        }
+    }
+    fn geom(self) -> RenderGeom {
+        match self {
+            RenderMode::InstancedSpheres => RenderGeom::Spheres,
+            RenderMode::Billboards => RenderGeom::Billboards,
+            RenderMode::SquareBillboards => RenderGeom::BillboardsSquare,
         }
     }
     fn from_env() -> Self {
         match std::env::var("CRITTERS3D_RENDER").ok().as_deref() {
             Some("billboards") => RenderMode::Billboards,
+            Some("square") => RenderMode::SquareBillboards,
             _ => RenderMode::InstancedSpheres,
         }
     }
@@ -247,6 +258,9 @@ async fn main() {
     let mut fps_accum_t = 0.0f32;
     let mut fps_accum_n = 0u32;
     let mut fps_display = 0.0f32;
+    // Rolling average of the per-cull time (a single frame's measurement is
+    // noisy — this smooths it into a real average without rounding to ~1 µs).
+    let mut cull_us_avg = 0.0f64;
 
     loop {
         let dt = (get_frame_time()).min(1.0 / 30.0);
@@ -476,6 +490,11 @@ async fn main() {
             stat_line = format!("combat (Tree3, item_limit {}): {} predators, {} attacks this frame", ITEM_LIMIT, predators, frame_attacks);
         }
         let seen_n = lit.iter().filter(|&&b| b).count();
+        // Feed the rolling cull-time average (skip frames with no measurement,
+        // e.g. combat frames where no predator was off cooldown).
+        if t_cull_us > 0.0 {
+            cull_us_avg = if cull_us_avg <= 0.0 { t_cull_us } else { cull_us_avg * 0.9 + t_cull_us * 0.1 };
+        }
 
         // --- render 3D ---
         clear_background(Color::new(0.05, 0.06, 0.09, 1.0));
@@ -532,7 +551,7 @@ async fn main() {
 
         // critters — GPU-instanced (spheres or billboards), one draw call.
         {
-            let geom = if render_mode == RenderMode::Billboards { RenderGeom::Billboards } else { RenderGeom::Spheres };
+            let geom = render_mode.geom();
             let instances: Vec<Instance> = critters.iter().enumerate().map(|(i, c)| {
                 Instance::new(c.pos, rads[i], [cols[i].r, cols[i].g, cols[i].b, cols[i].a])
             }).collect();
@@ -580,11 +599,17 @@ async fn main() {
         };
         hud(68.0, format!("{}{}", info_str, if paused { "   [PAUSED]" } else { "" }));
         let cull_note = match sim_mode {
-            SimMode::Observe => format!("cull {:.2} us (avg of {})", t_cull_us, cull_reps),
-            SimMode::Combat => format!("cull {:.2} us (avg per attack)", t_cull_us),
+            SimMode::Observe => format!("cull {:.3} us (rolling avg, x{} reps)", cull_us_avg, cull_reps),
+            SimMode::Combat => format!("cull {:.3} us (rolling avg, per attack)", cull_us_avg),
         };
         hud(90.0, format!("index: build {:.0} us | {}", t_build_us, cull_note));
-        hud(112.0, format!("render: {}  <- G switches", render_mode.label()));
+        let render_note = if render_mode == RenderMode::InstancedSpheres {
+            let tris = renderer.sphere_triangles() as i64 * critters.len() as i64;
+            format!("{}  |  {} tris/sphere -> {:.2}M tris", render_mode.label(), renderer.sphere_triangles(), tris as f64 / 1e6)
+        } else {
+            format!("{}  |  2 tris/critter", render_mode.label())
+        };
+        hud(112.0, format!("render: {}  <- G switches", render_note));
         hud(screen_height() - 18.0, "drag: orbit | scroll/zoom | +/-: pop | [ ]: radius | T: observe/combat | R: sync | M: structure | G: render | C: reps | B: boxes | Space | Esc".to_string());
 
         frame += 1;

@@ -39,7 +39,12 @@ impl Instance {
 #[derive(Clone, Copy, PartialEq)]
 pub enum Mode {
     Spheres,
+    /// Round billboards (a `discard` masks the quad to a disc). Prettiest, but
+    /// the discard disables early-Z so they go fill-bound under overdraw.
     Billboards,
+    /// Square billboards — no `discard`, so early-Z stays on and the fragment
+    /// stage is minimal. Fastest at huge counts (the point of billboards).
+    BillboardsSquare,
 }
 
 // Uniform blocks — `repr(C)` field order/offsets must match the `ShaderMeta`
@@ -62,6 +67,7 @@ pub struct InstancedRenderer {
     sphere_ibuf: BufferId,
     sphere_nidx: i32,
     quad_pipe: Pipeline,
+    square_pipe: Pipeline,
     quad_vbuf: BufferId,
     quad_ibuf: BufferId,
     quad_nidx: i32,
@@ -131,16 +137,23 @@ impl InstancedRenderer {
                 billboard_meta(),
             )
             .expect("billboard instanced shader compiles");
-        let quad_pipe = ctx.new_pipeline(
-            &layouts,
-            &[
-                VertexAttribute::with_buffer("in_local", VertexFormat::Float2, 0),
-                VertexAttribute::with_buffer("in_inst", VertexFormat::Float4, 1),
-                VertexAttribute::with_buffer("in_color", VertexFormat::Float4, 1),
-            ],
-            quad_shader,
-            params,
-        );
+        let quad_attrs = [
+            VertexAttribute::with_buffer("in_local", VertexFormat::Float2, 0),
+            VertexAttribute::with_buffer("in_inst", VertexFormat::Float4, 1),
+            VertexAttribute::with_buffer("in_color", VertexFormat::Float4, 1),
+        ];
+        let quad_pipe = ctx.new_pipeline(&layouts, &quad_attrs, quad_shader, params);
+
+        // Square billboards: same vertex shader, a fragment shader with no
+        // `discard`, so the GPU keeps early-Z (a separate program is required —
+        // a *conditional* discard would still disable early-Z).
+        let square_shader = ctx
+            .new_shader(
+                ShaderSource::Glsl { vertex: QUAD_VS, fragment: QUAD_FS_SQUARE },
+                billboard_meta(),
+            )
+            .expect("square billboard instanced shader compiles");
+        let square_pipe = ctx.new_pipeline(&layouts, &quad_attrs, square_shader, params);
 
         Self {
             sphere_pipe,
@@ -148,6 +161,7 @@ impl InstancedRenderer {
             sphere_ibuf,
             sphere_nidx,
             quad_pipe,
+            square_pipe,
             quad_vbuf,
             quad_ibuf,
             quad_nidx,
@@ -155,6 +169,10 @@ impl InstancedRenderer {
             inst_cap,
         }
     }
+
+    /// Triangles in one instanced sphere (the base mesh). Multiply by the
+    /// instance count for the total submitted in sphere mode.
+    pub fn sphere_triangles(&self) -> i32 { self.sphere_nidx / 3 }
 
     /// Draw all `instances` in one instanced call. Must be invoked inside an
     /// active render pass (the caller wraps it in `begin_default_pass` /
@@ -197,8 +215,9 @@ impl InstancedRenderer {
                 ctx.apply_uniforms(UniformsSource::table(&u));
                 ctx.draw(0, self.sphere_nidx, n);
             }
-            Mode::Billboards => {
-                ctx.apply_pipeline(&self.quad_pipe);
+            Mode::Billboards | Mode::BillboardsSquare => {
+                let pipe = if mode == Mode::BillboardsSquare { &self.square_pipe } else { &self.quad_pipe };
+                ctx.apply_pipeline(pipe);
                 ctx.apply_bindings(&Bindings {
                     vertex_buffers: vec![self.quad_vbuf, self.inst_buf],
                     index_buffer: self.quad_ibuf,
@@ -317,7 +336,8 @@ void main() {
 "#;
 
 // Round, faux-lit billboard: discard outside the unit disc, brighten toward
-// the centre so a flat quad reads as a little shaded ball.
+// the centre so a flat quad reads as a little ball. Parabolic falloff
+// (1 - k·d²) instead of a sqrt — same look, no per-fragment sqrt.
 const QUAD_FS: &str = r#"#version 100
 precision mediump float;
 varying lowp vec4 v_color;
@@ -325,7 +345,19 @@ varying lowp vec2 v_local;
 void main() {
     float d2 = dot(v_local, v_local);
     if (d2 > 1.0) { discard; }
-    float sh = 0.4 + 0.6 * sqrt(1.0 - d2);
+    float sh = 1.0 - 0.55 * d2;
+    gl_FragColor = vec4(v_color.rgb * sh, v_color.a);
+}
+"#;
+
+// Square billboard: NO discard (keeps early-Z) and no sqrt — the cheapest
+// fragment stage. A faint corner darkening still gives a little shading.
+const QUAD_FS_SQUARE: &str = r#"#version 100
+precision mediump float;
+varying lowp vec4 v_color;
+varying lowp vec2 v_local;
+void main() {
+    float sh = 1.0 - 0.25 * dot(v_local, v_local);
     gl_FragColor = vec4(v_color.rgb * sh, v_color.a);
 }
 "#;
