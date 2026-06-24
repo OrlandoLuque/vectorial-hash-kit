@@ -39,7 +39,6 @@ use std::time::Instant;
 use macroquad::camera::Camera;
 use macroquad::miniquad::PassAction;
 use macroquad::prelude::*;
-use macroquad::ui::{hash, root_ui, widgets};
 use macroquad::window::get_internal_gl;
 
 use vectorial_hash::{
@@ -52,8 +51,8 @@ const MARGIN: f32 = 4.0;
 const ITEM_LIMIT: usize = 16;
 
 // On-screen control panel (top-right) size.
-const UI_W: f32 = 290.0;
-const UI_H: f32 = 360.0;
+const UI_W: f32 = 300.0;
+const UI_H: f32 = 430.0;
 
 // Combat-mode tuning.
 const COOLDOWN: f32 = 0.7; // minimum seconds between a predator's attacks
@@ -248,6 +247,88 @@ fn draw_cone_wires(tip: Vec3, dir: Vec3, length: f32, radius: f32, color: Color)
         draw_line_3d(prev, pt, color); // ring segment
         draw_line_3d(tip, pt, color); // edge from the apex
         prev = pt;
+    }
+}
+
+/// A tiny immediate-mode control panel drawn in screen space: stacked rows of
+/// buttons and `[-] bar [+]` sliders with manual mouse hit-testing, plus a help
+/// box at the bottom that describes whatever row the mouse is hovering.
+struct Panel {
+    x: f32,
+    w: f32,
+    cur: f32,    // y of the next row
+    row: f32,    // row height
+    mx: f32,
+    my: f32,
+    pressed: bool, // left mouse pressed this frame (buttons / +/-)
+    down: bool,    // left mouse held (slider drag)
+    help: Option<&'static str>,
+}
+impl Panel {
+    fn new(x: f32, y: f32, w: f32, mx: f32, my: f32, pressed: bool, down: bool) -> Self {
+        draw_rectangle(x, y, w, UI_H, Color::new(0.06, 0.07, 0.10, 0.92));
+        draw_rectangle(x, y, w, 22.0, Color::new(0.12, 0.14, 0.20, 0.95));
+        draw_text("controls", x + 8.0, y + 16.0, 18.0, Color::new(0.8, 0.9, 1.0, 1.0));
+        Panel { x, w, cur: y + 26.0, row: 26.0, mx, my, pressed, down, help: None }
+    }
+    fn over(&self, rx: f32, ry: f32, rw: f32, rh: f32) -> bool {
+        self.mx >= rx && self.mx <= rx + rw && self.my >= ry && self.my <= ry + rh
+    }
+    fn cell(rx: f32, ry: f32, rw: f32, rh: f32, hov: bool, text: &str, tx: f32) {
+        draw_rectangle(rx, ry, rw, rh, if hov { Color::new(0.30, 0.36, 0.5, 0.95) } else { Color::new(0.18, 0.21, 0.30, 0.9) });
+        draw_text(text, rx + tx, ry + rh * 0.72, 17.0, Color::new(0.92, 0.95, 1.0, 1.0));
+    }
+    fn button(&mut self, label: &str, help: &'static str) -> bool {
+        let (rx, ry, rw, rh) = (self.x + 6.0, self.cur, self.w - 12.0, self.row - 5.0);
+        let hov = self.over(rx, ry, rw, rh);
+        Self::cell(rx, ry, rw, rh, hov, label, 8.0);
+        if hov { self.help = Some(help); }
+        self.cur += self.row;
+        hov && self.pressed
+    }
+    /// `[-] label: value bar [+]` — `step` snaps to multiples; drag the bar to set.
+    fn slider(&mut self, label: &str, min: f32, max: f32, step: f32, val: &mut f32, help: &'static str) {
+        let (ry, rh, bw) = (self.cur, self.row - 5.0, 22.0);
+        let (mx0, px0) = (self.x + 6.0, self.x + self.w - 6.0 - bw);
+        let bx = mx0 + bw + 4.0;
+        let bar_w = px0 - bx - 4.0;
+        let (hov_m, hov_p, hov_b) = (
+            self.over(mx0, ry, bw, rh),
+            self.over(px0, ry, bw, rh),
+            self.over(bx, ry, bar_w, rh),
+        );
+        Self::cell(mx0, ry, bw, rh, hov_m, "-", 8.0);
+        Self::cell(px0, ry, bw, rh, hov_p, "+", 7.0);
+        if hov_m && self.pressed { *val = (((*val / step).ceil() - 1.0) * step).max(min); }
+        if hov_p && self.pressed { *val = (((*val / step).floor() + 1.0) * step).min(max); }
+        draw_rectangle(bx, ry, bar_w, rh, Color::new(0.14, 0.16, 0.22, 0.9));
+        let frac = ((*val - min) / (max - min)).clamp(0.0, 1.0);
+        draw_rectangle(bx, ry, bar_w * frac, rh, Color::new(0.28, 0.5, 0.7, 0.9));
+        draw_text(&format!("{}: {:.0}", label, *val), bx + 6.0, ry + rh * 0.72, 16.0, Color::new(0.92, 0.95, 1.0, 1.0));
+        if hov_b && self.down { *val = (min + ((self.mx - bx) / bar_w) * (max - min)).clamp(min, max); }
+        if hov_m || hov_p || hov_b { self.help = Some(help); }
+        self.cur += self.row;
+    }
+    fn separator(&mut self) {
+        draw_rectangle(self.x + 6.0, self.cur + 2.0, self.w - 12.0, 1.0, Color::new(0.3, 0.34, 0.42, 0.8));
+        self.cur += 8.0;
+    }
+    /// Draw the help box filling the rest of the panel with the hovered help.
+    fn finish(&self, panel_y: f32) {
+        let hy = self.cur + 4.0;
+        let hh = panel_y + UI_H - hy - 4.0;
+        if hh < 12.0 { return; }
+        draw_rectangle(self.x + 4.0, hy, self.w - 8.0, hh, Color::new(0.08, 0.09, 0.13, 0.95));
+        match self.help {
+            Some(h) => {
+                for (i, line) in h.split('\n').enumerate() {
+                    draw_text(line, self.x + 10.0, hy + 18.0 + i as f32 * 16.0, 15.0, Color::new(0.82, 0.87, 0.97, 1.0));
+                }
+            }
+            None => {
+                draw_text("hover a control for help", self.x + 10.0, hy + 18.0, 15.0, Color::new(0.5, 0.55, 0.65, 1.0));
+            }
+        }
     }
 }
 
@@ -860,29 +941,37 @@ async fn main() {
         hud(screen_height() - 18.0, "drag/zoom | +/-: pop | [ ]: radius | T: combat | R: sync | O: separation | V: fps cap | M: structure | G: render | C: reps | B: boxes | Space | Esc".to_string());
 
         // --- on-screen mouse controls (top-right panel; keys still work too) ---
-        widgets::Window::new(hash!(), vec2(ui_x, ui_y), vec2(UI_W, UI_H))
-            .label("controls (click / drag)")
-            .titlebar(true)
-            .movable(false)
-            .ui(&mut root_ui(), |ui| {
-                if ui.button(None, format!("mode: {} [T]", if sim_mode == SimMode::Combat { "COMBAT" } else { "observe" })) {
-                    sim_mode = match sim_mode { SimMode::Observe => SimMode::Combat, SimMode::Combat => SimMode::Observe };
-                }
-                if ui.button(None, format!("structure: {} [M]", structure.label())) { structure = structure.next(); }
-                if ui.button(None, format!("render: {} [G]", render_mode.label())) { render_mode = render_mode.next(); }
-                ui.separator();
-                if ui.button(None, format!("attacks: {} [R]", if random_attacks { "desynced" } else { "SYNCED" })) { random_attacks = !random_attacks; }
-                if ui.button(None, format!("separation: {} [O]", if separation { "ON" } else { "off" })) { separation = !separation; }
-                if ui.button(None, format!("fps cap: {} [V]", if fps_cap { "165" } else { "OFF" })) { fps_cap = !fps_cap; }
-                if ui.button(None, format!("leaf boxes: {} [B]", if show_boxes { "ON" } else { "off" })) { show_boxes = !show_boxes; }
-                if ui.button(None, format!("cull reps: {} [C]", cull_reps)) { cull_rep_idx = (cull_rep_idx + 1) % cull_rep_steps.len(); }
-                ui.separator();
-                ui.slider(hash!(), "population", 0f32..80000f32, &mut pop_f);
-                match sim_mode {
-                    SimMode::Observe => ui.slider(hash!(), "vision r", 6f32..WORLD, &mut vision_r),
-                    SimMode::Combat => ui.slider(hash!(), "attack r", 4f32..(WORLD * 0.5), &mut attack_r),
-                }
-            });
+        let mut panel = Panel::new(ui_x, ui_y, UI_W, mp_now.0, mp_now.1,
+            is_mouse_button_pressed(MouseButton::Left), is_mouse_button_down(MouseButton::Left));
+        if panel.button(&format!("mode: {} [T]", if sim_mode == SimMode::Combat { "COMBAT" } else { "observe" }),
+            "Observe: one vision sphere from the centre\nlights the critters it sees.\nCombat: red critters become predators\nthat attack nearby prey (each attack is\nan index cull).") {
+            sim_mode = match sim_mode { SimMode::Observe => SimMode::Combat, SimMode::Combat => SimMode::Observe };
+        }
+        if panel.button(&format!("structure: {} [M]", structure.label()),
+            "Index used for the culls:\nTree3 (binary, persistent + update),\nOctree3 (8-way, rebuilt each frame),\nprojection (one 2D tree on xy + z-reject).") { structure = structure.next(); }
+        if panel.button(&format!("render: {} [G]", render_mode.label()),
+            "How critters are drawn:\ninstanced spheres / round billboards /\nsquare billboards (fastest) /\nNO RENDER (CPU only, to read the ceiling).") { render_mode = render_mode.next(); }
+        panel.separator();
+        if panel.button(&format!("attacks: {} [R]", if random_attacks { "desynced" } else { "SYNCED" }),
+            "Combat attack timing:\ndesynced = min + random cooldowns;\nSYNCED = all predators fire together,\na saturation spike to stress the index.") { random_attacks = !random_attacks; }
+        if panel.button(&format!("separation: {} [O]", if separation { "ON" } else { "off" }),
+            "Push critters apart so none overlap.\nOne neighbour cull per critter -> heavy\nat high counts (a good index workload).") { separation = !separation; }
+        if panel.button(&format!("fps cap: {} [V]", if fps_cap { "165" } else { "OFF" }),
+            "vsync is off so the fps counter shows the\nreal ceiling. Cap to ~165 to stop the GPU\nrendering frames the monitor can't show.") { fps_cap = !fps_cap; }
+        if panel.button(&format!("leaf boxes: {} [B]", if show_boxes { "ON" } else { "off" }),
+            "Draw the index's leaf cells (the boxes the\nculling descends through).") { show_boxes = !show_boxes; }
+        if panel.button(&format!("cull reps: {} [C]", cull_reps),
+            "Repeat the timed cull N times for a stable\nper-cull microsecond reading (one cull is\ntoo fast to time on its own).") { cull_rep_idx = (cull_rep_idx + 1) % cull_rep_steps.len(); }
+        panel.separator();
+        panel.slider("population", 0.0, 80000.0, 200.0, &mut pop_f,
+            "Number of critters. - / + step by 200,\ndrag the bar to set any value.");
+        match sim_mode {
+            SimMode::Observe => panel.slider("vision r", 6.0, WORLD, 5.0, &mut vision_r,
+                "Radius of the centre vision sphere."),
+            SimMode::Combat => panel.slider("attack r", 4.0, WORLD * 0.5, 5.0, &mut attack_r,
+                "Base size of the predators' attacks."),
+        }
+        panel.finish(ui_y);
         pop_f = pop_f.round().clamp(0.0, 80000.0);
 
         // Reseed predator cooldowns when the desync toggle flips (key or panel),
