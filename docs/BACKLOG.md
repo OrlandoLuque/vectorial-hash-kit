@@ -62,8 +62,13 @@ to triage later.
   gated. 2–13 µs/query at 50k for k=1..50; octree ≈ binary. `tree3d_bench --knn
   K`. See `THREE_D.md` § "k-nearest-neighbour". Follow-up: `MortonGrid3::knn`
   (ring-by-ring outward from the query cell).
-- **Index serialization** *(queued tonight, #3)* — save/load a built tree.
-  Round-trip test (serialize → deserialize → `cull` identical).
+- ~~**Index serialization**~~ — **done for `Tree3`.** `Tree3::serialize` /
+  `deserialize` round-trip the built tree (exact arena + free-list, no rebuild)
+  to any `std::io::Write`/`Read`, dependency-free, items via a caller closure
+  (works for any `T`). Round-trip test preserves cull + knn + arena and rejects
+  corruption. Follow-up: the same ~60-line pattern for `Octree3` and the 2D
+  trees (`Tree`/`QuadTree`/`IntegerTree`); a versioned format already in place
+  (magic `VHT3` + version byte).
 
 ## Dilation
 - **3D dilation (Minkowski)** — agent body radius for the 3D critters, the way

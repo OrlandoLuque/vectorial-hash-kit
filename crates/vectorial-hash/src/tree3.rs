@@ -18,6 +18,8 @@
 //! analogue of the 2D 1×1 raster: In/Out voxels resolve by lookup, only
 //! boundary (Maybe) voxels run the exact test.
 
+use std::io::{self, Read, Write};
+
 use crate::template::CellState;
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -660,6 +662,91 @@ pub(crate) fn aabb_min_dist2(b: &Aabb, q: Point3) -> f64 {
     dx * dx + dy * dy + dz * dz
 }
 
+// ------------------------------------------------------------- serialization
+// Little-endian primitive read/write helpers (no external dependency).
+
+fn w_u32<W: Write>(w: &mut W, v: u32) -> io::Result<()> { w.write_all(&v.to_le_bytes()) }
+fn w_u64<W: Write>(w: &mut W, v: u64) -> io::Result<()> { w.write_all(&v.to_le_bytes()) }
+fn w_f64<W: Write>(w: &mut W, v: f64) -> io::Result<()> { w.write_all(&v.to_le_bytes()) }
+fn r_u32<R: Read>(r: &mut R) -> io::Result<u32> { let mut b = [0u8; 4]; r.read_exact(&mut b)?; Ok(u32::from_le_bytes(b)) }
+fn r_u64<R: Read>(r: &mut R) -> io::Result<u64> { let mut b = [0u8; 8]; r.read_exact(&mut b)?; Ok(u64::from_le_bytes(b)) }
+fn r_f64<R: Read>(r: &mut R) -> io::Result<f64> { let mut b = [0u8; 8]; r.read_exact(&mut b)?; Ok(f64::from_le_bytes(b)) }
+fn r_u8<R: Read>(r: &mut R) -> io::Result<u8> { let mut b = [0u8; 1]; r.read_exact(&mut b)?; Ok(b[0]) }
+
+fn w_aabb<W: Write>(w: &mut W, b: &Aabb) -> io::Result<()> {
+    w_f64(w, b.x)?; w_f64(w, b.y)?; w_f64(w, b.z)?;
+    w_f64(w, b.w)?; w_f64(w, b.h)?; w_f64(w, b.d)
+}
+fn r_aabb<R: Read>(r: &mut R) -> io::Result<Aabb> {
+    Ok(Aabb::new(r_f64(r)?, r_f64(r)?, r_f64(r)?, r_f64(r)?, r_f64(r)?, r_f64(r)?))
+}
+
+const TREE3_MAGIC: &[u8; 4] = b"VHT3";
+const TREE3_VERSION: u8 = 1;
+
+fn corrupt(msg: &str) -> io::Error { io::Error::new(io::ErrorKind::InvalidData, msg) }
+
+impl<T: Positioned3> Tree3<T> {
+    /// Serialize the **built** tree (exact arena, free-list, and params — no
+    /// rebuild on load) to `w`. Items are written by the caller's `write_item`
+    /// closure, so this is dependency-free and works for any `T`. A loader must
+    /// pass a `read_item` that mirrors the same byte layout.
+    pub fn serialize<W: Write>(&self, w: &mut W, write_item: impl Fn(&mut W, &T) -> io::Result<()>) -> io::Result<()> {
+        w.write_all(TREE3_MAGIC)?;
+        w.write_all(&[TREE3_VERSION])?;
+        w_u64(w, self.item_limit as u64)?;
+        w_u64(w, self.merge_limit as u64)?;
+        w_f64(w, self.min_cell)?;
+        w_u32(w, self.root.0)?;
+        w_u32(w, self.free.len() as u32)?;
+        for f in &self.free { w_u32(w, f.0)?; }
+        w_u32(w, self.nodes.len() as u32)?;
+        for n in &self.nodes {
+            w_aabb(w, &n.bbox)?;
+            match n.parent {
+                Some(p) => { w.write_all(&[1])?; w_u32(w, p.0)?; }
+                None => w.write_all(&[0])?,
+            }
+            match n.children {
+                Some([a, b]) => { w.write_all(&[1])?; w_u32(w, a.0)?; w_u32(w, b.0)?; }
+                None => w.write_all(&[0])?,
+            }
+            w_u32(w, n.items.len() as u32)?;
+            for it in &n.items { write_item(w, it)?; }
+        }
+        Ok(())
+    }
+
+    /// Inverse of [`Tree3::serialize`]: rebuild the exact tree from `r`, reading
+    /// each item with `read_item` (must mirror the writer's layout).
+    pub fn deserialize<R: Read>(r: &mut R, read_item: impl Fn(&mut R) -> io::Result<T>) -> io::Result<Self> {
+        let mut magic = [0u8; 4];
+        r.read_exact(&mut magic)?;
+        if &magic != TREE3_MAGIC { return Err(corrupt("bad Tree3 magic")); }
+        if r_u8(r)? != TREE3_VERSION { return Err(corrupt("unsupported Tree3 version")); }
+        let item_limit = r_u64(r)? as usize;
+        let merge_limit = r_u64(r)? as usize;
+        let min_cell = r_f64(r)?;
+        let root = Node3Id(r_u32(r)?);
+        let nfree = r_u32(r)? as usize;
+        let mut free = Vec::with_capacity(nfree);
+        for _ in 0..nfree { free.push(Node3Id(r_u32(r)?)); }
+        let nnodes = r_u32(r)? as usize;
+        let mut nodes = Vec::with_capacity(nnodes);
+        for _ in 0..nnodes {
+            let bbox = r_aabb(r)?;
+            let parent = if r_u8(r)? == 1 { Some(Node3Id(r_u32(r)?)) } else { None };
+            let children = if r_u8(r)? == 1 { Some([Node3Id(r_u32(r)?), Node3Id(r_u32(r)?)]) } else { None };
+            let nitems = r_u32(r)? as usize;
+            let mut items = Vec::with_capacity(nitems);
+            for _ in 0..nitems { items.push(read_item(r)?); }
+            nodes.push(Node3 { bbox, parent, children, items });
+        }
+        if root.0 as usize >= nnodes { return Err(corrupt("root index out of range")); }
+        Ok(Tree3 { nodes, free, item_limit, merge_limit, min_cell, root })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -834,5 +921,84 @@ mod tests {
         // k == 0 → empty; k > n → all.
         assert!(tree.knn(Point3::new(1.0, 1.0, 1.0), 0).is_empty());
         assert_eq!(tree.knn(Point3::new(1.0, 1.0, 1.0), pts.len() + 10).len(), pts.len());
+    }
+
+    #[test]
+    fn serialize_roundtrip_preserves_tree() {
+        use std::io::{Cursor, Read, Write};
+
+        #[derive(Clone, Copy)]
+        struct M { id: u32, p: Point3 }
+        impl Positioned3 for M { fn position(&self) -> Point3 { self.p } }
+
+        // Build with churn so the free-list is non-empty and the arena has dead
+        // slots — the serializer must round-trip the exact arena, not a rebuild.
+        let mut x = 0x5E21_A112u64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        let world = Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0);
+        let mut tree = Tree3::<M>::new(world, 6);
+        let mut live: std::collections::HashMap<u32, Point3> = std::collections::HashMap::new();
+        let mut next = 0u32;
+        for _ in 0..1500 {
+            let p = Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0);
+            tree.insert(M { id: next, p }); live.insert(next, p); next += 1;
+        }
+        for _ in 0..3000 {
+            let roll = rng();
+            let ids: Vec<u32> = live.keys().copied().collect();
+            if roll < 0.5 && !ids.is_empty() {
+                let id = ids[(rng() * ids.len() as f64) as usize % ids.len()];
+                let old = live[&id]; let np = Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0);
+                if tree.update(old, |m| m.id == id, |m| m.p = np) { live.insert(id, np); }
+            } else if roll < 0.7 && !ids.is_empty() {
+                let id = ids[(rng() * ids.len() as f64) as usize % ids.len()];
+                tree.remove(live[&id], |m| m.id == id); live.remove(&id);
+            } else {
+                let p = Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0);
+                tree.insert(M { id: next, p }); live.insert(next, p); next += 1;
+            }
+        }
+        assert!(tree.node_count() > tree.live_node_count(), "expected dead slots from churn");
+
+        // Serialize → deserialize with a matching item codec (id + x,y,z).
+        let mut buf = Vec::new();
+        tree.serialize(&mut buf, |w, it| {
+            w.write_all(&it.id.to_le_bytes())?;
+            w.write_all(&it.p.x.to_le_bytes())?;
+            w.write_all(&it.p.y.to_le_bytes())?;
+            w.write_all(&it.p.z.to_le_bytes())
+        }).unwrap();
+        let mut cur = Cursor::new(&buf);
+        let loaded = Tree3::<M>::deserialize(&mut cur, |r| {
+            let mut a = [0u8; 4]; r.read_exact(&mut a)?;
+            let mut b = [0u8; 8];
+            let id = u32::from_le_bytes(a);
+            r.read_exact(&mut b)?; let px = f64::from_le_bytes(b);
+            r.read_exact(&mut b)?; let py = f64::from_le_bytes(b);
+            r.read_exact(&mut b)?; let pz = f64::from_le_bytes(b);
+            Ok(M { id, p: Point3::new(px, py, pz) })
+        }).unwrap();
+
+        // Exact arena + reachable structure preserved.
+        assert_eq!(loaded.node_count(), tree.node_count(), "arena size");
+        assert_eq!(loaded.live_node_count(), tree.live_node_count(), "live nodes");
+        assert_eq!(loaded.leaf_count(), tree.leaf_count(), "leaves");
+        assert_eq!(loaded.item_count(), tree.item_count(), "items");
+
+        // Culls identical for several spheres.
+        for (cx, cy, cz, r) in [(128.0, 128.0, 128.0, 30.0), (60.0, 200.0, 90.0, 50.0), (10.0, 10.0, 10.0, 80.0)] {
+            let s = Sphere3::new(cx, cy, cz, r).with_raster();
+            let mut a: Vec<u32> = tree.cull(&s).iter().map(|m| m.id).collect();
+            let mut b: Vec<u32> = loaded.cull(&s).iter().map(|m| m.id).collect();
+            a.sort(); b.sort();
+            assert_eq!(a, b, "cull differs after round-trip ({cx},{cy},{cz}) r={r}");
+        }
+        // And knn identical.
+        let ka: Vec<f64> = tree.knn(Point3::new(120.0, 120.0, 120.0), 8).iter().map(|(d, _)| *d).collect();
+        let kb: Vec<f64> = loaded.knn(Point3::new(120.0, 120.0, 120.0), 8).iter().map(|(d, _)| *d).collect();
+        assert_eq!(ka, kb, "knn differs after round-trip");
+
+        // Corruption is rejected, not panicked.
+        assert!(Tree3::<M>::deserialize(&mut Cursor::new(&b"XXXXX"[..]), |_| unreachable!()).is_err());
     }
 }
