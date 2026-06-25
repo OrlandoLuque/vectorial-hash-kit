@@ -562,7 +562,7 @@ fn pt3(c: &Critter) -> Point3 { Point3::new(c.pos.x as f64, c.pos.y as f64, c.po
 /// "update" is a re-bucket). All exact.
 enum Index {
     Binary { tree: Tree3<C3>, refs: Vec<vectorial_hash::ItemRef> },
-    Octree { tree: Octree3<C3>, pos: Vec<Point3> },
+    Octree { tree: Octree3<C3>, refs: Vec<vectorial_hash::ItemRef> },
     Morton { grid: MortonGrid3<C3> },
     Projection { tree: Tree<P2> },
 }
@@ -580,10 +580,10 @@ impl Index {
             }
             Structure::Octree => {
                 let mut tree = Octree3::<C3>::new(wa, ITEM_LIMIT);
-                let pos = critters.iter().enumerate()
-                    .map(|(i, c)| { let p = pt3(c); tree.insert(C3 { id: i as u32, p }); p })
+                let refs = critters.iter().enumerate()
+                    .map(|(i, c)| tree.insert_ref(C3 { id: i as u32, p: pt3(c) }).unwrap())
                     .collect();
-                Index::Octree { tree, pos }
+                Index::Octree { tree, refs }
             }
             Structure::Morton => {
                 let levels = MortonGrid3::<C3>::levels_for_cell_size(wa, (cell as f64).max(4.0));
@@ -617,8 +617,8 @@ impl Index {
             Index::Binary { tree, refs } => {
                 for (i, c) in critters.iter().enumerate() { let np = pt3(c); tree.update_ref(refs[i], |x| x.p = np); }
             }
-            Index::Octree { tree, pos } => {
-                for (i, c) in critters.iter().enumerate() { let np = pt3(c); let id = i as u32; tree.update(pos[i], |x| x.id == id, |x| x.p = np); pos[i] = np; }
+            Index::Octree { tree, refs } => {
+                for (i, c) in critters.iter().enumerate() { let np = pt3(c); tree.update_ref(refs[i], |x| x.p = np); }
             }
             Index::Morton { .. } => *self = Index::build(Structure::Morton, world, cell, critters),
             Index::Projection { .. } => *self = Index::build(Structure::Projection, world, cell, critters),
@@ -659,7 +659,7 @@ impl Index {
     fn stat(&self) -> String {
         match self {
             Index::Binary { tree, .. } => format!("Tree3 (binary, ItemRef): {:>6} leaves, {:>6} arena", tree.leaf_count(), tree.node_count()),
-            Index::Octree { tree, .. } => format!("Octree3 (8-way, update): {:>6} leaves, {:>6} arena", tree.leaf_count(), tree.node_count()),
+            Index::Octree { tree, .. } => format!("Octree3 (8-way, ItemRef): {:>6} leaves, {:>6} arena", tree.leaf_count(), tree.node_count()),
             Index::Morton { grid } => format!("MortonGrid3 (Z-order, rebuilt): {:>6} cells, {:.2} items/cell", grid.cell_count(), grid.item_count() as f64 / grid.cell_count().max(1) as f64),
             Index::Projection { tree } => format!("projection (2D xy + z-reject): {:>6} leaves, {:>6} arena", tree.leaf_count(), tree.node_count()),
         }

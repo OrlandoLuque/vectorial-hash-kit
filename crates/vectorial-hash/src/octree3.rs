@@ -10,7 +10,7 @@
 //! reclaims merged-out slots.
 
 use crate::template::CellState;
-use crate::tree3::{aabb_min_dist2, knn_offer, knn_worst, Aabb, KnnEntry, Point3, Positioned3, Shape3};
+use crate::tree3::{aabb_min_dist2, knn_offer, knn_worst, Aabb, ItemRef, KnnEntry, Point3, Positioned3, Shape3};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ONodeId(pub u32);
@@ -20,11 +20,20 @@ pub struct ONode<T> {
     pub parent: Option<ONodeId>,
     pub children: Option<[ONodeId; 8]>,
     pub items: Vec<T>,
+    /// Parallel to `items`: the stable handle of each item (see the
+    /// [`crate::ItemRef`] layer on [`crate::Tree3`]). Empty on internal nodes.
+    hs: Vec<u32>,
 }
+
+/// Where a handle's item currently lives (leaf node + slot).
+#[derive(Copy, Clone)]
+struct OItemLoc { node: ONodeId, slot: u32 }
 
 pub struct Octree3<T: Positioned3> {
     nodes: Vec<ONode<T>>,
     free: Vec<ONodeId>,
+    locs: Vec<OItemLoc>,
+    free_handles: Vec<u32>,
     pub item_limit: usize,
     pub merge_limit: usize,
     min_cell: f64,
@@ -36,8 +45,10 @@ impl<T: Positioned3> Octree3<T> {
         assert!(item_limit >= 1, "item_limit must be >= 1");
         let min_cell = bbox.w.max(bbox.h).max(bbox.d) * 1e-12;
         Self {
-            nodes: vec![ONode { bbox, parent: None, children: None, items: Vec::new() }],
+            nodes: vec![ONode { bbox, parent: None, children: None, items: Vec::new(), hs: Vec::new() }],
             free: Vec::new(),
+            locs: Vec::new(),
+            free_handles: Vec::new(),
             item_limit,
             merge_limit: item_limit,
             min_cell,
@@ -60,13 +71,44 @@ impl<T: Positioned3> Octree3<T> {
     pub fn node_count(&self) -> usize { self.nodes.len() }
     pub fn live_node_count(&self) -> usize { self.nodes.len() - self.free.len() }
 
+    // ---- stable ItemRef handle layer (mirrors Tree3) ----
+    fn alloc_handle(&mut self) -> u32 {
+        if let Some(h) = self.free_handles.pop() { h }
+        else { let h = self.locs.len() as u32; self.locs.push(OItemLoc { node: ONodeId(0), slot: 0 }); h }
+    }
+    fn push_h(&mut self, node: ONodeId, item: T, h: u32) {
+        let slot = self.get(node).items.len() as u32;
+        let n = self.get_mut(node);
+        n.items.push(item);
+        n.hs.push(h);
+        self.locs[h as usize] = OItemLoc { node, slot };
+    }
+    fn swap_remove_h(&mut self, node: ONodeId, slot: usize) -> (T, u32) {
+        let (item, h, moved) = {
+            let n = self.get_mut(node);
+            let item = n.items.swap_remove(slot);
+            let h = n.hs.swap_remove(slot);
+            let moved = if slot < n.hs.len() { Some(n.hs[slot]) } else { None };
+            (item, h, moved)
+        };
+        if let Some(m) = moved { self.locs[m as usize].slot = slot as u32; }
+        (item, h)
+    }
+
     pub fn insert(&mut self, item: T) -> bool {
+        self.insert_ref(item).is_some()
+    }
+
+    /// Insert and return a stable [`crate::ItemRef`] for O(1) `update_ref` /
+    /// `remove_ref` (skips the predicate scan). `None` if outside the root.
+    pub fn insert_ref(&mut self, item: T) -> Option<ItemRef> {
         let p = item.position();
-        if !self.get(self.root).bbox.contains(p) { return false; }
+        if !self.get(self.root).bbox.contains(p) { return None; }
         let leaf = self.locate(p);
-        self.get_mut(leaf).items.push(item);
+        let h = self.alloc_handle();
+        self.push_h(leaf, item, h);
         if self.get(leaf).items.len() > self.item_limit { self.divide(leaf); }
-        true
+        Some(ItemRef(h))
     }
 
     pub fn locate(&self, p: Point3) -> ONodeId {
@@ -83,14 +125,16 @@ impl<T: Positioned3> Octree3<T> {
     }
 
     fn divide(&mut self, id: ONodeId) {
-        let (b, items) = {
+        let (b, items, hs) = {
             let n = self.get_mut(id);
-            (n.bbox, std::mem::take(&mut n.items))
+            (n.bbox, std::mem::take(&mut n.items), std::mem::take(&mut n.hs))
         };
         let first = items[0].position();
         let inseparable = items.iter().all(|it| it.position() == first);
         if inseparable || b.w.max(b.h).max(b.d) <= self.min_cell {
-            self.get_mut(id).items = items;
+            let n = self.get_mut(id);
+            n.items = items;
+            n.hs = hs;
             return;
         }
         let (hw, hh, hd) = (b.w / 2.0, b.h / 2.0, b.d / 2.0);
@@ -103,15 +147,15 @@ impl<T: Positioned3> Octree3<T> {
                         b.x + sx as f64 * hw, b.y + sy as f64 * hh, b.z + sz as f64 * hd,
                         hw, hh, hd,
                     );
-                    kids[oi] = self.alloc(ONode { bbox: oct, parent: Some(id), children: None, items: Vec::new() });
+                    kids[oi] = self.alloc(ONode { bbox: oct, parent: Some(id), children: None, items: Vec::new(), hs: Vec::new() });
                     oi += 1;
                 }
             }
         }
-        for item in items {
+        for (item, h) in items.into_iter().zip(hs) {
             let p = item.position();
             let k = *kids.iter().find(|&&k| self.get(k).bbox.contains(p)).expect("octants tile the parent");
-            self.get_mut(k).items.push(item);
+            self.push_h(k, item, h);
         }
         self.get_mut(id).children = Some(kids);
         for k in kids {
@@ -135,22 +179,38 @@ impl<T: Positioned3> Octree3<T> {
         mutator(&mut self.get_mut(leaf).items[idx]);
         let np = self.get(leaf).items[idx].position();
         if self.get(leaf).bbox.contains(np) { return true; }
-        // ascend to LCA
+        self.relocate(leaf, idx, np)
+    }
+
+    /// O(1) relocation via a stable [`crate::ItemRef`] — no locate, no scan.
+    pub fn update_ref<M: FnOnce(&mut T)>(&mut self, r: ItemRef, mutator: M) -> bool {
+        let loc = self.locs[r.0 as usize];
+        let (node, slot) = (loc.node, loc.slot as usize);
+        mutator(&mut self.get_mut(node).items[slot]);
+        let np = self.get(node).items[slot].position();
+        if self.get(node).bbox.contains(np) { return true; }
+        self.relocate(node, slot, np)
+    }
+
+    /// Shared tail of `update`/`update_ref`: the item at `(leaf, slot)` left its
+    /// leaf — ascend to the LCA, re-descend; drop (freeing its handle) if out.
+    fn relocate(&mut self, leaf: ONodeId, slot: usize, np: Point3) -> bool {
         let mut anc = self.get(leaf).parent;
         let lca = loop {
             match anc {
                 Some(a) if self.get(a).bbox.contains(np) => break a,
                 Some(a) => anc = self.get(a).parent,
-                None => { // out of bounds: drop + merge
-                    let _ = self.get_mut(leaf).items.remove(idx);
+                None => {
+                    let (_, h) = self.swap_remove_h(leaf, slot);
+                    self.free_handles.push(h);
                     self.try_merge_up(leaf);
                     return false;
                 }
             }
         };
-        let item = self.get_mut(leaf).items.remove(idx);
+        let (item, h) = self.swap_remove_h(leaf, slot);
         let dest = self.locate_from(lca, np);
-        self.get_mut(dest).items.push(item);
+        self.push_h(dest, item, h);
         if self.get(dest).items.len() > self.item_limit { self.divide(dest); }
         self.try_merge_up(leaf);
         true
@@ -172,13 +232,20 @@ impl<T: Positioned3> Octree3<T> {
     pub fn remove<F: Fn(&T) -> bool>(&mut self, p: Point3, predicate: F) -> Option<T> {
         if !self.get(self.root).bbox.contains(p) { return None; }
         let leaf = self.locate(p);
-        let removed = {
-            let items = &mut self.get_mut(leaf).items;
-            let idx = items.iter().position(|it| predicate(it))?;
-            items.remove(idx)
-        };
+        let idx = self.get(leaf).items.iter().position(|it| predicate(it))?;
+        let (item, h) = self.swap_remove_h(leaf, idx);
+        self.free_handles.push(h);
         self.try_merge_up(leaf);
-        Some(removed)
+        Some(item)
+    }
+
+    /// Remove the item behind a stable [`crate::ItemRef`] in O(1).
+    pub fn remove_ref(&mut self, r: ItemRef) -> Option<T> {
+        let loc = self.locs[r.0 as usize];
+        let (item, h) = self.swap_remove_h(loc.node, loc.slot as usize);
+        self.free_handles.push(h);
+        self.try_merge_up(loc.node);
+        Some(item)
     }
 
     fn try_merge_up(&mut self, mut node: ONodeId) {
@@ -189,10 +256,20 @@ impl<T: Positioned3> Octree3<T> {
             let combined: usize = kids.iter().map(|&k| self.get(k).items.len()).sum();
             if combined > self.merge_limit { return; }
             let mut merged: Vec<T> = Vec::with_capacity(combined);
-            for &k in &kids { merged.append(&mut std::mem::take(&mut self.get_mut(k).items)); }
+            let mut merged_hs: Vec<u32> = Vec::with_capacity(combined);
+            for &k in &kids {
+                merged.append(&mut std::mem::take(&mut self.get_mut(k).items));
+                merged_hs.append(&mut std::mem::take(&mut self.get_mut(k).hs));
+            }
             let pnode = self.get_mut(parent);
             pnode.items = merged;
+            pnode.hs = merged_hs;
             pnode.children = None;
+            let len = self.get(parent).hs.len();
+            for slot in 0..len {
+                let h = self.get(parent).hs[slot];
+                self.locs[h as usize] = OItemLoc { node: parent, slot: slot as u32 };
+            }
             for k in kids { self.free.push(k); }
             node = parent;
         }
@@ -402,6 +479,58 @@ mod tests {
             let mut got: Vec<u32> = tree.cull(&sphere).iter().map(|m| m.id).collect();
             want.sort(); got.sort();
             assert_eq!(want, got, "post-churn octree cull != brute for sphere ({cx},{cy},{cz}) r={r}");
+        }
+    }
+
+    #[test]
+    fn octree_update_ref_churn_matches_brute() {
+        // Build with insert_ref, churn with update_ref/remove_ref/insert_ref
+        // (the O(1) stable-handle path), and verify cull == brute (by id) + count.
+        use crate::ItemRef;
+        #[derive(Clone, Copy)]
+        struct M { id: u32, p: Point3 }
+        impl Positioned3 for M { fn position(&self) -> Point3 { self.p } }
+
+        let mut x = 0x0C7_EF00Du64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        let world = Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0);
+        let mut tree = Octree3::<M>::new(world, 6);
+        let rp = |rng: &mut dyn FnMut() -> f64| Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0);
+        let mut live: std::collections::HashMap<u32, (ItemRef, Point3)> = std::collections::HashMap::new();
+        let mut next = 0u32;
+        for _ in 0..2000 {
+            let p = rp(&mut rng);
+            let r = tree.insert_ref(M { id: next, p }).unwrap();
+            live.insert(next, (r, p)); next += 1;
+        }
+        for _ in 0..6000 {
+            let roll = rng();
+            let ids: Vec<u32> = live.keys().copied().collect();
+            if roll < 0.6 && !ids.is_empty() {
+                let id = ids[(rng() * ids.len() as f64) as usize % ids.len()];
+                let (r, _) = live[&id];
+                let np = rp(&mut rng);
+                assert!(tree.update_ref(r, |m| m.p = np), "in-bounds update_ref should not drop");
+                live.get_mut(&id).unwrap().1 = np;
+            } else if roll < 0.8 && !ids.is_empty() {
+                let id = ids[(rng() * ids.len() as f64) as usize % ids.len()];
+                tree.remove_ref(live[&id].0);
+                live.remove(&id);
+            } else {
+                let p = rp(&mut rng);
+                let r = tree.insert_ref(M { id: next, p }).unwrap();
+                live.insert(next, (r, p)); next += 1;
+            }
+        }
+        assert_eq!(tree.item_count(), live.len(), "octree handle-churn item count drift");
+        for (cx, cy, cz, r) in [(128.0, 128.0, 128.0, 30.0), (60.0, 200.0, 90.0, 50.0), (10.0, 10.0, 10.0, 80.0)] {
+            let sphere = Sphere3::new(cx, cy, cz, r).with_raster();
+            let mut want: Vec<u32> = live.iter()
+                .filter(|(_, (_, p))| { let dx = p.x - cx; let dy = p.y - cy; let dz = p.z - cz; dx * dx + dy * dy + dz * dz <= r * r })
+                .map(|(id, _)| *id).collect();
+            let mut got: Vec<u32> = tree.cull(&sphere).iter().map(|m| m.id).collect();
+            want.sort(); got.sort();
+            assert_eq!(want, got, "octree handle-churn cull != brute ({cx},{cy},{cz}) r={r}");
         }
     }
 }
