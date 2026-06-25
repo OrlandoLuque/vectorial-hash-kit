@@ -564,7 +564,7 @@ enum Index {
     Binary { tree: Tree3<C3>, refs: Vec<vectorial_hash::ItemRef> },
     Octree { tree: Octree3<C3>, refs: Vec<vectorial_hash::ItemRef> },
     Morton { grid: MortonGrid3<C3> },
-    Projection { tree: Tree<P2> },
+    Projection { tree: Tree<P2>, refs: Vec<vectorial_hash::ItemRef> },
 }
 
 impl Index {
@@ -593,10 +593,10 @@ impl Index {
             }
             Structure::Projection => {
                 let mut tree = Tree::<P2>::new(Rect::new(0.0, 0.0, world as f64, world as f64), ITEM_LIMIT);
-                for (i, c) in critters.iter().enumerate() {
-                    tree.insert(P2 { id: i as u32, p: Point::new(c.pos.x as f64, c.pos.y as f64), z: c.pos.z as f64 });
-                }
-                Index::Projection { tree }
+                let refs = critters.iter().enumerate()
+                    .map(|(i, c)| tree.insert_ref(P2 { id: i as u32, p: Point::new(c.pos.x as f64, c.pos.y as f64), z: c.pos.z as f64 }).unwrap())
+                    .collect();
+                Index::Projection { tree, refs }
             }
         }
     }
@@ -621,7 +621,11 @@ impl Index {
                 for (i, c) in critters.iter().enumerate() { let np = pt3(c); tree.update_ref(refs[i], |x| x.p = np); }
             }
             Index::Morton { .. } => *self = Index::build(Structure::Morton, world, cell, critters),
-            Index::Projection { .. } => *self = Index::build(Structure::Projection, world, cell, critters),
+            Index::Projection { tree, refs } => {
+                for (i, c) in critters.iter().enumerate() {
+                    tree.update_ref(refs[i], |p| { p.p = Point::new(c.pos.x as f64, c.pos.y as f64); p.z = c.pos.z as f64; });
+                }
+            }
         }
     }
 
@@ -632,7 +636,7 @@ impl Index {
             Index::Binary { tree, .. } => tree.cull(shape).iter().map(|c| c.id).collect(),
             Index::Octree { tree, .. } => tree.cull(shape).iter().map(|c| c.id).collect(),
             Index::Morton { grid } => grid.cull(shape).iter().map(|c| c.id).collect(),
-            Index::Projection { tree } => {
+            Index::Projection { tree, .. } => {
                 let bb = shape.bounding_box();
                 let (cx, cy) = (bb.x + bb.w * 0.5, bb.y + bb.h * 0.5);
                 let r = (bb.w * bb.w + bb.h * bb.h).sqrt() * 0.5; // disc covering the xy bbox
@@ -648,7 +652,7 @@ impl Index {
             Index::Binary { tree, .. } => tree.visit_leaves(|l| boxes.push(aabb_box(&l.bbox))),
             Index::Octree { tree, .. } => tree.visit_leaves(|l| boxes.push(aabb_box(&l.bbox))),
             Index::Morton { grid } => grid.visit_cells(|b, _| boxes.push(aabb_box(b))),
-            Index::Projection { tree } => tree.visit_leaves(|_, l| {
+            Index::Projection { tree, .. } => tree.visit_leaves(|_, l| {
                 let b = l.bbox;
                 let c = vec3((b.x + b.width * 0.5) as f32, (b.y + b.height * 0.5) as f32, world * 0.5);
                 boxes.push((c, vec3(b.width as f32, b.height as f32, world)));
@@ -661,7 +665,7 @@ impl Index {
             Index::Binary { tree, .. } => format!("Tree3 (binary, ItemRef): {:>6} leaves, {:>6} arena", tree.leaf_count(), tree.node_count()),
             Index::Octree { tree, .. } => format!("Octree3 (8-way, ItemRef): {:>6} leaves, {:>6} arena", tree.leaf_count(), tree.node_count()),
             Index::Morton { grid } => format!("MortonGrid3 (Z-order, rebuilt): {:>6} cells, {:.2} items/cell", grid.cell_count(), grid.item_count() as f64 / grid.cell_count().max(1) as f64),
-            Index::Projection { tree } => format!("projection (2D xy + z-reject): {:>6} leaves, {:>6} arena", tree.leaf_count(), tree.node_count()),
+            Index::Projection { tree, .. } => format!("projection (2D xy ItemRef + z-reject): {:>6} leaves, {:>6} arena", tree.leaf_count(), tree.node_count()),
         }
     }
 }

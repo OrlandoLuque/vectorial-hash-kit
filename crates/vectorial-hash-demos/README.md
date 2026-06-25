@@ -105,13 +105,13 @@ reports a CPU-bound vs GPU-bound verdict and the CPU-only fps ceiling.
 - `M` — **index structure** (a *real* switch: the selected structure resolves
   *everything* — observe vision, combat attacks, persistence — and the others
   don't exist): `Tree3` (binary, **stable `ItemRef`** → O(1) `update_ref`) /
-  `Octree3` (8-way, predicate `update`) / `MortonGrid3` (Z-order hash grid,
-  rebuilt each frame) / projection (one 2D `Tree` on xy + z-reject, rebuilt).
-  All exact. Because the chosen structure now does all the work, the **fps
-  reflects the structure** — e.g. at 40k in `NO RENDER`: binary+`ItemRef` ~0.7
-  ms/frame (the O(1) handle), Morton ~2.4 ms, octree ~5 ms (still the predicate
-  scan), projection ~6 ms. The index is rebuilt only when the structure / world
-  / population changes; relocated in place otherwise. `B` shows its cells/leaves.
+  `Octree3` (8-way, **`ItemRef`**) / `MortonGrid3` (Z-order hash grid, rebuilt
+  each frame) / projection (a 2D `Tree` on xy, **`ItemRef`** + z-reject). All
+  exact. Because the chosen structure does all the work, the **fps reflects the
+  structure**: binary / octree / projection all relocate in place via the stable
+  `ItemRef` (O(1) — no predicate scan); the Morton grid re-buckets each frame.
+  The index is rebuilt only when the structure / world / population changes.
+  `B` shows its cells/leaves.
 - `G` — **render path**: GPU-instanced spheres / round billboards / square
   billboards (fastest) / NO RENDER (CPU only, to read the CPU's fps ceiling).
   The instanced paths (raw miniquad, `src/instanced3d.rs`) draw all critters

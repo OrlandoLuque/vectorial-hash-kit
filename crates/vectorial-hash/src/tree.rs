@@ -1,6 +1,7 @@
 //! Spatial tree: items live in leaf cells; cells split when they overflow.
 
 use crate::geom::{Point, Rect};
+use crate::tree3::ItemRef;
 
 /// Stable handle into the tree's node arena.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -82,6 +83,9 @@ pub struct Node<T> {
     pub parent: Option<NodeId>,
     pub children: Option<[NodeId; 2]>,
     pub items: Vec<T>,
+    /// Parallel to `items`: the stable handle of each item (the [`ItemRef`]
+    /// layer — orthogonal to the ropes below). Empty on internal nodes.
+    hs: Vec<u32>,
     /// Leaf neighbour lists ("ropes") per side (W, E, N, S). Maintained on
     /// every split and merge; only meaningful for leaves.
     #[cfg(feature = "neighbors")]
@@ -95,11 +99,16 @@ impl<T> Node<T> {
             parent,
             children: None,
             items: Vec::new(),
+            hs: Vec::new(),
             #[cfg(feature = "neighbors")]
             ropes: Default::default(),
         }
     }
 }
+
+/// Where a handle's item currently lives (leaf node + slot in its vectors).
+#[derive(Copy, Clone)]
+struct ItemLoc { node: NodeId, slot: u32 }
 
 pub struct Tree<T: Positioned> {
     nodes: Vec<Node<T>>,
@@ -110,6 +119,10 @@ pub struct Tree<T: Positioned> {
     /// `NodeId`s of freed nodes are NOT stable — a freed id may be handed
     /// to a different node by a later `alloc`.
     free: Vec<NodeId>,
+    /// Handle → current location (the stable [`ItemRef`] layer). Indexed by the
+    /// handle's u32; freed handles sit on `free_handles`.
+    locs: Vec<ItemLoc>,
+    free_handles: Vec<u32>,
     /// A leaf splits when it holds more than this many items.
     pub item_limit: usize,
     /// Two sibling leaves merge back into their parent when their combined
@@ -138,7 +151,7 @@ impl<T: Positioned> Tree<T> {
         );
         let min_cell = bbox.width.max(bbox.height) * 1e-12;
         let root = Node::new_leaf(bbox, None);
-        Self { nodes: vec![root], free: Vec::new(), item_limit, merge_limit, min_cell, root: NodeId(0) }
+        Self { nodes: vec![root], free: Vec::new(), locs: Vec::new(), free_handles: Vec::new(), item_limit, merge_limit, min_cell, root: NodeId(0) }
     }
 
     pub fn get(&self, id: NodeId) -> &Node<T> {
@@ -147,6 +160,30 @@ impl<T: Positioned> Tree<T> {
 
     fn get_mut(&mut self, id: NodeId) -> &mut Node<T> {
         &mut self.nodes[id.0 as usize]
+    }
+
+    // ---- stable ItemRef handle layer (mirrors Tree3) ----
+    fn alloc_handle(&mut self) -> u32 {
+        if let Some(h) = self.free_handles.pop() { h }
+        else { let h = self.locs.len() as u32; self.locs.push(ItemLoc { node: NodeId(0), slot: 0 }); h }
+    }
+    fn push_h(&mut self, node: NodeId, item: T, h: u32) {
+        let slot = self.get(node).items.len() as u32;
+        let n = self.get_mut(node);
+        n.items.push(item);
+        n.hs.push(h);
+        self.locs[h as usize] = ItemLoc { node, slot };
+    }
+    fn swap_remove_h(&mut self, node: NodeId, slot: usize) -> (T, u32) {
+        let (item, h, moved) = {
+            let n = self.get_mut(node);
+            let item = n.items.swap_remove(slot);
+            let h = n.hs.swap_remove(slot);
+            let moved = if slot < n.hs.len() { Some(n.hs[slot]) } else { None };
+            (item, h, moved)
+        };
+        if let Some(m) = moved { self.locs[m as usize].slot = slot as u32; }
+        (item, h)
     }
 
     fn alloc(&mut self, node: Node<T>) -> NodeId {
@@ -162,16 +199,23 @@ impl<T: Positioned> Tree<T> {
 
     /// Insert an item. Returns `false` if its position falls outside the root bbox.
     pub fn insert(&mut self, item: T) -> bool {
+        self.insert_ref(item).is_some()
+    }
+
+    /// Insert and return a stable [`ItemRef`] for O(1) `update_ref`/`remove_ref`
+    /// (skips `update`'s O(item_limit) predicate scan). `None` if out of bounds.
+    pub fn insert_ref(&mut self, item: T) -> Option<ItemRef> {
         let pos = item.position();
         if !self.get(self.root).bbox.contains(pos) {
-            return false;
+            return None;
         }
         let leaf = self.locate(pos);
-        self.get_mut(leaf).items.push(item);
+        let h = self.alloc_handle();
+        self.push_h(leaf, item, h);
         if self.get(leaf).items.len() > self.item_limit {
             self.divide(leaf);
         }
-        true
+        Some(ItemRef(h))
     }
 
     /// Find the leaf that contains `point`. Caller must ensure `point` is in-bounds.
@@ -222,13 +266,34 @@ impl<T: Positioned> Tree<T> {
             return None;
         }
         let leaf = self.locate(point);
-        let removed = {
-            let items = &mut self.get_mut(leaf).items;
-            let idx = items.iter().position(|it| predicate(it))?;
-            items.remove(idx)
-        };
+        let idx = self.get(leaf).items.iter().position(|it| predicate(it))?;
+        let (item, h) = self.swap_remove_h(leaf, idx);
+        self.free_handles.push(h);
         self.try_merge_up(leaf);
-        Some(removed)
+        Some(item)
+    }
+
+    /// O(1) relocation through a stable [`ItemRef`] — no locate walk, no
+    /// predicate scan. Mutate in place; relocate (ascend-to-LCA) only if the
+    /// item leaves its leaf. `false` (and the handle freed) if it left the root.
+    pub fn update_ref<M: FnOnce(&mut T)>(&mut self, r: ItemRef, mutator: M) -> bool {
+        let loc = self.locs[r.0 as usize];
+        let (node, slot) = (loc.node, loc.slot as usize);
+        mutator(&mut self.get_mut(node).items[slot]);
+        let np = self.get(node).items[slot].position();
+        if self.get(node).bbox.contains(np) {
+            return true;
+        }
+        self.relocate_via_lca(node, slot, np)
+    }
+
+    /// Remove the item behind a stable [`ItemRef`] in O(1) (no scan).
+    pub fn remove_ref(&mut self, r: ItemRef) -> Option<T> {
+        let loc = self.locs[r.0 as usize];
+        let (item, h) = self.swap_remove_h(loc.node, loc.slot as usize);
+        self.free_handles.push(h);
+        self.try_merge_up(loc.node);
+        Some(item)
     }
 
     /// Find the first item in the leaf at `old_position` matching `predicate`,
@@ -282,7 +347,11 @@ impl<T: Positioned> Tree<T> {
 
         match strategy {
             UpdateStrategy::Legacy => {
-                let item = self.get_mut(leaf).items.remove(idx);
+                // remove + re-insert reassigns the item's handle (any held
+                // ItemRef to it is invalidated) — the default Lca path below
+                // preserves it. Legacy is a benchmarking-only strategy.
+                let (item, h) = self.swap_remove_h(leaf, idx);
+                self.free_handles.push(h);
                 self.try_merge_up(leaf);
                 self.insert(item)
             }
@@ -304,15 +373,16 @@ impl<T: Positioned> Tree<T> {
         let lca = match self.ascend_to_lca(leaf, new_pos) {
             Some(id) => id,
             None => {
-                // Out of bounds: drop the item, then merge-up.
-                let _ = self.get_mut(leaf).items.remove(idx);
+                // Out of bounds: drop the item (freeing its handle), then merge.
+                let (_, h) = self.swap_remove_h(leaf, idx);
+                self.free_handles.push(h);
                 self.try_merge_up(leaf);
                 return false;
             }
         };
-        let item = self.get_mut(leaf).items.remove(idx);
+        let (item, h) = self.swap_remove_h(leaf, idx);
         let dest = self.locate_from(lca, new_pos);
-        self.get_mut(dest).items.push(item);
+        self.push_h(dest, item, h);
         if self.get(dest).items.len() > self.item_limit {
             self.divide(dest);
         }
@@ -324,8 +394,8 @@ impl<T: Positioned> Tree<T> {
     /// Triggers the usual divide/merge-up bookkeeping on each side.
     #[cfg(feature = "neighbors")]
     fn relocate_to_neighbour(&mut self, leaf: NodeId, idx: usize, nbr: NodeId) -> bool {
-        let item = self.get_mut(leaf).items.remove(idx);
-        self.get_mut(nbr).items.push(item);
+        let (item, h) = self.swap_remove_h(leaf, idx);
+        self.push_h(nbr, item, h);
         if self.get(nbr).items.len() > self.item_limit {
             self.divide(nbr);
         }
@@ -369,11 +439,22 @@ impl<T: Positioned> Tree<T> {
                 return;
             }
             let mut items_a = std::mem::take(&mut self.get_mut(a).items);
+            let mut hs_a = std::mem::take(&mut self.get_mut(a).hs);
             let mut items_b = std::mem::take(&mut self.get_mut(b).items);
+            let mut hs_b = std::mem::take(&mut self.get_mut(b).hs);
             items_a.append(&mut items_b);
+            hs_a.append(&mut hs_b);
             let parent = self.get_mut(parent_id);
             parent.items = items_a;
+            parent.hs = hs_a;
             parent.children = None;
+            // The merged items now live in `parent` (a leaf again) — re-point
+            // their handle locations.
+            let len = self.get(parent_id).hs.len();
+            for slot in 0..len {
+                let h = self.get(parent_id).hs[slot];
+                self.locs[h as usize] = ItemLoc { node: parent_id, slot: slot as u32 };
+            }
             #[cfg(feature = "neighbors")]
             self.update_ropes_on_merge(parent_id, a, b);
             // The two child slots are now unreachable — return them to the
@@ -391,16 +472,20 @@ impl<T: Positioned> Tree<T> {
     /// split can make progress: all its items share one position, or the
     /// cell has already shrunk to the minimum size.
     fn divide(&mut self, id: NodeId) {
-        let (bbox, items) = {
+        let (bbox, items, hs) = {
             let n = self.get_mut(id);
             let items = std::mem::take(&mut n.items);
-            (n.bbox, items)
+            let hs = std::mem::take(&mut n.hs);
+            (n.bbox, items, hs)
         };
 
         let first = items[0].position();
         let inseparable = items.iter().all(|it| it.position() == first);
         if inseparable || bbox.width.max(bbox.height) <= self.min_cell {
-            self.get_mut(id).items = items;
+            // Put them back unchanged — same slots, so `locs` stays valid.
+            let n = self.get_mut(id);
+            n.items = items;
+            n.hs = hs;
             return;
         }
 
@@ -409,13 +494,10 @@ impl<T: Positioned> Tree<T> {
         let a = self.alloc(Node::new_leaf(a_bbox, Some(id)));
         let b = self.alloc(Node::new_leaf(b_bbox, Some(id)));
 
-        for item in items {
+        for (item, h) in items.into_iter().zip(hs) {
             let pos = item.position();
-            if self.get(a).bbox.contains(pos) {
-                self.get_mut(a).items.push(item);
-            } else {
-                self.get_mut(b).items.push(item);
-            }
+            let dest = if self.get(a).bbox.contains(pos) { a } else { b };
+            self.push_h(dest, item, h);
         }
 
         self.get_mut(id).children = Some([a, b]);
@@ -740,6 +822,59 @@ mod tests {
         assert!(tree.insert(Pt(Point::new(20.0, 80.0))));
         assert_eq!(tree.get(tree.root).items.len(), 2);
         assert!(tree.get(tree.root).children.is_none());
+    }
+
+    #[test]
+    fn update_ref_churn_matches_brute() {
+        // Build with insert_ref, churn with update_ref/remove_ref/insert_ref
+        // (the O(1) stable-handle path); verify cull == brute (by id) under the
+        // splits/merges that move handles between leaves.
+        #[derive(Clone, Copy)]
+        struct M { id: u32, p: Point }
+        impl Positioned for M { fn position(&self) -> Point { self.p } }
+        struct Box2 { r: Rect }
+        impl crate::Shape for Box2 {
+            fn bounding_box(&self) -> Rect { self.r }
+            fn contains_point(&self, p: Point) -> bool { self.r.contains(p) }
+        }
+
+        let mut x = 0x2D7_EF00Du64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        let mut tree = Tree::<M>::new(Rect::new(0.0, 0.0, 256.0, 256.0), 6);
+        let rp = |rng: &mut dyn FnMut() -> f64| Point::new(rng() * 256.0, rng() * 256.0);
+        let mut live: std::collections::HashMap<u32, (ItemRef, Point)> = std::collections::HashMap::new();
+        let mut next = 0u32;
+        for _ in 0..2000 {
+            let p = rp(&mut rng);
+            let r = tree.insert_ref(M { id: next, p }).unwrap();
+            live.insert(next, (r, p)); next += 1;
+        }
+        for _ in 0..6000 {
+            let roll = rng();
+            let ids: Vec<u32> = live.keys().copied().collect();
+            if roll < 0.6 && !ids.is_empty() {
+                let id = ids[(rng() * ids.len() as f64) as usize % ids.len()];
+                let (r, _) = live[&id];
+                let np = rp(&mut rng);
+                assert!(tree.update_ref(r, |m| m.p = np));
+                live.get_mut(&id).unwrap().1 = np;
+            } else if roll < 0.8 && !ids.is_empty() {
+                let id = ids[(rng() * ids.len() as f64) as usize % ids.len()];
+                tree.remove_ref(live[&id].0);
+                live.remove(&id);
+            } else {
+                let p = rp(&mut rng);
+                let r = tree.insert_ref(M { id: next, p }).unwrap();
+                live.insert(next, (r, p)); next += 1;
+            }
+        }
+        for r in [Rect::new(100.0, 100.0, 60.0, 60.0), Rect::new(0.0, 0.0, 128.0, 128.0), Rect::new(200.0, 10.0, 50.0, 200.0)] {
+            let mut want: Vec<u32> = live.iter()
+                .filter(|(_, (_, p))| r.contains(*p)).map(|(id, _)| *id).collect();
+            let mut got: Vec<u32> = tree.cull(&Box2 { r }).iter().map(|m| m.id).collect();
+            want.sort(); got.sort();
+            assert_eq!(want, got, "2D handle-churn cull != brute for {r:?}");
+        }
     }
 
     #[test]
