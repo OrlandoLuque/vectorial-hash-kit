@@ -75,8 +75,12 @@ visual glance the next morning; everything else is autonomously verifiable.
 7. **Ray-cast / segment query** — visit cells/leaves along a ray (line-of-sight,
    picking). *The user has their own approach (to be shared tomorrow); implement
    a reasonable one now and **compare designs** the next day.*
-8. **Frustum as a first-class `Shape3`** — a camera frustum shape so the cull is
-   not only spheres (the demo's vision cull could use it).
+8. ~~**Frustum as a first-class `Shape3`**~~ — **done.** A view frustum is just
+   6 half-spaces, i.e. a `Polyhedron3`; added `Polyhedron3::from_corners([Point3;
+   8])` (near face then far face, bl/br/tr/tl) that derives the six inward face
+   planes (oriented against the corner centroid, so winding need not be exact).
+   `tree.cull(&Polyhedron3::from_corners(corners))` culls a camera frustum.
+   Tested: an axis-aligned box's corners recover its faces exactly.
 9. ~~**`clear()` retaining capacity**~~ — **done.** `clear()` on all five trees
    + `MortonGrid3`: resets to an empty root leaf / clears the bucket table while
    keeping the arena/hash-map capacity (the cheap path for per-frame rebuilds).

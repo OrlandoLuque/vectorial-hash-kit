@@ -197,6 +197,46 @@ impl Polyhedron3 {
         Self { planes, bbox: b, raster: None }
     }
 
+    /// Build the convex solid from **8 corner points** — the camera-frustum
+    /// constructor (a view frustum is just 6 half-spaces). Corners are the near
+    /// face then the far face, each ordered (bottom-left, bottom-right,
+    /// top-right, top-left): indices `0..4` near, `4..8` far. Each face plane is
+    /// derived with an **inward** normal (oriented against the corner centroid),
+    /// so the winding need not be exact and an axis-aligned box passed as corners
+    /// recovers its own six faces. `bbox` is the corners' AABB. Use it to cull a
+    /// camera frustum: `tree.cull(&Polyhedron3::from_corners(frustum_corners))`.
+    pub fn from_corners(corners: [Point3; 8]) -> Self {
+        let cen = {
+            let (mut sx, mut sy, mut sz) = (0.0, 0.0, 0.0);
+            for p in &corners { sx += p.x; sy += p.y; sz += p.z; }
+            Point3::new(sx / 8.0, sy / 8.0, sz / 8.0)
+        };
+        // Three non-collinear points on each face: near, far, left, right, bottom, top.
+        let faces = [[0, 1, 2], [4, 5, 6], [0, 3, 7], [1, 2, 6], [0, 1, 5], [3, 2, 6]];
+        let mut planes = Vec::with_capacity(6);
+        for [i, j, k] in faces {
+            let (a, b, c) = (corners[i], corners[j], corners[k]);
+            let e1 = (b.x - a.x, b.y - a.y, b.z - a.z);
+            let e2 = (c.x - a.x, c.y - a.y, c.z - a.z);
+            let mut nx = e1.1 * e2.2 - e1.2 * e2.1;
+            let mut ny = e1.2 * e2.0 - e1.0 * e2.2;
+            let mut nz = e1.0 * e2.1 - e1.1 * e2.0;
+            let mut d = nx * a.x + ny * a.y + nz * a.z;
+            // Orient inward: the centroid must satisfy the half-space n·p <= d.
+            if nx * cen.x + ny * cen.y + nz * cen.z > d {
+                nx = -nx; ny = -ny; nz = -nz; d = -d;
+            }
+            planes.push((nx, ny, nz, d));
+        }
+        let (mut lo, mut hi) = (corners[0], corners[0]);
+        for p in &corners {
+            lo.x = lo.x.min(p.x); lo.y = lo.y.min(p.y); lo.z = lo.z.min(p.z);
+            hi.x = hi.x.max(p.x); hi.y = hi.y.max(p.y); hi.z = hi.z.max(p.z);
+        }
+        let bbox = Aabb::new(lo.x, lo.y, lo.z, hi.x - lo.x, hi.y - lo.y, hi.z - lo.z);
+        Self { planes, bbox, raster: None }
+    }
+
     pub fn with_raster(mut self) -> Self {
         // Borrow-checker: build against a raster-less copy of self.
         let probe = Polyhedron3 { planes: self.planes.clone(), bbox: self.bbox, raster: None };
@@ -973,6 +1013,27 @@ mod tests {
             a.sort(); b.sort();
             assert_eq!(a, b, "parallel batch cull disagrees with serial at query {i}");
         }
+    }
+
+    #[test]
+    fn frustum_from_corners_box_recovers_faces() {
+        // An axis-aligned box passed as 8 corners must cull exactly the points
+        // inside that box — the derived six planes are the box faces.
+        let corners = [
+            Point3::new(0.0, 0.0, 0.0), Point3::new(10.0, 0.0, 0.0), Point3::new(10.0, 10.0, 0.0), Point3::new(0.0, 10.0, 0.0),
+            Point3::new(0.0, 0.0, 10.0), Point3::new(10.0, 0.0, 10.0), Point3::new(10.0, 10.0, 10.0), Point3::new(0.0, 10.0, 10.0),
+        ];
+        let poly = Polyhedron3::from_corners(corners);
+        let mut x = 0x00C0_FFEEu64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        let pts: Vec<P> = (0..3000).map(|_| P(Point3::new(rng() * 20.0 - 5.0, rng() * 20.0 - 5.0, rng() * 20.0 - 5.0))).collect();
+        let mut tree = Tree3::<P>::new(Aabb::new(-5.0, -5.0, -5.0, 30.0, 30.0, 30.0), 8);
+        for p in &pts { tree.insert(*p); }
+        let inside = |q: Point3| q.x >= 0.0 && q.x <= 10.0 && q.y >= 0.0 && q.y <= 10.0 && q.z >= 0.0 && q.z <= 10.0;
+        let mut want: Vec<(u64, u64, u64)> = pts.iter().filter(|p| inside(p.0)).map(|p| (p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits())).collect();
+        let mut got: Vec<(u64, u64, u64)> = tree.cull(&poly).iter().map(|p| (p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits())).collect();
+        want.sort(); got.sort();
+        assert_eq!(want, got, "frustum-from-box cull != box contains");
     }
 
     #[test]
