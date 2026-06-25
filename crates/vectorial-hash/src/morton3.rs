@@ -66,6 +66,24 @@ pub fn demorton3(code: u64) -> (u32, u32, u32) {
     (compact1by2(code) as u32, compact1by2(code >> 1) as u32, compact1by2(code >> 2) as u32)
 }
 
+/// Clamp a world coordinate to a cell index in `0..n` along one axis. Free fn
+/// (not a method) so the parallel bulk build can call it without borrowing the
+/// grid; `MortonGrid3::axis_index` delegates here.
+#[inline]
+fn axis_index_n(v: f64, lo: f64, cell: f64, n: u32) -> u32 {
+    if cell <= 0.0 {
+        return 0;
+    }
+    let i = ((v - lo) / cell).floor();
+    if i < 0.0 {
+        0
+    } else if i as u64 >= n as u64 {
+        n - 1
+    } else {
+        i as u32
+    }
+}
+
 pub struct MortonGrid3<T: Positioned3> {
     world: Aabb,
     levels: u32,
@@ -108,17 +126,7 @@ impl<T: Positioned3> MortonGrid3<T> {
 
     #[inline]
     fn axis_index(&self, v: f64, lo: f64, cell: f64) -> u32 {
-        if cell <= 0.0 {
-            return 0;
-        }
-        let i = ((v - lo) / cell).floor();
-        if i < 0.0 {
-            0
-        } else if i as u64 >= self.cells_per_axis as u64 {
-            self.cells_per_axis - 1
-        } else {
-            i as u32
-        }
+        axis_index_n(v, lo, cell, self.cells_per_axis)
     }
 
     #[inline]
@@ -152,6 +160,42 @@ impl<T: Positioned3> MortonGrid3<T> {
         self.cells.entry(morton3(ix, iy, iz)).or_default().push(item);
         self.len += 1;
         true
+    }
+
+    /// Bulk-insert from a parallel iterator (feature `parallel`): each item's
+    /// Morton cell is computed on rayon's thread pool, then the `(code, item)`
+    /// pairs are grouped into buckets serially. The grouping is the serial tail
+    /// (Amdahl), so the speedup is modest — the parallel part is the per-item
+    /// quantise-and-encode, which pays for large `N`. Out-of-world items are
+    /// skipped (as in [`MortonGrid3::insert`]); returns the count inserted.
+    /// Pair with [`MortonGrid3::clear`] for a cheap parallel rebuild-per-frame.
+    #[cfg(feature = "parallel")]
+    pub fn extend_par<I>(&mut self, items: I) -> usize
+    where
+        I: rayon::iter::IntoParallelIterator<Item = T>,
+        T: Send,
+    {
+        use rayon::prelude::*;
+        let (world, cw, ch, cd, n) = (self.world, self.cw, self.ch, self.cd, self.cells_per_axis);
+        let coded: Vec<(u64, T)> = items
+            .into_par_iter()
+            .filter_map(|it| {
+                let p = it.position();
+                if !world.contains(p) {
+                    return None;
+                }
+                let ix = axis_index_n(p.x, world.x, cw, n);
+                let iy = axis_index_n(p.y, world.y, ch, n);
+                let iz = axis_index_n(p.z, world.z, cd, n);
+                Some((morton3(ix, iy, iz), it))
+            })
+            .collect();
+        let added = coded.len();
+        for (code, it) in coded {
+            self.cells.entry(code).or_default().push(it);
+        }
+        self.len += added;
+        added
     }
 
     /// Empty the grid, **retaining the hash-map capacity** — the table is
@@ -362,6 +406,31 @@ mod tests {
         for _ in 0..100 { g.insert(P(Point3::new(50.0, 50.0, 50.0))); }
         assert_eq!(g.item_count(), 100);
         assert_eq!(g.cull(&Sphere3::new(50.0, 50.0, 50.0, 5.0)).len(), 100);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn extend_par_matches_serial_insert() {
+        // The parallel bulk build must produce an identical grid to inserting
+        // serially — same items, same buckets, same culls.
+        let mut x = 0x5EED_1234u64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        let pts: Vec<P> = (0..5000).map(|_| P(Point3::new(rng() * 300.0 - 22.0, rng() * 300.0 - 22.0, rng() * 300.0 - 22.0))).collect();
+        let world = Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0);
+        let mut a = MortonGrid3::<P>::new(world, 5);
+        for p in &pts { a.insert(*p); }
+        let mut b = MortonGrid3::<P>::new(world, 5);
+        let added = b.extend_par(pts.clone());
+        assert_eq!(added, a.item_count(), "extend_par count != serial inserted count");
+        assert_eq!(a.item_count(), b.item_count());
+        assert_eq!(a.cell_count(), b.cell_count());
+        for (cx, cy, cz, r) in [(128.0, 128.0, 128.0, 40.0), (20.0, 240.0, 60.0, 50.0), (0.0, 0.0, 0.0, 100.0)] {
+            let s = Sphere3::new(cx, cy, cz, r).with_raster();
+            let mut wa: Vec<(u64, u64, u64)> = a.cull(&s).iter().map(|p| (p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits())).collect();
+            let mut wb: Vec<(u64, u64, u64)> = b.cull(&s).iter().map(|p| (p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits())).collect();
+            wa.sort(); wb.sort();
+            assert_eq!(wa, wb, "extend_par cull != serial cull");
+        }
     }
 
     #[test]

@@ -66,9 +66,13 @@ visual glance the next morning; everything else is autonomously verifiable.
    the deferred follow-up).
 
 **Newly added (round 2 — autonomously verifiable)**
-5. **Bulk-build parallel** (`from_positions_par`) — the natural follow-up to
-   rayon: parallel sort-then-link bulk load for static datasets + parallel Morton
-   code computation (then serial group). Already flagged in `docs/PARALLEL.md`.
+5. ~~**Bulk-build parallel**~~ — **done (Morton).** `MortonGrid3::extend_par`
+   (feature `parallel`): per-item quantise+Morton-encode on rayon, then a serial
+   bucket group. The grouping is the serial tail (Amdahl), so the win is the
+   encode for large `N`; pair with `clear()` for a cheap parallel
+   rebuild-per-frame. Tested identical to serial insert (count/cells/cull).
+   *Remaining:* a parallel **tree** bulk-load (sort-then-link) is a different
+   algorithm and is left as future work.
 6. **k-NN parity** — `knn` exists on `Tree3`/`Octree3`; add it to `Tree`,
    `QuadTree`, `IntegerTree`, and `MortonGrid3` (the latter ring-by-ring, shared
    with item 3). Brute-force gated.
