@@ -53,6 +53,7 @@ const EFFECT_TTL: f64 = 0.45;
 
 const COL_BIN: Color = ORANGE;
 const COL_QUAD: Color = SKYBLUE;
+const COL_INT: Color = VIOLET;
 
 fn kind_color(kind: Kind) -> Color {
     match kind {
@@ -264,7 +265,8 @@ async fn main() {
         mem.dedup_keys_bytes as f64 / 1e6,
     );
 
-    let mut sim = Sim::new(Mode::Binary, ITEM_LIMIT, ITEM_LIMIT, 42);
+    let init_mode = std::env::var("CRITTERS_MODE").ok().and_then(|s| Mode::parse(&s)).unwrap_or(Mode::Binary);
+    let mut sim = Sim::new(init_mode, ITEM_LIMIT, ITEM_LIMIT, 42);
     // Optional initial world size (the panel's "world" button steps it live).
     if let Some(w) = std::env::var("CRITTERS_WORLD").ok().and_then(|v| v.parse::<f64>().ok()) {
         sim.set_world_size(w, ITEM_LIMIT, ITEM_LIMIT);
@@ -298,10 +300,10 @@ async fn main() {
 
     let cap = 240;
     let mut g_frame = Series::new(cap);
-    let (mut g_atk_t, mut g_atk_q) = (Series::new(cap), Series::new(cap));
-    let (mut g_vis_t, mut g_vis_q) = (Series::new(cap), Series::new(cap));
-    let (mut g_mv_t, mut g_mv_q) = (Series::new(cap), Series::new(cap));
-    let (mut g_rm_t, mut g_rm_q) = (Series::new(cap), Series::new(cap));
+    let (mut g_atk_t, mut g_atk_q, mut g_atk_it) = (Series::new(cap), Series::new(cap), Series::new(cap));
+    let (mut g_vis_t, mut g_vis_q, mut g_vis_it) = (Series::new(cap), Series::new(cap), Series::new(cap));
+    let (mut g_mv_t, mut g_mv_q, mut g_mv_it) = (Series::new(cap), Series::new(cap), Series::new(cap));
+    let (mut g_rm_t, mut g_rm_q, mut g_rm_it) = (Series::new(cap), Series::new(cap), Series::new(cap));
 
     loop {
         if is_key_pressed(KeyCode::Escape) {
@@ -494,12 +496,16 @@ async fn main() {
         let avg = |total: f64, n: u32| if n > 0 { (total / n as f64) as f32 } else { 0.0 };
         g_atk_t.push(avg(sim.sims.t.atk, sim.sims.t.atk_n));
         g_atk_q.push(avg(sim.sims.q.atk, sim.sims.q.atk_n));
+        g_atk_it.push(avg(sim.sims.it.atk, sim.sims.it.atk_n));
         g_vis_t.push(avg(sim.sims.t.vis, sim.sims.t.vis_n));
         g_vis_q.push(avg(sim.sims.q.vis, sim.sims.q.vis_n));
+        g_vis_it.push(avg(sim.sims.it.vis, sim.sims.it.vis_n));
         g_mv_t.push((sim.sims.t.mv / 1000.0) as f32);
         g_mv_q.push((sim.sims.q.mv / 1000.0) as f32);
+        g_mv_it.push((sim.sims.it.mv / 1000.0) as f32);
         g_rm_t.push(sim.sims.t.rm as f32);
         g_rm_q.push(sim.sims.q.rm as f32);
+        g_rm_it.push(sim.sims.it.rm as f32);
 
         // ---------- draw ----------
         clear_background(Color::new(0.07, 0.07, 0.10, 1.0));
@@ -573,6 +579,28 @@ async fn main() {
                         b.height as f32 * S,
                         1.5,
                         Color::new(COL_QUAD.r, COL_QUAD.g, COL_QUAD.b, 0.55),
+                    );
+                }
+            });
+        }
+        if let Some(t) = &sim.sims.itree {
+            // IntegerTree (IBinary mode): same region rendering as the binary
+            // tree, but the leaf bbox is integer (`IRect` x/y/w/h).
+            t.visit_leaves(|id, leaf| {
+                tree_leaves += 1;
+                items += leaf.items.len();
+                let b = leaf.bbox;
+                let c = region_color(id.0);
+                if region_mode == 0 {
+                    draw_rectangle(
+                        b.x as f32 * S, b.y as f32 * S, b.w as f32 * S, b.h as f32 * S,
+                        Color::new(c.r, c.g, c.b, 0.28),
+                    );
+                }
+                if region_mode <= 1 {
+                    draw_rectangle_lines(
+                        b.x as f32 * S, b.y as f32 * S, b.w as f32 * S, b.h as f32 * S,
+                        1.0, Color::new(COL_INT.r, COL_INT.g, COL_INT.b, 0.45),
                     );
                 }
             });
@@ -665,7 +693,7 @@ async fn main() {
                 Mode::Binary => COL_BIN,
                 Mode::Quad => COL_QUAD,
                 Mode::Both => YELLOW,
-                Mode::IBinary => COL_BIN,
+                Mode::IBinary => COL_INT,
             },
             &mut ty,
         );
@@ -782,22 +810,22 @@ async fn main() {
         gy += gh + 8.0;
         draw_graph(
             gx + gpad, gy, gw, gh, "attack cull", " us",
-            &[(&g_atk_t, COL_BIN, "bin"), (&g_atk_q, COL_QUAD, "quad")],
+            &[(&g_atk_t, COL_BIN, "bin"), (&g_atk_q, COL_QUAD, "quad"), (&g_atk_it, COL_INT, "int")],
         );
         gy += gh + 8.0;
         draw_graph(
             gx + gpad, gy, gw, gh, "vision cull", " us",
-            &[(&g_vis_t, COL_BIN, "bin"), (&g_vis_q, COL_QUAD, "quad")],
+            &[(&g_vis_t, COL_BIN, "bin"), (&g_vis_q, COL_QUAD, "quad"), (&g_vis_it, COL_INT, "int")],
         );
         gy += gh + 8.0;
         draw_graph(
             gx + gpad, gy, gw, gh, "move+update", " ms",
-            &[(&g_mv_t, COL_BIN, "bin"), (&g_mv_q, COL_QUAD, "quad")],
+            &[(&g_mv_t, COL_BIN, "bin"), (&g_mv_q, COL_QUAD, "quad"), (&g_mv_it, COL_INT, "int")],
         );
         gy += gh + 8.0;
         draw_graph(
             gx + gpad, gy, gw, gh, "insert+remove", " us",
-            &[(&g_rm_t, COL_BIN, "bin"), (&g_rm_q, COL_QUAD, "quad")],
+            &[(&g_rm_t, COL_BIN, "bin"), (&g_rm_q, COL_QUAD, "quad"), (&g_rm_it, COL_INT, "int")],
         );
 
         let help = [
