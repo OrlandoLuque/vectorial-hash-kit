@@ -141,10 +141,12 @@ workload Morton wins maintain (flat re-bucket beats the trees' predicate-scan
 
 Three ways, easiest first:
 
-### 1. In your browser (nothing to install) — *coming soon*
+### 1. In your browser (nothing to install)
 
-A WebAssembly build of the 2D and 3D critters, hosted on GitHub Pages, so you
-can play with no install. (Being set up — it needs a small wasm timing port.)
+The 2D and 3D critters run as a WebAssembly page — just open
+**https://orlandoluque.github.io/vectorial-hash-kit/** and click a demo.
+Click the canvas to give it keyboard focus. *(Rebuild with `scripts/build-web.sh`;
+served from `main` `/docs` via GitHub Pages.)*
 
 ### 2. Download a prebuilt program (no Rust needed)
 

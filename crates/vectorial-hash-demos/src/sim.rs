@@ -9,7 +9,7 @@
 //! headless statistics comparable across structures.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use crate::time::Instant; // wasm-compatible drop-in (native + browser)
 
 use vectorial_hash::{
     IntegerTree, IPoint, IPositioned, IRect, IUpdateStrategy, PlacedTemplate, Point as VPoint,

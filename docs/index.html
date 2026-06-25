@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>critters — vectorial-hash-kit demos</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100vh; display:flex; flex-direction:column; align-items:center; justify-content:center;
+         font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+         background: radial-gradient(1200px 600px at 50% -10%, #18203a, #0a0c14 60%); color:#dfe6f2; padding:2rem; }
+  h1 { font-size: clamp(1.6rem, 4vw, 2.6rem); margin:0 0 .5rem; letter-spacing:-.02em; }
+  p.sub { margin:0 0 2rem; color:#8a96ad; max-width:44rem; text-align:center; line-height:1.55; }
+  .cards { display:flex; gap:1.2rem; flex-wrap:wrap; justify-content:center; }
+  a.card { text-decoration:none; color:inherit; width:19rem; border:1px solid #2a3550; border-radius:14px; padding:1.4rem 1.5rem;
+           background:linear-gradient(180deg,#141a2c,#10131f); transition:transform .12s ease, border-color .12s ease; }
+  a.card:hover { transform:translateY(-3px); border-color:#4a6cff; }
+  a.card h2 { margin:.3rem 0 .5rem; font-size:1.25rem; }
+  a.card span.d { color:#8a96ad; font-size:.92rem; line-height:1.5; display:block; }
+  .tag { display:inline-block; font-size:.7rem; letter-spacing:.08em; text-transform:uppercase; color:#7fa0ff;
+         border:1px solid #2a3550; border-radius:999px; padding:.15rem .55rem; }
+  b { color:#cdd6e6; }
+  .note { margin-top:1.6rem; font-size:.82rem; color:#5b667e; max-width:42rem; text-align:center; line-height:1.5; }
+  footer { margin-top:1.4rem; }
+  footer a { color:#7fa0ff; text-decoration:none; }
+</style>
+</head>
+<body>
+  <h1>critters — spatial-index demos</h1>
+  <p class="sub">Live demos for <b>vectorial-hash-kit</b>, a Rust spatial-index library. Watch the index
+  split &amp; merge in real time as critters move, hunt and attack — running right here in your browser
+  via WebAssembly.</p>
+  <div class="cards">
+    <a class="card" href="2d.html">
+      <span class="tag">2D</span>
+      <h2>2D critters →</h2>
+      <span class="d">Predators &amp; prey on a flat map. A live tuning panel and performance graphs;
+      the index's leaf regions recolour as cells subdivide and merge.</span>
+    </a>
+    <a class="card" href="3d.html">
+      <span class="tag">3D</span>
+      <h2>3D critters →</h2>
+      <span class="d">A cube world with GPU-instanced rendering. Press <b>M</b> to switch the index live
+      (binary tree / octree / Morton grid / projection — all O(1)-relocated via stable handles).</span>
+    </a>
+  </div>
+  <p class="note">Click the canvas to give it keyboard focus. The first load fetches ~1&nbsp;MB of
+  WebAssembly. Needs a WebGL2-capable browser (any recent desktop browser).</p>
+  <footer><a href="https://github.com/OrlandoLuque/vectorial-hash-kit">Source &amp; docs on GitHub →</a></footer>
+</body>
+</html>

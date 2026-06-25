@@ -41,7 +41,7 @@
 //! CRITTERS3D_COMBAT=1 starts in combat; CRITTERS3D_SEP=1 starts with separation.
 
 use std::collections::VecDeque;
-use std::time::Instant;
+use vectorial_hash_demos::time::Instant; // wasm-compatible drop-in (native + browser)
 
 use macroquad::camera::Camera;
 use macroquad::miniquad::PassAction;
@@ -1485,6 +1485,10 @@ async fn main() {
         // Optional fps cap (V): with vsync off the GPU would otherwise render
         // thousands of fps the monitor can't show. Sleep the bulk of the
         // remaining frame budget, then spin the last ~2 ms for a precise cap.
+        // On the web the browser caps the frame rate (requestAnimationFrame),
+        // and blocking the main thread isn't allowed — so this spin/sleep cap is
+        // native-only.
+        #[cfg(not(target_arch = "wasm32"))]
         if fps_cap {
             let target = std::time::Duration::from_secs_f64(1.0 / 165.0);
             loop {

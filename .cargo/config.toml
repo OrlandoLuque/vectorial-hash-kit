@@ -1,0 +1,9 @@
+# WebAssembly (browser) builds of the visual demos.
+#
+# macroquad's wasm backend provides the GL calls and `now()` (the clock) as
+# JS-side *imports*, resolved at runtime by its JS bundle (`mq_js_bundle.js`) —
+# not at link time. So the wasm linker must be told to leave those symbols
+# undefined (emit them as imports) instead of erroring. Native builds are
+# unaffected (this only applies to the wasm32 target).
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=--no-entry", "-C", "link-arg=--allow-undefined"]

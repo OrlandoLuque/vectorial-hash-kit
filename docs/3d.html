@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3D critters — vectorial-hash-kit</title>
+<style>
+  html,body { margin:0; padding:0; height:100%; overflow:hidden; background:#0a0c14; }
+  canvas { display:block; width:100vw; height:100vh; }
+  #back { position:fixed; top:10px; left:12px; z-index:10; color:#9fb0d8; font:14px system-ui;
+          text-decoration:none; background:#141a2ccc; padding:4px 11px; border-radius:8px; border:1px solid #2a3550; }
+  #back:hover { color:#fff; border-color:#4a6cff; }
+</style>
+</head>
+<body>
+<a id="back" href="index.html">← demos</a>
+<canvas id="glcanvas" tabindex="1"></canvas>
+<script src="mq_js_bundle.js"></script>
+<script>load("critters3d.wasm");</script>
+</body>
+</html>
