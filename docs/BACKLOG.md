@@ -61,6 +61,13 @@ Everything else in this file is **future** — left to triage later.
   when many are on screen at once.
 
 ## Index / algorithms
+- **Structure decision-map sweep** — extend `critters3d_headless` to all four
+  structures (binary / octree / Morton / projection — it's binary-vs-octree
+  today) and sweep world × population × vision × `item_limit`, reporting the
+  winner per cell. Makes the "which wins, and when" synthesis in `THREE_D.md`
+  quantitative (today it's by-eye from the live demo). The persistent-vs-rebuilt
+  build-cost asymmetry (binary/octree `update` vs Morton/projection rebuild) is
+  the dominant effect to capture; the `C` cull-rep readout isolates the cull.
 - ~~**`Octree3::update` (ascend-to-LCA)**~~ — **done.** `Octree3` now has the
   same ascend-to-LCA `update` as `Tree3` (churn-tested), and
   `critters3d_headless --structure both` compares the *dynamic* octree vs the

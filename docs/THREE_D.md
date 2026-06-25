@@ -437,7 +437,72 @@ story is the **absolute** 2–13 µs, not the inflated ×. (`tree3d_bench --knn 
 `MortonGrid3` has no `knn` yet — a grid would spiral outward ring-by-ring from
 `q`'s cell; noted as a follow-up.
 
+## Synthesis — which structure wins, and when
+
+Playing with the live `critters3d` demo (the `M` toggle), the ranking visibly
+*changes with the scenario*: sometimes the binary `Tree3` is fastest, and it's
+near the top almost everywhere else. That is the headline of the whole 3D
+study — **there is no universal winner; the binary tree is the robust default
+and each alternative has a sweet spot.** Two layers explain the observation.
+
+### Demo nuance: persistent (`update`) vs rebuilt-every-frame
+
+The four structures are not on equal footing for the per-frame *build* cost:
+
+| structure | per frame | build cost |
+| --- | --- | --- |
+| Tree3 (binary) | incremental `update` (ascend-to-LCA) | cheap |
+| Octree3 | incremental `update` | cheap |
+| MortonGrid3 | full rebuild (re-insert all) | medium |
+| projection | rebuild the 2D tree + broad/narrowphase | high |
+
+In *observe* mode a frame is **build + one vision cull**, and that single cull
+is microscopic, so the **build cost dominates the per-frame number**. The two
+persistent structures (binary, octree) therefore beat the two that rebuild
+(Morton, projection) on the build side, and the binary is the leanest
+persistent one (one comparison per level, fewest nodes, least memory). That is
+why it "wins in many scenarios" — not because it is best at everything, but
+because it has **no pathological weakness**. To *isolate the cull* (where the
+others can lead) the `C` key cranks up the cull-repetition count: there the
+octree edges ahead (shorter descent) and Morton flies when density is uniform
+and its cell ≈ the vision radius.
+
+### The mechanism: what flips the ranking
+
+- **World size / density → tree depth.** Small/dense world = deep tree → the
+  octree's fewer levels win (on cull *and* on long relocations). Large/sparse
+  world = shallow tree → the binary wins: less work per node and less memory
+  traffic (an octree allocates 8 children even when 1–2 are occupied, so it
+  thrashes cache at low density).
+- **Vision radius (`[` / `]`) → query selectivity.** A large query is low
+  selectivity (little to prune, structure barely matters); a small, realistic
+  query is where the trees separate.
+- **`item_limit` → leaf granularity.** Larger leaves = fewer, fatter cells;
+  both update and cull keep improving with it across the measured range.
+
+### The takeaway
+
+- **Binary `Tree3` — the safe default.** No extra machinery, no N³ memory,
+  adapts to any density, cheapest/leanest persistent `update`. Pick it unless
+  there's a reason not to.
+- **Octree3** — when the tree is *deep* (small/dense world, tight queries): the
+  shallower descent pays on both cull and relocation, at the cost of more
+  nodes/memory.
+- **MortonGrid3** — *uniform* density with a *known* query scale (cell ≈ query):
+  fastest cull and cheapest build, but a single fixed resolution and (in the
+  demo) rebuilt each frame.
+- **Projection** — a *2.5D* world (large in xy, thin in z) or an *expensive*
+  narrowphase, reusing the whole 2D stack with no N³ memory.
+
+A rigorous **decision map** — a headless sweep over (world × population ×
+vision × item_limit) reporting the winner per cell across all four structures —
+would turn this qualitative picture into a table. Not yet run (see Still open).
+
 ## Still open
+- **Decision-map sweep** — extend `critters3d_headless` to all four structures
+  (it compares binary vs octree today) and sweep world × population × vision ×
+  item_limit, reporting the winner per cell, to make the synthesis above
+  quantitative instead of "by eye".
 - **Non-analytic 3D shapes** in the *projection* comparison: the
   static bench used a sphere (analytic); the polyhedron crossover above
   lives in the voxel-raster bench. Running the projection methods against a
