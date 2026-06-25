@@ -18,6 +18,10 @@ reprioritise, or drop freely. Items graduate into the per-crate roadmaps
 Worked top-down. Commit + push per task. Items marked **[review]** need a human
 visual glance the next morning; everything else is autonomously verifiable.
 
+> **Local handoff:** a gitignored `CLAUDE.md` at the repo root summarises the
+> project state, conventions, and what's done vs. open — for future sessions on
+> this machine. (User asked to add it + gitignore it.)
+
 **Done**
 1. ~~**rayon / multithreading**~~ — **done.** `parallel` feature → rayon-backed
    `cull_many_par` on all five structures (serial `cull_many` always available).

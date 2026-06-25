@@ -7,3 +7,6 @@
 .claude/
 .env
 *.log
+# Local project handoff notes for Claude sessions (not committed by request).
+/CLAUDE.md
+/target/pub/
