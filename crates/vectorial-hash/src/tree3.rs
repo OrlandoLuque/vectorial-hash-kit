@@ -337,11 +337,29 @@ impl VoxelRaster {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Node3Id(pub u32);
 
+/// A **stable handle** to an inserted item (the "Stable `ItemRef`"): returned by
+/// [`Tree3::insert_ref`] and accepted by [`Tree3::update_ref`] /
+/// [`Tree3::remove_ref`]. It stays valid as the item moves between leaves, so
+/// those calls reach the item in **O(1)** — no locate walk, no per-leaf
+/// predicate scan (the cost that made the predicate [`Tree3::update`] lose the
+/// relocate race to a flat rebuild; see `docs/THREE_D.md` § Synthesis).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ItemRef(pub u32);
+
+/// Where a handle's item currently lives: its leaf node and slot within that
+/// leaf's `items`/`hs` vectors.
+#[derive(Copy, Clone)]
+struct ItemLoc { node: Node3Id, slot: u32 }
+
 pub struct Node3<T> {
     pub bbox: Aabb,
     pub parent: Option<Node3Id>,
     pub children: Option<[Node3Id; 2]>,
     pub items: Vec<T>,
+    /// Parallel to `items`: `hs[i]` is the handle of `items[i]`. Lets a
+    /// `swap_remove` fix the moved item's location in O(1). Empty on internal
+    /// (non-leaf) nodes.
+    hs: Vec<u32>,
 }
 
 pub struct Tree3<T: Positioned3> {
@@ -349,6 +367,10 @@ pub struct Tree3<T: Positioned3> {
     /// Slots freed by merge-ups, reused before the arena grows — see
     /// [`crate::Tree`]'s free-list for the rationale.
     free: Vec<Node3Id>,
+    /// Handle → current location. Indexed by [`ItemRef`]'s u32. Stale entries
+    /// (freed handles) sit on `free_handles`.
+    locs: Vec<ItemLoc>,
+    free_handles: Vec<u32>,
     pub item_limit: usize,
     pub merge_limit: usize,
     min_cell: f64,
@@ -360,8 +382,10 @@ impl<T: Positioned3> Tree3<T> {
         assert!(item_limit >= 1, "item_limit must be >= 1");
         let min_cell = bbox.w.max(bbox.h).max(bbox.d) * 1e-12;
         Self {
-            nodes: vec![Node3 { bbox, parent: None, children: None, items: Vec::new() }],
+            nodes: vec![Node3 { bbox, parent: None, children: None, items: Vec::new(), hs: Vec::new() }],
             free: Vec::new(),
+            locs: Vec::new(),
+            free_handles: Vec::new(),
             item_limit,
             merge_limit: item_limit,
             min_cell,
@@ -381,18 +405,60 @@ impl<T: Positioned3> Tree3<T> {
             id
         }
     }
+
+    // ---- handle bookkeeping (the Stable ItemRef layer) ----
+
+    fn alloc_handle(&mut self) -> u32 {
+        if let Some(h) = self.free_handles.pop() {
+            h
+        } else {
+            let h = self.locs.len() as u32;
+            self.locs.push(ItemLoc { node: Node3Id(0), slot: 0 });
+            h
+        }
+    }
+
+    /// Push `item` (with handle `h`) into leaf `node`, recording its location.
+    fn push_h(&mut self, node: Node3Id, item: T, h: u32) {
+        let slot = self.get(node).items.len() as u32;
+        let n = self.get_mut(node);
+        n.items.push(item);
+        n.hs.push(h);
+        self.locs[h as usize] = ItemLoc { node, slot };
+    }
+
+    /// `swap_remove` slot `slot` of leaf `node`, fixing the moved item's
+    /// recorded location. Returns `(item, its handle)`.
+    fn swap_remove_h(&mut self, node: Node3Id, slot: usize) -> (T, u32) {
+        let (item, h, moved) = {
+            let n = self.get_mut(node);
+            let item = n.items.swap_remove(slot);
+            let h = n.hs.swap_remove(slot);
+            let moved = if slot < n.hs.len() { Some(n.hs[slot]) } else { None };
+            (item, h, moved)
+        };
+        if let Some(m) = moved { self.locs[m as usize].slot = slot as u32; }
+        (item, h)
+    }
     /// Arena capacity (high-water-mark). [`Tree3::live_node_count`] is the
     /// reachable count.
     pub fn node_count(&self) -> usize { self.nodes.len() }
     pub fn live_node_count(&self) -> usize { self.nodes.len() - self.free.len() }
 
     pub fn insert(&mut self, item: T) -> bool {
+        self.insert_ref(item).is_some()
+    }
+
+    /// Insert and return a [stable handle](ItemRef) for O(1) future
+    /// `update_ref`/`remove_ref` — `None` if the point is outside the root.
+    pub fn insert_ref(&mut self, item: T) -> Option<ItemRef> {
         let p = item.position();
-        if !self.get(self.root).bbox.contains(p) { return false; }
+        if !self.get(self.root).bbox.contains(p) { return None; }
         let leaf = self.locate(p);
-        self.get_mut(leaf).items.push(item);
+        let h = self.alloc_handle();
+        self.push_h(leaf, item, h);
         if self.get(leaf).items.len() > self.item_limit { self.divide(leaf); }
-        true
+        Some(ItemRef(h))
     }
 
     pub fn locate(&self, p: Point3) -> Node3Id {
@@ -408,14 +474,17 @@ impl<T: Positioned3> Tree3<T> {
     }
 
     fn divide(&mut self, id: Node3Id) {
-        let (bbox, items) = {
+        let (bbox, items, hs) = {
             let n = self.get_mut(id);
-            (n.bbox, std::mem::take(&mut n.items))
+            (n.bbox, std::mem::take(&mut n.items), std::mem::take(&mut n.hs))
         };
         let first = items[0].position();
         let inseparable = items.iter().all(|it| it.position() == first);
         if inseparable || bbox.w.max(bbox.h).max(bbox.d) <= self.min_cell {
-            self.get_mut(id).items = items;
+            // Put them back unchanged — same slots, so `locs` stays valid.
+            let n = self.get_mut(id);
+            n.items = items;
+            n.hs = hs;
             return;
         }
         // Split the longest axis at its midpoint.
@@ -432,22 +501,24 @@ impl<T: Positioned3> Tree3<T> {
             (Aabb::new(bbox.x, bbox.y, bbox.z, bbox.w, bbox.h, half),
              Aabb::new(bbox.x, bbox.y, bbox.z + half, bbox.w, bbox.h, half))
         };
-        let a = self.alloc(Node3 { bbox: a_box, parent: Some(id), children: None, items: Vec::new() });
-        let b = self.alloc(Node3 { bbox: b_box, parent: Some(id), children: None, items: Vec::new() });
-        for item in items {
+        let a = self.alloc(Node3 { bbox: a_box, parent: Some(id), children: None, items: Vec::new(), hs: Vec::new() });
+        let b = self.alloc(Node3 { bbox: b_box, parent: Some(id), children: None, items: Vec::new(), hs: Vec::new() });
+        for (item, h) in items.into_iter().zip(hs) {
             let p = item.position();
-            if self.get(a).bbox.contains(p) { self.get_mut(a).items.push(item); }
-            else { self.get_mut(b).items.push(item); }
+            let dest = if self.get(a).bbox.contains(p) { a } else { b };
+            self.push_h(dest, item, h);
         }
         self.get_mut(id).children = Some([a, b]);
         if self.get(a).items.len() > self.item_limit { self.divide(a); }
         if self.get(b).items.len() > self.item_limit { self.divide(b); }
     }
 
-    /// Relocate via ascend-to-LCA (the 2D winner): mutate in place, and if
-    /// the item leaves its leaf, ascend to the lowest ancestor containing
-    /// the new position and descend from there. Returns `false` if not
-    /// found or pushed out of the root.
+    /// Relocate via ascend-to-LCA (the 2D winner): find the item by `old` +
+    /// `predicate`, mutate in place, and if it leaves its leaf, ascend to the
+    /// lowest ancestor containing the new position and descend from there.
+    /// Returns `false` if not found or pushed out of the root. This is the
+    /// **predicate** path (O(item_limit) leaf scan); for O(1) relocation hold a
+    /// stable [`ItemRef`] from [`Tree3::insert_ref`] and use [`Tree3::update_ref`].
     pub fn update<F, M>(&mut self, old: Point3, predicate: F, mutator: M) -> bool
     where F: Fn(&T) -> bool, M: FnOnce(&mut T) {
         if !self.get(self.root).bbox.contains(old) { return false; }
@@ -458,22 +529,42 @@ impl<T: Positioned3> Tree3<T> {
         mutator(&mut self.get_mut(leaf).items[idx]);
         let np = self.get(leaf).items[idx].position();
         if self.get(leaf).bbox.contains(np) { return true; }
-        // ascend to LCA
+        self.relocate(leaf, idx, np)
+    }
+
+    /// O(1) relocation through a stable [`ItemRef`]: no locate walk, no
+    /// predicate scan — go straight to the item, mutate it, and only pay the
+    /// ascend-to-LCA descent if it actually leaves its leaf. Returns `false`
+    /// (and frees the handle) if it left the root.
+    pub fn update_ref<M: FnOnce(&mut T)>(&mut self, r: ItemRef, mutator: M) -> bool {
+        let loc = self.locs[r.0 as usize];
+        let (node, slot) = (loc.node, loc.slot as usize);
+        mutator(&mut self.get_mut(node).items[slot]);
+        let np = self.get(node).items[slot].position();
+        if self.get(node).bbox.contains(np) { return true; }
+        self.relocate(node, slot, np)
+    }
+
+    /// Shared tail of `update`/`update_ref`: the item at `(leaf, slot)` has
+    /// moved to `np` outside `leaf`. Ascend to the LCA, re-descend, move it;
+    /// drop it (freeing its handle) if it left the root.
+    fn relocate(&mut self, leaf: Node3Id, slot: usize, np: Point3) -> bool {
         let mut anc = self.get(leaf).parent;
         let lca = loop {
             match anc {
                 Some(a) if self.get(a).bbox.contains(np) => break a,
                 Some(a) => anc = self.get(a).parent,
-                None => { // out of bounds: drop + merge
-                    let _ = self.get_mut(leaf).items.remove(idx);
+                None => { // out of bounds: drop + merge, free the handle
+                    let (_, h) = self.swap_remove_h(leaf, slot);
+                    self.free_handles.push(h);
                     self.try_merge_up(leaf);
                     return false;
                 }
             }
         };
-        let item = self.get_mut(leaf).items.remove(idx);
+        let (item, h) = self.swap_remove_h(leaf, slot);
         let dest = self.locate_from(lca, np);
-        self.get_mut(dest).items.push(item);
+        self.push_h(dest, item, h);
         if self.get(dest).items.len() > self.item_limit { self.divide(dest); }
         self.try_merge_up(leaf);
         true
@@ -492,13 +583,21 @@ impl<T: Positioned3> Tree3<T> {
     pub fn remove<F: Fn(&T) -> bool>(&mut self, p: Point3, predicate: F) -> Option<T> {
         if !self.get(self.root).bbox.contains(p) { return None; }
         let leaf = self.locate(p);
-        let removed = {
-            let items = &mut self.get_mut(leaf).items;
-            let idx = items.iter().position(|it| predicate(it))?;
-            items.remove(idx)
-        };
+        let idx = self.get(leaf).items.iter().position(|it| predicate(it))?;
+        let (item, h) = self.swap_remove_h(leaf, idx);
+        self.free_handles.push(h);
         self.try_merge_up(leaf);
-        Some(removed)
+        Some(item)
+    }
+
+    /// Remove the item behind a stable [`ItemRef`] in O(1) (no scan). The
+    /// handle is consumed; reusing it is a logic error.
+    pub fn remove_ref(&mut self, r: ItemRef) -> Option<T> {
+        let loc = self.locs[r.0 as usize];
+        let (item, h) = self.swap_remove_h(loc.node, loc.slot as usize);
+        self.free_handles.push(h);
+        self.try_merge_up(loc.node);
+        Some(item)
     }
 
     fn try_merge_up(&mut self, mut node: Node3Id) {
@@ -509,11 +608,22 @@ impl<T: Positioned3> Tree3<T> {
             let combined = self.get(a).items.len() + self.get(b).items.len();
             if combined > self.merge_limit { return; }
             let mut ia = std::mem::take(&mut self.get_mut(a).items);
+            let mut iha = std::mem::take(&mut self.get_mut(a).hs);
             let mut ib = std::mem::take(&mut self.get_mut(b).items);
+            let mut ihb = std::mem::take(&mut self.get_mut(b).hs);
             ia.append(&mut ib);
+            iha.append(&mut ihb);
             let pnode = self.get_mut(parent);
             pnode.items = ia;
+            pnode.hs = iha;
             pnode.children = None;
+            // The merged items now live in `parent` (a leaf again) — re-point
+            // their handle locations.
+            let len = self.get(parent).hs.len();
+            for slot in 0..len {
+                let h = self.get(parent).hs[slot];
+                self.locs[h as usize] = ItemLoc { node: parent, slot: slot as u32 };
+            }
             self.free.push(a);
             self.free.push(b);
             node = parent;
@@ -682,7 +792,7 @@ fn r_aabb<R: Read>(r: &mut R) -> io::Result<Aabb> {
 }
 
 const TREE3_MAGIC: &[u8; 4] = b"VHT3";
-const TREE3_VERSION: u8 = 1;
+const TREE3_VERSION: u8 = 2; // v2 adds per-leaf handle ids (the ItemRef layer)
 
 fn corrupt(msg: &str) -> io::Error { io::Error::new(io::ErrorKind::InvalidData, msg) }
 
@@ -713,6 +823,9 @@ impl<T: Positioned3> Tree3<T> {
             }
             w_u32(w, n.items.len() as u32)?;
             for it in &n.items { write_item(w, it)?; }
+            // Per-leaf stable-handle ids (parallel to items) — preserves
+            // ItemRefs across a save/load round-trip.
+            for &h in &n.hs { w_u32(w, h)?; }
         }
         Ok(())
     }
@@ -740,10 +853,24 @@ impl<T: Positioned3> Tree3<T> {
             let nitems = r_u32(r)? as usize;
             let mut items = Vec::with_capacity(nitems);
             for _ in 0..nitems { items.push(read_item(r)?); }
-            nodes.push(Node3 { bbox, parent, children, items });
+            let mut hs = Vec::with_capacity(nitems);
+            for _ in 0..nitems { hs.push(r_u32(r)?); }
+            nodes.push(Node3 { bbox, parent, children, items, hs });
         }
         if root.0 as usize >= nnodes { return Err(corrupt("root index out of range")); }
-        Ok(Tree3 { nodes, free, item_limit, merge_limit, min_cell, root })
+        // Rebuild the handle → location map (and the freed-handle list) from the
+        // leaves' handle ids, so ItemRefs stay valid across the round-trip.
+        let max_h = nodes.iter().flat_map(|n| n.hs.iter().copied()).max().map_or(0, |m| m + 1) as usize;
+        let mut locs = vec![ItemLoc { node: Node3Id(0), slot: 0 }; max_h];
+        let mut used = vec![false; max_h];
+        for (ni, n) in nodes.iter().enumerate() {
+            for (slot, &h) in n.hs.iter().enumerate() {
+                locs[h as usize] = ItemLoc { node: Node3Id(ni as u32), slot: slot as u32 };
+                used[h as usize] = true;
+            }
+        }
+        let free_handles: Vec<u32> = (0..max_h as u32).filter(|&h| !used[h as usize]).collect();
+        Ok(Tree3 { nodes, free, locs, free_handles, item_limit, merge_limit, min_cell, root })
     }
 }
 
@@ -1010,5 +1137,88 @@ mod tests {
 
         // Corruption is rejected, not panicked.
         assert!(Tree3::<M>::deserialize(&mut Cursor::new(&b"XXXXX"[..]), |_| unreachable!()).is_err());
+    }
+
+    #[test]
+    fn update_ref_churn_matches_brute() {
+        // Build with insert_ref, churn with update_ref / remove_ref / insert_ref
+        // (the O(1) stable-handle path), and verify the cull still equals brute
+        // force and the item count tracks ground truth — i.e. the handle layer's
+        // location bookkeeping stays consistent through splits and merges.
+        use std::io::{Cursor, Read, Write};
+        let mut x = 0x1772_EF00u64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+
+        #[derive(Clone, Copy)]
+        struct M { id: u32, p: Point3 }
+        impl Positioned3 for M { fn position(&self) -> Point3 { self.p } }
+
+        let world = Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0);
+        let mut tree = Tree3::<M>::new(world, 6);
+        let rp = |rng: &mut dyn FnMut() -> f64| Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0);
+        // id -> (handle, ground-truth position)
+        let mut live: std::collections::HashMap<u32, (ItemRef, Point3)> = std::collections::HashMap::new();
+        let mut next = 0u32;
+        for _ in 0..2000 {
+            let p = rp(&mut rng);
+            let r = tree.insert_ref(M { id: next, p }).unwrap();
+            live.insert(next, (r, p));
+            next += 1;
+        }
+        for _ in 0..6000 {
+            let roll = rng();
+            let ids: Vec<u32> = live.keys().copied().collect();
+            if roll < 0.6 && !ids.is_empty() {
+                let id = ids[(rng() * ids.len() as f64) as usize % ids.len()];
+                let (r, _) = live[&id];
+                let np = rp(&mut rng);
+                assert!(tree.update_ref(r, |m| m.p = np), "in-bounds update_ref should not drop");
+                live.get_mut(&id).unwrap().1 = np;
+            } else if roll < 0.8 && !ids.is_empty() {
+                let id = ids[(rng() * ids.len() as f64) as usize % ids.len()];
+                let (r, _) = live[&id];
+                tree.remove_ref(r);
+                live.remove(&id);
+            } else {
+                let p = rp(&mut rng);
+                let r = tree.insert_ref(M { id: next, p }).unwrap();
+                live.insert(next, (r, p));
+                next += 1;
+            }
+        }
+
+        assert_eq!(tree.item_count(), live.len(), "item count drifted under handle churn");
+        for (cx, cy, cz, r) in [(128.0, 128.0, 128.0, 30.0), (60.0, 200.0, 90.0, 50.0), (10.0, 10.0, 10.0, 80.0)] {
+            let sphere = Sphere3::new(cx, cy, cz, r).with_raster();
+            let mut want: Vec<u32> = live.iter()
+                .filter(|(_, (_, p))| { let dx = p.x - cx; let dy = p.y - cy; let dz = p.z - cz; dx * dx + dy * dy + dz * dz <= r * r })
+                .map(|(id, _)| *id).collect();
+            let mut got: Vec<u32> = tree.cull(&sphere).iter().map(|m| m.id).collect();
+            want.sort(); got.sort();
+            assert_eq!(want, got, "handle-churn cull != brute for sphere ({cx},{cy},{cz}) r={r}");
+        }
+
+        // ItemRefs survive a serialize round-trip: a kept handle still addresses
+        // its item in the loaded tree. Pick one, teleport it via the loaded
+        // tree's update_ref, and confirm the cull sees it at the new spot only.
+        let (&id0, &(r0, p0)) = live.iter().next().unwrap();
+        let mut buf = Vec::new();
+        tree.serialize(&mut buf, |w, it| {
+            w.write_all(&it.id.to_le_bytes())?;
+            w.write_all(&it.p.x.to_le_bytes())?; w.write_all(&it.p.y.to_le_bytes())?; w.write_all(&it.p.z.to_le_bytes())
+        }).unwrap();
+        let mut loaded = Tree3::<M>::deserialize(&mut Cursor::new(&buf), |r| {
+            let mut a = [0u8; 4]; r.read_exact(&mut a)?; let id = u32::from_le_bytes(a);
+            let mut b = [0u8; 8];
+            r.read_exact(&mut b)?; let px = f64::from_le_bytes(b);
+            r.read_exact(&mut b)?; let py = f64::from_le_bytes(b);
+            r.read_exact(&mut b)?; let pz = f64::from_le_bytes(b);
+            Ok(M { id, p: Point3::new(px, py, pz) })
+        }).unwrap();
+        // r0 must still point at id0 in the loaded tree.
+        let mut seen = None;
+        loaded.update_ref(r0, |m| seen = Some(m.id));
+        assert_eq!(seen, Some(id0), "ItemRef did not survive the round-trip");
+        let _ = p0;
     }
 }

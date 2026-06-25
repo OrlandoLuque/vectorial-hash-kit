@@ -69,10 +69,13 @@ Everything else in this file is **future** — left to triage later.
   `update`, which pays an O(item_limit) predicate scan per point); the trees win
   *cull* only in the deep/dense corner. → promotes **Stable `ItemRef`** (O(1)
   item access) as the highest-leverage follow-up. See `THREE_D.md` § "Synthesis".
-- **Stable `ItemRef`** — O(1) handle into the arena (kept valid across
-  splits/merges) so `update`/`remove` skip the predicate scan. The decision map
-  showed that scan is why the trees lose the relocate race to Morton's rebuild;
-  removing it would likely flip the maintain winner back to the trees.
+- ~~**Stable `ItemRef`**~~ — **done for `Tree3`** (`insert_ref` / `update_ref` /
+  `remove_ref`; parallel per-leaf handle vec + handle→location map, churn-tested,
+  survives `serialize`). Confirmed the decision map's prediction: O(1) handle
+  updates flip the maintain winner from Morton back to the binary tree in 15/16
+  configs, **~5–11× faster** (10× at item_limit 64). Follow-ups: port to
+  `Octree3`; wire the live `critters3d` persistent tree to it. See `THREE_D.md`
+  § "The fix: Stable ItemRef".
 - ~~**`Octree3::update` (ascend-to-LCA)**~~ — **done.** `Octree3` now has the
   same ascend-to-LCA `update` as `Tree3` (churn-tested), and `critters3d_headless`
   compares the *dynamic* octree vs the binary tree on one deterministic run

@@ -3,11 +3,14 @@
 //! the index and a sample run a sphere "vision" cull. The same deterministic
 //! simulation drives **all four** structures so they can be ranked head-to-head:
 //!
-//! - **binary** `Tree3` — persistent, incremental `update` (ascend-to-LCA),
-//! - **octree** `Octree3` — persistent, incremental `update`,
+//! - **binary** `Tree3` — persistent, predicate `update` (ascend-to-LCA),
+//! - **octree** `Octree3` — persistent, predicate `update`,
 //! - **morton** `MortonGrid3` — pointer-free, **rebuilt every frame**,
 //! - **projection** — a 2D `Tree` on xy **rebuilt every frame** + disc cull,
-//!   z-slab reject, exact 3D narrowphase.
+//!   z-slab reject, exact 3D narrowphase,
+//! - **binary-ref** — the binary `Tree3` maintained via the stable `ItemRef`
+//!   handle (`update_ref`, O(1) — no predicate scan). This is what flips the
+//!   maintain winner; see `THREE_D.md` § "The fix: Stable ItemRef".
 //!
 //! Two numbers per structure: **maintain** (per-frame update or rebuild cost)
 //! and **cull** (per-cull cost). The persistent-vs-rebuilt asymmetry is the
@@ -24,13 +27,15 @@
 use std::time::Instant;
 
 use vectorial_hash::{
-    Aabb, MortonGrid3, Octree3, Point, Point3, Positioned, Positioned3, Rect, Shape, Sphere3, Tree,
-    Tree3,
+    Aabb, ItemRef, MortonGrid3, Octree3, Point, Point3, Positioned, Positioned3, Rect, Shape,
+    Sphere3, Tree, Tree3,
 };
 
 const MARGIN: f64 = 4.0;
-const NAMES: [&str; 4] = ["binary", "octree", "morton", "projection"];
-const SHORT: [&str; 4] = ["bin", "oct", "mor", "prj"];
+// "binary-ref" is the binary Tree3 maintained through the stable ItemRef handle
+// (O(1) update_ref) instead of the predicate update — the Stable-ItemRef test.
+const NAMES: [&str; 5] = ["binary", "octree", "morton", "projection", "binary-ref"];
+const SHORT: [&str; 5] = ["bin", "oct", "mor", "prj", "binR"];
 
 struct Args {
     sweep: bool,
@@ -112,7 +117,7 @@ struct Cfg { world: f64, pop: usize, item_limit: usize, vision: f64, speed: f64,
 /// Run the deterministic sim with all four structures maintained on the same
 /// positions; return per-structure (maintain µs/frame, cull µs/cull) and
 /// whether all four culls agreed.
-fn measure(cfg: &Cfg) -> ([f64; 4], [f64; 4], bool) {
+fn measure(cfg: &Cfg) -> ([f64; 5], [f64; 5], bool) {
     let mut rng = Rng::new(cfg.seed);
     let world = Aabb::new(0.0, 0.0, 0.0, cfg.world, cfg.world, cfg.world);
     let rect = Rect::new(0.0, 0.0, cfg.world, cfg.world);
@@ -123,6 +128,8 @@ fn measure(cfg: &Cfg) -> ([f64; 4], [f64; 4], bool) {
     let mut old_pos: Vec<Point3> = vec![Point3::new(0.0, 0.0, 0.0); cfg.pop];
     let mut tree = Tree3::<C3>::new(world, cfg.item_limit);
     let mut octree = Octree3::<C3>::new(world, cfg.item_limit);
+    let mut tree_h = Tree3::<C3>::new(world, cfg.item_limit); // maintained via ItemRef
+    let mut refs: Vec<ItemRef> = Vec::with_capacity(cfg.pop);
     for id in 0..cfg.pop {
         let p = Point3::new(rng.range(MARGIN, cfg.world - MARGIN), rng.range(MARGIN, cfg.world - MARGIN), rng.range(MARGIN, cfg.world - MARGIN));
         let speed = rng.range(0.35 * cfg.speed, cfg.speed);
@@ -132,11 +139,12 @@ fn measure(cfg: &Cfg) -> ([f64; 4], [f64; 4], bool) {
         vel.push((speed * s * a.cos(), speed * s * a.sin(), speed * b));
         tree.insert(C3 { id: id as u32, p });
         octree.insert(C3 { id: id as u32, p });
+        refs.push(tree_h.insert_ref(C3 { id: id as u32, p }).unwrap());
     }
     let levels = MortonGrid3::<C3>::levels_for_cell_size(world, cfg.vision.max(4.0));
 
-    let mut mt = [Series::new(), Series::new(), Series::new(), Series::new()];
-    let mut cl = [Series::new(), Series::new(), Series::new(), Series::new()];
+    let mut mt: [Series; 5] = std::array::from_fn(|_| Series::new());
+    let mut cl: [Series; 5] = std::array::from_fn(|_| Series::new());
     let mut blackhole = 0usize;
     let mut agree = true;
 
@@ -156,9 +164,16 @@ fn measure(cfg: &Cfg) -> ([f64; 4], [f64; 4], bool) {
         let measuring = frame >= cfg.warmup;
 
         // --- maintain (persistent update vs full rebuild), timed each ---
+        // binary, predicate update (the O(item_limit) leaf scan):
         let t = Instant::now();
         for id in 0..cfg.pop { let cid = id as u32; tree.update(old_pos[id], |c| c.id == cid, |c| c.p = pos[id]); }
         if measuring { mt[0].push(us(t)); }
+
+        // binary, stable-handle update (O(1), no scan) — timed right after the
+        // predicate one so both read `pos` under the same cache conditions:
+        let t = Instant::now();
+        for id in 0..cfg.pop { tree_h.update_ref(refs[id], |c| c.p = pos[id]); }
+        if measuring { mt[4].push(us(t)); }
 
         let t = Instant::now();
         for id in 0..cfg.pop { let cid = id as u32; octree.update(old_pos[id], |c| c.id == cid, |c| c.p = pos[id]); }
@@ -181,6 +196,10 @@ fn measure(cfg: &Cfg) -> ([f64; 4], [f64; 4], bool) {
         let t = Instant::now();
         for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(tree.cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); }
         if measuring { cl[0].push(us(t) / n); }
+
+        let t = Instant::now();
+        for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(tree_h.cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); }
+        if measuring { cl[4].push(us(t) / n); }
 
         let t = Instant::now();
         for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(octree.cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); }
@@ -206,8 +225,8 @@ fn measure(cfg: &Cfg) -> ([f64; 4], [f64; 4], bool) {
         }
         if measuring { cl[3].push(us(t) / n); }
 
-        // Light agreement gate (untimed): all four return the same id set for
-        // the first sampled sphere.
+        // Light agreement gate (untimed): all structures return the same id set
+        // for the first sampled sphere — including the handle-maintained tree.
         if measuring && !ids.is_empty() {
             let c = pos[ids[0]];
             let s = Sphere3::new(c.x, c.y, c.z, cfg.vision);
@@ -217,8 +236,9 @@ fn measure(cfg: &Cfg) -> ([f64; 4], [f64; 4], bool) {
             let mut a3: Vec<u32> = proj.cull(&Disc { cx: c.x, cy: c.y, r: cfg.vision }).iter()
                 .filter(|p2| { let dz = p2.z - c.z; let dx = p2.p.x - c.x; let dy = p2.p.y - c.y; dx * dx + dy * dy + dz * dz <= cfg.vision * cfg.vision })
                 .map(|p2| p2.id).collect();
-            a0.sort_unstable(); a1.sort_unstable(); a2.sort_unstable(); a3.sort_unstable();
-            if a1 != a0 || a2 != a0 || a3 != a0 { agree = false; }
+            let mut a4: Vec<u32> = tree_h.cull(&s).iter().map(|x| x.id).collect();
+            a0.sort_unstable(); a1.sort_unstable(); a2.sort_unstable(); a3.sort_unstable(); a4.sort_unstable();
+            if a1 != a0 || a2 != a0 || a3 != a0 || a4 != a0 { agree = false; }
         }
     }
     if blackhole == usize::MAX { println!("unreachable"); }
@@ -228,8 +248,8 @@ fn measure(cfg: &Cfg) -> ([f64; 4], [f64; 4], bool) {
 }
 
 /// (winner index, margin = 2nd-best / best) for a 4-vector to minimise.
-fn winner(v: &[f64; 4]) -> (usize, f64) {
-    let mut order = [0usize, 1, 2, 3];
+fn winner(v: &[f64]) -> (usize, f64) {
+    let mut order: Vec<usize> = (0..v.len()).collect();
     order.sort_by(|&a, &b| v[a].partial_cmp(&v[b]).unwrap());
     let (w, second) = (order[0], order[1]);
     let margin = if v[w] > 0.0 { v[second] / v[w] } else { 1.0 };
@@ -245,17 +265,20 @@ fn main() {
         cfg.world, cfg.pop, cfg.item_limit, cfg.vision, cfg.speed, cfg.n_cull, cfg.frames, cfg.warmup, cfg.seed);
     let (maintain, cull, agree) = measure(&cfg);
     println!("\n{:<12} {:>16} {:>14} {:>20}", "structure", "maintain us/frame", "cull us/cull", "per-frame total us");
-    for k in 0..4 {
+    for k in 0..5 {
         let total = maintain[k] + cfg.n_cull as f64 * cull[k];
         println!("{:<12} {:>16.1} {:>14.3} {:>20.1}", NAMES[k], maintain[k], cull[k], total);
     }
-    let total: [f64; 4] = std::array::from_fn(|k| maintain[k] + cfg.n_cull as f64 * cull[k]);
+    let total: [f64; 5] = std::array::from_fn(|k| maintain[k] + cfg.n_cull as f64 * cull[k]);
     let (wm, mm) = winner(&maintain);
     let (wc, mc) = winner(&cull);
     let (wt, mt) = winner(&total);
     println!("\nwinner — maintain: {} ({:.2}× over 2nd) | cull: {} ({:.2}×) | total@{}culls: {} ({:.2}×)",
         NAMES[wm], mm, NAMES[wc], mc, cfg.n_cull, NAMES[wt], mt);
-    println!("cull agreement: all four {}", if agree { "EXACT (identical id sets)" } else { "DISAGREE <-- BUG" });
+    // binary predicate vs handle, the Stable-ItemRef headline:
+    println!("maintain: binary(predicate) {:.1}us  ->  binary(ItemRef) {:.1}us  =  {:.2}× faster",
+        maintain[0], maintain[4], maintain[0] / maintain[4].max(1e-9));
+    println!("cull agreement: all structures {}", if agree { "EXACT (identical id sets)" } else { "DISAGREE <-- BUG" });
 }
 
 fn run_sweep(args: &Args) {
@@ -276,8 +299,8 @@ fn run_sweep(args: &Args) {
     println!("(maintain = per-frame update[bin/oct] or rebuild[mor/prj]; cull = per-cull. winner = lowest, margin = 2nd/1st.)\n");
     println!("{:>6} {:>7} {:>4} {:>5} | {:<24} | {:<24} | {:<10}", "world", "pop", "il", "churn", "maintain winner", "cull winner", "agree");
 
-    let mut wins_m = [0u32; 4];
-    let mut wins_c = [0u32; 4];
+    let mut wins_m = [0u32; 5];
+    let mut wins_c = [0u32; 5];
     let mut all_agree = true;
     let mut n = 0;
     for &world in &worlds {
@@ -299,8 +322,8 @@ fn run_sweep(args: &Args) {
             }
         }
     }
-    println!("\nwins over {n} configs:");
-    println!("  maintain: bin {} | oct {} | mor {} | prj {}", wins_m[0], wins_m[1], wins_m[2], wins_m[3]);
-    println!("  cull:     bin {} | oct {} | mor {} | prj {}", wins_c[0], wins_c[1], wins_c[2], wins_c[3]);
-    println!("\nagreement across all four structures, every config: {}", if all_agree { "EXACT" } else { "DISAGREEMENT <-- BUG" });
+    println!("\nwins over {n} configs (binR = binary via stable ItemRef):");
+    println!("  maintain: bin {} | oct {} | mor {} | prj {} | binR {}", wins_m[0], wins_m[1], wins_m[2], wins_m[3], wins_m[4]);
+    println!("  cull:     bin {} | oct {} | mor {} | prj {} | binR {}", wins_c[0], wins_c[1], wins_c[2], wins_c[3], wins_c[4]);
+    println!("\nagreement across all structures, every config: {}", if all_agree { "EXACT" } else { "DISAGREEMENT <-- BUG" });
 }

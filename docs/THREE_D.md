@@ -485,9 +485,38 @@ O(item_limit) scan** — then walk to locate it, then maybe split/merge. For a
 workload that moves *every* point *every* frame, that per-point lookup costs more
 than rebuilding flat. The trees' incremental `update` only pays off when movement
 is **sparse** (it touches few points; a rebuild still does all N) or with a
-**stable item handle** (O(1) access instead of the predicate scan — the "Stable
-`ItemRef`" roadmap item). Neither holds here, so Morton wins the build side
-outright.
+**stable item handle** (O(1) access instead of the predicate scan). Without it,
+Morton wins the build side outright.
+
+### The fix: Stable `ItemRef` (and it flips the result)
+
+`Tree3` gained `insert_ref` → [`ItemRef`], a **stable handle** that stays valid
+as the item moves between leaves (a parallel handle vector per leaf + a
+handle→location map, maintained through splits/merges; round-trips through
+`serialize`; churn-tested as `update_ref_churn_matches_brute`). `update_ref` /
+`remove_ref` then reach the item in **O(1)** — no locate walk, no predicate scan.
+Re-running the sweep with a fifth competitor, `binary-ref` (the binary tree
+maintained via `update_ref`):
+
+| metric | binary | octree | morton | projection | **binary-ref** |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **maintain** wins | 0 | 0 | 1 | 0 | **15** |
+| **cull** wins | 0 | 0 | 6 | 0 | 10 |
+
+**The handle path flips the maintain winner from Morton back to the binary tree
+in 15 of 16 configs** — and not marginally: per-frame relocate drops **~5–11×**
+(e.g. at world 512, pop 20k, item_limit 64, churn 55: binary `update` 2,166 µs
+→ `update_ref` 217 µs, a **10× speedup**, because the predicate scan was an
+O(item_limit)=O(64) cost per point). So the earlier conclusion stands corrected
+*again*: the trees' incremental `update` **is** the cheaper relocate — the
+predicate scan was hiding it. The single Morton maintain win left is a 1.07×
+near-tie. (`binary-ref`'s *cull* is the same tree as `binary`; its higher cull
+win-count is a cache-ordering artefact of being timed right after it, not a real
+structural edge.)
+
+The lesson: **for a relocate-heavy dynamic index, hold a stable handle.** The
+predicate `update`/`remove` stay for callers without one (sparse edits, ad-hoc
+lookups); the handle path is the one to reach for in a per-frame movement loop.
 
 The trees keep the **cull** crown in the dense/deep corner (binary + octree take
 5 of 16): a small, dense world with tight queries is where a tree's descent
@@ -522,10 +551,12 @@ the cull champion in the deep/dense corner.
   maintain (no per-item lookup) and usually cheapest cull. Caveats: one fixed
   resolution (loses to the octree on *stacked*/non-uniform density), and it
   re-buckets the whole set each frame.
-- **Binary `Tree3` — the robust default.** Cull champion in the deep/dense
-  corner, adapts to any density, no N³ memory, no fixed resolution. Its maintain
-  loss is an artefact of the predicate-scan `update`; with **sparse** movement or
-  a **stable item handle** it would lead the relocate race too.
+- **Binary `Tree3` — the robust default, *and* the maintain champion with a
+  handle.** Adapts to any density, no N³ memory, no fixed resolution. Its
+  predicate-`update` maintain loss was an artefact of the O(item_limit) leaf
+  scan: with the new **stable `ItemRef`** (`update_ref`, O(1)) it wins maintain
+  15/16 at ~5–11×, and stays competitive on cull. The all-round pick for a
+  relocate-heavy dynamic index — *if* you hold the handle.
 - **Octree3** — when the tree is *deep* (small/dense world, tight queries): the
   shallower descent wins the cull, at more nodes/memory.
 - **Projection** — a *2.5D* world (large in xy, thin in z) or an *expensive*
@@ -533,11 +564,11 @@ the cull champion in the deep/dense corner.
   this uniform-cube sphere sweep.
 
 ## Still open
-- **Stable `ItemRef`** — the decision map showed the trees lose the relocate
-  race because `update` finds the item by an O(item_limit) predicate scan. An
-  O(1) stable handle (index into the arena, kept valid across splits/merges)
-  would remove that scan and likely flip the maintain winner back to the trees —
-  the single highest-leverage follow-up the sweep surfaced.
+- ~~**Stable `ItemRef`**~~ — **done** (`Tree3::insert_ref`/`update_ref`/
+  `remove_ref`). The sweep predicted it and confirmed it: O(1) handle updates
+  flip the maintain winner from Morton back to the binary tree in 15/16 configs,
+  ~5–11× faster (see § "The fix: Stable ItemRef"). Follow-ups: port it to
+  `Octree3`, and wire the live `critters3d` demo's persistent tree to it.
 - **Non-analytic 3D shapes** in the *projection* comparison: the
   static bench used a sphere (analytic); the polyhedron crossover above
   lives in the voxel-raster bench. Running the projection methods against a
