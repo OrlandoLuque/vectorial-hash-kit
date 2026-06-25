@@ -54,10 +54,16 @@ visual glance the next morning; everything else is autonomously verifiable.
    the tree k-NN but over Z-order cells) + a **multi-level linear octree** layer
    (one hashed level per cell size) so Morton can answer big-radius culls without
    scanning every fine cell. Brute-force gated tests.
-4. **[review] Web demo responsive + hide-UI button** — 2D demo adapts to window
-   size; a button that hides everything except the demo and itself (toggle to
-   restore) for mobile. Build-verified here; the on-device mobile look needs the
-   user's morning review.
+4. ~~**[review] Web demo responsive + hide-UI button**~~ — **done (needs visual
+   review).** Pure `docs/` HTML/JS, no wasm rebuild. The 2D demo (fixed layout,
+   no `screen_width` use) is centred and **CSS scale-to-fit** (letterbox) so the
+   whole thing shows on any screen; mouse stays aligned (miniquad maps through
+   the transformed bounding rect, framebuffer size unchanged). The 3D demo
+   already lays out from `screen_width`, so it keeps filling the viewport. Both
+   pages gain a **⤢ toggle** that hides the chrome and enters fullscreen (tap
+   again to restore). **Morning check:** in-browser look on a phone, esp. that
+   the 2D panel sliders are still usable when scaled (touch-friendly 2D panel is
+   the deferred follow-up).
 
 **Newly added (round 2 — autonomously verifiable)**
 5. **Bulk-build parallel** (`from_positions_par`) — the natural follow-up to

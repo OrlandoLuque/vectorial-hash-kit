@@ -2,19 +2,54 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>2D critters — vectorial-hash-kit</title>
 <style>
   html,body { margin:0; padding:0; height:100%; overflow:hidden; background:#0a0c14; }
-  canvas { display:block; width:100vw; height:100vh; }
-  #back { position:fixed; top:10px; left:12px; z-index:10; color:#9fb0d8; font:14px system-ui;
-          text-decoration:none; background:#141a2ccc; padding:4px 11px; border-radius:8px; border:1px solid #2a3550; }
-  #back:hover { color:#fff; border-color:#4a6cff; }
+  /* The 2D demo renders at a fixed logical size (panel + map + graphs). We
+     centre the canvas and scale-to-fit (letterbox) so the whole thing is
+     visible on any screen, phones included. CSS `transform` does not change
+     clientWidth, so macroquad keeps rendering at the native framebuffer size;
+     only the displayed pixels scale, and miniquad maps the mouse through the
+     (transformed) bounding rect, so input stays aligned. */
+  #glcanvas { position:fixed; left:50%; top:50%; width:1398px; height:768px;
+              transform:translate(-50%,-50%); transform-origin:center center; }
+  #back, #hide { position:fixed; z-index:10; color:#9fb0d8; font:14px system-ui;
+          background:#141a2ccc; padding:6px 11px; border-radius:8px; border:1px solid #2a3550;
+          text-decoration:none; cursor:pointer; user-select:none; }
+  #back { top:10px; left:12px; }
+  #hide { top:10px; right:12px; font-size:16px; line-height:1; }
+  #back:hover, #hide:hover { color:#fff; border-color:#4a6cff; }
+  body.immersive #back { display:none; }
 </style>
 </head>
 <body>
 <a id="back" href="index.html">← demos</a>
+<button id="hide" title="Hide UI / fullscreen (toggle)">⤢</button>
 <canvas id="glcanvas" tabindex="1"></canvas>
+<script>
+  // Scale-to-fit the fixed-size 2D demo into the viewport.
+  const W = 1398, H = 768, cv = document.getElementById('glcanvas');
+  function fit() {
+    const s = Math.min(window.innerWidth / W, window.innerHeight / H);
+    cv.style.transform = `translate(-50%,-50%) scale(${s})`;
+  }
+  addEventListener('resize', fit); fit();
+
+  // Hide-everything-but-the-demo toggle (plus fullscreen) for mobile.
+  const hide = document.getElementById('hide');
+  hide.addEventListener('click', () => {
+    const on = document.body.classList.toggle('immersive');
+    hide.textContent = on ? '⤡' : '⤢';
+    try { on ? document.documentElement.requestFullscreen?.() : document.exitFullscreen?.(); } catch (e) {}
+    cv.focus();
+  });
+  document.addEventListener('fullscreenchange', () => {
+    if (!document.fullscreenElement && document.body.classList.contains('immersive')) {
+      document.body.classList.remove('immersive'); hide.textContent = '⤢';
+    }
+  });
+</script>
 <script src="mq_js_bundle.js"></script>
 <script>load("critters.wasm");</script>
 </body>
