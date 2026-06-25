@@ -175,6 +175,18 @@ fn region_color(id: u32) -> Color {
     Color::new(0.25 + 0.75 * r, 0.25 + 0.75 * g, 0.25 + 0.75 * b, 1.0)
 }
 
+/// A region colour keyed on the cell's **position + size**, not its node id.
+/// Node ids churn as leaves split/merge (the free-list reuses them), so colours
+/// keyed on the id flicker every frame on any cell that's restructuring. A cell
+/// at a given place keeps the same colour here, however the ids shuffle; a
+/// split's children differ from the parent because the size is in the key.
+fn region_color_at(x: f64, y: f64, w: f64) -> Color {
+    let key = (x.round() as i64 as u32).wrapping_mul(73_856_093)
+        ^ (y.round() as i64 as u32).wrapping_mul(19_349_663)
+        ^ (w.round() as i64 as u32).wrapping_mul(83_492_791);
+    region_color(key)
+}
+
 struct Series {
     data: Vec<f32>,
     cap: usize,
@@ -516,11 +528,11 @@ async fn main() {
         let mut items = 0usize;
 
         if let Some(t) = &sim.sims.tree {
-            t.visit_leaves(|id, leaf| {
+            t.visit_leaves(|_id, leaf| {
                 tree_leaves += 1;
                 items += leaf.items.len();
                 let b = leaf.bbox;
-                let c = region_color(id.0);
+                let c = region_color_at(b.x, b.y, b.width);
                 if region_mode == 0 {
                     draw_rectangle(
                         b.x as f32 * S,
@@ -544,14 +556,14 @@ async fn main() {
         }
         if let Some(q) = &sim.sims.quad {
             let quad_only = sim.sims.tree.is_none();
-            q.visit_leaves(|id, leaf| {
+            q.visit_leaves(|_id, leaf| {
                 quad_leaves += 1;
                 if quad_only {
                     items += leaf.items.len();
                 }
                 let b = leaf.bbox;
                 if quad_only {
-                    let c = region_color(id.0.wrapping_add(101));
+                    let c = region_color_at(b.x, b.y, b.width);
                     if region_mode == 0 {
                         draw_rectangle(
                             b.x as f32 * S,
@@ -586,11 +598,11 @@ async fn main() {
         if let Some(t) = &sim.sims.itree {
             // IntegerTree (IBinary mode): same region rendering as the binary
             // tree, but the leaf bbox is integer (`IRect` x/y/w/h).
-            t.visit_leaves(|id, leaf| {
+            t.visit_leaves(|_id, leaf| {
                 tree_leaves += 1;
                 items += leaf.items.len();
                 let b = leaf.bbox;
-                let c = region_color(id.0);
+                let c = region_color_at(b.x as f64, b.y as f64, b.w as f64);
                 if region_mode == 0 {
                     draw_rectangle(
                         b.x as f32 * S, b.y as f32 * S, b.w as f32 * S, b.h as f32 * S,
