@@ -406,6 +406,21 @@ impl<T: Positioned> QuadTree<T> {
         out
     }
 
+    /// Batch cull — see [`crate::Tree3::cull_many`].
+    pub fn cull_many<'a, S: Shape>(&'a self, shapes: &[S]) -> Vec<Vec<&'a T>> {
+        shapes.iter().map(|s| self.cull(s)).collect()
+    }
+
+    /// Parallel batch cull — see [`crate::Tree3::cull_many_par`].
+    #[cfg(feature = "parallel")]
+    pub fn cull_many_par<'a, S: Shape + Sync>(&'a self, shapes: &[S]) -> Vec<Vec<&'a T>>
+    where
+        T: Sync,
+    {
+        use rayon::prelude::*;
+        shapes.par_iter().map(|s| self.cull(s)).collect()
+    }
+
     fn cull_recurse<'a, S: Shape>(
         &'a self,
         id: QNodeId,

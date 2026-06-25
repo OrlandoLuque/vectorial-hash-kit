@@ -13,6 +13,10 @@ rust-version.workspace = true
 # Propagates to vectorial-hash so the LcaRopes update strategy is compiled in
 # (otherwise it silently degrades to Lca).
 neighbors = ["vectorial-hash/neighbors"]
+# Enables vectorial-hash's rayon-backed batch cull, used by the
+# `critters3d_headless --parallel` crossover benchmark. NOT for the wasm build
+# (rayon needs OS threads): only pass this for native bench runs.
+parallel = ["vectorial-hash/parallel"]
 
 [dependencies]
 vectorial-hash = { workspace = true }

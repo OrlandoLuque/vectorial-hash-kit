@@ -39,6 +39,7 @@ const SHORT: [&str; 5] = ["bin", "oct", "mor", "prj", "binR"];
 
 struct Args {
     sweep: bool,
+    parallel: bool,
     world: f64,
     pop: usize,
     item_limit: usize,
@@ -53,7 +54,7 @@ struct Args {
 
 fn parse_args() -> Args {
     let mut a = Args {
-        sweep: false, world: 512.0, pop: 20000, item_limit: 8, vision: 36.0, speed: 120.0,
+        sweep: false, parallel: false, world: 512.0, pop: 20000, item_limit: 8, vision: 36.0, speed: 120.0,
         n_cull: 16, frames: 120, warmup: 30, dt: 1.0 / 60.0, seed: 42,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -63,6 +64,7 @@ fn parse_args() -> Args {
         let val = || argv.get(i + 1).cloned().unwrap_or_else(|| panic!("missing value for {key}"));
         match key {
             "--sweep" => { a.sweep = true; i -= 1; }
+            "--parallel" => { a.parallel = true; i -= 1; }
             "--world" => a.world = val().parse().unwrap(),
             "--pop" => a.pop = val().parse().unwrap(),
             "--item-limit" => a.item_limit = val().parse().unwrap(),
@@ -258,6 +260,15 @@ fn winner(v: &[f64]) -> (usize, f64) {
 
 fn main() {
     let args = parse_args();
+    if args.parallel {
+        #[cfg(feature = "parallel")]
+        { run_parallel(&args); return; }
+        #[cfg(not(feature = "parallel"))]
+        {
+            eprintln!("--parallel needs the `parallel` feature. Re-run with:\n  cargo run -p vectorial-hash-demos --bin critters3d_headless --features parallel --release -- --parallel");
+            return;
+        }
+    }
     if args.sweep { run_sweep(&args); return; }
 
     let cfg = Cfg { world: args.world, pop: args.pop, item_limit: args.item_limit, vision: args.vision, speed: args.speed, n_cull: args.n_cull, frames: args.frames, warmup: args.warmup, dt: args.dt, seed: args.seed };
@@ -326,4 +337,59 @@ fn run_sweep(args: &Args) {
     println!("  maintain: bin {} | oct {} | mor {} | prj {} | binR {}", wins_m[0], wins_m[1], wins_m[2], wins_m[3], wins_m[4]);
     println!("  cull:     bin {} | oct {} | mor {} | prj {} | binR {}", wins_c[0], wins_c[1], wins_c[2], wins_c[3], wins_c[4]);
     println!("\nagreement across all structures, every config: {}", if all_agree { "EXACT" } else { "DISAGREEMENT <-- BUG" });
+}
+
+/// Parallel batch-cull crossover (`--parallel`, feature `parallel`). For a grid
+/// of index size × query count, time serial `cull_many` against rayon-backed
+/// `cull_many_par` on the *same* immutable `Tree3`, and print the speedup so the
+/// crossover (where forking onto threads starts to pay) is visible. This is the
+/// combat phase in isolation: many independent culls over one shared index —
+/// the part of the per-frame work that genuinely parallelises (the relocation
+/// pass mutates the tree and stays serial; the lever there is `ItemRef`).
+#[cfg(feature = "parallel")]
+fn run_parallel(args: &Args) {
+    let world = Aabb::new(0.0, 0.0, 0.0, args.world, args.world, args.world);
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    println!("parallel batch-cull crossover | rayon over {threads} hardware threads | world={}³ | vision r={} | item_limit={} | seed={}",
+        args.world, args.vision, args.item_limit, args.seed);
+    println!("(serial = cull_many, par = cull_many_par; speedup = serial/par, averaged over reps. verdict at ±10%.)\n");
+    println!("{:>9} {:>8} | {:>12} {:>12} {:>8} | {}", "pop", "queries", "serial ms", "par ms", "speedup", "verdict");
+
+    let pops = [2_000usize, 20_000, 100_000];
+    let qs = [4usize, 16, 64, 256, 1024];
+    let reps = 40usize;
+    for &pop in &pops {
+        let mut rng = Rng::new(args.seed);
+        let mut tree = Tree3::<C3>::new(world, args.item_limit);
+        for id in 0..pop {
+            let p = Point3::new(
+                rng.range(MARGIN, args.world - MARGIN),
+                rng.range(MARGIN, args.world - MARGIN),
+                rng.range(MARGIN, args.world - MARGIN),
+            );
+            tree.insert(C3 { id: id as u32, p });
+        }
+        for &q in &qs {
+            let shapes: Vec<Sphere3> = (0..q)
+                .map(|_| Sphere3::new(rng.range(0.0, args.world), rng.range(0.0, args.world), rng.range(0.0, args.world), args.vision))
+                .collect();
+            // Warm both paths (page-in, thread-pool spin-up) before timing.
+            let mut bh = tree.cull_many(&shapes).iter().map(|v| v.len()).sum::<usize>();
+            bh = bh.wrapping_add(tree.cull_many_par(&shapes).iter().map(|v| v.len()).sum::<usize>());
+
+            let t = Instant::now();
+            for _ in 0..reps { bh = bh.wrapping_add(tree.cull_many(&shapes).iter().map(|v| v.len()).sum::<usize>()); }
+            let serial_ms = t.elapsed().as_secs_f64() * 1e3 / reps as f64;
+
+            let t = Instant::now();
+            for _ in 0..reps { bh = bh.wrapping_add(tree.cull_many_par(&shapes).iter().map(|v| v.len()).sum::<usize>()); }
+            let par_ms = t.elapsed().as_secs_f64() * 1e3 / reps as f64;
+
+            if bh == usize::MAX { println!("unreachable"); }
+            let speedup = serial_ms / par_ms.max(1e-9);
+            let verdict = if speedup >= 1.1 { "parallel wins" } else if speedup <= 0.9 { "serial wins (fork cost)" } else { "tie" };
+            println!("{:>9} {:>8} | {:>12.4} {:>12.4} {:>8.2} | {}", pop, q, serial_ms, par_ms, speedup, verdict);
+        }
+        println!();
+    }
 }

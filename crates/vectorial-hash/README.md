@@ -37,6 +37,7 @@ Leaf items can additionally be answered by a 1×1 raster (`Shape::point_template
 | Feature | Effect |
 | --- | --- |
 | `neighbors` | Per-leaf stored neighbour lists ("ropes", `Side`-indexed), rewired on every split/merge, plus `Tree::neighbors_ropes` and `WalkNeighbors::Ropes`. Off by default — none of the bookkeeping exists in the compiled code without it. The zero-storage neighbour finders (`neighbors_samet`, `neighbors_probe`) are always available. |
+| `parallel` | rayon-backed batch cull `cull_many_par` on every structure (the serial `cull_many` is always available). Reads fan out over a thread pool; writes stay serial. Off by default — rayon is not in the dependency tree (nor the wasm build) without it. Measured crossover for when threads pay vs. lose: `docs/PARALLEL.md`. |
 
 ## Example
 

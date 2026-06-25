@@ -16,6 +16,12 @@ readme = "README.md"
 # accessor used by the flood-fill cull. Off by default: when disabled, the
 # bookkeeping does not exist in the compiled code at all.
 neighbors = []
+# rayon-backed batch query helpers (`*::cull_many_par`). Off by default: the
+# serial `cull_many` is always available and rayon stays out of the dependency
+# tree entirely unless this is enabled.
+parallel = ["dep:rayon"]
 
 [dependencies]
 # Keep this crate dependency-light on purpose: it is the core algorithm.
+# rayon is the sole optional dependency, gated behind the `parallel` feature.
+rayon = { workspace = true, optional = true }

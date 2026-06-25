@@ -18,12 +18,13 @@ reprioritise, or drop freely. Items graduate into the per-crate roadmaps
 Worked in this order: autonomously-verifiable first, web polish last (its
 mobile look needs a morning visual review). Commit + push per task.
 
-1. **rayon / multithreading** — parallelise per-frame index maintenance
-   (`update_many` / batch `cull`) with rayon behind a `parallel` feature, and
-   **establish the crossover**: under what N / workload it pays vs. thread
-   overhead, and where to *avoid* it (small N). The stress test showed the live
-   demo is CPU-bound on the single-threaded `update`, so this is the headline
-   lever. Headless-benchmarkable; quantify and document.
+1. ~~**rayon / multithreading**~~ — **done.** `parallel` feature → rayon-backed
+   `cull_many_par` on all five structures (serial `cull_many` always available).
+   Finding: *reads fan out, writes don't* — batch culls parallelise cleanly
+   (the relocation pass mutates and stays serial; its lever is `ItemRef`).
+   Measured crossover in `critters3d_headless --parallel`: ≤4 queries never pays
+   (fork ~15–30 µs), 16 pays at ≥20k points, 64+ pays always (up to ~8× at 1024
+   queries / 100k points). Full table + guidance in `docs/PARALLEL.md`.
 2. **Morton extras** — `MortonGrid3::knn` (ring-by-ring expanding shell, like
    the tree k-NN but over Z-order cells) + a **multi-level linear octree** layer
    (one hashed level per cell size) so Morton can answer big-radius culls without

@@ -653,6 +653,29 @@ impl<T: Positioned3> Tree3<T> {
         out
     }
 
+    /// Cull many independent shapes in one call, returning one hit-list per
+    /// shape (`out[i]` is the cull for `shapes[i]`). Always available and
+    /// serial; see [`Tree3::cull_many_par`] for the rayon-backed version. This
+    /// is the batch shape of a per-attacker combat sweep: each attacker culls
+    /// its own attack volume against the shared, immutable index.
+    pub fn cull_many<'a, S: Shape3>(&'a self, shapes: &[S]) -> Vec<Vec<&'a T>> {
+        shapes.iter().map(|s| self.cull(s)).collect()
+    }
+
+    /// Parallel [`Tree3::cull_many`]: the independent, read-only queries run on
+    /// rayon's thread pool. Worth it only when many queries hit a large index
+    /// (see `docs/PARALLEL.md` for the measured crossover); for a handful of
+    /// queries the serial version wins (no fork/join overhead). The index is
+    /// shared `&self` — culls never mutate, so there is no contention.
+    #[cfg(feature = "parallel")]
+    pub fn cull_many_par<'a, S: Shape3 + Sync>(&'a self, shapes: &[S]) -> Vec<Vec<&'a T>>
+    where
+        T: Sync,
+    {
+        use rayon::prelude::*;
+        shapes.par_iter().map(|s| self.cull(s)).collect()
+    }
+
     fn cull_recurse<'a, S: Shape3>(
         &'a self, id: Node3Id, shape: &S, fully_inside: bool, out: &mut Vec<&'a T>,
     ) {
@@ -910,6 +933,32 @@ mod tests {
             assert_eq!(want, got, "cull != brute for sphere ({cx},{cy},{cz}) r={r}");
         }
         let _ = brute(&pts, &Sphere3::new(0.0,0.0,0.0,10.0));
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn cull_many_par_matches_serial() {
+        // The parallel batch cull must return exactly what the serial batch
+        // does, query for query — it is the same `cull` fanned over rayon.
+        let mut x = 0x0BAD_F00Du64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x >> 11) as f64 / (1u64 << 53) as f64 };
+        let pts: Vec<P> = (0..5000)
+            .map(|_| P(Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0)))
+            .collect();
+        let mut tree = Tree3::<P>::new(Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0), 8);
+        for p in &pts { tree.insert(*p); }
+        let shapes: Vec<Sphere3> = (0..200)
+            .map(|_| Sphere3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0, 8.0 + rng() * 40.0).with_raster())
+            .collect();
+        let serial = tree.cull_many(&shapes);
+        let par = tree.cull_many_par(&shapes);
+        assert_eq!(serial.len(), par.len());
+        for (i, (s, p)) in serial.iter().zip(par.iter()).enumerate() {
+            let mut a: Vec<(u64,u64,u64)> = s.iter().map(|p| (p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits())).collect();
+            let mut b: Vec<(u64,u64,u64)> = p.iter().map(|p| (p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits())).collect();
+            a.sort(); b.sort();
+            assert_eq!(a, b, "parallel batch cull disagrees with serial at query {i}");
+        }
     }
 
     #[test]
