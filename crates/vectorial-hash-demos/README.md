@@ -137,41 +137,45 @@ workload Morton wins maintain (flat re-bucket beats the trees' predicate-scan
 `update`), the trees win cull in the deep/dense corner — see `docs/THREE_D.md`
 § "Synthesis".
 
-## Build & run
+## Try the demos
 
-All from the workspace root. `--release` matters for the visual demos (they
-push a lot of geometry per frame).
+Three ways, easiest first:
 
-**2D critters** — predators/prey on a 1024×1024 map, live tuning panel:
+### 1. In your browser (nothing to install) — *coming soon*
+
+A WebAssembly build of the 2D and 3D critters, hosted on GitHub Pages, so you
+can play with no install. (Being set up — it needs a small wasm timing port.)
+
+### 2. Download a prebuilt program (no Rust needed)
+
+Grab a ready-to-run file from the
+[**Releases**](https://github.com/OrlandoLuque/vectorial-hash-kit/releases)
+page (Windows `.exe`), download it, and double-click. No build step.
+
+### 3. Build from source (any OS)
+
+You need **Rust**. If you don't have it, install it in one step from
+**https://rustup.rs** (it gives you the `cargo` command used below). Then:
 
 ```bash
-cargo run -p vectorial-hash-demos --bin critters --release
+# 1. get the code
+git clone https://github.com/OrlandoLuque/vectorial-hash-kit.git
+cd vectorial-hash-kit
+
+# 2. run a demo (the first build downloads dependencies + compiles — a few minutes)
+cargo run -p vectorial-hash-demos --bin critters   --release   # 2D
+cargo run -p vectorial-hash-demos --bin critters3d --release   # 3D
 ```
 
-**3D critters** — the cube world, observe/combat, instanced rendering, panel +
-graphs:
+`--release` matters for the visual demos (they push a lot of geometry per
+frame). `cargo` fetches every dependency and builds everything for you; there's
+nothing else to install.
+
+**Other binaries** (same pattern, swap the `--bin` name):
 
 ```bash
-cargo run -p vectorial-hash-demos --bin critters3d --release
-```
-
-**Console demos** (1 + 2, no window):
-
-```bash
-cargo run -p vectorial-hash-demos
-```
-
-**Headless benches** (statistics, no window):
-
-```bash
-cargo run -p vectorial-hash-demos --bin critters_headless --release
-cargo run -p vectorial-hash-demos --bin critters3d_headless --release -- \
-    --pop 20000 --item-limit 64 --frames 240 --vision 100 --seed 42
-```
-
-Build everything without running:
-
-```bash
-cargo build -p vectorial-hash-demos --release        # all binaries
-cargo build -p vectorial-hash-demos --bin critters3d # just one
+cargo run  -p vectorial-hash-demos                                   # console demos 1 + 2 (no window)
+cargo run  -p vectorial-hash-demos --bin critters_headless   --release   # 2D stats (no window)
+cargo run  -p vectorial-hash-demos --bin critters3d_headless --release -- --sweep   # 3D decision map
+cargo build -p vectorial-hash-demos --release                        # just compile everything
 ```
