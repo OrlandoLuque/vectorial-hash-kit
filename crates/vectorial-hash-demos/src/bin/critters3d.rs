@@ -317,7 +317,7 @@ impl Panel {
     /// `[-] label: value bar [+]` — `step` snaps to multiples, drag the bar to
     /// set, **right-click to type the value** (`id` identifies this slider; the
     /// main loop captures the keystrokes into `edit_buf` and applies on Enter).
-    fn slider(&mut self, label: &str, min: f32, max: f32, step: f32, val: &mut f32, id: u8, editing: &mut Option<u8>, edit_buf: &mut String, icon: Option<Color>, help: &'static str) {
+    fn slider(&mut self, label: &str, min: f32, max: f32, step: f32, val: &mut f32, id: u8, editing: &mut Option<u8>, edit_buf: &mut String, drag: &mut Option<u8>, icon: Option<Color>, help: &'static str) {
         let (ry, rh, bw) = (self.cur, self.row - 5.0, 22.0);
         let (mx0, px0) = (self.x + 6.0, self.x + self.w - 6.0 - bw);
         let bx = mx0 + bw + 4.0;
@@ -343,7 +343,11 @@ impl Panel {
         } else {
             if hov_m && self.pressed { *val = (((*val / step).ceil() - 1.0) * step).max(min); }
             if hov_p && self.pressed { *val = (((*val / step).floor() + 1.0) * step).min(max); }
-            if hov_b && self.down { *val = (min + ((self.mx - bx) / bar_w) * (max - min)).clamp(min, max); }
+            // A press on the bar captures the drag for THIS slider; while held,
+            // only the captured slider follows the mouse — so dragging off onto
+            // a neighbouring slider no longer hijacks it.
+            if hov_b && self.pressed { *drag = Some(id); }
+            if *drag == Some(id) && self.down { *val = (min + ((self.mx - bx) / bar_w) * (max - min)).clamp(min, max); }
             if hov_b && self.rpressed { *editing = Some(id); *edit_buf = format!("{:.0}", *val); } // start keyboard edit
             let frac = ((*val - min) / (max - min)).clamp(0.0, 1.0);
             draw_rectangle(bx, ry, bar_w * frac, rh, Color::new(0.28, 0.5, 0.7, 0.9));
@@ -354,7 +358,7 @@ impl Panel {
     }
     /// Like `slider`, but the value steps through a discrete list (e.g. powers
     /// of 2) — `[-]`/`[+]` move one entry, the bar snaps to the nearest.
-    fn stepper(&mut self, label: &str, values: &[f32], cur: &mut f32, help: &'static str) {
+    fn stepper(&mut self, label: &str, values: &[f32], cur: &mut f32, id: u8, drag: &mut Option<u8>, help: &'static str) {
         let (ry, rh, bw) = (self.cur, self.row - 5.0, 22.0);
         let (mx0, px0) = (self.x + 6.0, self.x + self.w - 6.0 - bw);
         let bx = mx0 + bw + 4.0;
@@ -374,7 +378,8 @@ impl Panel {
         Self::cell(px0, ry, bw, rh, hov_p, "+", 7.0);
         if hov_m && self.pressed && idx > 0 { idx -= 1; }
         if hov_p && self.pressed && idx + 1 < values.len() { idx += 1; }
-        if hov_b && self.down {
+        if hov_b && self.pressed { *drag = Some(id); }
+        if *drag == Some(id) && self.down {
             let frac = ((self.mx - bx) / bar_w).clamp(0.0, 1.0);
             idx = (frac * (values.len() - 1) as f32).round() as usize;
         }
@@ -729,6 +734,9 @@ async fn main() {
     // Keyboard editing of a slider value: which slider (0=pop, 1=radius) + buffer.
     let mut editing: Option<u8> = None;
     let mut edit_buf = String::new();
+    // Which slider/stepper currently owns the mouse drag (so dragging off one
+    // onto another doesn't hijack the second). Cleared when the button is up.
+    let mut slider_drag: Option<u8> = None;
 
     // Stress-sweep accumulators (after a short warmup): mean real fps + CPU ms
     // over the run, printed at exit when CRITTERS3D_MAX_FRAMES is set.
@@ -1412,6 +1420,8 @@ async fn main() {
         hud(screen_height() - 18.0, "drag/zoom | +/-: pop | [ ]: radius | T R O V M G C B | Space: play/pause | <- ->: step (hold to scrub) | K: rec | Esc".to_string());
 
         // --- on-screen mouse controls (top-right panel; keys still work too) ---
+        // Drag capture ends when the button is released.
+        if !is_mouse_button_down(MouseButton::Left) { slider_drag = None; }
         let mut panel = Panel::new(ui_x, ui_y, UI_W, mp_now.0, mp_now.1,
             is_mouse_button_pressed(MouseButton::Left), is_mouse_button_down(MouseButton::Left),
             is_mouse_button_pressed(MouseButton::Right));
@@ -1435,19 +1445,19 @@ async fn main() {
         if panel.button(&format!("cull reps: {} [C]", cull_reps),
             "Repeat the timed cull N times for a stable\nper-cull microsecond reading (one cull is\ntoo fast to time on its own).") { cull_rep_idx = (cull_rep_idx + 1) % cull_rep_steps.len(); }
         panel.separator();
-        panel.slider("Drifter", 0.0, pop_cap, 100.0, &mut pop_kind[0], 0, &mut editing, &mut edit_buf, Some(kind_color(0, false)),
+        panel.slider("Drifter", 0.0, pop_cap, 100.0, &mut pop_kind[0], 0, &mut editing, &mut edit_buf, &mut slider_drag, Some(kind_color(0, false)),
             "How many Drifters (random-direction drop).\n-/+, drag, or right-click to type.");
-        panel.slider("Hunter", 0.0, pop_cap, 100.0, &mut pop_kind[1], 1, &mut editing, &mut edit_buf, Some(kind_color(1, false)),
+        panel.slider("Hunter", 0.0, pop_cap, 100.0, &mut pop_kind[1], 1, &mut editing, &mut edit_buf, &mut slider_drag, Some(kind_color(1, false)),
             "How many Hunters (chase + aimed drop).");
-        panel.slider("Pulsar", 0.0, pop_cap, 100.0, &mut pop_kind[2], 2, &mut editing, &mut edit_buf, Some(kind_color(2, false)),
+        panel.slider("Pulsar", 0.0, pop_cap, 100.0, &mut pop_kind[2], 2, &mut editing, &mut edit_buf, &mut slider_drag, Some(kind_color(2, false)),
             "How many Pulsars (spin + sphere blast).");
         match sim_mode {
-            SimMode::Observe => panel.slider("vision r", 6.0, world, 5.0, &mut vision_r, 3, &mut editing, &mut edit_buf, None,
+            SimMode::Observe => panel.slider("vision r", 6.0, world, 5.0, &mut vision_r, 3, &mut editing, &mut edit_buf, &mut slider_drag, None,
                 "Radius of the centre vision sphere.\nRight-click to type a number."),
-            SimMode::Combat => panel.slider("attack r", 4.0, world * 0.5, 5.0, &mut attack_r, 3, &mut editing, &mut edit_buf, None,
+            SimMode::Combat => panel.slider("attack r", 4.0, world * 0.5, 5.0, &mut attack_r, 3, &mut editing, &mut edit_buf, &mut slider_drag, None,
                 "Base size of the attacks.\nRight-click to type a number."),
         }
-        panel.stepper("world size", &SIZE_STEPS, &mut world,
+        panel.stepper("world size", &SIZE_STEPS, &mut world, 4, &mut slider_drag,
             "Side of the cube the action lives in.\nStepped powers of 2 -- changing it rebuilds\nthe index and re-bounds the critters.");
         panel.separator();
         // Media-player controls: REC | step back | play/pause | step forward.
