@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 
 use crate::template::CellState;
-use crate::tree3::{Aabb, Point3, Positioned3, Shape3};
+use crate::tree3::{knn_offer, knn_worst, Aabb, KnnEntry, Point3, Positioned3, Shape3};
 
 /// Interleave the low 21 bits of `n` with two zero bits between each
 /// (`abc` → `a..b..c`), so three of these OR'd together (shifted 0/1/2) pack
@@ -214,6 +214,71 @@ impl<T: Positioned3> MortonGrid3<T> {
         shapes.iter().map(|s| self.cull(s)).collect()
     }
 
+    /// The `k` nearest items to `q`, sorted ascending by distance — the grid
+    /// analogue of [`crate::Tree3::knn`]. Where the tree descends nearest-child
+    /// first, the grid expands **ring by ring**: it scans the query's own cell,
+    /// then the surrounding Chebyshev shell (radius 1), then radius 2, … keeping
+    /// a bounded max-heap of the k best. It stops once the whole *unscanned*
+    /// region is provably farther than the current k-th nearest — i.e. when the
+    /// distance from `q` to the nearest face of the already-scanned cell cube
+    /// exceeds the k-th best distance (an exact lower bound, so no false stop).
+    /// Fewer than `k` items → all of them; `k == 0` → empty.
+    pub fn knn(&self, q: Point3, k: usize) -> Vec<(f64, &T)> {
+        if k == 0 || self.len == 0 { return Vec::new(); }
+        let (cx, cy, cz) = self.cell_of(q);
+        let (cx, cy, cz) = (cx as i64, cy as i64, cz as i64);
+        let n = self.cells_per_axis as i64;
+        let mut heap: std::collections::BinaryHeap<KnnEntry<T>> = std::collections::BinaryHeap::new();
+
+        let mut r = 0i64;
+        loop {
+            {
+                // Offer every point in the Chebyshev shell at radius `r`.
+                let cells = &self.cells;
+                let mut visit = |ix: i64, iy: i64, iz: i64| {
+                    if ix < 0 || iy < 0 || iz < 0 || ix >= n || iy >= n || iz >= n { return; }
+                    if let Some(bucket) = cells.get(&morton3(ix as u32, iy as u32, iz as u32)) {
+                        for it in bucket { knn_offer(&mut heap, k, it, q); }
+                    }
+                };
+                if r == 0 {
+                    visit(cx, cy, cz);
+                } else {
+                    for dx in -r..=r {
+                        for dy in -r..=r {
+                            if dx.abs() == r || dy.abs() == r {
+                                for dz in -r..=r { visit(cx + dx, cy + dy, cz + dz); }
+                            } else {
+                                // interior of the dx/dy face → only the two z caps lie on the shell.
+                                visit(cx + dx, cy + dy, cz - r);
+                                visit(cx + dx, cy + dy, cz + r);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Everything with all three cell-coords in [c-r, c+r] is now scanned.
+            // The nearest unscanned point is at least `safe` away: the distance
+            // from `q` to the nearest face of that scanned world-space box.
+            let xlo = self.world.x + (cx - r) as f64 * self.cw;
+            let xhi = self.world.x + (cx + r + 1) as f64 * self.cw;
+            let ylo = self.world.y + (cy - r) as f64 * self.ch;
+            let yhi = self.world.y + (cy + r + 1) as f64 * self.ch;
+            let zlo = self.world.z + (cz - r) as f64 * self.cd;
+            let zhi = self.world.z + (cz + r + 1) as f64 * self.cd;
+            let safe = (q.x - xlo).min(xhi - q.x).min(q.y - ylo).min(yhi - q.y).min(q.z - zlo).min(zhi - q.z);
+            if heap.len() >= k && safe > 0.0 && safe * safe >= knn_worst(&heap, k) { break; }
+
+            r += 1;
+            if r > n { break; } // whole grid covered
+        }
+
+        let mut v: Vec<(f64, &T)> = heap.into_iter().map(|e| (e.d2.sqrt(), e.item)).collect();
+        v.sort_by(|a, b| a.0.total_cmp(&b.0));
+        v
+    }
+
     /// Parallel batch cull — see [`crate::Tree3::cull_many_par`].
     #[cfg(feature = "parallel")]
     pub fn cull_many_par<'a, S: Shape3 + Sync>(&'a self, shapes: &[S]) -> Vec<Vec<&'a T>>
@@ -272,6 +337,34 @@ mod tests {
                     .map(|p| (p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits())).collect();
                 want.sort(); got.sort();
                 assert_eq!(want, got, "morton cull != brute (levels={levels}) for sphere ({cx},{cy},{cz}) r={r}");
+            }
+        }
+    }
+
+    #[test]
+    fn morton_knn_matches_brute() {
+        // k-NN over the grid must return the same k smallest distances as brute
+        // force. Compare distances (not item identity) so exact ties don't
+        // spuriously fail. Sweep resolutions, query points, and k.
+        let mut x = 0x51ED_270Bu64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        let pts: Vec<P> = (0..3000).map(|_| P(Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0))).collect();
+        let world = Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0);
+        for levels in [3u32, 5, 6] {
+            let mut grid = MortonGrid3::<P>::new(world, levels);
+            for p in &pts { grid.insert(*p); }
+            for (qx, qy, qz) in [(128.0, 128.0, 128.0), (10.0, 250.0, 40.0), (0.0, 0.0, 0.0), (255.0, 255.0, 255.0)] {
+                let q = Point3::new(qx, qy, qz);
+                for k in [1usize, 8, 32] {
+                    let mut brute: Vec<f64> = pts.iter().map(|p| { let d = (p.0.x - qx, p.0.y - qy, p.0.z - qz); (d.0 * d.0 + d.1 * d.1 + d.2 * d.2).sqrt() }).collect();
+                    brute.sort_by(|a, b| a.total_cmp(b));
+                    brute.truncate(k);
+                    let got: Vec<f64> = grid.knn(q, k).into_iter().map(|(d, _)| d).collect();
+                    assert_eq!(got.len(), brute.len(), "knn count (levels={levels}, k={k})");
+                    for (a, b) in got.iter().zip(brute.iter()) {
+                        assert!((a - b).abs() < 1e-9, "knn dist != brute (levels={levels}, k={k}): {a} vs {b}");
+                    }
+                }
             }
         }
     }
