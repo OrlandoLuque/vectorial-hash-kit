@@ -13,11 +13,12 @@ reprioritise, or drop freely. Items graduate into the per-crate roadmaps
 4. ~~World-size 2D stepper~~ — done (visual scaling review → see active queue).
 5. ~~Instancing stress test~~ — done.
 
-## Overnight queue — set 2026-06-25 (round 2, all four selected)
+## Overnight queue — set 2026-06-25 (expanded round 2)
 
-Worked in this order: autonomously-verifiable first, web polish last (its
-mobile look needs a morning visual review). Commit + push per task.
+Worked top-down. Commit + push per task. Items marked **[review]** need a human
+visual glance the next morning; everything else is autonomously verifiable.
 
+**Done**
 1. ~~**rayon / multithreading**~~ — **done.** `parallel` feature → rayon-backed
    `cull_many_par` on all five structures (serial `cull_many` always available).
    Finding: *reads fan out, writes don't* — batch culls parallelise cleanly
@@ -25,24 +26,79 @@ mobile look needs a morning visual review). Commit + push per task.
    Measured crossover in `critters3d_headless --parallel`: ≤4 queries never pays
    (fork ~15–30 µs), 16 pays at ≥20k points, 64+ pays always (up to ~8× at 1024
    queries / 100k points). Full table + guidance in `docs/PARALLEL.md`.
-2. **Morton extras** — `MortonGrid3::knn` (ring-by-ring expanding shell, like
+
+**Priority block (user bumped regression baseline to the front, 2026-06-25)**
+2. **Criterion benches + CI + regression baseline** — a `benches/` Criterion
+   suite (cull, update, update_ref, knn across the five structures) + a GitHub
+   Actions workflow (fmt + clippy + test on push). Then a **committed baseline**
+   + a comparison script so a perf regression is visible/fails (wide threshold —
+   CI runners are noisy; the gate may run locally and CI track-only). The
+   baseline is the headline ask.
+
+**Original remaining**
+3. **Morton extras** — `MortonGrid3::knn` (ring-by-ring expanding shell, like
    the tree k-NN but over Z-order cells) + a **multi-level linear octree** layer
    (one hashed level per cell size) so Morton can answer big-radius culls without
    scanning every fine cell. Brute-force gated tests.
-3. **Criterion benches + CI** — a `benches/` Criterion suite (cull, update,
-   update_ref, knn across the five structures) + a GitHub Actions workflow
-   (fmt + clippy + test on push). Establishes regression tracking.
-4. **Web demo responsive + hide-UI button** — 2D demo adapts to window size;
-   a button that hides everything except the demo and itself (toggle to restore)
-   for mobile. Build-verified here; **the on-device mobile look needs the user's
-   morning review.**
+4. **[review] Web demo responsive + hide-UI button** — 2D demo adapts to window
+   size; a button that hides everything except the demo and itself (toggle to
+   restore) for mobile. Build-verified here; the on-device mobile look needs the
+   user's morning review.
 
-### Deferred (not in the overnight queue)
-- **2D demo panel: figure-size slider + 3D-style sliders** — give the 2D
-  `critters` panel a slider for the **attack figure size** (rebuild the arsenal
-  via `build_arsenal_scaled`, ~0.45 s, so step on release not on drag), and port
-  the 3D demo's custom `Panel` into a shared `src/panel.rs`. *(Lower priority;
-  the user didn't select it for this round.)*
+**Newly added (round 2 — autonomously verifiable)**
+5. **Bulk-build parallel** (`from_positions_par`) — the natural follow-up to
+   rayon: parallel sort-then-link bulk load for static datasets + parallel Morton
+   code computation (then serial group). Already flagged in `docs/PARALLEL.md`.
+6. **k-NN parity** — `knn` exists on `Tree3`/`Octree3`; add it to `Tree`,
+   `QuadTree`, `IntegerTree`, and `MortonGrid3` (the latter ring-by-ring, shared
+   with item 3). Brute-force gated.
+7. **Ray-cast / segment query** — visit cells/leaves along a ray (line-of-sight,
+   picking). *The user has their own approach (to be shared tomorrow); implement
+   a reasonable one now and **compare designs** the next day.*
+8. **Frustum as a first-class `Shape3`** — a camera frustum shape so the cull is
+   not only spheres (the demo's vision cull could use it).
+9. **`clear()` retaining capacity** — Morton/projection rebuild a fresh structure
+   every frame and reallocate; a `clear()` that keeps the arena/buckets avoids
+   the per-frame alloc churn.
+10. **Property / fuzz tests** (proptest) — randomized insert/update/remove/cull
+    vs brute force with shrinking, across all structures. Stronger than the
+    hand-rolled churn tests.
+11. **Serialization for all structures** — only `Tree3` has versioned serialize;
+    extend to `Tree`/`QuadTree`/`IntegerTree`/`Octree3`/`MortonGrid3`.
+12. **SoA leaf storage + SIMD narrowphase** — store leaf positions contiguously
+    for cache-friendly `contains_point` sweeps; explore SIMD on the sphere/point
+    test. Measure vs current AoS.
+13. **"Choosing a structure" flowchart** in the README — distil the decision map
+    into a one-glance guide. *(User: "interesante, sí.")*
+
+**Newly added (round 2 — [review] / design)**
+14. **[review] 2D k-NN / line-of-sight demo** — visualise nearest-neighbour and
+    LoS in the 2D critters demo.
+15. **[review] Web touch controls + stats HUD** — orbit/zoom by touch on the 3D
+    web demo; an FPS/stats overlay in the browser.
+16. **CHANGELOG.md** + semver discipline.
+
+### Deferred — explicitly held back
+- **Publish to crates.io** — *deferred until the crate is more complete* (user,
+  2026-06-25). The crate is already publishable; cut a 0.1.0 when ready.
+- **Threading vs no-threading tutorial/guide** — document how a library user
+  opts into the demo's optimisations (it's mostly good defaults + a few opt-in
+  API choices, not manual threading). *Deferred to "when we stop adding so many
+  new things" (user, 2026-06-25).* Source material: the chat answer + `THREE_D.md`.
+- **2D demo panel: figure-size slider + 3D-style sliders** — figure-size slider
+  (rebuild arsenal via `build_arsenal_scaled`, step on release) + port the 3D
+  `Panel` into a shared `src/panel.rs`. *(Lower priority; not selected.)*
+
+### Templates — needs a rethink (design, not yet built)
+- **Next-size-up fallback** — when no template exists for a cell size, take the
+  next size up with special handling. *(See memory `project_template_application_design`.)*
+- **Template-not-found diagnostics / debug mode** — report which cases fell
+  through to the per-item point test (coverage gaps), and **bound the cell-size
+  range** where the next-size-up fallback fires (the largest cells need not have
+  templates). User flagged "other interesting things" here too — wants to give
+  the whole template-coverage story a repensada. *(2026-06-25.)*
+- **3D / voxel template bank** — extend the 2D template machinery to voxel
+  rasters.
 
 Everything else in this file is **future** — left to triage later.
 
