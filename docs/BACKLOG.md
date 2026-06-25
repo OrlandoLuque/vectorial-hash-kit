@@ -13,23 +13,35 @@ reprioritise, or drop freely. Items graduate into the per-crate roadmaps
 4. ~~World-size 2D stepper~~ — done (visual scaling review → see active queue).
 5. ~~Instancing stress test~~ — done.
 
-## Active queue (next)
+## Overnight queue — set 2026-06-25 (round 2, all four selected)
 
-1. **2D demo panel: figure-size slider + 3D-style sliders** — give the 2D
-   `critters` panel a slider for the **attack figure size** (rebuild the arsenal
-   via `build_arsenal_scaled`, ~0.45 s, so step on release not on drag), and
-   port the 3D demo's custom `Panel` (sliders with `[-]`/`[+]` and right-click
-   keyboard entry) to replace the basic `root_ui` sliders. Best done by
-   extracting the 3D `Panel` into a shared `src/panel.rs` so both demos use it.
-   *(Requested after the world-size stepper made fixed-world-unit figures look
-   huge in small worlds / tiny in large ones — the slider lets the user
-   compensate.)*
-2. **Multi-query cull + multithreading (rayon)** — the next-batch experiment:
-   parallelise the per-frame index maintenance (`update_many`) and/or batch
-   culls with rayon, and **establish under what workload / N it pays vs. the
-   thread overhead** (the stress test showed the live demo is CPU-bound on the
-   single-threaded `update`, so this is the headline lever). Quantify the
-   crossover and where to *avoid* rayon (small N). See Index/algorithms below.
+Worked in this order: autonomously-verifiable first, web polish last (its
+mobile look needs a morning visual review). Commit + push per task.
+
+1. **rayon / multithreading** — parallelise per-frame index maintenance
+   (`update_many` / batch `cull`) with rayon behind a `parallel` feature, and
+   **establish the crossover**: under what N / workload it pays vs. thread
+   overhead, and where to *avoid* it (small N). The stress test showed the live
+   demo is CPU-bound on the single-threaded `update`, so this is the headline
+   lever. Headless-benchmarkable; quantify and document.
+2. **Morton extras** — `MortonGrid3::knn` (ring-by-ring expanding shell, like
+   the tree k-NN but over Z-order cells) + a **multi-level linear octree** layer
+   (one hashed level per cell size) so Morton can answer big-radius culls without
+   scanning every fine cell. Brute-force gated tests.
+3. **Criterion benches + CI** — a `benches/` Criterion suite (cull, update,
+   update_ref, knn across the five structures) + a GitHub Actions workflow
+   (fmt + clippy + test on push). Establishes regression tracking.
+4. **Web demo responsive + hide-UI button** — 2D demo adapts to window size;
+   a button that hides everything except the demo and itself (toggle to restore)
+   for mobile. Build-verified here; **the on-device mobile look needs the user's
+   morning review.**
+
+### Deferred (not in the overnight queue)
+- **2D demo panel: figure-size slider + 3D-style sliders** — give the 2D
+  `critters` panel a slider for the **attack figure size** (rebuild the arsenal
+  via `build_arsenal_scaled`, ~0.45 s, so step on release not on drag), and port
+  the 3D demo's custom `Panel` into a shared `src/panel.rs`. *(Lower priority;
+  the user didn't select it for this round.)*
 
 Everything else in this file is **future** — left to triage later.
 
