@@ -551,6 +551,121 @@ fn aabb_box(b: &Aabb) -> (Vec3, Vec3) {
     )
 }
 
+fn pt3(c: &Critter) -> Point3 { Point3::new(c.pos.x as f64, c.pos.y as f64, c.pos.z as f64) }
+
+/// The single **active** index — the structure the `M` toggle selects now
+/// resolves *everything* (observe vision, combat attacks, persistence), and the
+/// others don't exist. Rebuilt on a structure / world / population change;
+/// otherwise relocated in place each frame: the binary tree via the **stable
+/// `ItemRef`** (O(1), no predicate scan), the octree via `update`, the
+/// pointer-free Morton grid and the 2D-projection tree by a flat rebuild (their
+/// "update" is a re-bucket). All exact.
+enum Index {
+    Binary { tree: Tree3<C3>, refs: Vec<vectorial_hash::ItemRef> },
+    Octree { tree: Octree3<C3>, pos: Vec<Point3> },
+    Morton { grid: MortonGrid3<C3> },
+    Projection { tree: Tree<P2> },
+}
+
+impl Index {
+    fn build(s: Structure, world: f32, cell: f32, critters: &[Critter]) -> Index {
+        let wa = world_aabb(world);
+        match s {
+            Structure::Binary3 => {
+                let mut tree = Tree3::<C3>::new(wa, ITEM_LIMIT);
+                let refs = critters.iter().enumerate()
+                    .map(|(i, c)| tree.insert_ref(C3 { id: i as u32, p: pt3(c) }).unwrap())
+                    .collect();
+                Index::Binary { tree, refs }
+            }
+            Structure::Octree => {
+                let mut tree = Octree3::<C3>::new(wa, ITEM_LIMIT);
+                let pos = critters.iter().enumerate()
+                    .map(|(i, c)| { let p = pt3(c); tree.insert(C3 { id: i as u32, p }); p })
+                    .collect();
+                Index::Octree { tree, pos }
+            }
+            Structure::Morton => {
+                let levels = MortonGrid3::<C3>::levels_for_cell_size(wa, (cell as f64).max(4.0));
+                let mut grid = MortonGrid3::<C3>::new(wa, levels);
+                for (i, c) in critters.iter().enumerate() { grid.insert(C3 { id: i as u32, p: pt3(c) }); }
+                Index::Morton { grid }
+            }
+            Structure::Projection => {
+                let mut tree = Tree::<P2>::new(Rect::new(0.0, 0.0, world as f64, world as f64), ITEM_LIMIT);
+                for (i, c) in critters.iter().enumerate() {
+                    tree.insert(P2 { id: i as u32, p: Point::new(c.pos.x as f64, c.pos.y as f64), z: c.pos.z as f64 });
+                }
+                Index::Projection { tree }
+            }
+        }
+    }
+
+    fn structure(&self) -> Structure {
+        match self {
+            Index::Binary { .. } => Structure::Binary3,
+            Index::Octree { .. } => Structure::Octree,
+            Index::Morton { .. } => Structure::Morton,
+            Index::Projection { .. } => Structure::Projection,
+        }
+    }
+
+    /// Relocate every critter in place (persistence). Binary/octree update;
+    /// Morton/projection re-bucket (a fresh build — their cheap "update").
+    fn sync(&mut self, world: f32, cell: f32, critters: &[Critter]) {
+        match self {
+            Index::Binary { tree, refs } => {
+                for (i, c) in critters.iter().enumerate() { let np = pt3(c); tree.update_ref(refs[i], |x| x.p = np); }
+            }
+            Index::Octree { tree, pos } => {
+                for (i, c) in critters.iter().enumerate() { let np = pt3(c); let id = i as u32; tree.update(pos[i], |x| x.id == id, |x| x.p = np); pos[i] = np; }
+            }
+            Index::Morton { .. } => *self = Index::build(Structure::Morton, world, cell, critters),
+            Index::Projection { .. } => *self = Index::build(Structure::Projection, world, cell, critters),
+        }
+    }
+
+    /// Cull any 3D query shape → the hit ids. The projection variant turns the
+    /// shape's xy-shadow into a disc broadphase, then exact-filters in 3D.
+    fn cull<S: Shape3>(&self, shape: &S) -> Vec<u32> {
+        match self {
+            Index::Binary { tree, .. } => tree.cull(shape).iter().map(|c| c.id).collect(),
+            Index::Octree { tree, .. } => tree.cull(shape).iter().map(|c| c.id).collect(),
+            Index::Morton { grid } => grid.cull(shape).iter().map(|c| c.id).collect(),
+            Index::Projection { tree } => {
+                let bb = shape.bounding_box();
+                let (cx, cy) = (bb.x + bb.w * 0.5, bb.y + bb.h * 0.5);
+                let r = (bb.w * bb.w + bb.h * bb.h).sqrt() * 0.5; // disc covering the xy bbox
+                tree.cull(&Disc { cx, cy, r }).iter()
+                    .filter(|p2| shape.contains_point(Point3::new(p2.p.x, p2.p.y, p2.z)))
+                    .map(|p2| p2.id).collect()
+            }
+        }
+    }
+
+    fn visit_boxes(&self, world: f32, boxes: &mut Vec<(Vec3, Vec3)>) {
+        match self {
+            Index::Binary { tree, .. } => tree.visit_leaves(|l| boxes.push(aabb_box(&l.bbox))),
+            Index::Octree { tree, .. } => tree.visit_leaves(|l| boxes.push(aabb_box(&l.bbox))),
+            Index::Morton { grid } => grid.visit_cells(|b, _| boxes.push(aabb_box(b))),
+            Index::Projection { tree } => tree.visit_leaves(|_, l| {
+                let b = l.bbox;
+                let c = vec3((b.x + b.width * 0.5) as f32, (b.y + b.height * 0.5) as f32, world * 0.5);
+                boxes.push((c, vec3(b.width as f32, b.height as f32, world)));
+            }),
+        }
+    }
+
+    fn stat(&self) -> String {
+        match self {
+            Index::Binary { tree, .. } => format!("Tree3 (binary, ItemRef): {:>6} leaves, {:>6} arena", tree.leaf_count(), tree.node_count()),
+            Index::Octree { tree, .. } => format!("Octree3 (8-way, update): {:>6} leaves, {:>6} arena", tree.leaf_count(), tree.node_count()),
+            Index::Morton { grid } => format!("MortonGrid3 (Z-order, rebuilt): {:>6} cells, {:.2} items/cell", grid.cell_count(), grid.item_count() as f64 / grid.cell_count().max(1) as f64),
+            Index::Projection { tree } => format!("projection (2D xy + z-reject): {:>6} leaves, {:>6} arena", tree.leaf_count(), tree.node_count()),
+        }
+    }
+}
+
 fn kind_color(k: u8, lit: bool) -> Color {
     // The observe "seen" highlight is white (not yellow) so it doesn't clash
     // with the GOLD Pulsars. Kind colours match the 2D demo.
@@ -630,30 +745,8 @@ async fn main() {
         critters.push(spawn(&mut rng, (i % 3) as u8, world));
     }
 
-    // Persistent binary-3D index. Instead of rebuilding it every frame, we
-    // keep it across frames and `update` each critter's position in place
-    // (ascend-to-LCA) — most critters stay in their leaf, so this is far
-    // cheaper than a full rebuild. `tree_pos[i]` is where critter i currently
-    // sits in the tree (the `old` position `update` needs to find it).
-    let pt3 = |c: &Critter| Point3::new(c.pos.x as f64, c.pos.y as f64, c.pos.z as f64);
-    let mut tree = Tree3::<C3>::new(world_aabb(world), ITEM_LIMIT);
-    let mut tree_pos: Vec<Point3> = Vec::with_capacity(critters.len());
-    for (i, c) in critters.iter().enumerate() {
-        let p = pt3(c);
-        tree.insert(C3 { id: i as u32, p });
-        tree_pos.push(p);
-    }
-
-    // Persistent octree, kept only while the `M` toggle is on Octree (the
-    // dynamic-octree-vs-Tree3 comparison). Built lazily on entry, then each
-    // critter is moved in place with `update` (ascend-to-LCA) like the binary
-    // tree — so the HUD shows the octree's *update* cost, not a full rebuild.
-    // Dropped when the mode is left (rebuilds fresh on re-entry); rebuilt when
-    // the population or world changes. `octree_pos` mirrors `tree_pos`.
-    let mut octree: Option<Octree3<C3>> = None;
-    let mut octree_pos: Vec<Point3> = Vec::new();
-    let mut octree_pop: usize = 0;
-    let mut octree_world: f32 = world;
+    // The single active index is built below, after the structure/vision/mode
+    // state it depends on (see `index`/`idx_world`/`idx_pop`).
 
     // Camera orbit state.
     let mut yaw: f32 = 0.7;
@@ -683,6 +776,16 @@ async fn main() {
     // kinds to these counts.
     let mut pop_kind: [f32; 3] = { let n = (critters.len() / 3) as f32; [n, n, n] };
     let mut attack_r: f32 = 22.0;
+
+    // The single ACTIVE index: the structure `M` selects resolves everything
+    // (observe vision, combat attacks, persistence). Rebuilt when the structure,
+    // world size, or population changes; relocated in place otherwise. The
+    // binary tree uses the stable `ItemRef` (O(1) update_ref).
+    let idx_cell = |sim_mode: SimMode, vision_r: f32, attack_r: f32| if sim_mode == SimMode::Combat { attack_r } else { vision_r };
+    let mut index = Index::build(structure, world, idx_cell(sim_mode, vision_r, attack_r), &critters);
+    let mut idx_world = world;
+    let mut idx_pop = critters.len();
+
     let mut attacks: Vec<Attack> = Vec::new();
     let mut bursts: Vec<(Vec3, f32)> = Vec::new(); // kill markers (pos, age)
     let mut kills: u64 = 0;
@@ -858,19 +961,14 @@ async fn main() {
         ];
         let total: usize = want.iter().sum();
         if advance {
+            // Spawn/remove only touch `critters`; the index rebuilds below when
+            // it notices the count changed (so reconcile is structure-agnostic).
             while critters.len() < total {
                 let id = critters.len() as u32;
-                let c = spawn(&mut rng, (id % 3) as u8, world);
-                let p = pt3(&c);
-                tree.insert(C3 { id, p });
-                tree_pos.push(p);
-                critters.push(c);
+                critters.push(spawn(&mut rng, (id % 3) as u8, world));
             }
             while critters.len() > total {
                 critters.pop();
-                let i = critters.len();
-                tree.remove(tree_pos[i], |c| c.id == i as u32);
-                tree_pos.pop();
             }
             let mut have = [0usize; 3];
             for c in &critters { have[c.kind as usize] += 1; }
@@ -901,8 +999,8 @@ async fn main() {
                     let p = critters[i].pos;
                     let s = Sphere3::new(p.x as f64, p.y as f64, p.z as f64, hunter_vision as f64);
                     let mut best_d2 = f32::INFINITY;
-                    for h in tree.cull(&s) {
-                        let j = h.id as usize;
+                    for jid in index.cull(&s) {
+                        let j = jid as usize;
                         if j == i { continue; }
                         let d2 = (critters[j].pos - p).length_squared();
                         if d2 < best_d2 { best_d2 = d2; targets[i] = Some(critters[j].pos); }
@@ -965,8 +1063,8 @@ async fn main() {
                 for i in 0..critters.len() {
                     let p = critters[i].pos;
                     let s = Sphere3::new(p.x as f64, p.y as f64, p.z as f64, SEP_R as f64);
-                    for h in tree.cull(&s) {
-                        let j = h.id as usize;
+                    for jid in index.cull(&s) {
+                        let j = jid as usize;
                         if j == i { continue; }
                         let d = p - critters[j].pos;
                         let dist = d.length();
@@ -992,18 +1090,19 @@ async fn main() {
         }
         sim_us = t_sim.elapsed().as_secs_f64() * 1e6;
 
-        // Sync the persistent index to the critters' new positions (move each
-        // in place via ascend-to-LCA). This replaces the per-frame full
-        // rebuild — `sync_us` is what the Binary3 / combat paths report as
-        // "build". Combat respawns (which jump a critter) are picked up by the
-        // next frame's sync.
+        // Maintain the active index. Rebuild it when the structure / world /
+        // population changed (so the chosen structure resolves everything);
+        // otherwise relocate every critter in place (binary via O(1) ItemRef,
+        // octree via update, Morton/projection re-bucket). `sync_us` is what the
+        // HUD reports as "build".
+        let cell = idx_cell(sim_mode, vision_r, attack_r);
         let t_sync = Instant::now();
-        if advance {
-            for i in 0..critters.len() {
-                let np = pt3(&critters[i]);
-                tree.update(tree_pos[i], |c| c.id == i as u32, |c| c.p = np);
-                tree_pos[i] = np;
-            }
+        if index.structure() != structure || (idx_world - world).abs() > 0.5 || idx_pop != critters.len() {
+            index = Index::build(structure, world, cell, &critters);
+            idx_world = world;
+            idx_pop = critters.len();
+        } else if advance {
+            index.sync(world, cell, &critters);
         }
         let sync_us = t_sync.elapsed().as_secs_f64() * 1e6;
 
@@ -1011,11 +1110,11 @@ async fn main() {
         let observer = vec3(world * 0.5, world * 0.5, world * 0.5);
         let (ox, oy, oz, r) = (observer.x as f64, observer.y as f64, observer.z as f64, vision_r as f64);
         let cull_reps = cull_rep_steps[cull_rep_idx];
-        // Optional self-check: the persistent tree's vision cull must match a
-        // brute-force scan (catches any update/insert/remove bookkeeping bug).
+        // Optional self-check: the active index's vision cull must equal a
+        // brute-force scan (catches any update/rebuild bookkeeping bug).
         if std::env::var("CRITTERS3D_VERIFY").is_ok() {
             let s = Sphere3::new(ox, oy, oz, r);
-            let mut got: Vec<u32> = tree.cull(&s).iter().map(|c| c.id).collect();
+            let mut got = index.cull(&s);
             let mut want: Vec<u32> = (0..critters.len() as u32).filter(|&i| {
                 let c = &critters[i as usize];
                 let (dx, dy, dz) = (c.pos.x as f64 - ox, c.pos.y as f64 - oy, c.pos.z as f64 - oz);
@@ -1024,183 +1123,31 @@ async fn main() {
             got.sort_unstable();
             want.sort_unstable();
             if got != want {
-                eprintln!("VERIFY mismatch frame {frame}: tree {} vs brute {} (pop {})", got.len(), want.len(), critters.len());
+                eprintln!("VERIFY mismatch frame {frame}: {} {} vs brute {} (pop {})", structure.label(), got.len(), want.len(), critters.len());
             }
         }
         let mut lit = vec![false; critters.len()];
         let mut boxes: Vec<(Vec3, Vec3)> = Vec::new();
         let stat_line: String;
-        let cand_n: Option<usize>; // broadphase candidates (projection only)
-        let r2 = r * r;
-        // Build time, and the cull averaged over `cull_reps` (a single sphere
-        // cull is microseconds — repeating it gives a stable, readable number
-        // that isolates the structure from the render cost).
+        let cand_n: Option<usize>; // (unused now; kept for the HUD line)
         let t_build_us: f64;
         let t_cull_us: f64;
         let mut frame_attacks = 0usize; // combat: predators that attacked this frame
 
-        // Drop the persistent octree whenever we're not actively in
-        // Observe+Octree, so re-entering the mode rebuilds it fresh (it would
-        // otherwise hold stale positions from when the mode was last left).
-        if !(sim_mode == SimMode::Observe && structure == Structure::Octree) {
-            octree = None;
-        }
-
         if sim_mode == SimMode::Observe {
-        match structure {
-            Structure::Binary3 => {
-                // Persistent tree, already synced above — just cull it.
-                t_build_us = sync_us;
-                let tc = Instant::now();
-                for rep in 0..cull_reps {
-                    let sphere = Sphere3::new(ox + rep as f64 * 0.01, oy, oz, r);
-                    let hits = tree.cull(&sphere);
-                    if rep == 0 { for c in hits { lit[c.id as usize] = true; } }
-                }
-                t_cull_us = tc.elapsed().as_secs_f64() * 1e6 / cull_reps as f64;
-                if rec || show_boxes { tree.visit_leaves(|l| boxes.push(aabb_box(&l.bbox))); }
-                cand_n = None;
-                stat_line = format!("Tree3 persistent/update: {:>6} leaves, {:>6} arena (item_limit {})", tree.leaf_count(), tree.node_count(), ITEM_LIMIT);
+            // The active index (whatever structure M selected) resolves the
+            // vision cull. Maintenance cost was paid above as `sync_us`.
+            t_build_us = sync_us;
+            let tc = Instant::now();
+            for rep in 0..cull_reps {
+                let sphere = Sphere3::new(ox + rep as f64 * 0.01, oy, oz, r);
+                let hits = index.cull(&sphere);
+                if rep == 0 { for id in hits { lit[id as usize] = true; } }
             }
-            Structure::Octree => {
-                // Persistent octree with dynamic relocation (ascend-to-LCA),
-                // mirroring the binary Tree3 path: built once on entry, then
-                // each critter moved in place via `update`. Rebuilt only when
-                // the population or world changes (rare, user-driven), so the
-                // steady-state cost reported is the *update* cost — the dynamic
-                // octree the backlog asked to measure against Tree3.
-                let stale = match &octree {
-                    None => true,
-                    Some(_) => octree_pop != critters.len() || (octree_world - world).abs() > 0.5,
-                };
-                if stale {
-                    let tb = Instant::now();
-                    let mut t = Octree3::<C3>::new(world_aabb(world), ITEM_LIMIT);
-                    octree_pos.clear();
-                    for (i, c) in critters.iter().enumerate() {
-                        let p = pt3(c);
-                        t.insert(C3 { id: i as u32, p });
-                        octree_pos.push(p);
-                    }
-                    t_build_us = tb.elapsed().as_secs_f64() * 1e6;
-                    octree = Some(t);
-                    octree_pop = critters.len();
-                    octree_world = world;
-                } else {
-                    // Move each critter in place (only when the sim advanced),
-                    // exactly like the binary tree's per-frame sync.
-                    let ts = Instant::now();
-                    if advance {
-                        let t = octree.as_mut().unwrap();
-                        for i in 0..critters.len() {
-                            let np = pt3(&critters[i]);
-                            t.update(octree_pos[i], |c| c.id == i as u32, |c| c.p = np);
-                            octree_pos[i] = np;
-                        }
-                    }
-                    t_build_us = ts.elapsed().as_secs_f64() * 1e6;
-                }
-                let t = octree.as_ref().unwrap();
-                let tc = Instant::now();
-                for rep in 0..cull_reps {
-                    let sphere = Sphere3::new(ox + rep as f64 * 0.01, oy, oz, r);
-                    let hits = t.cull(&sphere);
-                    if rep == 0 { for c in hits { lit[c.id as usize] = true; } }
-                }
-                t_cull_us = tc.elapsed().as_secs_f64() * 1e6 / cull_reps as f64;
-                // Self-check the dynamic octree's cull against brute force (the
-                // top-level VERIFY only covers the binary tree, synced earlier).
-                if std::env::var("CRITTERS3D_VERIFY").is_ok() {
-                    let s = Sphere3::new(ox, oy, oz, r);
-                    let mut got: Vec<u32> = t.cull(&s).iter().map(|c| c.id).collect();
-                    let mut want: Vec<u32> = (0..critters.len() as u32).filter(|&i| {
-                        let c = &critters[i as usize];
-                        let (dx, dy, dz) = (c.pos.x as f64 - ox, c.pos.y as f64 - oy, c.pos.z as f64 - oz);
-                        dx * dx + dy * dy + dz * dz <= r2
-                    }).collect();
-                    got.sort_unstable(); want.sort_unstable();
-                    if got != want {
-                        eprintln!("VERIFY octree mismatch frame {frame}: octree {} vs brute {} (pop {})", got.len(), want.len(), critters.len());
-                    }
-                }
-                if rec || show_boxes { t.visit_leaves(|l| boxes.push(aabb_box(&l.bbox))); }
-                cand_n = None;
-                stat_line = format!("Octree3 persistent/update: {:>6} leaves, {:>6} arena (item_limit {})", t.leaf_count(), t.node_count(), ITEM_LIMIT);
-            }
-            Structure::Morton => {
-                // Pointer-free Morton / Z-order grid. No `update`, so it's
-                // rebuilt from scratch every frame — cheap, and the grid's whole
-                // selling point (bucket-and-go, no rebalancing). Cell sized to
-                // the vision radius (the query scale) so a cull touches few cells.
-                let tb = Instant::now();
-                let levels = MortonGrid3::<C3>::levels_for_cell_size(world_aabb(world), (vision_r as f64).max(4.0));
-                let mut g = MortonGrid3::<C3>::new(world_aabb(world), levels);
-                for (i, c) in critters.iter().enumerate() {
-                    g.insert(C3 { id: i as u32, p: pt3(c) });
-                }
-                t_build_us = tb.elapsed().as_secs_f64() * 1e6;
-                let tc = Instant::now();
-                for rep in 0..cull_reps {
-                    let sphere = Sphere3::new(ox + rep as f64 * 0.01, oy, oz, r);
-                    let hits = g.cull(&sphere);
-                    if rep == 0 { for c in hits { lit[c.id as usize] = true; } }
-                }
-                t_cull_us = tc.elapsed().as_secs_f64() * 1e6 / cull_reps as f64;
-                if std::env::var("CRITTERS3D_VERIFY").is_ok() {
-                    let s = Sphere3::new(ox, oy, oz, r);
-                    let mut got: Vec<u32> = g.cull(&s).iter().map(|c| c.id).collect();
-                    let mut want: Vec<u32> = (0..critters.len() as u32).filter(|&i| {
-                        let c = &critters[i as usize];
-                        let (dx, dy, dz) = (c.pos.x as f64 - ox, c.pos.y as f64 - oy, c.pos.z as f64 - oz);
-                        dx * dx + dy * dy + dz * dz <= r2
-                    }).collect();
-                    got.sort_unstable(); want.sort_unstable();
-                    if got != want {
-                        eprintln!("VERIFY morton mismatch frame {frame}: morton {} vs brute {} (pop {})", got.len(), want.len(), critters.len());
-                    }
-                }
-                // Boxes: the occupied grid cells (the grid analogue of leaves).
-                if rec || show_boxes { g.visit_cells(|b, _| boxes.push(aabb_box(b))); }
-                cand_n = None;
-                stat_line = format!("MortonGrid3 (Z-order, rebuilt): {:>6} cells, {} levels, {:.2} items/cell",
-                    g.cell_count(), levels, g.item_count() as f64 / g.cell_count().max(1) as f64);
-            }
-            Structure::Projection => {
-                // Author's variant: index the xy projection in a 2D Tree, cull
-                // the sphere's shadow (a disc), then z-reject + exact 3D test.
-                let tb = Instant::now();
-                let mut t = Tree::<P2>::new(Rect::new(0.0, 0.0, world as f64, world as f64), ITEM_LIMIT);
-                for (i, c) in critters.iter().enumerate() {
-                    t.insert(P2 { id: i as u32, p: Point::new(c.pos.x as f64, c.pos.y as f64), z: c.pos.z as f64 });
-                }
-                t_build_us = tb.elapsed().as_secs_f64() * 1e6;
-                // The query is broadphase (disc cull) + narrowphase (z-reject +
-                // exact 3D) — time the whole thing, that's the variant's cost.
-                let tc = Instant::now();
-                let mut nc = 0;
-                for rep in 0..cull_reps {
-                    let disc = Disc { cx: ox + rep as f64 * 0.01, cy: oy, r };
-                    let cand = t.cull(&disc);
-                    if rep == 0 { nc = cand.len(); }
-                    for p2 in &cand {
-                        let (dx, dy, dz) = (p2.p.x - ox, p2.p.y - oy, p2.z - oz);
-                        let inside = dx * dx + dy * dy + dz * dz <= r2;
-                        if rep == 0 && inside { lit[p2.id as usize] = true; }
-                    }
-                }
-                t_cull_us = tc.elapsed().as_secs_f64() * 1e6 / cull_reps as f64;
-                // boxes: the 2D leaf rects, extruded through the full z depth.
-                if rec || show_boxes {
-                    t.visit_leaves(|_, l| {
-                        let b = l.bbox;
-                        let c = vec3((b.x + b.width * 0.5) as f32, (b.y + b.height * 0.5) as f32, world * 0.5);
-                        boxes.push((c, vec3(b.width as f32, b.height as f32, world)));
-                    });
-                }
-                cand_n = Some(nc);
-                stat_line = format!("{}: {:>6} leaves, {:>6} arena (item_limit {})", structure.label(), t.leaf_count(), t.node_count(), ITEM_LIMIT);
-            }
-        }
+            t_cull_us = tc.elapsed().as_secs_f64() * 1e6 / cull_reps as f64;
+            if rec || show_boxes { index.visit_boxes(world, &mut boxes); }
+            cand_n = None;
+            stat_line = index.stat();
         } else {
             // === COMBAT: predators (kind 1) attack nearby prey; each attack is
             // an index cull against the persistent tree (synced above), so this
@@ -1223,7 +1170,7 @@ async fn main() {
                         2 => {
                             // Pulsar: omnidirectional sphere blast (the 2D circle).
                             let s = Sphere3::new(cx, cy, cz, attack_r as f64);
-                            (AttackKind::Sphere, Vec3::ZERO, tree.cull(&s).iter().map(|h| h.id as usize).collect())
+                            (AttackKind::Sphere, Vec3::ZERO, index.cull(&s).into_iter().map(|id| id as usize).collect())
                         }
                         _ => {
                             // Hunter (1): flamer drop along its heading — it has
@@ -1250,7 +1197,7 @@ async fn main() {
                                 length: length as f64,
                                 max_r: maxr as f64,
                             };
-                            (AttackKind::Drop, dir, tree.cull(&s).iter().map(|h| h.id as usize).collect())
+                            (AttackKind::Drop, dir, index.cull(&s).into_iter().map(|id| id as usize).collect())
                         }
                     };
                     cull_us += tc.elapsed().as_secs_f64() * 1e6;
@@ -1277,8 +1224,8 @@ async fn main() {
                 last_wave_us = t_wave.elapsed().as_secs_f64() * 1e6;
             }
             t_cull_us = if frame_attacks > 0 { cull_us / frame_attacks as f64 } else { 0.0 };
-            // record/show the persistent tree's leaf cells (combat uses Tree3)
-            if rec || show_boxes { tree.visit_leaves(|l| boxes.push(aabb_box(&l.bbox))); }
+            // record/show the active index's cells (combat uses the same index)
+            if rec || show_boxes { index.visit_boxes(world, &mut boxes); }
             cand_n = None;
             let drifters = critters.iter().filter(|c| c.kind == 0).count();
             let hunters = critters.iter().filter(|c| c.kind == 1).count();
@@ -1496,19 +1443,12 @@ async fn main() {
         draw_graph(ui_x, gy, UI_W, gh, "cull us", &g_cull, Color::new(0.4, 0.82, 1.0, 1.0));
         for k in 0..3 { pop_kind[k] = pop_kind[k].round().clamp(0.0, pop_cap); }
 
-        // World resized (stepper): re-bound the critters and rebuild the index
-        // with the new cube. Rare and user-driven, so a full rebuild is fine.
+        // World resized (stepper): re-bound the critters into the new cube. The
+        // index notices `idx_world != world` next frame and rebuilds itself.
         if (world - prev_world).abs() > 0.5 {
             dist = (dist * world / prev_world).clamp(world * 0.6, world * 6.0);
             for c in critters.iter_mut() {
                 for axis in 0..3 { c.pos[axis] = c.pos[axis].clamp(MARGIN, world - MARGIN); }
-            }
-            tree = Tree3::<C3>::new(world_aabb(world), ITEM_LIMIT);
-            tree_pos.clear();
-            for (i, c) in critters.iter().enumerate() {
-                let p = pt3(c);
-                tree.insert(C3 { id: i as u32, p });
-                tree_pos.push(p);
             }
             prev_world = world;
         }
