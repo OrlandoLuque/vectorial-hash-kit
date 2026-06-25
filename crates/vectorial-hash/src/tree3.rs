@@ -393,6 +393,20 @@ impl<T: Positioned3> Tree3<T> {
         }
     }
 
+    /// Empty the tree, **retaining allocated capacity** — the node arena, the
+    /// handle table and the free lists are reset, not freed. Cheaper than
+    /// dropping and rebuilding when you refill the index every frame (e.g. a
+    /// per-frame projection rebuild). All existing [`ItemRef`]s are invalidated.
+    pub fn clear(&mut self) {
+        let bbox = self.get(self.root).bbox;
+        self.nodes.clear();
+        self.nodes.push(Node3 { bbox, parent: None, children: None, items: Vec::new(), hs: Vec::new() });
+        self.free.clear();
+        self.locs.clear();
+        self.free_handles.clear();
+        self.root = Node3Id(0);
+    }
+
     #[inline] pub fn get(&self, id: Node3Id) -> &Node3<T> { &self.nodes[id.0 as usize] }
     #[inline] fn get_mut(&mut self, id: Node3Id) -> &mut Node3<T> { &mut self.nodes[id.0 as usize] }
     fn alloc(&mut self, n: Node3<T>) -> Node3Id {
@@ -959,6 +973,24 @@ mod tests {
             a.sort(); b.sort();
             assert_eq!(a, b, "parallel batch cull disagrees with serial at query {i}");
         }
+    }
+
+    #[test]
+    fn clear_empties_and_refills() {
+        let world = Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0);
+        let mut t = Tree3::<P>::new(world, 4);
+        for i in 0..500u32 { t.insert(P(Point3::new((i % 16) as f64 * 15.0, (i / 16 % 16) as f64 * 15.0, 10.0))); }
+        assert!(t.item_count() > 0 && t.leaf_count() > 1, "tree should have split");
+        t.clear();
+        assert_eq!(t.item_count(), 0);
+        assert_eq!(t.leaf_count(), 1, "clear leaves a single root leaf");
+        assert!(t.cull(&Sphere3::new(128.0, 128.0, 128.0, 1000.0)).is_empty());
+        // Refilling after clear works (and reuses handles from 0).
+        let r0 = t.insert_ref(P(Point3::new(50.0, 50.0, 50.0))).unwrap();
+        assert_eq!(r0.0, 0);
+        for i in 0..300u32 { t.insert(P(Point3::new((i % 10) as f64 * 20.0, 20.0, 20.0))); }
+        assert_eq!(t.item_count(), 301);
+        assert!(!t.cull(&Sphere3::new(50.0, 50.0, 50.0, 5.0)).is_empty());
     }
 
     #[test]

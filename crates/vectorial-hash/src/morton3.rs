@@ -154,6 +154,15 @@ impl<T: Positioned3> MortonGrid3<T> {
         true
     }
 
+    /// Empty the grid, **retaining the hash-map capacity** — the table is
+    /// cleared, not freed. This is the cheap path for the rebuild-every-frame
+    /// pattern Morton is built for: `grid.clear()` then re-`insert` avoids
+    /// reallocating the bucket table each frame.
+    pub fn clear(&mut self) {
+        self.cells.clear();
+        self.len = 0;
+    }
+
     pub fn item_count(&self) -> usize { self.len }
     pub fn cell_count(&self) -> usize { self.cells.len() }
     pub fn levels(&self) -> u32 { self.levels }
@@ -339,6 +348,20 @@ mod tests {
                 assert_eq!(want, got, "morton cull != brute (levels={levels}) for sphere ({cx},{cy},{cz}) r={r}");
             }
         }
+    }
+
+    #[test]
+    fn clear_empties_and_refills() {
+        let world = Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0);
+        let mut g = MortonGrid3::<P>::new(world, 5);
+        for i in 0..400u32 { g.insert(P(Point3::new((i % 20) as f64 * 12.0, 10.0, 10.0))); }
+        assert!(g.item_count() > 0 && g.cell_count() > 0);
+        g.clear();
+        assert_eq!(g.item_count(), 0);
+        assert_eq!(g.cell_count(), 0);
+        for _ in 0..100 { g.insert(P(Point3::new(50.0, 50.0, 50.0))); }
+        assert_eq!(g.item_count(), 100);
+        assert_eq!(g.cull(&Sphere3::new(50.0, 50.0, 50.0, 5.0)).len(), 100);
     }
 
     #[test]

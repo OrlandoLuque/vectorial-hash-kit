@@ -56,6 +56,17 @@ impl<T: Positioned3> Octree3<T> {
         }
     }
 
+    /// Empty the octree, retaining capacity — see [`crate::Tree3::clear`].
+    pub fn clear(&mut self) {
+        let bbox = self.get(self.root).bbox;
+        self.nodes.clear();
+        self.nodes.push(ONode { bbox, parent: None, children: None, items: Vec::new(), hs: Vec::new() });
+        self.free.clear();
+        self.locs.clear();
+        self.free_handles.clear();
+        self.root = ONodeId(0);
+    }
+
     #[inline] pub fn get(&self, id: ONodeId) -> &ONode<T> { &self.nodes[id.0 as usize] }
     #[inline] fn get_mut(&mut self, id: ONodeId) -> &mut ONode<T> { &mut self.nodes[id.0 as usize] }
     fn alloc(&mut self, n: ONode<T>) -> ONodeId {

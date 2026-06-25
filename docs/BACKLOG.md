@@ -77,9 +77,10 @@ visual glance the next morning; everything else is autonomously verifiable.
    a reasonable one now and **compare designs** the next day.*
 8. **Frustum as a first-class `Shape3`** — a camera frustum shape so the cull is
    not only spheres (the demo's vision cull could use it).
-9. **`clear()` retaining capacity** — Morton/projection rebuild a fresh structure
-   every frame and reallocate; a `clear()` that keeps the arena/buckets avoids
-   the per-frame alloc churn.
+9. ~~**`clear()` retaining capacity**~~ — **done.** `clear()` on all five trees
+   + `MortonGrid3`: resets to an empty root leaf / clears the bucket table while
+   keeping the arena/hash-map capacity (the cheap path for per-frame rebuilds).
+   Invalidates outstanding `ItemRef`s. Tested on Tree3 + MortonGrid3.
 10. **Property / fuzz tests** (proptest) — randomized insert/update/remove/cull
     vs brute force with shrinking, across all structures. Stronger than the
     hand-rolled churn tests.

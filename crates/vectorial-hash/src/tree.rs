@@ -226,6 +226,17 @@ impl<T: Positioned> Tree<T> {
         self.insert_ref(item).is_some()
     }
 
+    /// Empty the tree, retaining capacity — see [`crate::Tree3::clear`].
+    pub fn clear(&mut self) {
+        let bbox = self.get(self.root).bbox;
+        self.nodes.clear();
+        self.nodes.push(Node::new_leaf(bbox, None));
+        self.free.clear();
+        self.locs.clear();
+        self.free_handles.clear();
+        self.root = NodeId(0);
+    }
+
     /// Insert and return a stable [`ItemRef`] for O(1) `update_ref`/`remove_ref`
     /// (skips `update`'s O(item_limit) predicate scan). `None` if out of bounds.
     pub fn insert_ref(&mut self, item: T) -> Option<ItemRef> {

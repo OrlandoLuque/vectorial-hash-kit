@@ -154,6 +154,17 @@ impl<T: IPositioned> IntegerTree<T> {
         }
     }
 
+    /// Empty the tree, retaining capacity — see [`crate::Tree3::clear`].
+    pub fn clear(&mut self) {
+        let bbox = self.get(self.root).bbox;
+        self.nodes.clear();
+        self.nodes.push(INode { bbox, parent: None, children: None, items: Vec::new(), hs: Vec::new() });
+        self.free.clear();
+        self.locs.clear();
+        self.free_handles.clear();
+        self.root = INodeId(0);
+    }
+
     pub fn get(&self, id: INodeId) -> &INode<T> { &self.nodes[id.0 as usize] }
     fn get_mut(&mut self, id: INodeId) -> &mut INode<T> { &mut self.nodes[id.0 as usize] }
 

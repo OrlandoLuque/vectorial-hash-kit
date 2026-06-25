@@ -65,6 +65,17 @@ impl<T: Positioned> QuadTree<T> {
         Self { nodes: vec![root], free: Vec::new(), locs: Vec::new(), free_handles: Vec::new(), item_limit, merge_limit, min_cell, root: QNodeId(0) }
     }
 
+    /// Empty the tree, retaining capacity — see [`crate::Tree3::clear`].
+    pub fn clear(&mut self) {
+        let bbox = self.get(self.root).bbox;
+        self.nodes.clear();
+        self.nodes.push(QNode { bbox, parent: None, children: None, items: Vec::new(), hs: Vec::new() });
+        self.free.clear();
+        self.locs.clear();
+        self.free_handles.clear();
+        self.root = QNodeId(0);
+    }
+
     pub fn get(&self, id: QNodeId) -> &QNode<T> {
         &self.nodes[id.0 as usize]
     }
