@@ -42,6 +42,12 @@ visual glance the next morning; everything else is autonomously verifiable.
    - *Follow-up:* templates + cli still carry ~21 pre-existing clippy lints
      (advisory in CI for now) — a focused cleanup pass should make them gate too
      (careful: some are `needless_range_loop` where the index is genuinely used).
+   - *Follow-up:* `vectorial-hash-templates`' `template_fingerprint_matches_fixture`
+     test is **not cross-platform** — the committed fixture was generated on the
+     Windows dev box and the fingerprint differs on the Linux CI runner (float
+     formatting / iteration order). Advisory in CI for now. Fix: make the
+     fingerprint platform-independent (deterministic float formatting + sorted
+     iteration), then move templates/cli tests back into the hard gate.
 
 **Original remaining**
 3. **Morton extras** — `MortonGrid3::knn` (ring-by-ring expanding shell, like
