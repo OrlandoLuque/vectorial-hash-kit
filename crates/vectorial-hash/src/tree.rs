@@ -110,6 +110,30 @@ impl<T> Node<T> {
 #[derive(Copy, Clone)]
 struct ItemLoc { node: NodeId, slot: u32 }
 
+/// Squared distance from `q` to the nearest point of `r` (0 if inside) — the 2D
+/// analogue of `tree3::aabb_min_dist2`, shared by the 2D k-NN searches.
+#[inline]
+pub(crate) fn rect_min_dist2(r: &Rect, q: Point) -> f64 {
+    let dx = if q.x < r.x { r.x - q.x } else if q.x > r.x_max() { q.x - r.x_max() } else { 0.0 };
+    let dy = if q.y < r.y { r.y - q.y } else if q.y > r.y_max() { q.y - r.y_max() } else { 0.0 };
+    dx * dx + dy * dy
+}
+
+/// Offer one 2D item to the bounded k-NN heap (keep it if the heap isn't full,
+/// or if it's closer than the current worst). Mirrors `tree3::knn_offer`.
+#[inline]
+pub(crate) fn knn_offer2<'a, T: Positioned>(heap: &mut std::collections::BinaryHeap<crate::tree3::KnnEntry<'a, T>>, k: usize, it: &'a T, q: Point) {
+    let p = it.position();
+    let (dx, dy) = (p.x - q.x, p.y - q.y);
+    let d2 = dx * dx + dy * dy;
+    if heap.len() < k {
+        heap.push(crate::tree3::KnnEntry { d2, item: it });
+    } else if d2 < heap.peek().unwrap().d2 {
+        heap.pop();
+        heap.push(crate::tree3::KnnEntry { d2, item: it });
+    }
+}
+
 pub struct Tree<T: Positioned> {
     nodes: Vec<Node<T>>,
     /// Slots in `nodes` freed by merge-ups, reused by the next `alloc`
@@ -315,6 +339,44 @@ impl<T: Positioned> Tree<T> {
         M: FnOnce(&mut T),
     {
         self.update_with(UpdateStrategy::default(), old_position, predicate, mutator)
+    }
+
+    /// The `k` nearest items to `q`, sorted ascending by distance (returns
+    /// `(distance, &item)`) — the 2D analogue of [`crate::Tree3::knn`].
+    /// Best-first descent: the nearer child is visited first to tighten the
+    /// bound, and a child whose box is already farther than the current k-th
+    /// nearest is skipped. Fewer than `k` items → all of them; `k == 0` → empty.
+    pub fn knn(&self, q: Point, k: usize) -> Vec<(f64, &T)> {
+        if k == 0 {
+            return Vec::new();
+        }
+        let mut heap = std::collections::BinaryHeap::new();
+        self.knn_recurse(self.root, q, k, &mut heap);
+        let mut v: Vec<(f64, &T)> = heap.into_iter().map(|e| (e.d2.sqrt(), e.item)).collect();
+        v.sort_by(|a, b| a.0.total_cmp(&b.0));
+        v
+    }
+
+    fn knn_recurse<'a>(&'a self, id: NodeId, q: Point, k: usize, heap: &mut std::collections::BinaryHeap<crate::tree3::KnnEntry<'a, T>>) {
+        let node = self.get(id);
+        match node.children {
+            None => {
+                for it in &node.items {
+                    knn_offer2(heap, k, it, q);
+                }
+            }
+            Some([a, b]) => {
+                let da = rect_min_dist2(&self.get(a).bbox, q);
+                let db = rect_min_dist2(&self.get(b).bbox, q);
+                let (first, dfirst, second, dsecond) = if da <= db { (a, da, b, db) } else { (b, db, a, da) };
+                if dfirst < crate::tree3::knn_worst(heap, k) {
+                    self.knn_recurse(first, q, k, heap);
+                }
+                if dsecond < crate::tree3::knn_worst(heap, k) {
+                    self.knn_recurse(second, q, k, heap);
+                }
+            }
+        }
     }
 
     /// Like [`Tree::update`] but with an explicit relocation strategy.
@@ -813,6 +875,30 @@ mod tests {
     struct Pt(Point);
     impl Positioned for Pt {
         fn position(&self) -> Point { self.0 }
+    }
+
+    #[test]
+    fn knn_matches_brute() {
+        // k-NN must return the same k smallest distances as brute force; compare
+        // distances (not identity) so exact ties don't spuriously fail.
+        let mut x = 0x2468_ACE0u64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        let pts: Vec<Pt> = (0..2000).map(|_| Pt(Point::new(rng() * 256.0, rng() * 256.0))).collect();
+        let mut tree = Tree::<Pt>::new(Rect::new(0.0, 0.0, 256.0, 256.0), 4);
+        for p in &pts { tree.insert(*p); }
+        for (qx, qy) in [(128.0, 128.0), (10.0, 240.0), (0.0, 0.0), (255.0, 255.0)] {
+            let q = Point::new(qx, qy);
+            for k in [1usize, 5, 25] {
+                let mut brute: Vec<f64> = pts.iter().map(|p| { let (dx, dy) = (p.0.x - qx, p.0.y - qy); (dx * dx + dy * dy).sqrt() }).collect();
+                brute.sort_by(|a, b| a.total_cmp(b));
+                brute.truncate(k);
+                let got: Vec<f64> = tree.knn(q, k).into_iter().map(|(d, _)| d).collect();
+                assert_eq!(got.len(), brute.len(), "knn count k={k}");
+                for (a, b) in got.iter().zip(brute.iter()) {
+                    assert!((a - b).abs() < 1e-9, "knn dist != brute k={k}: {a} vs {b}");
+                }
+            }
+        }
     }
 
     #[test]

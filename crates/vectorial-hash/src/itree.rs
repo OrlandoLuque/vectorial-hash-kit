@@ -47,6 +47,30 @@ pub struct IRect {
     pub h: i32,
 }
 
+/// Squared distance (`f64`) from integer point `q` to the nearest point of
+/// `r` — the integer analogue of `tree::rect_min_dist2`. Coords are widened to
+/// `f64` before subtraction so the difference can't overflow `i32`.
+#[inline]
+fn irect_min_dist2(r: &IRect, q: IPoint) -> f64 {
+    let dx = if q.x < r.x { (r.x as f64) - q.x as f64 } else if q.x > r.x_max() { (q.x as f64) - r.x_max() as f64 } else { 0.0 };
+    let dy = if q.y < r.y { (r.y as f64) - q.y as f64 } else if q.y > r.y_max() { (q.y as f64) - r.y_max() as f64 } else { 0.0 };
+    dx * dx + dy * dy
+}
+
+/// Offer one integer item to the bounded k-NN heap. Mirrors `tree3::knn_offer`.
+#[inline]
+fn iknn_offer<'a, T: IPositioned>(heap: &mut std::collections::BinaryHeap<crate::tree3::KnnEntry<'a, T>>, k: usize, it: &'a T, q: IPoint) {
+    let p = it.position();
+    let (dx, dy) = (p.x as f64 - q.x as f64, p.y as f64 - q.y as f64);
+    let d2 = dx * dx + dy * dy;
+    if heap.len() < k {
+        heap.push(crate::tree3::KnnEntry { d2, item: it });
+    } else if d2 < heap.peek().unwrap().d2 {
+        heap.pop();
+        heap.push(crate::tree3::KnnEntry { d2, item: it });
+    }
+}
+
 impl IRect {
     pub fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
         Self { x, y, w, h }
@@ -343,6 +367,41 @@ impl<T: IPositioned> IntegerTree<T> {
         shapes.iter().map(|s| self.cull(s)).collect()
     }
 
+    /// The `k` nearest items to integer point `q`, sorted ascending by distance
+    /// (distances are `f64`) — the integer analogue of [`crate::Tree::knn`].
+    pub fn knn(&self, q: IPoint, k: usize) -> Vec<(f64, &T)> {
+        if k == 0 {
+            return Vec::new();
+        }
+        let mut heap = std::collections::BinaryHeap::new();
+        self.knn_recurse(self.root, q, k, &mut heap);
+        let mut v: Vec<(f64, &T)> = heap.into_iter().map(|e| (e.d2.sqrt(), e.item)).collect();
+        v.sort_by(|a, b| a.0.total_cmp(&b.0));
+        v
+    }
+
+    fn knn_recurse<'a>(&'a self, id: INodeId, q: IPoint, k: usize, heap: &mut std::collections::BinaryHeap<crate::tree3::KnnEntry<'a, T>>) {
+        let node = self.get(id);
+        match node.children {
+            None => {
+                for it in &node.items {
+                    iknn_offer(heap, k, it, q);
+                }
+            }
+            Some([a, b]) => {
+                let da = irect_min_dist2(&self.get(a).bbox, q);
+                let db = irect_min_dist2(&self.get(b).bbox, q);
+                let (first, dfirst, second, dsecond) = if da <= db { (a, da, b, db) } else { (b, db, a, da) };
+                if dfirst < crate::tree3::knn_worst(heap, k) {
+                    self.knn_recurse(first, q, k, heap);
+                }
+                if dsecond < crate::tree3::knn_worst(heap, k) {
+                    self.knn_recurse(second, q, k, heap);
+                }
+            }
+        }
+    }
+
     /// Parallel batch cull — see [`crate::Tree3::cull_many_par`].
     #[cfg(feature = "parallel")]
     pub fn cull_many_par<'a, S: Shape + Sync>(&'a self, shapes: &[S]) -> Vec<Vec<&'a T>>
@@ -522,6 +581,28 @@ mod tests {
     #[derive(Clone, Copy)]
     struct IP(IPoint);
     impl IPositioned for IP { fn position(&self) -> IPoint { self.0 } }
+
+    #[test]
+    fn knn_matches_brute() {
+        let mut x = 0x0F1E_2D3Cu64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; ((x.wrapping_mul(0x2545F4914F6CDD1D) >> 40) % 256) as i32 };
+        let pts: Vec<IP> = (0..2000).map(|_| IP(IPoint::new(rng(), rng()))).collect();
+        let mut tree = IntegerTree::<IP>::new(IRect::new(0, 0, 256, 256), 4);
+        for p in &pts { tree.insert(*p); }
+        for (qx, qy) in [(128, 128), (10, 240), (0, 0), (255, 255)] {
+            let q = IPoint::new(qx, qy);
+            for k in [1usize, 5, 25] {
+                let mut brute: Vec<f64> = pts.iter().map(|p| { let (dx, dy) = (p.0.x as f64 - qx as f64, p.0.y as f64 - qy as f64); (dx * dx + dy * dy).sqrt() }).collect();
+                brute.sort_by(|a, b| a.total_cmp(b));
+                brute.truncate(k);
+                let got: Vec<f64> = tree.knn(q, k).into_iter().map(|(d, _)| d).collect();
+                assert_eq!(got.len(), brute.len(), "knn count k={k}");
+                for (a, b) in got.iter().zip(brute.iter()) {
+                    assert!((a - b).abs() < 1e-9, "knn dist != brute k={k}: {a} vs {b}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn update_ref_churn_matches_brute() {

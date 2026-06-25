@@ -411,6 +411,43 @@ impl<T: Positioned> QuadTree<T> {
         shapes.iter().map(|s| self.cull(s)).collect()
     }
 
+    /// The `k` nearest items to `q` — see [`crate::Tree::knn`]. 4-way best-first
+    /// descent: children are visited nearest-box-first and pruned once their box
+    /// is farther than the current k-th nearest.
+    pub fn knn(&self, q: Point, k: usize) -> Vec<(f64, &T)> {
+        if k == 0 {
+            return Vec::new();
+        }
+        let mut heap = std::collections::BinaryHeap::new();
+        self.knn_recurse(self.root, q, k, &mut heap);
+        let mut v: Vec<(f64, &T)> = heap.into_iter().map(|e| (e.d2.sqrt(), e.item)).collect();
+        v.sort_by(|a, b| a.0.total_cmp(&b.0));
+        v
+    }
+
+    fn knn_recurse<'a>(&'a self, id: QNodeId, q: Point, k: usize, heap: &mut std::collections::BinaryHeap<crate::tree3::KnnEntry<'a, T>>) {
+        let node = self.get(id);
+        match node.children {
+            None => {
+                for it in &node.items {
+                    crate::tree::knn_offer2(heap, k, it, q);
+                }
+            }
+            Some(children) => {
+                let mut kids: [(QNodeId, f64); 4] = [(children[0], 0.0); 4];
+                for (slot, &c) in children.iter().enumerate() {
+                    kids[slot] = (c, crate::tree::rect_min_dist2(&self.get(c).bbox, q));
+                }
+                kids.sort_by(|a, b| a.1.total_cmp(&b.1));
+                for (c, d) in kids {
+                    if d < crate::tree3::knn_worst(heap, k) {
+                        self.knn_recurse(c, q, k, heap);
+                    }
+                }
+            }
+        }
+    }
+
     /// Parallel batch cull — see [`crate::Tree3::cull_many_par`].
     #[cfg(feature = "parallel")]
     pub fn cull_many_par<'a, S: Shape + Sync>(&'a self, shapes: &[S]) -> Vec<Vec<&'a T>>
@@ -471,6 +508,28 @@ mod tests {
     impl Positioned for Pt {
         fn position(&self) -> Point {
             self.0
+        }
+    }
+
+    #[test]
+    fn knn_matches_brute() {
+        let mut x = 0x1357_9BDFu64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        let pts: Vec<Pt> = (0..2000).map(|_| Pt(Point::new(rng() * 256.0, rng() * 256.0))).collect();
+        let mut tree = QuadTree::<Pt>::new(Rect::new(0.0, 0.0, 256.0, 256.0), 4);
+        for p in &pts { tree.insert(*p); }
+        for (qx, qy) in [(128.0, 128.0), (10.0, 240.0), (0.0, 0.0), (255.0, 255.0)] {
+            let q = Point::new(qx, qy);
+            for k in [1usize, 5, 25] {
+                let mut brute: Vec<f64> = pts.iter().map(|p| { let (dx, dy) = (p.0.x - qx, p.0.y - qy); (dx * dx + dy * dy).sqrt() }).collect();
+                brute.sort_by(|a, b| a.total_cmp(b));
+                brute.truncate(k);
+                let got: Vec<f64> = tree.knn(q, k).into_iter().map(|(d, _)| d).collect();
+                assert_eq!(got.len(), brute.len(), "knn count k={k}");
+                for (a, b) in got.iter().zip(brute.iter()) {
+                    assert!((a - b).abs() < 1e-9, "knn dist != brute k={k}: {a} vs {b}");
+                }
+            }
         }
     }
 
