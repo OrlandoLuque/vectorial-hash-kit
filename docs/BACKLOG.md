@@ -72,9 +72,15 @@ visual glance the next morning; everything else is autonomously verifiable.
 6. **k-NN parity** — `knn` exists on `Tree3`/`Octree3`; add it to `Tree`,
    `QuadTree`, `IntegerTree`, and `MortonGrid3` (the latter ring-by-ring, shared
    with item 3). Brute-force gated.
-7. **Ray-cast / segment query** — visit cells/leaves along a ray (line-of-sight,
-   picking). *The user has their own approach (to be shared tomorrow); implement
-   a reasonable one now and **compare designs** the next day.*
+7. ~~**Ray-cast / segment query**~~ — **done (my approach; compare with the
+   user's tomorrow).** Modelled the ray as a **capsule**: a new `Segment3`
+   `Shape3` (segment `a`–`b` + radius `r`, exact point-to-segment distance), so
+   *every* structure's `cull` answers it. `Tree3::raycast(origin, dir, max_dist,
+   radius)` builds the capsule, culls, and returns `(t, &item)` sorted by
+   distance along the ray. It's a **thick** ray (point items need the radius to
+   register). Brute-force gated test. *Open design question for tomorrow: the
+   user's own ray approach — likely a DDA/cell-walk for a hard surface hit
+   rather than a capsule broadphase; compare the two.*
 8. ~~**Frustum as a first-class `Shape3`**~~ — **done.** A view frustum is just
    6 half-spaces, i.e. a `Polyhedron3`; added `Polyhedron3::from_corners([Point3;
    8])` (near face then far face, bl/br/tr/tl) that derives the six inward face

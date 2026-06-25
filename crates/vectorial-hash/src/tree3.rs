@@ -278,6 +278,61 @@ impl Shape3 for Polyhedron3 {
     }
 }
 
+// --------------------------------------------------------------- segment
+
+/// A **capsule**: a line segment `a`–`b` thickened by radius `r`. As a
+/// [`Shape3`] it's the query volume behind a "thick ray-cast" — every item
+/// within `r` of the segment (see [`Tree3::raycast`]). Point items need a
+/// radius to be hit; a hard surface-intersection ray is a different primitive.
+pub struct Segment3 {
+    pub a: Point3,
+    pub b: Point3,
+    pub r: f64,
+    pub raster: Option<VoxelRaster>,
+}
+
+impl Segment3 {
+    pub fn new(a: Point3, b: Point3, r: f64) -> Self {
+        Self { a, b, r, raster: None }
+    }
+    /// A capsule from a ray: `origin` to `origin + normalize(dir) * len`,
+    /// thickened by `r`. Zero-length `dir` collapses to a sphere at `origin`.
+    pub fn from_ray(origin: Point3, dir: Point3, len: f64, r: f64) -> Self {
+        let m = (dir.x * dir.x + dir.y * dir.y + dir.z * dir.z).sqrt();
+        let (ux, uy, uz) = if m > 0.0 { (dir.x / m, dir.y / m, dir.z / m) } else { (0.0, 0.0, 0.0) };
+        Self::new(origin, Point3::new(origin.x + ux * len, origin.y + uy * len, origin.z + uz * len), r)
+    }
+}
+
+/// Squared distance from `p` to segment `a`–`b` (clamped projection).
+#[inline]
+pub(crate) fn seg_point_dist2(p: Point3, a: Point3, b: Point3) -> f64 {
+    let ab = (b.x - a.x, b.y - a.y, b.z - a.z);
+    let ap = (p.x - a.x, p.y - a.y, p.z - a.z);
+    let denom = ab.0 * ab.0 + ab.1 * ab.1 + ab.2 * ab.2;
+    let t = if denom > 0.0 { ((ap.0 * ab.0 + ap.1 * ab.1 + ap.2 * ab.2) / denom).clamp(0.0, 1.0) } else { 0.0 };
+    let (dx, dy, dz) = (ap.0 - ab.0 * t, ap.1 - ab.1 * t, ap.2 - ab.2 * t);
+    dx * dx + dy * dy + dz * dz
+}
+
+impl Shape3 for Segment3 {
+    fn bounding_box(&self) -> Aabb {
+        let lx = self.a.x.min(self.b.x) - self.r;
+        let ly = self.a.y.min(self.b.y) - self.r;
+        let lz = self.a.z.min(self.b.z) - self.r;
+        let hx = self.a.x.max(self.b.x) + self.r;
+        let hy = self.a.y.max(self.b.y) + self.r;
+        let hz = self.a.z.max(self.b.z) + self.r;
+        Aabb::new(lx, ly, lz, hx - lx, hy - ly, hz - lz)
+    }
+    fn contains_point(&self, p: Point3) -> bool {
+        seg_point_dist2(p, self.a, self.b) <= self.r * self.r
+    }
+    // classify_aabb uses the default (bbox-overlap → Maybe): a capsule rarely
+    // fully contains a node box, so the per-point test does the exact work.
+    fn voxel_raster(&self) -> Option<&VoxelRaster> { self.raster.as_ref() }
+}
+
 // ----------------------------------------------------------- voxel raster
 
 /// A 1×1×1 voxel grid classifying each unit cell as In/Out/Maybe relative
@@ -716,6 +771,33 @@ impl<T: Positioned3> Tree3<T> {
         shapes.iter().map(|s| self.cull(s)).collect()
     }
 
+    /// "Thick ray-cast": every item within `radius` of the ray
+    /// `origin + t·normalize(dir)`, `t ∈ [0, max_dist]`, returned as
+    /// `(t, &item)` sorted by `t` (nearest first). Built on the [`Segment3`]
+    /// capsule + `cull`, then projected onto the ray. A zero-length `dir`
+    /// returns nothing. This is a *thick* ray — point items need the radius to
+    /// register; a hard surface-intersection ray is a separate primitive.
+    pub fn raycast(&self, origin: Point3, dir: Point3, max_dist: f64, radius: f64) -> Vec<(f64, &T)> {
+        let m = (dir.x * dir.x + dir.y * dir.y + dir.z * dir.z).sqrt();
+        if m == 0.0 {
+            return Vec::new();
+        }
+        let (ux, uy, uz) = (dir.x / m, dir.y / m, dir.z / m);
+        let end = Point3::new(origin.x + ux * max_dist, origin.y + uy * max_dist, origin.z + uz * max_dist);
+        let seg = Segment3::new(origin, end, radius);
+        let mut hits: Vec<(f64, &T)> = self
+            .cull(&seg)
+            .into_iter()
+            .map(|it| {
+                let p = it.position();
+                let t = ((p.x - origin.x) * ux + (p.y - origin.y) * uy + (p.z - origin.z) * uz).clamp(0.0, max_dist);
+                (t, it)
+            })
+            .collect();
+        hits.sort_by(|a, b| a.0.total_cmp(&b.0));
+        hits
+    }
+
     /// Parallel [`Tree3::cull_many`]: the independent, read-only queries run on
     /// rayon's thread pool. Worth it only when many queries hit a large index
     /// (see `docs/PARALLEL.md` for the measured crossover); for a handful of
@@ -1013,6 +1095,33 @@ mod tests {
             a.sort(); b.sort();
             assert_eq!(a, b, "parallel batch cull disagrees with serial at query {i}");
         }
+    }
+
+    #[test]
+    fn raycast_thick_matches_brute_and_sorted() {
+        // The thick ray-cast must return exactly the points within `radius` of
+        // the ray segment, sorted by distance along the ray.
+        let mut x = 0x0FAB_CA57u64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        let pts: Vec<P> = (0..4000).map(|_| P(Point3::new(rng() * 100.0, rng() * 100.0, rng() * 100.0))).collect();
+        let mut tree = Tree3::<P>::new(Aabb::new(0.0, 0.0, 0.0, 100.0, 100.0, 100.0), 8);
+        for p in &pts { tree.insert(*p); }
+        let (origin, dir, max_dist, radius) = (Point3::new(0.0, 50.0, 50.0), Point3::new(1.0, 0.0, 0.0), 100.0, 6.0);
+        // Brute force: project onto the ray, clamp, measure perpendicular distance.
+        let (ux, uy, uz) = (1.0, 0.0, 0.0);
+        let mut want: Vec<(u64, u64, u64)> = pts.iter().filter(|p| {
+            let q = p.0;
+            let t = ((q.x - origin.x) * ux + (q.y - origin.y) * uy + (q.z - origin.z) * uz).clamp(0.0, max_dist);
+            let (cx, cy, cz) = (origin.x + ux * t, origin.y + uy * t, origin.z + uz * t);
+            let (dx, dy, dz) = (q.x - cx, q.y - cy, q.z - cz);
+            dx * dx + dy * dy + dz * dz <= radius * radius
+        }).map(|p| (p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits())).collect();
+        let hits = tree.raycast(origin, dir, max_dist, radius);
+        // sorted ascending by t
+        for w in hits.windows(2) { assert!(w[0].0 <= w[1].0, "raycast hits not sorted by t"); }
+        let mut got: Vec<(u64, u64, u64)> = hits.iter().map(|(_, p)| (p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits())).collect();
+        want.sort(); got.sort();
+        assert_eq!(want, got, "raycast set != brute capsule");
     }
 
     #[test]

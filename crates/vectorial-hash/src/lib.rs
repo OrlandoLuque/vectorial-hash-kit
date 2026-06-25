@@ -44,6 +44,6 @@ pub use tree::{Node, NodeId, Positioned, Side, Tree, UpdateStrategy};
 pub use culling::{Shape, WalkNeighbors};
 pub use quadtree::{QNode, QNodeId, QuadTree};
 pub use itree::{INode, INodeId, IPoint, IPositioned, IRect, IUpdateStrategy, IntegerTree};
-pub use tree3::{Aabb, ItemRef, Node3, Node3Id, Point3, Polyhedron3, Positioned3, Shape3, Sphere3, Tree3, VoxelRaster};
+pub use tree3::{Aabb, ItemRef, Node3, Node3Id, Point3, Polyhedron3, Positioned3, Segment3, Shape3, Sphere3, Tree3, VoxelRaster};
 pub use octree3::{ONode, ONodeId, Octree3};
 pub use morton3::MortonGrid3;
