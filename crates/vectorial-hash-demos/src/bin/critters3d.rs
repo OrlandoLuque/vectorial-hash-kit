@@ -49,7 +49,8 @@ use macroquad::prelude::*;
 use macroquad::window::get_internal_gl;
 
 use vectorial_hash::{
-    Aabb, Octree3, Point, Point3, Positioned, Positioned3, Rect, Shape, Shape3, Sphere3, Tree, Tree3,
+    Aabb, MortonGrid3, Octree3, Point, Point3, Positioned, Positioned3, Rect, Shape, Shape3, Sphere3,
+    Tree, Tree3,
 };
 use vectorial_hash_demos::instanced3d::{
     EffectInstance, EffectMesh, Instance, InstancedRenderer, Mode as RenderGeom,
@@ -224,17 +225,28 @@ impl RenderMode {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Structure { Binary3, Octree, Projection }
+enum Structure { Binary3, Octree, Morton, Projection }
 impl Structure {
     fn next(self) -> Self {
-        match self { Structure::Binary3 => Structure::Octree, Structure::Octree => Structure::Projection, Structure::Projection => Structure::Binary3 }
+        match self {
+            Structure::Binary3 => Structure::Octree,
+            Structure::Octree => Structure::Morton,
+            Structure::Morton => Structure::Projection,
+            Structure::Projection => Structure::Binary3,
+        }
     }
     fn label(self) -> &'static str {
-        match self { Structure::Binary3 => "Tree3 (binary-3D)", Structure::Octree => "Octree3 (8-way)", Structure::Projection => "projection (1×2D + z-reject)" }
+        match self {
+            Structure::Binary3 => "Tree3 (binary-3D)",
+            Structure::Octree => "Octree3 (8-way)",
+            Structure::Morton => "MortonGrid3 (Z-order)",
+            Structure::Projection => "projection (1×2D + z-reject)",
+        }
     }
     fn from_env() -> Self {
         match std::env::var("CRITTERS3D_STRUCTURE").ok().as_deref() {
             Some("octree") => Structure::Octree,
+            Some("morton") => Structure::Morton,
             Some("projection") => Structure::Projection,
             _ => Structure::Binary3,
         }
@@ -1107,6 +1119,44 @@ async fn main() {
                 cand_n = None;
                 stat_line = format!("Octree3 persistent/update: {:>6} leaves, {:>6} arena (item_limit {})", t.leaf_count(), t.node_count(), ITEM_LIMIT);
             }
+            Structure::Morton => {
+                // Pointer-free Morton / Z-order grid. No `update`, so it's
+                // rebuilt from scratch every frame — cheap, and the grid's whole
+                // selling point (bucket-and-go, no rebalancing). Cell sized to
+                // the vision radius (the query scale) so a cull touches few cells.
+                let tb = Instant::now();
+                let levels = MortonGrid3::<C3>::levels_for_cell_size(world_aabb(world), (vision_r as f64).max(4.0));
+                let mut g = MortonGrid3::<C3>::new(world_aabb(world), levels);
+                for (i, c) in critters.iter().enumerate() {
+                    g.insert(C3 { id: i as u32, p: pt3(c) });
+                }
+                t_build_us = tb.elapsed().as_secs_f64() * 1e6;
+                let tc = Instant::now();
+                for rep in 0..cull_reps {
+                    let sphere = Sphere3::new(ox + rep as f64 * 0.01, oy, oz, r);
+                    let hits = g.cull(&sphere);
+                    if rep == 0 { for c in hits { lit[c.id as usize] = true; } }
+                }
+                t_cull_us = tc.elapsed().as_secs_f64() * 1e6 / cull_reps as f64;
+                if std::env::var("CRITTERS3D_VERIFY").is_ok() {
+                    let s = Sphere3::new(ox, oy, oz, r);
+                    let mut got: Vec<u32> = g.cull(&s).iter().map(|c| c.id).collect();
+                    let mut want: Vec<u32> = (0..critters.len() as u32).filter(|&i| {
+                        let c = &critters[i as usize];
+                        let (dx, dy, dz) = (c.pos.x as f64 - ox, c.pos.y as f64 - oy, c.pos.z as f64 - oz);
+                        dx * dx + dy * dy + dz * dz <= r2
+                    }).collect();
+                    got.sort_unstable(); want.sort_unstable();
+                    if got != want {
+                        eprintln!("VERIFY morton mismatch frame {frame}: morton {} vs brute {} (pop {})", got.len(), want.len(), critters.len());
+                    }
+                }
+                // Boxes: the occupied grid cells (the grid analogue of leaves).
+                if rec || show_boxes { g.visit_cells(|b, _| boxes.push(aabb_box(b))); }
+                cand_n = None;
+                stat_line = format!("MortonGrid3 (Z-order, rebuilt): {:>6} cells, {} levels, {:.2} items/cell",
+                    g.cell_count(), levels, g.item_count() as f64 / g.cell_count().max(1) as f64);
+            }
             Structure::Projection => {
                 // Author's variant: index the xy projection in a 2D Tree, cull
                 // the sphere's shadow (a disc), then z-reject + exact 3D test.
@@ -1370,7 +1420,7 @@ async fn main() {
             sim_mode = match sim_mode { SimMode::Observe => SimMode::Combat, SimMode::Combat => SimMode::Observe };
         }
         if panel.button(&format!("structure: {} [M]", structure.label()),
-            "Index used for the culls:\nTree3 (binary, persistent + update),\nOctree3 (8-way, persistent + update),\nprojection (one 2D tree on xy + z-reject).") { structure = structure.next(); }
+            "Index used for the culls:\nTree3 (binary, persistent + update),\nOctree3 (8-way, persistent + update),\nMortonGrid3 (Z-order hash, rebuilt),\nprojection (one 2D tree on xy + z-reject).") { structure = structure.next(); }
         if panel.button(&format!("render: {} [G]", render_mode.label()),
             "How critters are drawn:\ninstanced spheres / round billboards /\nsquare billboards (fastest) /\nNO RENDER (CPU only, to read the ceiling).") { render_mode = render_mode.next(); }
         panel.separator();

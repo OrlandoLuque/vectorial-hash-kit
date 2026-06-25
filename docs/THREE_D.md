@@ -394,8 +394,12 @@ build, trivial code); a tree when density varies or query sizes span a wide
 range (adaptive depth earns its keep).** A multi-level linear octree (codes at
 mixed depths) would recover the adaptivity, at the cost of the grid's
 simplicity — noted as a possible follow-up. `MortonGrid3` is build-and-cull
-only (no `update`); for the dynamic critters workload it would be rebuilt or
-need an `update`, unmeasured here.
+only (no `update`); in the live `critters3d` demo it's selectable via the `M`
+toggle (`CRITTERS3D_STRUCTURE=morton`) and **rebuilt from scratch each frame**
+— which is fine precisely because its build is so cheap (the dynamic workload
+where the trees use `update`, the grid just re-buckets). `visit_cells` exposes
+the occupied cells for the `B` box overlay; `demorton3` decodes a code back to
+its `(x,y,z)` cell.
 
 ## k-nearest-neighbour (`knn`) — a different query than range cull
 

@@ -4,19 +4,34 @@ Future work queued for review. Nothing here is committed scope — prune,
 reprioritise, or drop freely. Items graduate into the per-crate roadmaps
 (e.g. `crates/vectorial-hash/README.md`) once picked up.
 
-## Overnight queue (set 2026-06-25)
+## Overnight queue (set 2026-06-25) — ✅ all done
 
-Autonomous session, in order (prioritised by what can be finished + self-verified
-without the user — brute-force / round-trip gated first; visual-feedback last):
+1. ~~Morton / Z-order (linear octree)~~ — done (also now selectable in the
+   `critters3d` `M` toggle).
+2. ~~k-NN queries~~ — done.
+3. ~~Index serialization~~ — done (`Tree3`).
+4. ~~World-size 2D stepper~~ — done (visual scaling review → see active queue).
+5. ~~Instancing stress test~~ — done.
 
-1. **Morton / Z-order (linear octree)** — Index/algorithms below.
-2. **k-NN queries** — Index/algorithms below.
-3. **Index serialization** — Index/algorithms below.
-4. **World-size 2D stepper** — Render/demos below (visual scaling needs review).
-5. **Instancing stress test** — Render/demos below (GPU profiling semi-manual).
+## Active queue (next)
 
-Everything else in this file is **future / not in the night queue** — left here
-to triage later.
+1. **2D demo panel: figure-size slider + 3D-style sliders** — give the 2D
+   `critters` panel a slider for the **attack figure size** (rebuild the arsenal
+   via `build_arsenal_scaled`, ~0.45 s, so step on release not on drag), and
+   port the 3D demo's custom `Panel` (sliders with `[-]`/`[+]` and right-click
+   keyboard entry) to replace the basic `root_ui` sliders. Best done by
+   extracting the 3D `Panel` into a shared `src/panel.rs` so both demos use it.
+   *(Requested after the world-size stepper made fixed-world-unit figures look
+   huge in small worlds / tiny in large ones — the slider lets the user
+   compensate.)*
+2. **Multi-query cull + multithreading (rayon)** — the next-batch experiment:
+   parallelise the per-frame index maintenance (`update_many`) and/or batch
+   culls with rayon, and **establish under what workload / N it pays vs. the
+   thread overhead** (the stress test showed the live demo is CPU-bound on the
+   single-threaded `update`, so this is the headline lever). Quantify the
+   crossover and where to *avoid* rayon (small N). See Index/algorithms below.
+
+Everything else in this file is **future** — left to triage later.
 
 ## Render / demos
 - ~~**Instancing stress test**~~ — **done.** Swept `critters3d` to 1M critters

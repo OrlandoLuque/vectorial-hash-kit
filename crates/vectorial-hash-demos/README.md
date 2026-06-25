@@ -102,9 +102,12 @@ hover-help box) and shown live in **time-series graphs** (fps / cpu ms / cull
 reports a CPU-bound vs GPU-bound verdict and the CPU-only fps ceiling.
 
 - `M` — **index structure**: persistent `Tree3` (update) / `Octree3` (8-way,
-  also persistent + `update`) / projection (one 2D `Tree` on xy + z-reject).
-  All exact. Both trees relocate critters in place each frame (ascend-to-LCA);
-  the octree is built on entry to the mode and updated thereafter.
+  also persistent + `update`) / `MortonGrid3` (Z-order hash grid, rebuilt each
+  frame) / projection (one 2D `Tree` on xy + z-reject). All exact. The two trees
+  relocate critters in place each frame (ascend-to-LCA); the octree is built on
+  entry and updated thereafter; the Morton grid is rebuilt from scratch each
+  frame (its build is cheap — bucket-and-go) with the cell sized to the vision
+  radius. Toggle `B` to see each one's cells/leaves.
 - `G` — **render path**: GPU-instanced spheres / round billboards / square
   billboards (fastest) / NO RENDER (CPU only, to read the CPU's fps ceiling).
   The instanced paths (raw miniquad, `src/instanced3d.rs`) draw all critters
@@ -117,7 +120,7 @@ reports a CPU-bound vs GPU-bound verdict and the CPU-only fps ceiling.
 Env: `CRITTERS3D_MAX_FRAMES=N` (smoke runs; also prints a one-line `STRESS`
 summary — mean fps / frame ms / cpu ms / CPU-vs-GPU-bound),
 `CRITTERS3D_RENDER=instanced|billboards|square|none`,
-`CRITTERS3D_STRUCTURE=binary|octree|projection` (initial index),
+`CRITTERS3D_STRUCTURE=binary|octree|morton|projection` (initial index),
 `CRITTERS3D_POP=N` / `CRITTERS3D_WORLD=N` / `CRITTERS3D_FREEZE=1` (the
 instancing stress sweep — see `docs/THREE_D.md`: scales to 1M critters in one
 draw call, GPU upload-bound; the live demo is CPU-bound on the index update),

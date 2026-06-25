@@ -47,6 +47,25 @@ pub fn morton3(x: u32, y: u32, z: u32) -> u64 {
     part1by2(x as u64) | (part1by2(y as u64) << 1) | (part1by2(z as u64) << 2)
 }
 
+/// Inverse of [`part1by2`]: gather every third bit back down.
+#[inline]
+fn compact1by2(mut n: u64) -> u64 {
+    n &= 0x1249249249249249;
+    n = (n ^ (n >> 2)) & 0x10c30c30c30c30c3;
+    n = (n ^ (n >> 4)) & 0x100f00f00f00f00f;
+    n = (n ^ (n >> 8)) & 0x1f0000ff0000ff;
+    n = (n ^ (n >> 16)) & 0x1f00000000ffff;
+    n = (n ^ (n >> 32)) & 0x1f_ffff;
+    n
+}
+
+/// Decode a Morton code back to its integer cell `(x, y, z)` — inverse of
+/// [`morton3`].
+#[inline]
+pub fn demorton3(code: u64) -> (u32, u32, u32) {
+    (compact1by2(code) as u32, compact1by2(code >> 1) as u32, compact1by2(code >> 2) as u32)
+}
+
 pub struct MortonGrid3<T: Positioned3> {
     world: Aabb,
     levels: u32,
@@ -139,6 +158,16 @@ impl<T: Positioned3> MortonGrid3<T> {
     pub fn cell_count(&self) -> usize { self.cells.len() }
     pub fn levels(&self) -> u32 { self.levels }
 
+    /// Visit each **occupied** cell's box and item count (for visualisation /
+    /// debugging — the grid analogue of a tree's `visit_leaves`). Order is the
+    /// hash map's, i.e. unspecified.
+    pub fn visit_cells<F: FnMut(&Aabb, usize)>(&self, mut f: F) {
+        for (&code, bucket) in &self.cells {
+            let (ix, iy, iz) = demorton3(code);
+            f(&self.cell_box(ix, iy, iz), bucket.len());
+        }
+    }
+
     /// Same cull contract as [`crate::Tree3::cull`]: every item inside `shape`.
     /// Visits only the cells overlapping the shape's bounding box; a cell fully
     /// inside short-circuits (all points, no test), a straddling cell runs the
@@ -198,6 +227,13 @@ mod tests {
         assert_eq!(morton3(0, 0, 1), 4); // z bit 0 → position 2
         assert_eq!(morton3(1, 1, 1), 7);
         assert_eq!(morton3(2, 0, 0), 8); // x bit 1 → position 3
+    }
+
+    #[test]
+    fn morton_decode_roundtrips() {
+        for (x, y, z) in [(0u32, 0u32, 0u32), (1, 2, 3), (1023, 7, 511), (1_048_575, 0, 1_048_575), (12345, 67890, 13579)] {
+            assert_eq!(demorton3(morton3(x, y, z)), (x, y, z), "demorton3∘morton3 != id for ({x},{y},{z})");
+        }
     }
 
     #[test]
