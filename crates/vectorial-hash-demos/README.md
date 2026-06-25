@@ -77,8 +77,9 @@ The **"tuning (live)" panel** adjusts everything while the simulation runs: the 
 
 ```bash
 cargo run -p vectorial-hash-demos --bin critters3d --release            # visual (macroquad 3D)
-cargo run -p vectorial-hash-demos --bin critters3d_headless --release \  # statistics
-    -- --structure both --pop 20000 --item-limit 64 --frames 240 --vision 100 --seed 42
+cargo run -p vectorial-hash-demos --bin critters3d_headless --release \  # all 4 structures, one config
+    -- --pop 20000 --item-limit 64 --vision 36 --frames 120 --seed 42
+cargo run -p vectorial-hash-demos --bin critters3d_headless --release -- --sweep   # decision map
 ```
 
 The 3D analogue. The index is a **persistent** `Tree3` (binary-split 3D tree,
@@ -124,11 +125,14 @@ summary — mean fps / frame ms / cpu ms / CPU-vs-GPU-bound),
 `CRITTERS3D_POP=N` / `CRITTERS3D_WORLD=N` / `CRITTERS3D_FREEZE=1` (the
 instancing stress sweep — see `docs/THREE_D.md`: scales to 1M critters in one
 draw call, GPU upload-bound; the live demo is CPU-bound on the index update),
-`CRITTERS3D_COMBAT=1`, `CRITTERS3D_SEP=1`. The **headless** version measures
-`update` + sphere-cull cost under churn and (`--structure both`) compares the
-dynamic octree head-to-head against the binary tree on one deterministic run
-— see `docs/THREE_D.md` for the true-3D-tree vs projection-indexing comparison
-and the octree-vs-binary result (static cull + dynamic `update`).
+`CRITTERS3D_COMBAT=1`, `CRITTERS3D_SEP=1`. The **headless** version drives all
+four structures (binary `Tree3` / octree / Morton / projection) on one
+deterministic sim, reporting per-structure **maintain** (update or rebuild) and
+**cull** cost; `--sweep` prints the **structure decision map** (winner per cell
+over world × pop × item_limit × churn). Headline: for this full-relocation
+workload Morton wins maintain (flat re-bucket beats the trees' predicate-scan
+`update`), the trees win cull in the deep/dense corner — see `docs/THREE_D.md`
+§ "Synthesis".
 
 ## Build & run
 

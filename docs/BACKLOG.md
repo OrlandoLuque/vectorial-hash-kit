@@ -61,19 +61,25 @@ Everything else in this file is **future** — left to triage later.
   when many are on screen at once.
 
 ## Index / algorithms
-- **Structure decision-map sweep** — extend `critters3d_headless` to all four
-  structures (binary / octree / Morton / projection — it's binary-vs-octree
-  today) and sweep world × population × vision × `item_limit`, reporting the
-  winner per cell. Makes the "which wins, and when" synthesis in `THREE_D.md`
-  quantitative (today it's by-eye from the live demo). The persistent-vs-rebuilt
-  build-cost asymmetry (binary/octree `update` vs Morton/projection rebuild) is
-  the dominant effect to capture; the `C` cull-rep readout isolates the cull.
+- ~~**Structure decision-map sweep**~~ — **done.** `critters3d_headless` now
+  drives all four structures on one deterministic sim (per-structure maintain +
+  cull) and `--sweep` prints the winner-per-cell map over world × pop ×
+  item_limit × churn. **Surprise result that corrected the by-eye synthesis:**
+  Morton wins *maintain* in every config (its flat re-bucket beats the trees'
+  `update`, which pays an O(item_limit) predicate scan per point); the trees win
+  *cull* only in the deep/dense corner. → promotes **Stable `ItemRef`** (O(1)
+  item access) as the highest-leverage follow-up. See `THREE_D.md` § "Synthesis".
+- **Stable `ItemRef`** — O(1) handle into the arena (kept valid across
+  splits/merges) so `update`/`remove` skip the predicate scan. The decision map
+  showed that scan is why the trees lose the relocate race to Morton's rebuild;
+  removing it would likely flip the maintain winner back to the trees.
 - ~~**`Octree3::update` (ascend-to-LCA)**~~ — **done.** `Octree3` now has the
-  same ascend-to-LCA `update` as `Tree3` (churn-tested), and
-  `critters3d_headless --structure both` compares the *dynamic* octree vs the
-  binary tree on one deterministic run (octree's update is ~5–15% faster; cull
-  ≈ equal; id sets identical). The live demo's `M` toggle keeps a persistent
-  octree too. See `THREE_D.md` § "Dynamic octree vs binary".
+  same ascend-to-LCA `update` as `Tree3` (churn-tested), and `critters3d_headless`
+  compares the *dynamic* octree vs the binary tree on one deterministic run
+  (octree's update is ~5–15% faster; cull ≈ equal; id sets identical) — though
+  the decision map shows both trees lose *maintain* to Morton. The live demo's
+  `M` toggle keeps a persistent octree too. See `THREE_D.md` § "Dynamic octree
+  vs binary".
 - **Full 3-projection vs expensive narrowphase** — `THREE_D.md`'s open item:
   run the projection methods (not just 1-proj) against a many-faced
   `Polyhedron3` to find where the tight broadphase finally pays for itself.

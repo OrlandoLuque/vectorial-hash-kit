@@ -323,10 +323,11 @@ wider.) Both remain exact vs brute force.
 `Octree3` gained `update` — the same ascend-to-LCA relocation as
 `Tree3::update`, ported to the 8-way split (a churn test,
 `octree_cull_matches_brute_after_churn`, gates it against ground truth the
-way `Tree3`'s does). `critters3d_headless --structure both` now runs the
-**same deterministic simulation** against both indexes, times each
-separately, and cross-checks every vision cull for agreement. 20k critters
-moving in a 512³ cube, 60 vision culls/frame (r=36), seed 42:
+way `Tree3`'s does). `critters3d_headless` runs the **same deterministic
+simulation** against all the indexes, times each separately, and cross-checks
+every vision cull for agreement; this table is the **binary-vs-octree pair**
+(the full four-way picture, where Morton beats both on *maintain*, is in
+§ Synthesis below). 20k critters moving in a 512³ cube, seed 42:
 
 | item_limit | update bin / oct (µs/frame) | cull bin / oct (µs/cull) | agreement |
 | ---: | ---: | ---: | --- |
@@ -342,11 +343,11 @@ static bench (octree ≈ binary, within noise at this density), and the two
 structures returned **identical** id sets on every sampled cull across all
 item_limits.
 
-The `both`-mode numbers are not a cache-contention artifact: isolated
-single-structure runs (`--structure binary` and `--structure octree` in
-separate processes) reproduce them within noise — at item_limit 8, isolated
-update is 3,066 µs (binary) vs 2,645 µs (octree), matching the 3,097 / 2,650
-measured in one `both` run. The two index footprints are similar (binary
+These numbers are not a cache-contention artifact: isolated single-structure
+runs (in the earlier two-structure version of the tool, run in separate
+processes) reproduced them within noise — at item_limit 8, isolated update was
+3,066 µs (binary) vs 2,645 µs (octree), matching the 3,097 / 2,650 measured in
+one combined run. The two index footprints are similar (binary
 ~7.3k arena nodes / 3.6k leaves vs octree ~7.0k / 5.7k at il 8), so neither
 thrashes the other's cache enough to skew the comparison. So in 3D the 8-way split is a small, free win on both the cull
 and the dynamic-relocation paths — the binary tree stays the reference (it
@@ -445,64 +446,98 @@ near the top almost everywhere else. That is the headline of the whole 3D
 study — **there is no universal winner; the binary tree is the robust default
 and each alternative has a sweet spot.** Two layers explain the observation.
 
-### Demo nuance: persistent (`update`) vs rebuilt-every-frame
+### The build cost: persistent `update` vs full rebuild — and the surprise
 
-The four structures are not on equal footing for the per-frame *build* cost:
+The four structures differ in how they track the moving points:
 
-| structure | per frame | build cost |
+| structure | per frame | kind |
 | --- | --- | --- |
-| Tree3 (binary) | incremental `update` (ascend-to-LCA) | cheap |
-| Octree3 | incremental `update` | cheap |
-| MortonGrid3 | full rebuild (re-insert all) | medium |
-| projection | rebuild the 2D tree + broad/narrowphase | high |
+| Tree3 (binary) | incremental `update` (ascend-to-LCA) | persistent |
+| Octree3 | incremental `update` | persistent |
+| MortonGrid3 | full rebuild (re-bucket all) | rebuilt |
+| projection | rebuild the 2D tree | rebuilt |
 
-In *observe* mode a frame is **build + one vision cull**, and that single cull
-is microscopic, so the **build cost dominates the per-frame number**. The two
-persistent structures (binary, octree) therefore beat the two that rebuild
-(Morton, projection) on the build side, and the binary is the leanest
-persistent one (one comparison per level, fewest nodes, least memory). That is
-why it "wins in many scenarios" — not because it is best at everything, but
-because it has **no pathological weakness**. To *isolate the cull* (where the
-others can lead) the `C` key cranks up the cull-repetition count: there the
-octree edges ahead (shorter descent) and Morton flies when density is uniform
-and its cell ≈ the vision radius.
+The intuition — and the first draft of this section — was that the *persistent*
+structures must beat the *rebuilt* ones on build: an incremental `update` sounds
+cheaper than re-inserting everything. **The decision map below shows the
+opposite, and that is the most important finding here.**
 
-### The mechanism: what flips the ranking
+### Decision map (`critters3d_headless --sweep`)
 
-- **World size / density → tree depth.** Small/dense world = deep tree → the
-  octree's fewer levels win (on cull *and* on long relocations). Large/sparse
-  world = shallow tree → the binary wins: less work per node and less memory
-  traffic (an octree allocates 8 children even when 1–2 are occupied, so it
-  thrashes cache at low density).
-- **Vision radius (`[` / `]`) → query selectivity.** A large query is low
-  selectivity (little to prune, structure barely matters); a small, realistic
-  query is where the trees separate.
-- **`item_limit` → leaf granularity.** Larger leaves = fewer, fatter cells;
-  both update and cull keep improving with it across the measured range.
+The same deterministic simulation drives all four structures; each frame every
+point is relocated (update or rebuild) and a sample run a sphere cull. The sweep
+varies world × population × `item_limit` × churn (vision radius fixed), two
+winners per config — **maintain** (per-frame relocate cost) and **cull**
+(per-cull) — over 16 configs:
+
+| metric | binary | octree | morton | projection |
+| --- | ---: | ---: | ---: | ---: |
+| **maintain** wins | 0 | 0 | **16** | 0 |
+| **cull** wins | 2 | 3 | **11** | 0 |
+
+(All four returned identical id sets in every config — exact.)
+
+**Morton wins `maintain` in *every* config** — its flat re-bucket (N hash
+inserts) is cheaper than the trees' `update`, at every population from 1k to 50k,
+slow or fast churn. Why do the trees lose the relocate race? Each `update(old,
+predicate, …)` must **find the item in its old leaf by predicate — an
+O(item_limit) scan** — then walk to locate it, then maybe split/merge. For a
+workload that moves *every* point *every* frame, that per-point lookup costs more
+than rebuilding flat. The trees' incremental `update` only pays off when movement
+is **sparse** (it touches few points; a rebuild still does all N) or with a
+**stable item handle** (O(1) access instead of the predicate scan — the "Stable
+`ItemRef`" roadmap item). Neither holds here, so Morton wins the build side
+outright.
+
+The trees keep the **cull** crown in the dense/deep corner (binary + octree take
+5 of 16): a small, dense world with tight queries is where a tree's descent
+prunes hardest; elsewhere Morton's cell ≈ query also wins the cull. Projection
+never wins here — its rebuild is a full 2D tree plus a disc-cull + z-reject +
+exact narrowphase; its sweet spot (2.5D thin-z worlds, expensive narrowphase) is
+a different sweep.
+
+So the by-eye demo impression that "the binary tree wins" is the **low-N
+near-tie**: at pop ~1–2k the maintain gap is only ~1.1× (a few µs), and the HUD's
+rolling average jitters between them. The data shows Morton edging it even there.
+What *is* true is that the binary tree has **no pathological weakness** and is
+the cull champion in the deep/dense corner.
+
+### The knobs that move the ranking
+
+- **Churn (movement speed) → relocate cost.** High churn = more cross-leaf moves
+  = more split/merge for the trees; Morton re-buckets flat regardless. It widens
+  Morton's maintain lead but does not flip it here.
+- **World size / density → tree depth.** Small/dense = deep tree → the octree's
+  fewer levels win the *cull* (it allocates 8 children even when 1–2 are used, so
+  it thrashes cache at low density).
+- **Vision radius → cull selectivity.** A large query is low selectivity
+  (structure barely matters); a small query is where the trees separate.
+- **`item_limit` → leaf granularity *and* the per-`update` scan length** — bigger
+  leaves mean fewer, shallower nodes but a longer predicate scan per relocate.
 
 ### The takeaway
 
-- **Binary `Tree3` — the safe default.** No extra machinery, no N³ memory,
-  adapts to any density, cheapest/leanest persistent `update`. Pick it unless
-  there's a reason not to.
+- **MortonGrid3** — for *this* workload (uniform-ish density, *every* point
+  relocated each frame, sphere queries) it is the all-round winner: cheapest
+  maintain (no per-item lookup) and usually cheapest cull. Caveats: one fixed
+  resolution (loses to the octree on *stacked*/non-uniform density), and it
+  re-buckets the whole set each frame.
+- **Binary `Tree3` — the robust default.** Cull champion in the deep/dense
+  corner, adapts to any density, no N³ memory, no fixed resolution. Its maintain
+  loss is an artefact of the predicate-scan `update`; with **sparse** movement or
+  a **stable item handle** it would lead the relocate race too.
 - **Octree3** — when the tree is *deep* (small/dense world, tight queries): the
-  shallower descent pays on both cull and relocation, at the cost of more
-  nodes/memory.
-- **MortonGrid3** — *uniform* density with a *known* query scale (cell ≈ query):
-  fastest cull and cheapest build, but a single fixed resolution and (in the
-  demo) rebuilt each frame.
+  shallower descent wins the cull, at more nodes/memory.
 - **Projection** — a *2.5D* world (large in xy, thin in z) or an *expensive*
-  narrowphase, reusing the whole 2D stack with no N³ memory.
-
-A rigorous **decision map** — a headless sweep over (world × population ×
-vision × item_limit) reporting the winner per cell across all four structures —
-would turn this qualitative picture into a table. Not yet run (see Still open).
+  narrowphase, reusing the whole 2D stack with no N³ memory; not competitive on
+  this uniform-cube sphere sweep.
 
 ## Still open
-- **Decision-map sweep** — extend `critters3d_headless` to all four structures
-  (it compares binary vs octree today) and sweep world × population × vision ×
-  item_limit, reporting the winner per cell, to make the synthesis above
-  quantitative instead of "by eye".
+- **Stable `ItemRef`** — the decision map showed the trees lose the relocate
+  race because `update` finds the item by an O(item_limit) predicate scan. An
+  O(1) stable handle (index into the arena, kept valid across splits/merges)
+  would remove that scan and likely flip the maintain winner back to the trees —
+  the single highest-leverage follow-up the sweep surfaced.
 - **Non-analytic 3D shapes** in the *projection* comparison: the
   static bench used a sphere (analytic); the polyhedron crossover above
   lives in the voxel-raster bench. Running the projection methods against a
