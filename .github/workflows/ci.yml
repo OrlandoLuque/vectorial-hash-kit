@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Native: fmt + clippy + tests for the library crates. The demos crate
+  # (macroquad/GUI) and the optional `redis-store` feature are intentionally
+  # excluded here — the demos are covered by the wasm job below, and redis needs
+  # a running server. Everything tested here is dependency-light and offline.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      # Advisory only: this codebase uses a deliberately dense hand-formatting
+      # style (one-line match arms / impls) that rustfmt would expand, so fmt is
+      # informational, not a gate. clippy + tests below are the real gates.
+      - name: rustfmt (advisory)
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+
+      # Hard gate on the flagship crate (kept clippy-clean).
+      - name: clippy (vectorial-hash — gate)
+        run: cargo clippy -p vectorial-hash --all-targets -- -D warnings
+
+      - name: clippy (vectorial-hash, parallel feature — gate)
+        run: cargo clippy -p vectorial-hash --all-targets --features parallel -- -D warnings
+
+      # Advisory: templates + cli still carry pre-existing lints (tracked in the
+      # backlog). Visible here, but not blocking until that cleanup pass lands.
+      - name: clippy (templates + cli — advisory)
+        continue-on-error: true
+        run: cargo clippy -p vectorial-hash-templates -p vectorial-hash-cli --all-targets -- -D warnings
+
+      - name: test (lib + templates + cli)
+        run: cargo test -p vectorial-hash -p vectorial-hash-templates -p vectorial-hash-cli
+
+      - name: test (lib, parallel feature)
+        run: cargo test -p vectorial-hash --features parallel
+
+      - name: benches + examples compile
+        run: |
+          cargo bench -p vectorial-hash --no-run
+          cargo build -p vectorial-hash --examples --release
+
+      # Informational only — the committed baseline is hardware-specific, and CI
+      # runners differ in microarchitecture, so this is not a gate (wide
+      # threshold + non-fatal). Run the gate locally to actually catch
+      # regressions. See crates/vectorial-hash/benches/README.md.
+      - name: regression gate (informational)
+        continue-on-error: true
+        run: cargo run -p vectorial-hash --example regression_gate --release -- --threshold 1.0
+
+  # The web demos must keep building for the wasm target (GitHub Pages site).
+  # No GUI system libraries needed: miniquad resolves GL/clock as JS imports.
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: build web demos (wasm32)
+        run: cargo build --target wasm32-unknown-unknown -p vectorial-hash-demos --bin critters --bin critters3d --release

@@ -28,12 +28,20 @@ visual glance the next morning; everything else is autonomously verifiable.
    queries / 100k points). Full table + guidance in `docs/PARALLEL.md`.
 
 **Priority block (user bumped regression baseline to the front, 2026-06-25)**
-2. **Criterion benches + CI + regression baseline** — a `benches/` Criterion
-   suite (cull, update, update_ref, knn across the five structures) + a GitHub
-   Actions workflow (fmt + clippy + test on push). Then a **committed baseline**
-   + a comparison script so a perf regression is visible/fails (wide threshold —
-   CI runners are noisy; the gate may run locally and CI track-only). The
-   baseline is the headline ask.
+2. ~~**Criterion benches + CI + regression baseline**~~ — **done.**
+   - `benches/spatial.rs` (Criterion: build/cull/update/knn across structures).
+   - `examples/regression_gate.rs` — deterministic gate vs a **committed**
+     `benches/baseline.tsv`, exits 1 on regression. **min-of-N + a calibration
+     loop** (compare op/`_calib` ratios) cut back-to-back variance ±60% → ±6%,
+     so it can actually gate. `benches/README.md` documents both tools.
+   - `.github/workflows/ci.yml` — clippy (`-D warnings`, gating on the flagship)
+     + tests (lib/templates/cli, ±parallel) + bench/example compile + wasm build
+     of the web demos. fmt is advisory (the dense hand-style isn't rustfmt-clean).
+   - Cleaned 11 pre-existing clippy lints in `vectorial-hash` to make the gate
+     pass.
+   - *Follow-up:* templates + cli still carry ~21 pre-existing clippy lints
+     (advisory in CI for now) — a focused cleanup pass should make them gate too
+     (careful: some are `needless_range_loop` where the index is genuinely used).
 
 **Original remaining**
 3. **Morton extras** — `MortonGrid3::knn` (ring-by-ring expanding shell, like

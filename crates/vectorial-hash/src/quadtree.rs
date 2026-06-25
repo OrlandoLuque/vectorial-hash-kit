@@ -209,7 +209,7 @@ impl<T: Positioned> QuadTree<T> {
             return None;
         }
         let leaf = self.locate(point);
-        let idx = self.get(leaf).items.iter().position(|it| predicate(it))?;
+        let idx = self.get(leaf).items.iter().position(&predicate)?;
         let (item, h) = self.swap_remove_h(leaf, idx);
         self.free_handles.push(h);
         self.try_merge_up(leaf);
@@ -242,7 +242,7 @@ impl<T: Positioned> QuadTree<T> {
             return false;
         }
         let leaf = self.locate(old_position);
-        let idx = match self.get(leaf).items.iter().position(|it| predicate(it)) {
+        let idx = match self.get(leaf).items.iter().position(&predicate) {
             Some(i) => i,
             None => return false,
         };

@@ -173,7 +173,7 @@ impl<T: Positioned3> Octree3<T> {
     where F: Fn(&T) -> bool, M: FnOnce(&mut T) {
         if !self.get(self.root).bbox.contains(old) { return false; }
         let leaf = self.locate(old);
-        let idx = match self.get(leaf).items.iter().position(|it| predicate(it)) {
+        let idx = match self.get(leaf).items.iter().position(&predicate) {
             Some(i) => i, None => return false,
         };
         mutator(&mut self.get_mut(leaf).items[idx]);
@@ -232,7 +232,7 @@ impl<T: Positioned3> Octree3<T> {
     pub fn remove<F: Fn(&T) -> bool>(&mut self, p: Point3, predicate: F) -> Option<T> {
         if !self.get(self.root).bbox.contains(p) { return None; }
         let leaf = self.locate(p);
-        let idx = self.get(leaf).items.iter().position(|it| predicate(it))?;
+        let idx = self.get(leaf).items.iter().position(&predicate)?;
         let (item, h) = self.swap_remove_h(leaf, idx);
         self.free_handles.push(h);
         self.try_merge_up(leaf);

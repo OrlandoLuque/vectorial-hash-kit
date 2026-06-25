@@ -84,16 +84,11 @@ struct IItemLoc { node: INodeId, slot: u32 }
 
 /// Same relocation strategies as [`crate::UpdateStrategy`]; `LcaRopes`
 /// behaves like `Lca` here (no rope bookkeeping in this tree).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum IUpdateStrategy {
     Legacy,
+    #[default]
     Lca,
-}
-
-impl Default for IUpdateStrategy {
-    fn default() -> Self {
-        IUpdateStrategy::Lca
-    }
 }
 
 pub struct IntegerTree<T: IPositioned> {
@@ -285,7 +280,7 @@ impl<T: IPositioned> IntegerTree<T> {
     pub fn remove<F: Fn(&T) -> bool>(&mut self, point: IPoint, predicate: F) -> Option<T> {
         if !self.get(self.root).bbox.contains(point) { return None; }
         let leaf = self.locate(point);
-        let idx = self.get(leaf).items.iter().position(|it| predicate(it))?;
+        let idx = self.get(leaf).items.iter().position(&predicate)?;
         let (item, h) = self.swap_remove_h(leaf, idx);
         self.free_handles.push(h);
         self.try_merge_up(leaf);
@@ -307,7 +302,7 @@ impl<T: IPositioned> IntegerTree<T> {
     where F: Fn(&T) -> bool, M: FnOnce(&mut T) {
         if !self.get(self.root).bbox.contains(old_position) { return false; }
         let leaf = self.locate(old_position);
-        let idx = match self.get(leaf).items.iter().position(|it| predicate(it)) {
+        let idx = match self.get(leaf).items.iter().position(&predicate) {
             Some(i) => i,
             None => return false,
         };

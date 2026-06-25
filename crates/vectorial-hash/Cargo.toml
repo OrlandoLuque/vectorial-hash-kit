@@ -25,3 +25,11 @@ parallel = ["dep:rayon"]
 # Keep this crate dependency-light on purpose: it is the core algorithm.
 # rayon is the sole optional dependency, gated behind the `parallel` feature.
 rayon = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Benchmark harness (benches/spatial.rs). Dev-only — never in the shipped crate.
+criterion = { workspace = true }
+
+[[bench]]
+name = "spatial"
+harness = false

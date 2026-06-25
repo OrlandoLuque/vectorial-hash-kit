@@ -1,0 +1,12 @@
+# vectorial-hash regression baseline — op<TAB>nanoseconds (min-of-N).
+# _calib is a fixed CPU loop; the gate compares op/_calib ratios to cancel clock scaling. Regenerate with --save on a quiet machine.
+_calib	5520400
+build_tree3	6085200
+build_octree3	4599700
+build_morton3	1661300
+cull_tree3_x64	124600
+cull_octree3_x64	113600
+cull_morton3_x64	64000
+knn_tree3_k16_x256	576400
+update_predicate_frame	3163800
+update_ref_frame	653200
