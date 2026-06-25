@@ -82,15 +82,17 @@ visual glance the next morning; everything else is autonomously verifiable.
 12. **SoA leaf storage + SIMD narrowphase** — store leaf positions contiguously
     for cache-friendly `contains_point` sweeps; explore SIMD on the sphere/point
     test. Measure vs current AoS.
-13. **"Choosing a structure" flowchart** in the README — distil the decision map
-    into a one-glance guide. *(User: "interesante, sí.")*
+13. ~~**"Choosing a structure" flowchart**~~ — **done.** `docs/CHOOSING.md` (a
+    2D/3D decision flowchart + summary table + rules of thumb), linked from the
+    lib README. *(User: "interesante, sí.")*
 
 **Newly added (round 2 — [review] / design)**
 14. **[review] 2D k-NN / line-of-sight demo** — visualise nearest-neighbour and
     LoS in the 2D critters demo.
 15. **[review] Web touch controls + stats HUD** — orbit/zoom by touch on the 3D
     web demo; an FPS/stats overlay in the browser.
-16. **CHANGELOG.md** + semver discipline.
+16. ~~**CHANGELOG.md**~~ — **done.** Root `CHANGELOG.md` (Keep-a-Changelog),
+    `[Unreleased]` capturing this round + a `[0.1.0]` baseline.
 
 ### Deferred — explicitly held back
 - **Publish to crates.io** — *deferred until the crate is more complete* (user,

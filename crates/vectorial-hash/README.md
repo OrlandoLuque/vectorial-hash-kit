@@ -4,6 +4,11 @@ Core index and hash algorithms for vectorial spaces, designed with modern CPU ar
 
 Part of the [`vectorial-hash-kit`](https://github.com/OrlandoLuque/vectorial-hash-kit) workspace.
 
+**New here?** Six structures answer the same queries — see
+[`docs/CHOOSING.md`](../../docs/CHOOSING.md) for a one-glance flowchart on which
+to pick, [`docs/THREE_D.md`](../../docs/THREE_D.md) for the quantitative decision
+map, and [`docs/PARALLEL.md`](../../docs/PARALLEL.md) for when threads pay.
+
 ## Status
 
 Runtime tree, template-driven culling, the dynamic `remove` / `update` operations (with the paper's merge-up rule), and the templates-crate adapter are wired up. `Tree::visit_leaves` exposes the live regions (used by the visual demo) and `TemplateGrid::translated` re-anchors a precomputed template at any world position. 3D support is next.
