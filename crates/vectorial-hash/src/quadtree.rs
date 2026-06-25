@@ -14,6 +14,7 @@
 use crate::culling::{classify_child, collect_matching_items, SizeCache};
 use crate::geom::{Point, Rect};
 use crate::tree::{Positioned, UpdateStrategy};
+use crate::tree3::ItemRef;
 use crate::CellState;
 use crate::Shape;
 
@@ -26,13 +27,21 @@ pub struct QNode<T> {
     pub parent: Option<QNodeId>,
     pub children: Option<[QNodeId; 4]>,
     pub items: Vec<T>,
+    /// Parallel to `items`: each item's stable handle (the [`ItemRef`] layer).
+    hs: Vec<u32>,
 }
+
+/// Where a handle's item currently lives (leaf node + slot).
+#[derive(Copy, Clone)]
+struct QItemLoc { node: QNodeId, slot: u32 }
 
 pub struct QuadTree<T: Positioned> {
     nodes: Vec<QNode<T>>,
     /// Slots freed by 4-way merge-ups, reused before the arena grows — see
     /// [`crate::Tree`]'s free-list for the rationale.
     free: Vec<QNodeId>,
+    locs: Vec<QItemLoc>,
+    free_handles: Vec<u32>,
     /// A leaf splits when it holds more than this many items.
     pub item_limit: usize,
     /// Four sibling leaves merge back into their parent when their combined
@@ -52,8 +61,8 @@ impl<T: Positioned> QuadTree<T> {
         assert!(item_limit >= 1, "item_limit must be >= 1");
         assert!(merge_limit <= item_limit, "merge_limit must be <= item_limit");
         let min_cell = bbox.width.max(bbox.height) * 1e-12;
-        let root = QNode { bbox, parent: None, children: None, items: Vec::new() };
-        Self { nodes: vec![root], free: Vec::new(), item_limit, merge_limit, min_cell, root: QNodeId(0) }
+        let root = QNode { bbox, parent: None, children: None, items: Vec::new(), hs: Vec::new() };
+        Self { nodes: vec![root], free: Vec::new(), locs: Vec::new(), free_handles: Vec::new(), item_limit, merge_limit, min_cell, root: QNodeId(0) }
     }
 
     pub fn get(&self, id: QNodeId) -> &QNode<T> {
@@ -62,6 +71,29 @@ impl<T: Positioned> QuadTree<T> {
 
     fn get_mut(&mut self, id: QNodeId) -> &mut QNode<T> {
         &mut self.nodes[id.0 as usize]
+    }
+
+    fn alloc_handle(&mut self) -> u32 {
+        if let Some(h) = self.free_handles.pop() { h }
+        else { let h = self.locs.len() as u32; self.locs.push(QItemLoc { node: QNodeId(0), slot: 0 }); h }
+    }
+    fn push_h(&mut self, node: QNodeId, item: T, h: u32) {
+        let slot = self.get(node).items.len() as u32;
+        let n = self.get_mut(node);
+        n.items.push(item);
+        n.hs.push(h);
+        self.locs[h as usize] = QItemLoc { node, slot };
+    }
+    fn swap_remove_h(&mut self, node: QNodeId, slot: usize) -> (T, u32) {
+        let (item, h, moved) = {
+            let n = self.get_mut(node);
+            let item = n.items.swap_remove(slot);
+            let h = n.hs.swap_remove(slot);
+            let moved = if slot < n.hs.len() { Some(n.hs[slot]) } else { None };
+            (item, h, moved)
+        };
+        if let Some(m) = moved { self.locs[m as usize].slot = slot as u32; }
+        (item, h)
     }
 
     fn alloc(&mut self, node: QNode<T>) -> QNodeId {
@@ -77,15 +109,63 @@ impl<T: Positioned> QuadTree<T> {
 
     /// Insert an item. Returns `false` if its position falls outside the root bbox.
     pub fn insert(&mut self, item: T) -> bool {
+        self.insert_ref(item).is_some()
+    }
+
+    /// Insert and return a stable [`ItemRef`] for O(1) `update_ref`/`remove_ref`.
+    pub fn insert_ref(&mut self, item: T) -> Option<ItemRef> {
         let pos = item.position();
         if !self.get(self.root).bbox.contains(pos) {
-            return false;
+            return None;
         }
         let leaf = self.locate(pos);
-        self.get_mut(leaf).items.push(item);
+        let h = self.alloc_handle();
+        self.push_h(leaf, item, h);
         if self.get(leaf).items.len() > self.item_limit {
             self.divide(leaf);
         }
+        Some(ItemRef(h))
+    }
+
+    /// O(1) relocation through a stable [`ItemRef`] (no locate, no scan).
+    pub fn update_ref<M: FnOnce(&mut T)>(&mut self, r: ItemRef, mutator: M) -> bool {
+        let loc = self.locs[r.0 as usize];
+        let (node, slot) = (loc.node, loc.slot as usize);
+        mutator(&mut self.get_mut(node).items[slot]);
+        let np = self.get(node).items[slot].position();
+        if self.get(node).bbox.contains(np) {
+            return true;
+        }
+        self.relocate(node, slot, np)
+    }
+
+    /// Remove the item behind a stable [`ItemRef`] in O(1).
+    pub fn remove_ref(&mut self, r: ItemRef) -> Option<T> {
+        let loc = self.locs[r.0 as usize];
+        let (item, h) = self.swap_remove_h(loc.node, loc.slot as usize);
+        self.free_handles.push(h);
+        self.try_merge_up(loc.node);
+        Some(item)
+    }
+
+    /// Shared LCA relocate tail (predicate `update` and `update_ref`).
+    fn relocate(&mut self, leaf: QNodeId, slot: usize, new_pos: Point) -> bool {
+        let lca = match self.ascend_to_lca(leaf, new_pos) {
+            Some(id) => id,
+            None => {
+                let (_, h) = self.swap_remove_h(leaf, slot);
+                self.free_handles.push(h);
+                self.try_merge_up(leaf);
+                return false;
+            }
+        };
+        let (item, h) = self.swap_remove_h(leaf, slot);
+        let dest = self.locate_from(lca, new_pos);
+        self.push_h(dest, item, h);
+        if self.get(dest).items.len() > self.item_limit {
+            self.divide(dest);
+        }
+        self.try_merge_up(leaf);
         true
     }
 
@@ -129,13 +209,11 @@ impl<T: Positioned> QuadTree<T> {
             return None;
         }
         let leaf = self.locate(point);
-        let removed = {
-            let items = &mut self.get_mut(leaf).items;
-            let idx = items.iter().position(|it| predicate(it))?;
-            items.remove(idx)
-        };
+        let idx = self.get(leaf).items.iter().position(|it| predicate(it))?;
+        let (item, h) = self.swap_remove_h(leaf, idx);
+        self.free_handles.push(h);
         self.try_merge_up(leaf);
-        Some(removed)
+        Some(item)
     }
 
     /// Same contract as [`crate::Tree::update`].
@@ -177,28 +255,13 @@ impl<T: Positioned> QuadTree<T> {
 
         match strategy {
             UpdateStrategy::Legacy => {
-                let item = self.get_mut(leaf).items.remove(idx);
+                // remove + re-insert reassigns the handle; the Lca path preserves it.
+                let (item, h) = self.swap_remove_h(leaf, idx);
+                self.free_handles.push(h);
                 self.try_merge_up(leaf);
                 self.insert(item)
             }
-            UpdateStrategy::Lca | UpdateStrategy::LcaRopes => {
-                let lca = match self.ascend_to_lca(leaf, new_pos) {
-                    Some(id) => id,
-                    None => {
-                        let _ = self.get_mut(leaf).items.remove(idx);
-                        self.try_merge_up(leaf);
-                        return false;
-                    }
-                };
-                let item = self.get_mut(leaf).items.remove(idx);
-                let dest = self.locate_from(lca, new_pos);
-                self.get_mut(dest).items.push(item);
-                if self.get(dest).items.len() > self.item_limit {
-                    self.divide(dest);
-                }
-                self.try_merge_up(leaf);
-                true
-            }
+            UpdateStrategy::Lca | UpdateStrategy::LcaRopes => self.relocate(leaf, idx, new_pos),
         }
     }
 
@@ -219,12 +282,20 @@ impl<T: Positioned> QuadTree<T> {
                 return;
             }
             let mut merged: Vec<T> = Vec::with_capacity(combined);
+            let mut merged_hs: Vec<u32> = Vec::with_capacity(combined);
             for &k in &kids {
                 merged.append(&mut std::mem::take(&mut self.get_mut(k).items));
+                merged_hs.append(&mut std::mem::take(&mut self.get_mut(k).hs));
             }
             let parent = self.get_mut(parent_id);
             parent.items = merged;
+            parent.hs = merged_hs;
             parent.children = None;
+            let len = self.get(parent_id).hs.len();
+            for slot in 0..len {
+                let h = self.get(parent_id).hs[slot];
+                self.locs[h as usize] = QItemLoc { node: parent_id, slot: slot as u32 };
+            }
             for k in kids {
                 self.free.push(k);
             }
@@ -235,16 +306,19 @@ impl<T: Positioned> QuadTree<T> {
     /// Split a leaf into four quadrants; same degenerate-subdivision guards
     /// as the binary tree (identical positions, minimum cell size).
     fn divide(&mut self, id: QNodeId) {
-        let (bbox, items) = {
+        let (bbox, items, hs) = {
             let n = self.get_mut(id);
             let items = std::mem::take(&mut n.items);
-            (n.bbox, items)
+            let hs = std::mem::take(&mut n.hs);
+            (n.bbox, items, hs)
         };
 
         let first = items[0].position();
         let inseparable = items.iter().all(|it| it.position() == first);
         if inseparable || bbox.width.max(bbox.height) <= self.min_cell {
-            self.get_mut(id).items = items;
+            let n = self.get_mut(id);
+            n.items = items;
+            n.hs = hs;
             return;
         }
 
@@ -263,16 +337,17 @@ impl<T: Positioned> QuadTree<T> {
                 parent: Some(id),
                 children: None,
                 items: Vec::new(),
+                hs: Vec::new(),
             });
         }
-        for item in items {
+        for (item, h) in items.into_iter().zip(hs) {
             let pos = item.position();
             let k = kids
                 .iter()
                 .copied()
                 .find(|&k| self.get(k).bbox.contains(pos))
                 .expect("quadrants tile the parent");
-            self.get_mut(k).items.push(item);
+            self.push_h(k, item, h);
         }
         self.get_mut(id).children = Some(kids);
         for k in kids {
@@ -381,6 +456,43 @@ mod tests {
     impl Positioned for Pt {
         fn position(&self) -> Point {
             self.0
+        }
+    }
+
+    #[test]
+    fn update_ref_churn_matches_brute() {
+        #[derive(Clone, Copy)]
+        struct M { id: u32, p: Point }
+        impl Positioned for M { fn position(&self) -> Point { self.p } }
+        struct Box2 { r: Rect }
+        impl crate::Shape for Box2 {
+            fn bounding_box(&self) -> Rect { self.r }
+            fn contains_point(&self, p: Point) -> bool { self.r.contains(p) }
+        }
+        let mut x = 0x9D7_EF00Du64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        let mut q = QuadTree::<M>::new(Rect::new(0.0, 0.0, 256.0, 256.0), 6);
+        let rp = |rng: &mut dyn FnMut() -> f64| Point::new(rng() * 256.0, rng() * 256.0);
+        let mut live: std::collections::HashMap<u32, (ItemRef, Point)> = std::collections::HashMap::new();
+        let mut next = 0u32;
+        for _ in 0..2000 { let p = rp(&mut rng); let r = q.insert_ref(M { id: next, p }).unwrap(); live.insert(next, (r, p)); next += 1; }
+        for _ in 0..6000 {
+            let roll = rng();
+            let ids: Vec<u32> = live.keys().copied().collect();
+            if roll < 0.6 && !ids.is_empty() {
+                let id = ids[(rng() * ids.len() as f64) as usize % ids.len()];
+                let (r, _) = live[&id]; let np = rp(&mut rng);
+                assert!(q.update_ref(r, |m| m.p = np)); live.get_mut(&id).unwrap().1 = np;
+            } else if roll < 0.8 && !ids.is_empty() {
+                let id = ids[(rng() * ids.len() as f64) as usize % ids.len()];
+                q.remove_ref(live[&id].0); live.remove(&id);
+            } else { let p = rp(&mut rng); let r = q.insert_ref(M { id: next, p }).unwrap(); live.insert(next, (r, p)); next += 1; }
+        }
+        for r in [Rect::new(100.0, 100.0, 60.0, 60.0), Rect::new(0.0, 0.0, 128.0, 128.0), Rect::new(200.0, 10.0, 50.0, 200.0)] {
+            let mut want: Vec<u32> = live.iter().filter(|(_, (_, p))| r.contains(*p)).map(|(id, _)| *id).collect();
+            let mut got: Vec<u32> = q.cull(&Box2 { r }).iter().map(|m| m.id).collect();
+            want.sort(); got.sort();
+            assert_eq!(want, got, "quadtree handle-churn cull != brute for {r:?}");
         }
     }
 

@@ -24,6 +24,7 @@
 use crate::culling::{classify_child, SizeCache};
 use crate::geom::{Point, Rect};
 use crate::template::CellState;
+use crate::tree3::ItemRef;
 use crate::Shape;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -72,7 +73,14 @@ pub struct INode<T> {
     pub parent: Option<INodeId>,
     pub children: Option<[INodeId; 2]>,
     pub items: Vec<T>,
+    /// Parallel to `items`: each item's stable handle (the [`crate::ItemRef`]
+    /// layer).
+    hs: Vec<u32>,
 }
+
+/// Where a handle's item currently lives (leaf node + slot).
+#[derive(Copy, Clone)]
+struct IItemLoc { node: INodeId, slot: u32 }
 
 /// Same relocation strategies as [`crate::UpdateStrategy`]; `LcaRopes`
 /// behaves like `Lca` here (no rope bookkeeping in this tree).
@@ -93,6 +101,8 @@ pub struct IntegerTree<T: IPositioned> {
     /// Slots freed by merge-ups, reused before the arena grows — see
     /// [`crate::Tree`]'s free-list for the rationale.
     free: Vec<INodeId>,
+    locs: Vec<IItemLoc>,
+    free_handles: Vec<u32>,
     pub item_limit: usize,
     pub merge_limit: usize,
     /// Smallest non-degenerate cell dimension. With integer coords this is 1.
@@ -112,10 +122,12 @@ impl<T: IPositioned> IntegerTree<T> {
         assert!(bbox.w > 0 && bbox.h > 0, "bbox extent must be positive");
         assert!((bbox.w as u32).is_power_of_two(), "bbox.w must be a power of two");
         assert!((bbox.h as u32).is_power_of_two(), "bbox.h must be a power of two");
-        let root = INode { bbox, parent: None, children: None, items: Vec::new() };
+        let root = INode { bbox, parent: None, children: None, items: Vec::new(), hs: Vec::new() };
         Self {
             nodes: vec![root],
             free: Vec::new(),
+            locs: Vec::new(),
+            free_handles: Vec::new(),
             item_limit,
             merge_limit,
             min_cell: 1,
@@ -125,6 +137,29 @@ impl<T: IPositioned> IntegerTree<T> {
 
     pub fn get(&self, id: INodeId) -> &INode<T> { &self.nodes[id.0 as usize] }
     fn get_mut(&mut self, id: INodeId) -> &mut INode<T> { &mut self.nodes[id.0 as usize] }
+
+    fn alloc_handle(&mut self) -> u32 {
+        if let Some(h) = self.free_handles.pop() { h }
+        else { let h = self.locs.len() as u32; self.locs.push(IItemLoc { node: INodeId(0), slot: 0 }); h }
+    }
+    fn push_h(&mut self, node: INodeId, item: T, h: u32) {
+        let slot = self.get(node).items.len() as u32;
+        let n = self.get_mut(node);
+        n.items.push(item);
+        n.hs.push(h);
+        self.locs[h as usize] = IItemLoc { node, slot };
+    }
+    fn swap_remove_h(&mut self, node: INodeId, slot: usize) -> (T, u32) {
+        let (item, h, moved) = {
+            let n = self.get_mut(node);
+            let item = n.items.swap_remove(slot);
+            let h = n.hs.swap_remove(slot);
+            let moved = if slot < n.hs.len() { Some(n.hs[slot]) } else { None };
+            (item, h, moved)
+        };
+        if let Some(m) = moved { self.locs[m as usize].slot = slot as u32; }
+        (item, h)
+    }
 
     fn alloc(&mut self, node: INode<T>) -> INodeId {
         if let Some(id) = self.free.pop() {
@@ -166,11 +201,55 @@ impl<T: IPositioned> IntegerTree<T> {
     }
 
     pub fn insert(&mut self, item: T) -> bool {
+        self.insert_ref(item).is_some()
+    }
+
+    /// Insert and return a stable [`crate::ItemRef`] for O(1) `update_ref`/`remove_ref`.
+    pub fn insert_ref(&mut self, item: T) -> Option<ItemRef> {
         let pos = item.position();
-        if !self.get(self.root).bbox.contains(pos) { return false; }
+        if !self.get(self.root).bbox.contains(pos) { return None; }
         let leaf = self.locate(pos);
-        self.get_mut(leaf).items.push(item);
+        let h = self.alloc_handle();
+        self.push_h(leaf, item, h);
         if self.get(leaf).items.len() > self.item_limit { self.divide(leaf); }
+        Some(ItemRef(h))
+    }
+
+    /// O(1) relocation through a stable [`crate::ItemRef`] (no locate, no scan).
+    pub fn update_ref<M: FnOnce(&mut T)>(&mut self, r: ItemRef, mutator: M) -> bool {
+        let loc = self.locs[r.0 as usize];
+        let (node, slot) = (loc.node, loc.slot as usize);
+        mutator(&mut self.get_mut(node).items[slot]);
+        let np = self.get(node).items[slot].position();
+        if self.get(node).bbox.contains(np) { return true; }
+        self.relocate(node, slot, np)
+    }
+
+    /// Remove the item behind a stable [`crate::ItemRef`] in O(1).
+    pub fn remove_ref(&mut self, r: ItemRef) -> Option<T> {
+        let loc = self.locs[r.0 as usize];
+        let (item, h) = self.swap_remove_h(loc.node, loc.slot as usize);
+        self.free_handles.push(h);
+        self.try_merge_up(loc.node);
+        Some(item)
+    }
+
+    /// Shared LCA relocate tail (predicate `update` and `update_ref`).
+    fn relocate(&mut self, leaf: INodeId, slot: usize, new_pos: IPoint) -> bool {
+        let lca = match self.ascend_to_lca(leaf, new_pos) {
+            Some(id) => id,
+            None => {
+                let (_, h) = self.swap_remove_h(leaf, slot);
+                self.free_handles.push(h);
+                self.try_merge_up(leaf);
+                return false;
+            }
+        };
+        let (item, h) = self.swap_remove_h(leaf, slot);
+        let dest = self.locate_from(lca, new_pos);
+        self.push_h(dest, item, h);
+        if self.get(dest).items.len() > self.item_limit { self.divide(dest); }
+        self.try_merge_up(leaf);
         true
     }
 
@@ -206,13 +285,11 @@ impl<T: IPositioned> IntegerTree<T> {
     pub fn remove<F: Fn(&T) -> bool>(&mut self, point: IPoint, predicate: F) -> Option<T> {
         if !self.get(self.root).bbox.contains(point) { return None; }
         let leaf = self.locate(point);
-        let removed = {
-            let items = &mut self.get_mut(leaf).items;
-            let idx = items.iter().position(|it| predicate(it))?;
-            items.remove(idx)
-        };
+        let idx = self.get(leaf).items.iter().position(|it| predicate(it))?;
+        let (item, h) = self.swap_remove_h(leaf, idx);
+        self.free_handles.push(h);
         self.try_merge_up(leaf);
-        Some(removed)
+        Some(item)
     }
 
     pub fn update<F, M>(&mut self, old_position: IPoint, predicate: F, mutator: M) -> bool
@@ -241,26 +318,13 @@ impl<T: IPositioned> IntegerTree<T> {
 
         match strategy {
             IUpdateStrategy::Legacy => {
-                let item = self.get_mut(leaf).items.remove(idx);
+                // remove + re-insert reassigns the handle; the Lca path preserves it.
+                let (item, h) = self.swap_remove_h(leaf, idx);
+                self.free_handles.push(h);
                 self.try_merge_up(leaf);
                 self.insert(item)
             }
-            IUpdateStrategy::Lca => {
-                let lca = match self.ascend_to_lca(leaf, new_pos) {
-                    Some(id) => id,
-                    None => {
-                        let _ = self.get_mut(leaf).items.remove(idx);
-                        self.try_merge_up(leaf);
-                        return false;
-                    }
-                };
-                let item = self.get_mut(leaf).items.remove(idx);
-                let dest = self.locate_from(lca, new_pos);
-                self.get_mut(dest).items.push(item);
-                if self.get(dest).items.len() > self.item_limit { self.divide(dest); }
-                self.try_merge_up(leaf);
-                true
-            }
+            IUpdateStrategy::Lca => self.relocate(leaf, idx, new_pos),
         }
     }
 
@@ -329,11 +393,20 @@ impl<T: IPositioned> IntegerTree<T> {
             let combined = self.get(a).items.len() + self.get(b).items.len();
             if combined > self.merge_limit { return; }
             let mut items_a = std::mem::take(&mut self.get_mut(a).items);
+            let mut hs_a = std::mem::take(&mut self.get_mut(a).hs);
             let mut items_b = std::mem::take(&mut self.get_mut(b).items);
+            let mut hs_b = std::mem::take(&mut self.get_mut(b).hs);
             items_a.append(&mut items_b);
+            hs_a.append(&mut hs_b);
             let parent = self.get_mut(parent_id);
             parent.items = items_a;
+            parent.hs = hs_a;
             parent.children = None;
+            let len = self.get(parent_id).hs.len();
+            for slot in 0..len {
+                let h = self.get(parent_id).hs[slot];
+                self.locs[h as usize] = IItemLoc { node: parent_id, slot: slot as u32 };
+            }
             self.free.push(a);
             self.free.push(b);
             node = parent_id;
@@ -341,15 +414,18 @@ impl<T: IPositioned> IntegerTree<T> {
     }
 
     fn divide(&mut self, id: INodeId) {
-        let (bbox, items) = {
+        let (bbox, items, hs) = {
             let n = self.get_mut(id);
             let items = std::mem::take(&mut n.items);
-            (n.bbox, items)
+            let hs = std::mem::take(&mut n.hs);
+            (n.bbox, items, hs)
         };
         let first = items[0].position();
         let inseparable = items.iter().all(|it| it.position() == first);
         if inseparable || bbox.w.max(bbox.h) <= self.min_cell {
-            self.get_mut(id).items = items;
+            let n = self.get_mut(id);
+            n.items = items;
+            n.hs = hs;
             return;
         }
         // Split policy mirrors the float tree's `pick_split`:
@@ -382,15 +458,12 @@ impl<T: IPositioned> IntegerTree<T> {
                  IRect::new(bbox.x, bbox.y + half, bbox.w, half))
             }
         };
-        let a = self.alloc(INode { bbox: a_bbox, parent: Some(id), children: None, items: Vec::new() });
-        let b = self.alloc(INode { bbox: b_bbox, parent: Some(id), children: None, items: Vec::new() });
-        for item in items {
+        let a = self.alloc(INode { bbox: a_bbox, parent: Some(id), children: None, items: Vec::new(), hs: Vec::new() });
+        let b = self.alloc(INode { bbox: b_bbox, parent: Some(id), children: None, items: Vec::new(), hs: Vec::new() });
+        for (item, h) in items.into_iter().zip(hs) {
             let pos = item.position();
-            if self.get(a).bbox.contains(pos) {
-                self.get_mut(a).items.push(item);
-            } else {
-                self.get_mut(b).items.push(item);
-            }
+            let dest = if self.get(a).bbox.contains(pos) { a } else { b };
+            self.push_h(dest, item, h);
         }
         self.get_mut(id).children = Some([a, b]);
         if self.get(a).items.len() > self.item_limit { self.divide(a); }
@@ -439,6 +512,45 @@ mod tests {
     #[derive(Clone, Copy)]
     struct IP(IPoint);
     impl IPositioned for IP { fn position(&self) -> IPoint { self.0 } }
+
+    #[test]
+    fn update_ref_churn_matches_brute() {
+        // Build with insert_ref, churn with update_ref/remove_ref/insert_ref;
+        // verify a whole-world cull returns exactly the live id set (no loss /
+        // dup / corruption from the handle bookkeeping) + item count.
+        #[derive(Clone, Copy)]
+        struct M { id: u32, p: IPoint }
+        impl IPositioned for M { fn position(&self) -> IPoint { self.p } }
+        struct Box2 { r: Rect }
+        impl crate::Shape for Box2 {
+            fn bounding_box(&self) -> Rect { self.r }
+            fn contains_point(&self, p: Point) -> bool { self.r.contains(p) }
+        }
+        let mut x = 0x17_7EF00Du64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        let mut t = IntegerTree::<M>::new(IRect::new(0, 0, 1024, 1024), 6);
+        let rp = |rng: &mut dyn FnMut() -> f64| IPoint::new((rng() * 1024.0) as i32, (rng() * 1024.0) as i32);
+        let mut live: std::collections::HashMap<u32, ItemRef> = std::collections::HashMap::new();
+        let mut next = 0u32;
+        for _ in 0..2000 { let p = rp(&mut rng); let r = t.insert_ref(M { id: next, p }).unwrap(); live.insert(next, r); next += 1; }
+        for _ in 0..6000 {
+            let roll = rng();
+            let ids: Vec<u32> = live.keys().copied().collect();
+            if roll < 0.6 && !ids.is_empty() {
+                let id = ids[(rng() * ids.len() as f64) as usize % ids.len()];
+                let np = rp(&mut rng);
+                assert!(t.update_ref(live[&id], |m| m.p = np));
+            } else if roll < 0.8 && !ids.is_empty() {
+                let id = ids[(rng() * ids.len() as f64) as usize % ids.len()];
+                t.remove_ref(live[&id]); live.remove(&id);
+            } else { let p = rp(&mut rng); let r = t.insert_ref(M { id: next, p }).unwrap(); live.insert(next, r); next += 1; }
+        }
+        assert_eq!(t.item_count(), live.len(), "itree handle-churn item count drift");
+        let mut want: Vec<u32> = live.keys().copied().collect();
+        let mut got: Vec<u32> = t.cull(&Box2 { r: Rect::new(0.0, 0.0, 1024.0, 1024.0) }).iter().map(|m| m.id).collect();
+        want.sort(); got.sort();
+        assert_eq!(want, got, "itree handle-churn whole-world cull != live set");
+    }
 
     #[test]
     #[should_panic(expected = "must be a power of two")]
