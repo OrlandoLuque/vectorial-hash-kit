@@ -301,6 +301,7 @@ async fn main() {
     let mut rings: Vec<Ring> = Vec::new();
     let mut last_paint: f64 = 0.0;
     let mut paused = false;
+    let mut ui_hidden = false; // visual-only mode (hide tuning window + panel + graphs)
     let mut brush = Kind::Hunter;
     let mut region_mode: u8 = 0;
 
@@ -340,6 +341,11 @@ async fn main() {
         if is_key_pressed(KeyCode::D) {
             // Toggle Minkowski dilation: agents gain / lose a body radius.
             agent_radius_f = if agent_radius_f > 0.0 { 0.0 } else { 16.0 };
+        }
+        if is_key_pressed(KeyCode::U) {
+            // Visual-only mode: hide the tuning window, side panel and graphs,
+            // leaving just the map. Keys still work. ([U] or the web button.)
+            ui_hidden = !ui_hidden;
         }
         if is_key_pressed(KeyCode::LeftBracket) {
             speed_f = (speed_f * 0.5).max(0.25);
@@ -425,6 +431,7 @@ async fn main() {
 
         // --- tuning panel ---
         let mut want_world_step = false;
+        if !ui_hidden {
         widgets::Window::new(
             hash!(),
             vec2(MAP_PX + 10.0, 446.0),
@@ -454,6 +461,7 @@ async fn main() {
             ui.separator();
             ui.slider(hash!(), "agent r [D]", 0f32..40f32, &mut agent_radius_f);
         });
+        }
 
         split_f = split_f.round().clamp(1.0, 12.0);
         merge_f = merge_f.round().clamp(1.0, split_f);
@@ -685,7 +693,8 @@ async fn main() {
             );
         }
 
-        // ---------- side panel ----------
+        // ---------- side panel (hidden in visual-only mode) ----------
+        if !ui_hidden {
         let map_px = MAP_PX;
         let map_py = MAP_PX;
         draw_rectangle_lines(0.0, 0.0, map_px, map_py, 2.0, GRAY);
@@ -853,6 +862,7 @@ async fn main() {
                 15.0,
                 GRAY,
             );
+        }
         }
 
         frame += 1;

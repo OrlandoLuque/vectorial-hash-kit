@@ -14,18 +14,21 @@
      (transformed) bounding rect, so input stays aligned. */
   #glcanvas { position:fixed; left:50%; top:50%; width:1398px; height:768px;
               transform:translate(-50%,-50%); transform-origin:center center; }
-  #back, #hide { position:fixed; z-index:10; color:#9fb0d8; font:14px system-ui;
+  #back, #hide, #visual { position:fixed; z-index:10; color:#9fb0d8; font:13px system-ui;
           background:#141a2ccc; padding:6px 11px; border-radius:8px; border:1px solid #2a3550;
           text-decoration:none; cursor:pointer; user-select:none; }
   #back { top:10px; left:12px; }
   #hide { top:10px; right:12px; font-size:16px; line-height:1; }
-  #back:hover, #hide:hover { color:#fff; border-color:#4a6cff; }
+  #visual { top:46px; right:12px; }
+  #back:hover, #hide:hover, #visual:hover { color:#fff; border-color:#4a6cff; }
+  #visual.active { color:#fff; border-color:#4a6cff; background:#1d2747ee; }
   body.immersive #back { display:none; }
 </style>
 </head>
 <body>
 <a id="back" href="index.html">← demos</a>
-<button id="hide" title="Hide UI / fullscreen (toggle)">⤢</button>
+<button id="hide" title="Hide page chrome + fullscreen (toggle)">⤢</button>
+<button id="visual" title="Show only the demo — hide controls, text &amp; graphs (or press U)">hide UI</button>
 <canvas id="glcanvas" tabindex="1"></canvas>
 <script>
   // Scale-to-fit the fixed-size 2D demo into the viewport.
@@ -36,7 +39,7 @@
   }
   addEventListener('resize', fit); fit();
 
-  // Hide-everything-but-the-demo toggle (plus fullscreen) for mobile.
+  // ⤢ — hide the page chrome (back link) and go fullscreen, for mobile.
   const hide = document.getElementById('hide');
   hide.addEventListener('click', () => {
     const on = document.body.classList.toggle('immersive');
@@ -48,6 +51,24 @@
     if (!document.fullscreenElement && document.body.classList.contains('immersive')) {
       document.body.classList.remove('immersive'); hide.textContent = '⤢';
     }
+  });
+
+  // Dispatch a key to the wasm canvas — miniquad listens for keydown/keyup.
+  function pressKey(code, key, keyCode) {
+    const o = { key, code, keyCode, which: keyCode, bubbles: true };
+    cv.dispatchEvent(new KeyboardEvent('keydown', o));
+    setTimeout(() => cv.dispatchEvent(new KeyboardEvent('keyup', o)), 40);
+  }
+  // "hide UI" — presses [U] so the demo hides its own panel / text / graphs,
+  // leaving just the rendered critters. Click again (or [U]) to bring it back.
+  const visual = document.getElementById('visual');
+  let visOn = false;
+  visual.addEventListener('click', () => {
+    visOn = !visOn;
+    visual.classList.toggle('active', visOn);
+    visual.textContent = visOn ? 'show UI' : 'hide UI';
+    pressKey('KeyU', 'u', 85);
+    cv.focus();
   });
 </script>
 <script src="mq_js_bundle.js"></script>

@@ -64,7 +64,7 @@ const HIST_MAX: usize = 90; // frames kept in the replay history ring
 
 // On-screen control panel (top-right) size.
 const UI_W: f32 = 300.0;
-const UI_H: f32 = 490.0;
+const UI_H: f32 = 400.0;
 
 // Combat-mode tuning.
 // Per-kind attack cooldown ranges (seconds) — see `kind_cooldown`.
@@ -295,16 +295,16 @@ struct Panel {
 impl Panel {
     fn new(x: f32, y: f32, w: f32, mx: f32, my: f32, pressed: bool, down: bool, rpressed: bool) -> Self {
         draw_rectangle(x, y, w, UI_H, Color::new(0.06, 0.07, 0.10, 0.92));
-        draw_rectangle(x, y, w, 22.0, Color::new(0.12, 0.14, 0.20, 0.95));
-        draw_text("controls", x + 8.0, y + 16.0, 18.0, Color::new(0.8, 0.9, 1.0, 1.0));
-        Panel { x, w, cur: y + 26.0, row: 26.0, mx, my, pressed, down, rpressed, help: None }
+        draw_rectangle(x, y, w, 19.0, Color::new(0.12, 0.14, 0.20, 0.95));
+        draw_text("controls", x + 8.0, y + 14.0, 15.0, Color::new(0.8, 0.9, 1.0, 1.0));
+        Panel { x, w, cur: y + 22.0, row: 21.0, mx, my, pressed, down, rpressed, help: None }
     }
     fn over(&self, rx: f32, ry: f32, rw: f32, rh: f32) -> bool {
         self.mx >= rx && self.mx <= rx + rw && self.my >= ry && self.my <= ry + rh
     }
     fn cell(rx: f32, ry: f32, rw: f32, rh: f32, hov: bool, text: &str, tx: f32) {
         draw_rectangle(rx, ry, rw, rh, if hov { Color::new(0.30, 0.36, 0.5, 0.95) } else { Color::new(0.18, 0.21, 0.30, 0.9) });
-        draw_text(text, rx + tx, ry + rh * 0.72, 17.0, Color::new(0.92, 0.95, 1.0, 1.0));
+        draw_text(text, rx + tx, ry + rh * 0.72, 14.0, Color::new(0.92, 0.95, 1.0, 1.0));
     }
     fn button(&mut self, label: &str, help: &'static str) -> bool {
         let (rx, ry, rw, rh) = (self.x + 6.0, self.cur, self.w - 12.0, self.row - 5.0);
@@ -318,7 +318,7 @@ impl Panel {
     /// set, **right-click to type the value** (`id` identifies this slider; the
     /// main loop captures the keystrokes into `edit_buf` and applies on Enter).
     fn slider(&mut self, label: &str, min: f32, max: f32, step: f32, val: &mut f32, id: u8, editing: &mut Option<u8>, edit_buf: &mut String, drag: &mut Option<u8>, icon: Option<Color>, help: &'static str) {
-        let (ry, rh, bw) = (self.cur, self.row - 5.0, 22.0);
+        let (ry, rh, bw) = (self.cur, self.row - 4.0, 20.0);
         let (mx0, px0) = (self.x + 6.0, self.x + self.w - 6.0 - bw);
         let bx = mx0 + bw + 4.0;
         let bar_w = px0 - bx - 4.0;
@@ -339,7 +339,7 @@ impl Panel {
             6.0
         };
         if is_editing {
-            draw_text(&format!("{}: {}_", label, edit_buf), bx + tx, ry + rh * 0.72, 16.0, Color::new(1.0, 0.9, 0.4, 1.0));
+            draw_text(&format!("{}: {}_", label, edit_buf), bx + tx, ry + rh * 0.72, 13.0, Color::new(1.0, 0.9, 0.4, 1.0));
         } else {
             if hov_m && self.pressed { *val = (((*val / step).ceil() - 1.0) * step).max(min); }
             if hov_p && self.pressed { *val = (((*val / step).floor() + 1.0) * step).min(max); }
@@ -351,7 +351,7 @@ impl Panel {
             if hov_b && self.rpressed { *editing = Some(id); *edit_buf = format!("{:.0}", *val); } // start keyboard edit
             let frac = ((*val - min) / (max - min)).clamp(0.0, 1.0);
             draw_rectangle(bx, ry, bar_w * frac, rh, Color::new(0.28, 0.5, 0.7, 0.9));
-            draw_text(&format!("{}: {:.0}", label, *val), bx + tx, ry + rh * 0.72, 16.0, Color::new(0.92, 0.95, 1.0, 1.0));
+            draw_text(&format!("{}: {:.0}", label, *val), bx + tx, ry + rh * 0.72, 13.0, Color::new(0.92, 0.95, 1.0, 1.0));
         }
         if hov_m || hov_p || hov_b { self.help = Some(help); }
         self.cur += self.row;
@@ -359,7 +359,7 @@ impl Panel {
     /// Like `slider`, but the value steps through a discrete list (e.g. powers
     /// of 2) — `[-]`/`[+]` move one entry, the bar snaps to the nearest.
     fn stepper(&mut self, label: &str, values: &[f32], cur: &mut f32, id: u8, drag: &mut Option<u8>, help: &'static str) {
-        let (ry, rh, bw) = (self.cur, self.row - 5.0, 22.0);
+        let (ry, rh, bw) = (self.cur, self.row - 4.0, 20.0);
         let (mx0, px0) = (self.x + 6.0, self.x + self.w - 6.0 - bw);
         let bx = mx0 + bw + 4.0;
         let bar_w = px0 - bx - 4.0;
@@ -387,7 +387,7 @@ impl Panel {
         draw_rectangle(bx, ry, bar_w, rh, Color::new(0.14, 0.16, 0.22, 0.9));
         let frac = idx as f32 / (values.len() - 1).max(1) as f32;
         draw_rectangle(bx, ry, bar_w * frac, rh, Color::new(0.28, 0.5, 0.7, 0.9));
-        draw_text(&format!("{}: {:.0}", label, *cur), bx + 6.0, ry + rh * 0.72, 16.0, Color::new(0.92, 0.95, 1.0, 1.0));
+        draw_text(&format!("{}: {:.0}", label, *cur), bx + 6.0, ry + rh * 0.72, 13.0, Color::new(0.92, 0.95, 1.0, 1.0));
         if hov_m || hov_p || hov_b { self.help = Some(help); }
         self.cur += self.row;
     }
@@ -456,11 +456,11 @@ impl Panel {
         match self.help {
             Some(h) => {
                 for (i, line) in h.split('\n').enumerate() {
-                    draw_text(line, self.x + 10.0, hy + 18.0 + i as f32 * 16.0, 15.0, Color::new(0.82, 0.87, 0.97, 1.0));
+                    draw_text(line, self.x + 10.0, hy + 16.0 + i as f32 * 14.0, 13.0, Color::new(0.82, 0.87, 0.97, 1.0));
                 }
             }
             None => {
-                draw_text("hover a control for help", self.x + 10.0, hy + 18.0, 15.0, Color::new(0.5, 0.55, 0.65, 1.0));
+                draw_text("hover a control for help", self.x + 10.0, hy + 16.0, 13.0, Color::new(0.5, 0.55, 0.65, 1.0));
             }
         }
     }
@@ -488,9 +488,9 @@ fn draw_graph(x: f32, y: f32, w: f32, h: f32, label: &str, data: &[f32], color: 
             let y1 = y + h - (data[i] / maxv) * plot_h;
             draw_line(x0, y0, x1, y1, 1.5, color);
         }
-        draw_text(&format!("{}: {:.0}  (peak {:.0})", label, data[n - 1], maxv), x + 5.0, y + 13.0, 15.0, color);
+        draw_text(&format!("{}: {:.0}  (peak {:.0})", label, data[n - 1], maxv), x + 5.0, y + 12.0, 13.0, color);
     } else {
-        draw_text(label, x + 5.0, y + 13.0, 15.0, color);
+        draw_text(label, x + 5.0, y + 12.0, 13.0, color);
     }
 }
 
@@ -764,6 +764,10 @@ async fn main() {
     // update removed (the CPU bottleneck that otherwise dominates).
     let mut paused = std::env::var("CRITTERS3D_FREEZE").is_ok();
     let mut show_boxes = false;
+    // Visual-only mode: hide all 2D overlay UI (HUD text, control panel, graphs)
+    // leaving just the rendered scene. Toggled by [U] or the web "visual only"
+    // button. Keyboard shortcuts still work while hidden.
+    let mut ui_hidden = false;
     let mut structure = Structure::from_env();
     let mut render_mode = RenderMode::from_env();
     let cull_rep_steps = [1usize, 50, 200, 1000];
@@ -899,6 +903,7 @@ async fn main() {
         if editing.is_none() {
         if is_key_pressed(KeyCode::Escape) { break; }
         if is_key_pressed(KeyCode::B) { show_boxes = !show_boxes; }
+        if is_key_pressed(KeyCode::U) { ui_hidden = !ui_hidden; }
         if is_key_pressed(KeyCode::M) { structure = structure.next(); }
         if is_key_pressed(KeyCode::G) { render_mode = render_mode.next(); }
         if is_key_pressed(KeyCode::T) { sim_mode = match sim_mode { SimMode::Observe => SimMode::Combat, SimMode::Combat => SimMode::Observe }; }
@@ -1330,6 +1335,9 @@ async fn main() {
         // --- HUD (2D overlay) ---
         set_default_camera();
         let hud = |y: f32, s: String| draw_text(&s, 12.0, y, 20.0, Color::new(0.85, 0.9, 1.0, 1.0));
+        // Visual-only mode ([U] / web button) hides every 2D overlay: HUD, panel,
+        // graphs. Keyboard shortcuts keep working so you can still drive it blind.
+        if !ui_hidden {
         // Numbers are right-aligned in fixed-width fields so they don't shift
         // the text sideways as they change (which made it jitter illegibly).
         let mode_str = if sim_mode == SimMode::Combat { "COMBAT " } else { "observe" };
@@ -1368,11 +1376,14 @@ async fn main() {
         let cpu_ceiling = if cpu_ms_avg > 0.0 { 1000.0 / cpu_ms_avg } else { 0.0 };
         let bound = if frame_ms > 0.0 && cpu_ms_avg >= 0.85 * frame_ms { "CPU-BOUND" } else { "GPU-bound" };
         hud(134.0, format!("cpu ~{:>6.2} ms (sim {:>6.0}+build {:>6.0}+prep {:>6.0} us) -> CPU ceiling ~{:>6.0} fps -> {}", cpu_ms_avg, sim_us_avg, t_build_us, prep_us_avg, cpu_ceiling, bound));
-        hud(screen_height() - 18.0, "drag/zoom | +/-: pop | [ ]: radius | T R O V M G C B | Space: play/pause | <- ->: step (hold to scrub) | K: rec | Esc".to_string());
+        hud(screen_height() - 18.0, "drag/zoom | +/-: pop | [ ]: radius | T R O V M G C B | Space: play/pause | <- ->: step | K: rec | U: hide UI | Esc".to_string());
+        }
 
         // --- on-screen mouse controls (top-right panel; keys still work too) ---
         // Drag capture ends when the button is released.
         if !is_mouse_button_down(MouseButton::Left) { slider_drag = None; }
+        let mut pa = PlayerActions::default();
+        if !ui_hidden {
         let mut panel = Panel::new(ui_x, ui_y, UI_W, mp_now.0, mp_now.1,
             is_mouse_button_pressed(MouseButton::Left), is_mouse_button_down(MouseButton::Left),
             is_mouse_button_pressed(MouseButton::Right));
@@ -1412,8 +1423,9 @@ async fn main() {
             "Side of the cube the action lives in.\nStepped powers of 2 -- changing it rebuilds\nthe index and re-bounds the critters.");
         panel.separator();
         // Media-player controls: REC | step back | play/pause | step forward.
-        let pa = panel.player(rec, paused || scrub > 0);
+        pa = panel.player(rec, paused || scrub > 0);
         panel.finish(ui_y);
+        }
 
         // Apply playback actions (panel buttons + keys), with hold-to-repeat on
         // the step controls. Play/pause from the history jumps back to live.
@@ -1438,6 +1450,7 @@ async fn main() {
         push_hist(&mut g_fps, fps_display);
         push_hist(&mut g_cpu, cpu_ms_avg as f32);
         push_hist(&mut g_cull, cull_us_avg as f32);
+        if !ui_hidden {
         let gh = 64.0;
         let mut gy = ui_y + UI_H + 8.0;
         draw_graph(ui_x, gy, UI_W, gh, "fps", &g_fps, Color::new(0.45, 0.9, 0.55, 1.0));
@@ -1445,6 +1458,7 @@ async fn main() {
         draw_graph(ui_x, gy, UI_W, gh, "cpu ms", &g_cpu, Color::new(1.0, 0.82, 0.35, 1.0));
         gy += gh + 4.0;
         draw_graph(ui_x, gy, UI_W, gh, "cull us", &g_cull, Color::new(0.4, 0.82, 1.0, 1.0));
+        }
         for k in 0..3 { pop_kind[k] = pop_kind[k].round().clamp(0.0, pop_cap); }
 
         // World resized (stepper): re-bound the critters into the new cube. The
