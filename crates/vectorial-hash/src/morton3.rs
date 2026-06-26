@@ -23,7 +23,32 @@
 use std::collections::HashMap;
 
 use crate::template::CellState;
+use crate::tree::RaycastOut;
 use crate::tree3::{knn_offer, knn_worst, Aabb, KnnEntry, Point3, Positioned3, Shape3};
+
+/// Clip the ray `o + t·u` to the world AABB → the `[t_enter, t_exit]` parameter
+/// range it spends inside (capped at `max_t`), or `None` if it misses. Slab test.
+fn clip_ray_aabb(o: Point3, ux: f64, uy: f64, uz: f64, w: &Aabb, max_t: f64) -> Option<(f64, f64)> {
+    let (mut t0, mut t1) = (0.0_f64, max_t);
+    for (oa, ua, lo, hi) in [(o.x, ux, w.x, w.x_max()), (o.y, uy, w.y, w.y_max()), (o.z, uz, w.z, w.z_max())] {
+        if ua == 0.0 {
+            if oa < lo || oa > hi {
+                return None; // parallel to this slab and outside it
+            }
+        } else {
+            let (mut ta, mut tb) = ((lo - oa) / ua, (hi - oa) / ua);
+            if ta > tb {
+                std::mem::swap(&mut ta, &mut tb);
+            }
+            t0 = t0.max(ta);
+            t1 = t1.min(tb);
+            if t0 > t1 {
+                return None;
+            }
+        }
+    }
+    Some((t0, t1))
+}
 
 /// Interleave the low 21 bits of `n` with two zero bits between each
 /// (`abc` → `a..b..c`), so three of these OR'd together (shifted 0/1/2) pack
@@ -267,6 +292,190 @@ impl<T: Positioned3> MortonGrid3<T> {
         shapes.iter().map(|s| self.cull(s)).collect()
     }
 
+    /// **DDA ray-cast** over the Z-order grid — the 3D **Amanatides–Woo** voxel
+    /// traversal (the grid analogue of [`crate::Tree::raycast`]). Walks the cells
+    /// the centre ray crosses front-to-back; on a *uniform* grid `tMax`/`tDelta`
+    /// are constant, so each step is one add + compare — no neighbour-finding, no
+    /// per-cell recompute. Collects items within `radius` of the ray segment,
+    /// sorted by distance along the ray, plus stats (`leaves_visited` = cells
+    /// visited, `items_tested`). The ray is clipped to the world first.
+    ///
+    /// Thin corridor: items within `radius` in cells the centre line misses are
+    /// not seen — use `cull(&Segment3)` for the exact thick band. `radius == 0`
+    /// is the pure line.
+    pub fn raycast(&self, origin: Point3, dir: Point3, max_t: f64, radius: f64) -> RaycastOut<'_, T> {
+        let mut out = RaycastOut { hits: Vec::new(), leaves_visited: 0, items_tested: 0 };
+        let m = (dir.x * dir.x + dir.y * dir.y + dir.z * dir.z).sqrt();
+        if m == 0.0 {
+            return out;
+        }
+        let (ux, uy, uz) = (dir.x / m, dir.y / m, dir.z / m);
+        let (t0, t1) = match clip_ray_aabb(origin, ux, uy, uz, &self.world, max_t) {
+            Some(v) => v,
+            None => return out, // ray misses the world
+        };
+        let r2 = radius * radius;
+        let end = Point3::new(origin.x + ux * max_t, origin.y + uy * max_t, origin.z + uz * max_t);
+        let n = self.cells_per_axis as i64;
+        // Start cell = the entry point's cell.
+        let s = Point3::new(origin.x + ux * t0, origin.y + uy * t0, origin.z + uz * t0);
+        let mut ix = axis_index_n(s.x, self.world.x, self.cw, self.cells_per_axis) as i64;
+        let mut iy = axis_index_n(s.y, self.world.y, self.ch, self.cells_per_axis) as i64;
+        let mut iz = axis_index_n(s.z, self.world.z, self.cd, self.cells_per_axis) as i64;
+        // (step, tMax-from-origin, tDelta) per axis on the uniform grid.
+        let setup = |u: f64, lo: f64, cell: f64, i: i64, o: f64| -> (i64, f64, f64) {
+            if u > 0.0 {
+                (1, (lo + (i + 1) as f64 * cell - o) / u, cell / u)
+            } else if u < 0.0 {
+                (-1, (lo + i as f64 * cell - o) / u, cell / (-u))
+            } else {
+                (0, f64::INFINITY, f64::INFINITY)
+            }
+        };
+        let (sx, mut tmx, tdx) = setup(ux, self.world.x, self.cw, ix, origin.x);
+        let (sy, mut tmy, tdy) = setup(uy, self.world.y, self.ch, iy, origin.y);
+        let (sz, mut tmz, tdz) = setup(uz, self.world.z, self.cd, iz, origin.z);
+        let t_end = max_t.min(t1);
+        let mut guard = 0usize;
+        loop {
+            guard += 1;
+            if guard > n as usize * 3 + 16 {
+                break;
+            }
+            if (0..n).contains(&ix) && (0..n).contains(&iy) && (0..n).contains(&iz) {
+                out.leaves_visited += 1;
+                if let Some(bucket) = self.cells.get(&morton3(ix as u32, iy as u32, iz as u32)) {
+                    for it in bucket {
+                        out.items_tested += 1;
+                        let p = it.position();
+                        let (apx, apy, apz) = (p.x - origin.x, p.y - origin.y, p.z - origin.z);
+                        let proj = apx * ux + apy * uy + apz * uz;
+                        let d2 = if proj <= 0.0 {
+                            apx * apx + apy * apy + apz * apz
+                        } else if proj >= max_t {
+                            let (bx, by, bz) = (p.x - end.x, p.y - end.y, p.z - end.z);
+                            bx * bx + by * by + bz * bz
+                        } else {
+                            (apx * apx + apy * apy + apz * apz) - proj * proj
+                        };
+                        if d2 <= r2 {
+                            out.hits.push((proj.clamp(0.0, max_t), it));
+                        }
+                    }
+                }
+            }
+            // Step the axis whose next boundary comes first.
+            if tmx <= tmy && tmx <= tmz {
+                if tmx > t_end { break; }
+                ix += sx;
+                tmx += tdx;
+                if ix < 0 || ix >= n { break; }
+            } else if tmy <= tmz {
+                if tmy > t_end { break; }
+                iy += sy;
+                tmy += tdy;
+                if iy < 0 || iy >= n { break; }
+            } else {
+                if tmz > t_end { break; }
+                iz += sz;
+                tmz += tdz;
+                if iz < 0 || iz >= n { break; }
+            }
+        }
+        out.hits.sort_by(|a, b| a.0.total_cmp(&b.0));
+        out
+    }
+
+    /// **First hit** along the ray (nearest by distance along it) with
+    /// front-to-back **early-exit** — the grid analogue of
+    /// [`crate::Tree::raycast_first`]. Same DDA walk, but it keeps the nearest
+    /// item within `radius` and stops as soon as the next cell begins beyond the
+    /// best hit (its entry `t` minus the `radius` slack exceeds the best `t`).
+    /// Exact for thin rays; for thick rays it's the nearest hit *in the
+    /// corridor*. Typically touches a handful of cells — the line-of-sight /
+    /// picking query.
+    pub fn raycast_first(&self, origin: Point3, dir: Point3, max_t: f64, radius: f64) -> Option<(f64, &T)> {
+        let m = (dir.x * dir.x + dir.y * dir.y + dir.z * dir.z).sqrt();
+        if m == 0.0 {
+            return None;
+        }
+        let (ux, uy, uz) = (dir.x / m, dir.y / m, dir.z / m);
+        let (t0, t1) = clip_ray_aabb(origin, ux, uy, uz, &self.world, max_t)?;
+        let r2 = radius * radius;
+        let end = Point3::new(origin.x + ux * max_t, origin.y + uy * max_t, origin.z + uz * max_t);
+        let n = self.cells_per_axis as i64;
+        let s = Point3::new(origin.x + ux * t0, origin.y + uy * t0, origin.z + uz * t0);
+        let mut ix = axis_index_n(s.x, self.world.x, self.cw, self.cells_per_axis) as i64;
+        let mut iy = axis_index_n(s.y, self.world.y, self.ch, self.cells_per_axis) as i64;
+        let mut iz = axis_index_n(s.z, self.world.z, self.cd, self.cells_per_axis) as i64;
+        let setup = |u: f64, lo: f64, cell: f64, i: i64, o: f64| -> (i64, f64, f64) {
+            if u > 0.0 { (1, (lo + (i + 1) as f64 * cell - o) / u, cell / u) }
+            else if u < 0.0 { (-1, (lo + i as f64 * cell - o) / u, cell / (-u)) }
+            else { (0, f64::INFINITY, f64::INFINITY) }
+        };
+        let (sx, mut tmx, tdx) = setup(ux, self.world.x, self.cw, ix, origin.x);
+        let (sy, mut tmy, tdy) = setup(uy, self.world.y, self.ch, iy, origin.y);
+        let (sz, mut tmz, tdz) = setup(uz, self.world.z, self.cd, iz, origin.z);
+        let t_end = max_t.min(t1);
+        let mut best: Option<(f64, &T)> = None;
+        let mut t_enter = t0;
+        let mut guard = 0usize;
+        loop {
+            guard += 1;
+            if guard > n as usize * 3 + 16 {
+                break;
+            }
+            if let Some((bt, _)) = best {
+                if t_enter - radius > bt {
+                    break; // this cell and every later one start beyond the best hit
+                }
+            }
+            if (0..n).contains(&ix) && (0..n).contains(&iy) && (0..n).contains(&iz) {
+                if let Some(bucket) = self.cells.get(&morton3(ix as u32, iy as u32, iz as u32)) {
+                    for it in bucket {
+                        let p = it.position();
+                        let (apx, apy, apz) = (p.x - origin.x, p.y - origin.y, p.z - origin.z);
+                        let proj = apx * ux + apy * uy + apz * uz;
+                        let d2 = if proj <= 0.0 {
+                            apx * apx + apy * apy + apz * apz
+                        } else if proj >= max_t {
+                            let (bx, by, bz) = (p.x - end.x, p.y - end.y, p.z - end.z);
+                            bx * bx + by * by + bz * bz
+                        } else {
+                            (apx * apx + apy * apy + apz * apz) - proj * proj
+                        };
+                        if d2 <= r2 {
+                            let t = proj.clamp(0.0, max_t);
+                            if best.is_none_or(|(bt, _)| t < bt) {
+                                best = Some((t, it));
+                            }
+                        }
+                    }
+                }
+            }
+            if tmx <= tmy && tmx <= tmz {
+                if tmx > t_end { break; }
+                t_enter = tmx;
+                ix += sx;
+                tmx += tdx;
+                if ix < 0 || ix >= n { break; }
+            } else if tmy <= tmz {
+                if tmy > t_end { break; }
+                t_enter = tmy;
+                iy += sy;
+                tmy += tdy;
+                if iy < 0 || iy >= n { break; }
+            } else {
+                if tmz > t_end { break; }
+                t_enter = tmz;
+                iz += sz;
+                tmz += tdz;
+                if iz < 0 || iz >= n { break; }
+            }
+        }
+        best
+    }
+
     /// The `k` nearest items to `q`, sorted ascending by distance — the grid
     /// analogue of [`crate::Tree3::knn`]. Where the tree descends nearest-child
     /// first, the grid expands **ring by ring**: it scans the query's own cell,
@@ -430,6 +639,62 @@ mod tests {
             let mut wb: Vec<(u64, u64, u64)> = b.cull(&s).iter().map(|p| (p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits())).collect();
             wa.sort(); wb.sort();
             assert_eq!(wa, wb, "extend_par cull != serial cull");
+        }
+    }
+
+    #[test]
+    fn morton_raycast_subset_of_capsule_and_sorted() {
+        // The DDA hits must be a subset of the exact capsule cull (no invented
+        // items / wrong cells), sorted by t, and non-empty on a populated ray.
+        use crate::Segment3;
+        let mut x = 0x3ABC_1199u64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        let pts: Vec<P> = (0..6000).map(|_| P(Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0))).collect();
+        let world = Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0);
+        let mut grid = MortonGrid3::<P>::new(world, 5);
+        for p in &pts { grid.insert(*p); }
+        let rays = [
+            (Point3::new(10.0, 10.0, 10.0), Point3::new(1.0, 0.8, 0.6), 400.0, 8.0),
+            (Point3::new(250.0, 10.0, 128.0), Point3::new(-1.0, 1.0, 0.2), 400.0, 12.0),
+            (Point3::new(128.0, 250.0, 5.0), Point3::new(0.1, -1.0, 0.3), 360.0, 5.0),
+            (Point3::new(0.0, 128.0, 128.0), Point3::new(1.0, 0.0, 0.0), 256.0, 20.0),
+        ];
+        let mut any = false;
+        for (o, d, mt, r) in rays {
+            let dda = grid.raycast(o, d, mt, r);
+            for w in dda.hits.windows(2) { assert!(w[0].0 <= w[1].0, "DDA hits not sorted by t"); }
+            let m = (d.x * d.x + d.y * d.y + d.z * d.z).sqrt();
+            let (ux, uy, uz) = (d.x / m, d.y / m, d.z / m);
+            let end = Point3::new(o.x + ux * mt, o.y + uy * mt, o.z + uz * mt);
+            let cull: std::collections::HashSet<(u64, u64, u64)> = grid.cull(&Segment3::new(o, end, r)).iter().map(|p| (p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits())).collect();
+            for (_, p) in &dda.hits {
+                let k = (p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits());
+                assert!(cull.contains(&k), "DDA hit not in the exact capsule cull (wrong cell or false positive)");
+                any = true;
+            }
+        }
+        assert!(any, "DDA found nothing on any ray — likely a traversal bug");
+    }
+
+    #[test]
+    fn morton_raycast_first_matches_nearest() {
+        let mut x = 0x77AA_3311u64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        let pts: Vec<P> = (0..6000).map(|_| P(Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0))).collect();
+        let mut grid = MortonGrid3::<P>::new(Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0), 5);
+        for p in &pts { grid.insert(*p); }
+        for (o, d, mt, r) in [
+            (Point3::new(10.0, 10.0, 10.0), Point3::new(1.0, 0.8, 0.6), 400.0, 8.0),
+            (Point3::new(250.0, 10.0, 128.0), Point3::new(-1.0, 1.0, 0.2), 400.0, 12.0),
+            (Point3::new(0.0, 128.0, 128.0), Point3::new(1.0, 0.0, 0.0), 256.0, 20.0),
+        ] {
+            let first = grid.raycast_first(o, d, mt, r);
+            let all = grid.raycast(o, d, mt, r);
+            match (first, all.hits.first()) {
+                (None, None) => {}
+                (Some((t1, _)), Some(&(t0, _))) => assert!((t1 - t0).abs() < 1e-9, "raycast_first t {t1} != raycast nearest t {t0}"),
+                _ => panic!("raycast_first / raycast nearest disagree on hit/miss"),
+            }
         }
     }
 
