@@ -85,8 +85,10 @@ built. New bin `vectorial-hash-demos/src/bin/siege.rs`.
   in the line blocks the shot (same parallel-safe emit pattern). Healer **done**:
   carries unit health in the index item, seeks its most-wounded comrade
   (friendly `knn`), heals it as *negative* damage (capped at full HP in apply).
-  **Eight troop types, all eight a distinct query.** **Still to layer:** boids
-  *alignment*, bridges/forests/rivers, balance, and the wasm/Pages publish.
+  **Eight troop types, all eight a distinct query.** **Published to the web**
+  (2026-06-27): `docs/siege.html` + `docs/siege.wasm` (626 K) + index card; the
+  wasm AI runs serial (no threads). **Still to layer:** boids *alignment*,
+  bridges/forests/rivers, balance, projectile travel time, baked terrain mesh.
 
 **Thread-slider retrofit for the critters demos** (user, 2026-06-27) — the same
 live `num_threads` slider in `critters` (2D) and `critters3d` (3D), but it only

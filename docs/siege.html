@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Siege — vectorial-hash-kit</title>
+<style>
+  html,body { margin:0; padding:0; height:100%; overflow:hidden; background:#0a0c14; }
+  /* The demo lays itself out from screen_width()/screen_height(), so it already
+     adapts to the canvas — just let the canvas fill the viewport. */
+  canvas { display:block; width:100vw; height:100vh; }
+  #back, #hide { position:fixed; z-index:10; color:#9fb0d8; font:13px system-ui;
+          background:#141a2ccc; padding:6px 11px; border-radius:8px; border:1px solid #2a3550;
+          text-decoration:none; cursor:pointer; user-select:none; }
+  #back { top:10px; left:12px; }
+  #hide { top:10px; right:12px; font-size:16px; line-height:1; }
+  #back:hover, #hide:hover { color:#fff; border-color:#4a6cff; }
+  body.immersive #back { display:none; }
+</style>
+</head>
+<body>
+<a id="back" href="index.html">← demos</a>
+<button id="hide" title="Hide page chrome + fullscreen (toggle)">⤢</button>
+<canvas id="glcanvas" tabindex="1"></canvas>
+<script>
+  const cv = document.getElementById('glcanvas');
+
+  // ⤢ — hide the page chrome (back link) and go fullscreen, for mobile.
+  const hide = document.getElementById('hide');
+  hide.addEventListener('click', () => {
+    const on = document.body.classList.toggle('immersive');
+    hide.textContent = on ? '⤡' : '⤢';
+    try { on ? document.documentElement.requestFullscreen?.() : document.exitFullscreen?.(); } catch (e) {}
+    cv.focus();
+  });
+  document.addEventListener('fullscreenchange', () => {
+    if (!document.fullscreenElement && document.body.classList.contains('immersive')) {
+      document.body.classList.remove('immersive'); hide.textContent = '⤢';
+    }
+  });
+</script>
+<script src="mq_js_bundle.js"></script>
+<script>load("siege.wasm");</script>
+</body>
+</html>

@@ -44,6 +44,14 @@
       <span class="d">A cube world with GPU-instanced rendering. Press <b>M</b> to switch the index live
       (binary tree / octree / Morton grid / projection — all O(1)-relocated via stable handles).</span>
     </a>
+    <a class="card" href="siege.html">
+      <span class="tag">3D</span>
+      <h2>Siege →</h2>
+      <span class="d">A procedural medieval battlefield: two castles sally their armies and clash.
+      Every unit's brain is a spatial query — k-NN targeting, raycast line-of-fire, sphere-cull
+      AoE, smoke that blocks shots. Eight troop types, one query each. (Native runs the AI
+      across all cores via a live thread slider; the web build is single-threaded.)</span>
+    </a>
   </div>
   <p class="note">Click the canvas to give it keyboard focus. The first load fetches ~1&nbsp;MB of
   WebAssembly. Needs a WebGL2-capable browser. On a phone, tap <b>⤢</b> (top-right) to hide the

@@ -506,6 +506,8 @@ async fn main() {
     let (mut n_threads, mut cur_threads) = (max_threads, max_threads);
     #[cfg(not(target_arch = "wasm32"))]
     let mut pool = rayon::ThreadPoolBuilder::new().num_threads(cur_threads).build().unwrap();
+    // Mutated only by the (native-only) thread slider; immutable on wasm.
+    #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
     let mut slider_drag = false;
 
     // Headless smoke hook: run N frames then exit (CI / startup-panic check).
