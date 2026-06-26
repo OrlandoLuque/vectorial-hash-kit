@@ -71,11 +71,15 @@ built. New bin `vectorial-hash-demos/src/bin/siege.rs`.
   balance is iterated with the user (the artistic side needs their eyes).
   **Foundation built (2026-06-27):** value-noise terrain + volcano, two castles,
   Red/Blue armies (soldier/archer/knight/dragon) spawning + advancing + clashing,
-  per-unit AI (`knn` targeting + dragon `Sphere3` `cull` AoE) on the parallel
-  decide→serial-apply split, deaths + respawns, instanced render, orbit camera,
-  thread slider. **Still to layer:** archer `raycast` LoS, boids formations,
-  smoke blockers, the remaining troop queries (ballista/catapult/mage/healer),
-  bridges/forests/rivers, balance, and the wasm/Pages publish.
+  per-unit AI on the parallel decide→serial-apply split, deaths + respawns,
+  instanced render, orbit camera, thread slider. The decide pass now runs three
+  library queries per unit: **`knn`** (nearest enemy *and* nearby friends in one
+  pass), **boids** separation+cohesion flocking for ground melee (from those
+  friends), the dragon's **`Sphere3` `cull`** AoE, and the archer's thick
+  **`raycast`** line-of-fire (first unit struck blocks the shot). **Still to
+  layer:** smoke blockers (dynamic-obstacle raycast), the remaining troop
+  queries (ballista pierce / catapult AoE / mage chain / healer), boids
+  *alignment*, bridges/forests/rivers, balance, and the wasm/Pages publish.
 
 **Thread-slider retrofit for the critters demos** (user, 2026-06-27) — the same
 live `num_threads` slider in `critters` (2D) and `critters3d` (3D), but it only

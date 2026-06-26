@@ -180,21 +180,34 @@ fn spawn_army(rng: &mut Rng) -> Vec<Unit> {
 
 // ----------------------------------------------------------------- AI: decide
 
+const SEP_RADIUS: f64 = 11.0; // boids: friends closer than this push apart
+
 /// One unit's per-frame brain — *read-only* on the shared index, writes only
-/// into `u`'s own `vel`/`attacks`. This is the body that fans out over rayon in
-/// the parallel build; here (foundation) it runs serially.
+/// into `u`'s own `vel`/`attacks`. This is the body that fans out over rayon
+/// (`par_iter_mut`): each unit reads the shared index and mutates only itself.
+///
+/// Three library queries, one per concern: **k-NN** finds the nearest enemy
+/// (targeting) *and* the nearby friends (boids); the dragon's AoE is a sphere
+/// **`cull`**; the archer's line-of-fire is a thick **`raycast`**.
 fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>) {
     u.vel = (0.0, 0.0, 0.0);
     u.attacks.clear();
     if !u.alive() { return; }
 
-    // Targeting: nearest *enemy*. k-NN returns the nearest units of either
-    // faction (including self at distance 0); filter to the enemy and take the
-    // closest. k=14 almost always contains an enemy once the lines meet; before
-    // contact the fallback below marches on the enemy keep.
+    // One k-NN pass yields both the nearest enemy (targeting) and the nearby
+    // friends used for flocking (separation + cohesion). k=16 reliably spans
+    // both once the lines meet.
     let mut target: Option<(Point3, u32, f64)> = None; // (pos, id, dist)
-    for (d, it) in index.knn(u.p, 14) {
-        if it.faction != u.faction && it.id != id { target = Some((it.p, it.id, d)); break; }
+    let (mut sep_x, mut sep_z) = (0.0, 0.0); // separation: away from close friends
+    let (mut coh_x, mut coh_z, mut friends) = (0.0, 0.0, 0u32); // cohesion centroid
+    for (d, it) in index.knn(u.p, 16) {
+        if it.id == id { continue; }
+        if it.faction != u.faction {
+            if target.is_none() { target = Some((it.p, it.id, d)); }
+        } else {
+            if d < SEP_RADIUS { let dd = d.max(1e-3); sep_x += (u.p.x - it.p.x) / dd; sep_z += (u.p.z - it.p.z) / dd; }
+            coh_x += it.p.x; coh_z += it.p.z; friends += 1;
+        }
     }
 
     let (tx, ty, tz, tdist) = match target {
@@ -202,15 +215,23 @@ fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>) {
         None => { let (cx, cz) = u.faction.other().castle(); (cx, u.p.y, cz, f64::INFINITY) }
     };
 
-    // Steering: head toward the target (full 3D for the dragon, ground-plane for
-    // the rest — their y is pinned to the terrain in the apply pass).
-    let (dx, dz) = (tx - u.p.x, tz - u.p.z);
-    let dy = if u.kind == Kind::Dragon { ty - u.p.y } else { 0.0 };
-    let len = (dx * dx + dy * dy + dz * dz).sqrt().max(1e-6);
+    // Steering in direction space: seek the target, then (for ground melee that
+    // fight shoulder-to-shoulder) add boids separation + cohesion so they hold a
+    // loose formation instead of stacking. Normalise, then scale by speed.
+    let seek = (tx - u.p.x, tz - u.p.z);
+    let slen = (seek.0 * seek.0 + seek.1 * seek.1).sqrt().max(1e-6);
+    let (mut dx, mut dz) = (seek.0 / slen, seek.1 / slen);
+    if matches!(u.kind, Kind::Soldier | Kind::Knight) && friends > 0 {
+        dx += sep_x * 0.5; dz += sep_z * 0.5; // push out of crowding
+        let (cx, cz) = (coh_x / friends as f64 - u.p.x, coh_z / friends as f64 - u.p.z);
+        let cl = (cx * cx + cz * cz).sqrt().max(1e-6);
+        dx += cx / cl * 0.25; dz += cz / cl * 0.25; // drift toward the band's centre
+    }
+    let dlen = (dx * dx + dz * dz).sqrt().max(1e-6);
+    let dy = if u.kind == Kind::Dragon { (ty - u.p.y).clamp(-1.0, 1.0) } else { 0.0 };
     let speed = u.kind.speed();
-    // Stop pressing in once inside reach (so melee units don't shove through).
     let approach = if tdist < u.kind.reach() * 0.8 { 0.0 } else { speed };
-    u.vel = (dx / len * approach, dy / len * approach, dz / len * approach);
+    u.vel = (dx / dlen * approach, dy * approach, dz / dlen * approach);
 
     // Attacking: only when in reach and off cooldown.
     if u.cooldown > 0.0 || tdist > u.kind.reach() { return; }
@@ -222,11 +243,22 @@ fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>) {
                 if it.faction != u.faction { u.attacks.push((it.id, u.kind.dmg())); }
             }
         }
-        // Everyone else: single-target (the k-NN target). Archer line-of-fire
-        // via raycast lands in the next layer; for now it's a direct shot.
-        _ => {
-            if let Some((_, tid, _)) = target { u.attacks.push((tid, u.kind.dmg())); }
+        // Archer line-of-fire: a thick raycast at the target. The *first* unit
+        // struck takes the arrow — a friend in the way blocks the shot (real
+        // line-of-sight, and a `raycast` showcase). The ray starts at the
+        // archer, so skip the self-hit at t≈0.
+        Kind::Archer => {
+            let dir = Point3::new(tx - u.p.x, ty - u.p.y, tz - u.p.z);
+            let len = (dir.x * dir.x + dir.y * dir.y + dir.z * dir.z).sqrt().max(1e-6);
+            let ndir = Point3::new(dir.x / len, dir.y / len, dir.z / len);
+            for (_, it) in index.raycast(u.p, ndir, len + 4.0, 3.0) {
+                if it.id == id { continue; }
+                if it.faction != u.faction { u.attacks.push((it.id, u.kind.dmg())); }
+                break; // the first thing hit stops the arrow
+            }
         }
+        // Soldier / knight: single melee strike on the k-NN target.
+        _ => { if let Some((_, tid, _)) = target { u.attacks.push((tid, u.kind.dmg())); } }
     }
 }
 
