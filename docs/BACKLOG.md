@@ -79,9 +79,12 @@ built. New bin `vectorial-hash-demos/src/bin/siege.rs`.
   **`raycast`** line-of-fire (first unit struck blocks the shot). Seven troop
   types now, each a distinct query: + catapult (**wide `Sphere3` cull** AoE),
   ballista (**all-hits `raycast`** pierce — doesn't stop at the first hit, vs the
-  archer), mage (**chained `knn`** lightning, 4 links). **Still to layer:** smoke
-  blockers (dynamic-obstacle raycast), healer (friendly `knn` + heal), boids
-  *alignment*, bridges/forests/rivers, balance, and the wasm/Pages publish.
+  archer), mage (**chained `knn`** lightning, 4 links). Smoke = dynamic LoS
+  blockers **done**: catapult/dragon strikes spawn puffs into their own `Tree3`
+  (capped, aging out ~3.5s); archer/ballista `raycast_dda_first` it and a puff
+  in the line blocks the shot (same parallel-safe emit pattern). **Still to
+  layer:** healer (friendly `knn` + heal), boids *alignment*, bridges/forests/
+  rivers, balance, and the wasm/Pages publish.
 
 **Thread-slider retrofit for the critters demos** (user, 2026-06-27) — the same
 live `num_threads` slider in `critters` (2D) and `critters3d` (3D), but it only

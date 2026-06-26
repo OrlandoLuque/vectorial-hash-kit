@@ -130,6 +130,7 @@ struct Unit {
     // serial *apply* pass. Keeping writes unit-local is what makes decide parallel.
     vel: (f64, f64, f64),
     attacks: Vec<(u32, f64)>, // (target unit id, damage) — many for AoE (dragon)
+    emit: Option<Point3>, // strike point that should spawn a smoke puff this frame
 }
 impl Unit {
     fn alive(&self) -> bool { self.hp > 0.0 }
@@ -141,6 +142,19 @@ impl Unit {
 #[derive(Clone, Copy)]
 struct IUnit { id: u32, faction: Faction, p: Point3 }
 impl Positioned3 for IUnit { fn position(&self) -> Point3 { self.p } }
+
+// ----------------------------------------------------------------- smoke (LoS)
+
+const SMOKE_R: f64 = 24.0; // puff radius — also the raycast corridor half-width
+const SMOKE_LIFE: f64 = 3.5; // seconds before a puff dissipates
+const SMOKE_CAP: usize = 240; // hard cap on live puffs
+
+/// A smoke cloud — a dynamic line-of-sight blocker. Catapult and dragon strikes
+/// spawn one; it lives in its own `Tree3` so an archer/ballista shot can
+/// `raycast` it: a puff between the shooter and the target blocks the shot.
+#[derive(Clone, Copy)]
+struct Puff { p: Point3, born: f64 }
+impl Positioned3 for Puff { fn position(&self) -> Point3 { self.p } }
 
 // ----------------------------------------------------------------- spawning
 
@@ -163,6 +177,7 @@ fn spawn_unit(rng: &mut Rng, faction: Faction) -> Unit {
         respawn_at: f64::INFINITY,
         vel: (0.0, 0.0, 0.0),
         attacks: Vec::new(),
+        emit: None,
     };
     place_at_castle(rng, &mut u);
     u
@@ -197,9 +212,10 @@ const SEP_RADIUS: f64 = 11.0; // boids: friends closer than this push apart
 /// Three library queries, one per concern: **k-NN** finds the nearest enemy
 /// (targeting) *and* the nearby friends (boids); the dragon's AoE is a sphere
 /// **`cull`**; the archer's line-of-fire is a thick **`raycast`**.
-fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>) {
+fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>) {
     u.vel = (0.0, 0.0, 0.0);
     u.attacks.clear();
+    u.emit = None;
     if !u.alive() { return; }
 
     // One k-NN pass yields both the nearest enemy (targeting) and the nearby
@@ -244,28 +260,32 @@ fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>) {
     // Attacking: only when in reach and off cooldown.
     if u.cooldown > 0.0 || tdist > u.kind.reach() { return; }
     match u.kind {
-        // Dragon fire-breath: an area cull — every enemy in the blast takes a hit.
+        // Dragon fire-breath: an area cull — every enemy in the blast takes a hit,
+        // and the scorched ground belches a smoke cloud (a new LoS blocker).
         Kind::Dragon => {
             let blast = Sphere3::new(tx, ty, tz, u.kind.reach() * 0.5);
             for it in index.cull(&blast) {
                 if it.faction != u.faction { u.attacks.push((it.id, u.kind.dmg())); }
             }
+            u.emit = Some(Point3::new(tx, ty, tz));
         }
         // Catapult: a lobbed boulder — a wide `Sphere3` AoE cull at the target
-        // spot, every enemy caught splashed (ground siege analogue of the dragon).
+        // spot (ground siege analogue of the dragon), kicking up smoke on impact.
         Kind::Catapult => {
             let blast = Sphere3::new(tx, ty, tz, 26.0);
             for it in index.cull(&blast) {
                 if it.faction != u.faction { u.attacks.push((it.id, u.kind.dmg())); }
             }
+            u.emit = Some(Point3::new(tx, ty, tz));
         }
         // Ballista: a piercing bolt — an all-hits `raycast` that does NOT stop at
         // the first unit; every enemy on the line is skewered. (Contrast the
-        // archer, who stops at the first hit.)
+        // archer, who stops at the first hit.) Smoke blocks the line.
         Kind::Ballista => {
             let dir = Point3::new(tx - u.p.x, ty - u.p.y, tz - u.p.z);
             let len = (dir.x * dir.x + dir.y * dir.y + dir.z * dir.z).sqrt().max(1e-6);
             let ndir = Point3::new(dir.x / len, dir.y / len, dir.z / len);
+            if smoke.raycast_dda_first(u.p, ndir, len, SMOKE_R).is_some() { return; } // blocked
             for (_, it) in index.raycast(u.p, ndir, len + 30.0, 3.5) {
                 if it.id != id && it.faction != u.faction { u.attacks.push((it.id, u.kind.dmg())); }
             }
@@ -289,6 +309,7 @@ fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>) {
             let dir = Point3::new(tx - u.p.x, ty - u.p.y, tz - u.p.z);
             let len = (dir.x * dir.x + dir.y * dir.y + dir.z * dir.z).sqrt().max(1e-6);
             let ndir = Point3::new(dir.x / len, dir.y / len, dir.z / len);
+            if smoke.raycast_dda_first(u.p, ndir, len, SMOKE_R).is_some() { return; } // smoke blocks LoS
             for (_, it) in index.raycast(u.p, ndir, len + 4.0, 3.0) {
                 if it.id == id { continue; }
                 if it.faction != u.faction { u.attacks.push((it.id, u.kind.dmg())); }
@@ -303,9 +324,10 @@ fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>) {
 // ----------------------------------------------------------------- AI: apply
 
 /// Serial resolution of one frame's intents: move units, apply accumulated
-/// damage, kill the fallen, respawn the dead. Reads every unit's `vel`/`attacks`
+/// damage, kill the fallen, respawn the dead, and turn smoke emissions into
+/// puffs (aging out the old ones). Reads every unit's `vel`/`attacks`/`emit`
 /// (written by `decide`) and is the only place cross-unit writes happen.
-fn apply(units: &mut [Unit], rng: &mut Rng, dt: f64, now: f64) {
+fn apply(units: &mut [Unit], smoke: &mut Vec<Puff>, rng: &mut Rng, dt: f64, now: f64) {
     // 1) movement + cooldown tick (each unit, independent).
     for u in units.iter_mut() {
         if !u.alive() { continue; }
@@ -315,8 +337,8 @@ fn apply(units: &mut [Unit], rng: &mut Rng, dt: f64, now: f64) {
         let ground = terrain_height(nx, nz) + u.kind.radius() as f64;
         let ny = if u.kind == Kind::Dragon { (terrain_height(nx, nz) + u.kind.altitude()).max(ground) } else { ground };
         u.p = Point3::new(nx, ny, nz);
-        // Set the attack cooldown if this unit landed any hits this frame.
-        if !u.attacks.is_empty() { u.cooldown = u.kind.cooldown(); }
+        // Reload after a shot (an AoE that caught nobody still fired).
+        if !u.attacks.is_empty() || u.emit.is_some() { u.cooldown = u.kind.cooldown(); }
     }
 
     // 2) damage resolution — gather first (immutable borrow), then apply.
@@ -339,6 +361,14 @@ fn apply(units: &mut [Unit], rng: &mut Rng, dt: f64, now: f64) {
             place_at_castle(rng, u);
         }
     }
+
+    // 4) smoke — spawn a puff per emission (under the cap), age out the rest.
+    for u in units.iter() {
+        if let Some(p) = u.emit {
+            if smoke.len() < SMOKE_CAP { smoke.push(Puff { p, born: now }); }
+        }
+    }
+    smoke.retain(|s| now - s.born < SMOKE_LIFE);
 }
 
 // ----------------------------------------------------------------- rendering
@@ -426,6 +456,10 @@ async fn main() {
     let mut units = spawn_army(&mut rng);
     let world = Aabb::new(0.0, 0.0, 0.0, WORLD, SKY, WORLD);
     let mut index = Tree3::<IUnit>::new(world, 8);
+    // Smoke lives in its own index so archer/ballista shots can raycast it.
+    let mut smoke: Vec<Puff> = Vec::new();
+    let mut smoke_index = Tree3::<Puff>::new(world, 8);
+    let mut smoke_instances: Vec<Instance> = Vec::new();
 
     // Camera orbit state — looking down on the battlefield centre.
     let mut yaw: f32 = 0.9;
@@ -486,22 +520,25 @@ async fn main() {
             for (i, u) in units.iter().enumerate() {
                 if u.alive() { index.insert(IUnit { id: i as u32, faction: u.faction, p: u.p }); }
             }
+            // Rebuild the smoke index from last frame's live puffs.
+            smoke_index.clear();
+            for s in &smoke { smoke_index.insert(*s); }
 
-            // Decide (read-only on `index`) then apply (serial resolution). The
-            // decide pass fans out over the rayon pool (native) — each unit
-            // mutates only itself while reading the shared index. wasm: serial.
+            // Decide (read-only on both indices) then apply (serial resolution).
+            // The decide pass fans out over the rayon pool (native) — each unit
+            // mutates only itself while reading the shared indices. wasm: serial.
             #[cfg(not(target_arch = "wasm32"))]
             {
                 if cur_threads != n_threads {
                     pool = rayon::ThreadPoolBuilder::new().num_threads(n_threads).build().unwrap();
                     cur_threads = n_threads;
                 }
-                let idx = &index;
-                pool.install(|| units.par_iter_mut().enumerate().for_each(|(i, u)| decide(u, i as u32, idx)));
+                let (idx, smk) = (&index, &smoke_index);
+                pool.install(|| units.par_iter_mut().enumerate().for_each(|(i, u)| decide(u, i as u32, idx, smk)));
             }
             #[cfg(target_arch = "wasm32")]
-            for i in 0..units.len() { decide(&mut units[i], i as u32, &index); }
-            apply(&mut units, &mut rng, dt, now);
+            for i in 0..units.len() { decide(&mut units[i], i as u32, &index, &smoke_index); }
+            apply(&mut units, &mut smoke, &mut rng, dt, now);
         }
 
         // ----- render 3D -----
@@ -533,9 +570,18 @@ async fn main() {
                 faction_color(u.faction, u.kind),
             ));
         }
+        // Smoke as a second instanced batch — grey puffs that grow as they age.
+        smoke_instances.clear();
+        for s in &smoke {
+            let age = ((now - s.born) / SMOKE_LIFE).clamp(0.0, 1.0) as f32;
+            let r = SMOKE_R as f32 * (0.55 + 0.45 * age);
+            let g = 0.78 - 0.15 * age; // darkens slightly as it thins
+            smoke_instances.push(Instance::new(vec3(s.p.x as f32, s.p.y as f32, s.p.z as f32), r, [g, g, g + 0.02, 0.6]));
+        }
         {
             let gl = unsafe { get_internal_gl() };
             renderer.draw(gl.quad_context, Mode::Spheres, &instances, mvp, cam_right, cam_up);
+            renderer.draw(gl.quad_context, Mode::Spheres, &smoke_instances, mvp, cam_right, cam_up);
         }
 
         // ----- HUD -----
