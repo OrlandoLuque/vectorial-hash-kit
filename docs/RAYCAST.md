@@ -273,10 +273,35 @@ radius   capsule ms   dda ms   first ms   cells  tested  coverage
   the binary tree) now prunes tightly too, because `Segment3` gained an analytic
   `classify_aabb` (conservative sphere test: box bounding-sphere vs the spine).
 
-**Still open in 3D:** the *variable-cell* DDA on `Tree3` / `Octree3` (the 3D
-analogue of the 2D `Tree::raycast`) — it needs **3D neighbour-finding** (ropes /
-Samet in 3D), which doesn't exist yet. The Morton DDA covers the uniform-grid
-case; the adaptive-cell case is the next step.
+### Variable-cell 3D DDA — `Tree3::raycast_dda`
+
+The adaptive-cell version is in too: `Tree3::raycast_dda` / `raycast_dda_first`.
+`Tree3` has no 3D neighbour links, so the step is **Probe-style** — the slab test
+on the current leaf gives the exit, and `locate` finds the next leaf just across
+the face (the 3D analogue of the 2D `WalkNeighbors::Probe`). Measured (N=200k,
+item_limit 8):
+
+```
+radius   capsule ms   dda ms   first ms   leaves  tested  coverage
+4         0.62        0.21     0.063       18      104      96.9%
+16        1.13        0.31     0.039       18      104      74.4%
+64        6.92        0.40     0.063       18      104      10.7%
+256      86.6         0.41     0.130       18      104       0.6%
+```
+
+Two points stand out. **(1)** The variable-cell DDA works — 96.9 % coverage at a
+thin radius, ~18 adaptive leaves per ray (vs Morton's 34 uniform cells). **(2)
+The hierarchical `Tree3` capsule is far better than the flat Morton one for thick
+bands** — 86.6 ms vs Morton's 207 ms at r=256 — because the tree *prunes*
+(`classify_aabb` + the `In`/`Out` descent) where the flat grid just *scans* the
+`r³` bbox. So the 3D scorecard: thin ray / first-hit → either DDA (fast); thick
+"all within `r`" → the **`Tree3` capsule**, not the Morton one.
+
+The Probe step nudges a hair across the exit face, so on pathologically thin
+neighbour cells a sliver can be skipped (never a false positive — always a subset
+of the exact capsule). A nudge-free **3D Samet/ropes** walk is the remaining
+refinement (the 2D ledger already showed ropes rarely pay their upkeep, so Probe
+is a fine default).
 
 ## Concepts (glossary)
 
