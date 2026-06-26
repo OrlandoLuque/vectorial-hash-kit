@@ -134,18 +134,6 @@ pub(crate) fn knn_offer2<'a, T: Positioned>(heap: &mut std::collections::BinaryH
     }
 }
 
-/// Squared distance from `p` to the 2D segment `a`–`b` (clamped projection) —
-/// the thickness test for [`Tree::raycast`]. 2D analogue of `tree3`'s version.
-#[inline]
-pub(crate) fn seg_point_dist2_2d(p: Point, a: Point, b: Point) -> f64 {
-    let (abx, aby) = (b.x - a.x, b.y - a.y);
-    let (apx, apy) = (p.x - a.x, p.y - a.y);
-    let denom = abx * abx + aby * aby;
-    let t = if denom > 0.0 { ((apx * abx + apy * aby) / denom).clamp(0.0, 1.0) } else { 0.0 };
-    let (dx, dy) = (apx - abx * t, apy - aby * t);
-    dx * dx + dy * dy
-}
-
 /// Result of a [`Tree::raycast`] DDA walk: the hits (`(t, &item)` sorted by
 /// distance along the ray) plus traversal stats for the capsule-vs-DDA
 /// comparison — `leaves_visited` is the corridor size, `items_tested` the
@@ -676,6 +664,10 @@ impl<T: Positioned> Tree<T> {
         let (ux, uy) = (dir.x / m, dir.y / m);
         let end = Point::new(origin.x + ux * max_t, origin.y + uy * max_t);
         let r2 = radius * radius;
+        // Precompute the reciprocal direction so the per-cell slab test is a
+        // multiply, not a divide (the Amanatides–Woo `1/dir` trick).
+        let inv_ux = if ux != 0.0 { 1.0 / ux } else { 0.0 };
+        let inv_uy = if uy != 0.0 { 1.0 / uy } else { 0.0 };
         let mut leaf = self.locate(origin);
         let mut nbuf: Vec<NodeId> = Vec::new();
         let mut guard = 0usize;
@@ -688,15 +680,26 @@ impl<T: Positioned> Tree<T> {
             for it in &self.get(leaf).items {
                 out.items_tested += 1;
                 let p = it.position();
-                if seg_point_dist2_2d(p, origin, end) <= r2 {
-                    let t = ((p.x - origin.x) * ux + (p.y - origin.y) * uy).clamp(0.0, max_t);
-                    out.hits.push((t, it));
+                // Distance to the ray via the unit-dir projection (no division,
+                // no projected-point construction); `proj` doubles as the hit t.
+                let (apx, apy) = (p.x - origin.x, p.y - origin.y);
+                let proj = apx * ux + apy * uy;
+                let d2 = if proj <= 0.0 {
+                    apx * apx + apy * apy
+                } else if proj >= max_t {
+                    let (bx, by) = (p.x - end.x, p.y - end.y);
+                    bx * bx + by * by
+                } else {
+                    (apx * apx + apy * apy) - proj * proj
+                };
+                if d2 <= r2 {
+                    out.hits.push((proj.clamp(0.0, max_t), it));
                 }
             }
             // Exit of this leaf: the nearer far-edge (slab test) → the side and t.
             let lb = self.get(leaf).bbox;
-            let tx = if ux > 0.0 { (lb.x_max() - origin.x) / ux } else if ux < 0.0 { (lb.x - origin.x) / ux } else { f64::INFINITY };
-            let ty = if uy > 0.0 { (lb.y_max() - origin.y) / uy } else if uy < 0.0 { (lb.y - origin.y) / uy } else { f64::INFINITY };
+            let tx = if ux > 0.0 { (lb.x_max() - origin.x) * inv_ux } else if ux < 0.0 { (lb.x - origin.x) * inv_ux } else { f64::INFINITY };
+            let ty = if uy > 0.0 { (lb.y_max() - origin.y) * inv_uy } else if uy < 0.0 { (lb.y - origin.y) * inv_uy } else { f64::INFINITY };
             let t_exit = tx.min(ty);
             if t_exit >= max_t {
                 break; // the ray ends inside this leaf
