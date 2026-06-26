@@ -239,6 +239,45 @@ real win remains `-C target-cpu=native`. A *permanent* SoA leaf store (vs the
 scratch) would only save the copy, which isn't the bottleneck, so it stays
 deferred.
 
+## 3D — `MortonGrid3` DDA
+
+The ray-cast is in 3D too, on the uniform Z-order grid: `MortonGrid3::raycast`
+(all hits) + `raycast_first` (nearest, early-exit). On a **uniform** grid the DDA
+is the textbook **3D Amanatides–Woo** — `tMax`/`tDelta` are constant, so each
+voxel step is one add + compare, with **no neighbour-finding** (the user's
+`TestDraw` 3D, exactly). The ray is clipped to the world AABB first.
+
+Measured (N=200k in 1024³, 64 cells/axis ≈ 16-unit cells, 64 rays × min-of-40,
+interleaved; two back-to-back runs agreed):
+
+```
+radius   capsule ms   dda ms   first ms   cells  tested  coverage
+4         11.3        0.094    0.028       34     26       90.2%
+16        15.9        0.127    0.014       34     26       43.5%
+64        35.4        0.110    0.022       34     26        2.7%
+256      207.3        0.094    0.043       34     26        0.1%
+```
+
+- **The DDA's lead is huge in 3D — ~100–2000×** (vs 8–15× in 2D). The reason is
+  structural: `MortonGrid3` is **flat** (no hierarchy), so the capsule
+  `cull(&Segment3)` scans the whole bounding-box of cells — which grows as `r³`
+  (207 ms at r=256!) — while the DDA walks only the **fixed thin corridor** (34
+  cells, flat in radius). `raycast_first` early-exits to ~tens of µs.
+- **But the coverage gap is also worse in 3D**: the radius-`r` band's volume
+  grows as `r³` while the corridor stays fixed, so the thin DDA's coverage falls
+  off a cliff (90 % → 0.1 %). For a thick 3D "all within `r`", the thin DDA is
+  useless.
+- **So for a thick 3D band, the flat Morton grid is the wrong structure** — its
+  capsule cull has no hierarchy to prune with. The hierarchical **`Tree3` /
+  `Octree3`** are the right home: `Tree3::raycast` (the `Segment3` capsule over
+  the binary tree) now prunes tightly too, because `Segment3` gained an analytic
+  `classify_aabb` (conservative sphere test: box bounding-sphere vs the spine).
+
+**Still open in 3D:** the *variable-cell* DDA on `Tree3` / `Octree3` (the 3D
+analogue of the 2D `Tree::raycast`) — it needs **3D neighbour-finding** (ropes /
+Samet in 3D), which doesn't exist yet. The Morton DDA covers the uniform-grid
+case; the adaptive-cell case is the next step.
+
 ## Concepts (glossary)
 
 **Descent vs. `cull_walk` — two ways to traverse the same tree.** Both return the

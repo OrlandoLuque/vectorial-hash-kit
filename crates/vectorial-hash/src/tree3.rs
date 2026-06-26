@@ -328,8 +328,24 @@ impl Shape3 for Segment3 {
     fn contains_point(&self, p: Point3) -> bool {
         seg_point_dist2(p, self.a, self.b) <= self.r * self.r
     }
-    // classify_aabb uses the default (bbox-overlap → Maybe): a capsule rarely
-    // fully contains a node box, so the per-point test does the exact work.
+    fn classify_aabb(&self, b: &Aabb) -> CellState {
+        // Conservative sphere classify (cheap, safe): the box's bounding sphere
+        // (centre `c`, radius = half-diagonal) vs the capsule spine. Centre
+        // farther than `r + half_diag` → whole box outside → Out; within
+        // `r − half_diag` → whole box inside → In; else Maybe. One segment↔point
+        // distance, no exact segment↔box distance. Looser than an exact test but
+        // prunes the cells far from the diagonal that a bbox-overlap test keeps.
+        let c = Point3::new(b.x + b.w * 0.5, b.y + b.h * 0.5, b.z + b.d * 0.5);
+        let half_diag = 0.5 * (b.w * b.w + b.h * b.h + b.d * b.d).sqrt();
+        let d = seg_point_dist2(c, self.a, self.b).sqrt();
+        if d > self.r + half_diag {
+            CellState::Out
+        } else if d + half_diag <= self.r {
+            CellState::In
+        } else {
+            CellState::Maybe
+        }
+    }
     fn voxel_raster(&self) -> Option<&VoxelRaster> { self.raster.as_ref() }
 }
 
