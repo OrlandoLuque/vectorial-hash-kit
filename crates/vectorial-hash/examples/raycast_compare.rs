@@ -21,7 +21,7 @@
 //!
 //! `coverage` = how much of cap-opt's exact result the thin DDA recovers.
 
-use vectorial_hash::{CellState, Point, Positioned, Rect, Shape, Tree, WalkNeighbors};
+use vectorial_hash::{Capsule, CellState, Point, Positioned, Rect, Shape, Tree, WalkNeighbors};
 use std::time::Instant;
 
 struct Rng(u64);
@@ -97,67 +97,6 @@ impl Shape for CapsuleNaive {
     }
 }
 
-// ------------------------------------------------------------ optimised capsule
-struct Capsule2 {
-    a: Point,
-    abx: f64, aby: f64,
-    len2: f64, inv_len2: f64, len: f64,
-    ux: f64, uy: f64,
-    nx: f64, ny: f64,
-    r: f64, r2: f64,
-    bbox: Rect,
-}
-impl Capsule2 {
-    fn new(a: Point, b: Point, r: f64) -> Self {
-        let (abx, aby) = (b.x - a.x, b.y - a.y);
-        let len2 = abx * abx + aby * aby;
-        let len = len2.sqrt();
-        let (ux, uy) = if len > 0.0 { (abx / len, aby / len) } else { (1.0, 0.0) };
-        let (nx, ny) = (-uy, ux);
-        let bbox = Rect::new(a.x.min(b.x) - r, a.y.min(b.y) - r, (a.x.max(b.x) - a.x.min(b.x)) + 2.0 * r, (a.y.max(b.y) - a.y.min(b.y)) + 2.0 * r);
-        Self { a, abx, aby, len2, inv_len2: if len2 > 0.0 { 1.0 / len2 } else { 0.0 }, len, ux, uy, nx, ny, r, r2: r * r, bbox }
-    }
-    #[inline]
-    fn spine_dist2(&self, p: Point) -> f64 {
-        let (apx, apy) = (p.x - self.a.x, p.y - self.a.y);
-        let dot = apx * self.abx + apy * self.aby;
-        if dot <= 0.0 {
-            apx * apx + apy * apy
-        } else if dot >= self.len2 {
-            let (bpx, bpy) = (p.x - (self.a.x + self.abx), p.y - (self.a.y + self.aby));
-            bpx * bpx + bpy * bpy
-        } else {
-            (apx * apx + apy * apy) - dot * dot * self.inv_len2
-        }
-    }
-}
-impl Shape for Capsule2 {
-    fn bounding_box(&self) -> Rect { self.bbox }
-    fn contains_point(&self, p: Point) -> bool { self.spine_dist2(p) <= self.r2 }
-    fn classify_box(&self, b: &Rect) -> Option<CellState> {
-        let pick = |dx: f64, dy: f64| {
-            let lo = dx * (if dx > 0.0 { b.x } else { b.x_max() }) + dy * (if dy > 0.0 { b.y } else { b.y_max() });
-            let hi = dx * (if dx > 0.0 { b.x_max() } else { b.x }) + dy * (if dy > 0.0 { b.y_max() } else { b.y });
-            (lo, hi)
-        };
-        let off_u = self.ux * self.a.x + self.uy * self.a.y;
-        let off_n = self.nx * self.a.x + self.ny * self.a.y;
-        let (u_lo, u_hi) = pick(self.ux, self.uy);
-        let (n_lo, n_hi) = pick(self.nx, self.ny);
-        let (u_lo, u_hi) = (u_lo - off_u, u_hi - off_u);
-        let (n_lo, n_hi) = (n_lo - off_n, n_hi - off_n);
-        if u_hi < -self.r || u_lo > self.len + self.r || n_hi < -self.r || n_lo > self.r {
-            return Some(CellState::Out);
-        }
-        let (cx, cy) = (b.x + b.width * 0.5, b.y + b.height * 0.5);
-        let half_diag = 0.5 * (b.width * b.width + b.height * b.height).sqrt();
-        if self.r > half_diag && self.spine_dist2(Point::new(cx, cy)) <= (self.r - half_diag) * (self.r - half_diag) {
-            return Some(CellState::In);
-        }
-        Some(CellState::Maybe)
-    }
-}
-
 // ------------------------------------------------------------------- harness
 struct Ray { o: Point, d: Point, len: f64 }
 
@@ -185,13 +124,13 @@ enum Method { Naive, Opt, Dda(WalkNeighbors), First(WalkNeighbors), Walk(WalkNei
 fn run_batch(tree: &Tree<P>, rays: &[Ray], radius: f64, m: Method) -> usize {
     match m {
         Method::Naive => rays.iter().map(|r| tree.cull(&CapsuleNaive { a: r.o, b: endpoint(r), r: radius }).len()).sum(),
-        Method::Opt => rays.iter().map(|r| tree.cull(&Capsule2::new(r.o, endpoint(r), radius)).len()).sum(),
+        Method::Opt => rays.iter().map(|r| tree.cull(&Capsule::new(r.o, endpoint(r), radius)).len()).sum(),
         Method::Dda(w) => rays.iter().map(|r| tree.raycast(r.o, r.d, r.len, radius, w).hits.len()).sum(),
         Method::First(w) => rays.iter().map(|r| tree.raycast_first(r.o, r.d, r.len, radius, w).is_some() as usize).sum(),
         // Exact thick band via the neighbour flood (cull_walk seeded at the ray
         // origin) — the "widened DDA": same result as the descent cull, found by
         // walking instead of descending, with the selectable neighbour method.
-        Method::Walk(w) => rays.iter().map(|r| tree.cull_walk(&Capsule2::new(r.o, endpoint(r), radius), r.o, w).len()).sum(),
+        Method::Walk(w) => rays.iter().map(|r| tree.cull_walk(&Capsule::new(r.o, endpoint(r), radius), r.o, w).len()).sum(),
     }
 }
 
@@ -256,7 +195,7 @@ fn main() {
 
                 // Exact reference (cap-opt) + DDA walk stats / coverage (deterministic).
                 let refsets: Vec<std::collections::HashSet<(u64, u64)>> = rays.iter().map(|r| {
-                    tree.cull(&Capsule2::new(r.o, endpoint(r), radius)).iter().map(|p| key(p)).collect()
+                    tree.cull(&Capsule::new(r.o, endpoint(r), radius)).iter().map(|p| key(p)).collect()
                 }).collect();
                 let cap_hits: usize = refsets.iter().map(|s| s.len()).sum();
                 let (mut leaves, mut tested, mut found, mut dda_hits) = (0usize, 0usize, 0usize, 0usize);
@@ -303,8 +242,8 @@ fn main() {
         // Coverage: flood-walk vs the exact descent — should be 100%.
         let (mut found, mut total) = (0usize, 0usize);
         for r in &rays {
-            let refset: std::collections::HashSet<(u64, u64)> = tree.cull(&Capsule2::new(r.o, endpoint(r), radius)).iter().map(|p| key(p)).collect();
-            let got: std::collections::HashSet<(u64, u64)> = tree.cull_walk(&Capsule2::new(r.o, endpoint(r), radius), r.o, walks[0]).iter().map(|p| key(p)).collect();
+            let refset: std::collections::HashSet<(u64, u64)> = tree.cull(&Capsule::new(r.o, endpoint(r), radius)).iter().map(|p| key(p)).collect();
+            let got: std::collections::HashSet<(u64, u64)> = tree.cull_walk(&Capsule::new(r.o, endpoint(r), radius), r.o, walks[0]).iter().map(|p| key(p)).collect();
             total += refset.len();
             found += refset.iter().filter(|k| got.contains(k)).count();
         }

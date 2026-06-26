@@ -127,10 +127,14 @@ visual glance the next morning; everything else is autonomously verifiable.
 ### Deferred — explicitly held back
 - **Publish to crates.io** — *deferred until the crate is more complete* (user,
   2026-06-25). The crate is already publishable; cut a 0.1.0 when ready.
-- **Threading vs no-threading tutorial/guide** — document how a library user
-  opts into the demo's optimisations (it's mostly good defaults + a few opt-in
-  API choices, not manual threading). *Deferred to "when we stop adding so many
-  new things" (user, 2026-06-25).* Source material: the chat answer + `THREE_D.md`.
+- **Performance guides** — when written, cover: how a library user opts into the
+  demo's optimisations (mostly good defaults + a few opt-in API choices, not
+  manual threading); **`-C target-cpu=native`** (the cheapest perf knob — unlocks
+  AVX / wider auto-vectorisation, ~2–10× on number-crunching, but non-portable so
+  local/bench/self-hosted only — see `docs/RAYCAST.md` § Concepts); and the
+  AoS/SoA + SIMD story (the narrowphase-ceiling microbench). *Deferred to "when we
+  stop adding so many new things" (user, 2026-06-25).* Source: the chat answers +
+  `THREE_D.md` + `RAYCAST.md` (Concepts).
 - **2D demo panel: figure-size slider + 3D-style sliders** — figure-size slider
   (rebuild arsenal via `build_arsenal_scaled`, step on release) + port the 3D
   `Panel` into a shared `src/panel.rs`. *(Lower priority; not selected.)*

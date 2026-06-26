@@ -88,6 +88,89 @@ pub trait Shape {
     }
 }
 
+/// A **2D capsule**: the segment `a`–`b` thickened by radius `r`. As a [`Shape`]
+/// it answers "every item within `r` of the segment" — a thick ray-cast via the
+/// normal `cull` (the 2D analogue of [`crate::Segment3`]). All the segment
+/// invariants are precomputed in [`Capsule::new`]; `contains_point` is the
+/// branch-on-projection perpendicular distance (no division); and `classify_box`
+/// prunes the cull to the radius-`r` band with a cheap conservative slab test in
+/// segment-aligned coords + a centre-based `In` — **no template needed**, the
+/// tree recursion handles the thickness. For the *nearest* hit along the ray,
+/// `cull` then pick the minimum projection `t` (or use the thin-corridor
+/// [`crate::Tree::raycast_first`] when the ray is thin).
+pub struct Capsule {
+    a: Point,
+    abx: f64,
+    aby: f64,
+    len2: f64,
+    inv_len2: f64,
+    len: f64,
+    ux: f64,
+    uy: f64,
+    nx: f64,
+    ny: f64,
+    r: f64,
+    r2: f64,
+    bbox: Rect,
+}
+
+impl Capsule {
+    pub fn new(a: Point, b: Point, r: f64) -> Self {
+        let (abx, aby) = (b.x - a.x, b.y - a.y);
+        let len2 = abx * abx + aby * aby;
+        let len = len2.sqrt();
+        let (ux, uy) = if len > 0.0 { (abx / len, aby / len) } else { (1.0, 0.0) };
+        let (nx, ny) = (-uy, ux);
+        let bbox = Rect::new(a.x.min(b.x) - r, a.y.min(b.y) - r, (a.x.max(b.x) - a.x.min(b.x)) + 2.0 * r, (a.y.max(b.y) - a.y.min(b.y)) + 2.0 * r);
+        Self { a, abx, aby, len2, inv_len2: if len2 > 0.0 { 1.0 / len2 } else { 0.0 }, len, ux, uy, nx, ny, r, r2: r * r, bbox }
+    }
+    /// Squared distance from `p` to the spine, perpendicular form (no division).
+    #[inline]
+    pub fn spine_dist2(&self, p: Point) -> f64 {
+        let (apx, apy) = (p.x - self.a.x, p.y - self.a.y);
+        let dot = apx * self.abx + apy * self.aby;
+        if dot <= 0.0 {
+            apx * apx + apy * apy
+        } else if dot >= self.len2 {
+            let (bpx, bpy) = (p.x - (self.a.x + self.abx), p.y - (self.a.y + self.aby));
+            bpx * bpx + bpy * bpy
+        } else {
+            (apx * apx + apy * apy) - dot * dot * self.inv_len2
+        }
+    }
+}
+
+impl Shape for Capsule {
+    fn bounding_box(&self) -> Rect { self.bbox }
+    fn contains_point(&self, p: Point) -> bool { self.spine_dist2(p) <= self.r2 }
+    fn classify_box(&self, b: &Rect) -> Option<CellState> {
+        // Conservative slab reject: the whole capsule lives in the oriented box
+        // [−r, len+r] (along u) × [−r, r] (along n) about `a`. Project the query
+        // box onto u and n (AABB → corners by sign); no overlap ⟹ Out. Cheap, safe.
+        let pick = |dx: f64, dy: f64| {
+            let lo = dx * (if dx > 0.0 { b.x } else { b.x_max() }) + dy * (if dy > 0.0 { b.y } else { b.y_max() });
+            let hi = dx * (if dx > 0.0 { b.x_max() } else { b.x }) + dy * (if dy > 0.0 { b.y_max() } else { b.y });
+            (lo, hi)
+        };
+        let off_u = self.ux * self.a.x + self.uy * self.a.y;
+        let off_n = self.nx * self.a.x + self.ny * self.a.y;
+        let (u_lo, u_hi) = pick(self.ux, self.uy);
+        let (n_lo, n_hi) = pick(self.nx, self.ny);
+        let (u_lo, u_hi) = (u_lo - off_u, u_hi - off_u);
+        let (n_lo, n_hi) = (n_lo - off_n, n_hi - off_n);
+        if u_hi < -self.r || u_lo > self.len + self.r || n_hi < -self.r || n_lo > self.r {
+            return Some(CellState::Out);
+        }
+        // Conservative In: centre within r − half-diagonal ⟹ whole box inside.
+        let (cx, cy) = (b.x + b.width * 0.5, b.y + b.height * 0.5);
+        let half_diag = 0.5 * (b.width * b.width + b.height * b.height).sqrt();
+        if self.r > half_diag && self.spine_dist2(Point::new(cx, cy)) <= (self.r - half_diag) * (self.r - half_diag) {
+            return Some(CellState::In);
+        }
+        Some(CellState::Maybe)
+    }
+}
+
 /// Per-execution cache: one resolved template per distinct cell size.
 /// Shared with the reference quadtree so both structures classify cells
 /// through the exact same machinery.

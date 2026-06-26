@@ -209,6 +209,54 @@ cull the `classify_box` descent is the other half, so end-to-end gains are
 smaller (Amdahl). Wiring SoA into the leaf is the backlog's "SoA leaf storage +
 SIMD" item.
 
+## Concepts (glossary)
+
+**Descent vs. `cull_walk` — two ways to traverse the same tree.** Both return the
+same items; they differ in *direction*.
+- **Descent** (`cull`) is **top-down**: start at the root, recurse into children,
+  classify each node's box (`In`/`Out`/`Maybe`), **prune** `Out` subtrees, take
+  `In` subtrees *whole* (no per-item test), descend only `Maybe`. One pass over
+  parent→child pointers. The win is hierarchical pruning: a fat band's interior
+  is covered by a few **coarse `In` nodes**, and only the boundary needs fine
+  nodes — work ∝ the band's *surface*.
+- **`cull_walk`** is a **lateral flood**: start at the *leaf* containing a seed
+  point, then spread to neighbour leaves (find-neighbour by Samet/Probe/Ropes),
+  flood-filling outward, stopping at `Out` leaves, with a visited-set to avoid
+  repeats. It always works at *leaf* granularity (no coarse `In` shortcut) and
+  pays the neighbour-finding cost per leaf (O(depth) for Samet/Probe). That's why
+  the descent beats it for a connected band — `cull_walk` is for when you only
+  have a seed and want a local region, not a root-down query.
+
+**AoS vs. SoA — memory layout.** *Array of Structs* stores records interleaved:
+`Vec<Point>` ⇒ `[x0,y0, x1,y1, …]`. *Struct of Arrays* stores each field
+contiguously: `xs=[x0,x1,…]`, `ys=[y0,y1,…]`. SoA puts all the `x`s next to each
+other.
+
+**SIMD — Single Instruction, Multiple Data.** One CPU instruction that operates
+on several values at once, using wide registers: SSE2 (128-bit) = 2×f64 or 4×f32
+per op; **AVX/AVX2** (256-bit) = 4×f64 / 8×f32; AVX-512 = 8×f64. So a SIMD
+multiply does 4 lanes in roughly the time of one scalar multiply.
+
+**Why SoA + branchless ⇒ SIMD.** To do `x0..x3` in one SIMD load they must be
+contiguous — that's SoA (AoS would need a slow gather). And the loop must be
+**branchless**: a data-dependent `if` (like the cap branches in the
+point-segment distance) makes each lane take a different path, so the compiler
+can't run them in lockstep. The branchless clamped form (`t = clamp(dot·inv,0,1)`,
+no `if`; the hit test accumulated as a 0/1 mask) is what LLVM
+**auto-vectorises** — it turns the scalar loop into SIMD by itself when these
+conditions hold. That's the AoS-branch (16 ms) vs SoA-branchless (2.6 ms) gap.
+
+**`-C target-cpu=native`.** By default `cargo --release` builds for a *generic*
+x86-64 CPU, so the binary runs anywhere — but that baseline only guarantees SSE2,
+**not** AVX (older CPUs lack it). `RUSTFLAGS="-C target-cpu=native"` says "compile
+for *this* CPU", unlocking AVX2/AVX-512 and more aggressive auto-vectorisation —
+often a free 2–10× on number-crunching loops (it's what shrank the AoS time
+10×). The catch: the binary may crash on older CPUs (illegal instruction), so use
+it for **locally-built / self-hosted** hot paths and benchmarks, **not** for
+distributed releases or the wasm build — those keep a portable baseline (or do
+runtime feature detection). *(For the future how-to guides: this is the cheapest
+perf knob — worth a section, next to threading.)*
+
 ## Pitfall that nearly hid this
 
 The very first measurement had the capsule at ~12 ms and "concluded" the DDA was
@@ -217,17 +265,30 @@ back to the fat AABB. Adding the analytic classify dropped it to ~1.5 ms and
 flipped the conclusion. Lesson: an analytic shape *must* implement `classify_box`
 or the tree can't prune it.
 
-## Open
+## Resolved — the two "niche" follow-ups
 
-- **Ordered thick first-hit** — the one ray-cast not yet built: a *front-to-back*
-  widened walk (±1 perpendicular within `r`) that keeps the early-exit. The
-  unordered exact thick band is settled (descend, above); `raycast_first` is the
-  thin ordered case; this would be the thick ordered case. Niche — for most
-  thick queries you want all hits (descend) anyway.
-- **SoA leaf storage** — to *realise* the narrowphase ceiling measured above
-  (~6× on the default target). The kernel and the win are proven
-  (`narrowphase_simd`); what's left is storing leaf positions SoA so the cull can
-  run it. The backlog's "SoA leaf storage + SIMD" item.
+- **Thick ordered first-hit** — *use `cull(&Capsule)` + pick the minimum
+  projection `t`.* A dedicated front-to-back widened flood (±r perpendicular, with
+  early-exit) is the same *flood* family that already lost 2–4× to the descent
+  above, so it would lose here too; the early-exit only helps in the thin case,
+  which `raycast_first` already covers. So the completion is the right tool, not a
+  new walk — and the library now ships the **2D `Capsule` `Shape`** (with the
+  optimised `classify_box`) so the pattern works:
+  ```rust
+  let cap = Capsule::new(a, b, r);
+  let near = tree.cull(&cap).into_iter()
+      .map(|it| { let p = it.position(); /* project onto the ray */ (t_of(p), it) })
+      .min_by(|x, y| x.0.total_cmp(&y.0));
+  ```
+- **SoA leaf storage** — the *free* win is documented: build hot consumers with
+  `-C target-cpu=native` (see Concepts), which auto-vectorises the existing AoS
+  narrowphase ~10×. The full SoA-leaf refactor (to win on portable, generic-target
+  builds) stays deferred on purpose: its payoff is **build-dependent** (~6× on the
+  default target, ~1.3× with native) and only material for **many-items-per-leaf**
+  structures (high `item_limit` / the Morton grid), at the cost of a core
+  data-structure change + a parallel position array. The kernel and ceiling are
+  proven (`narrowphase_simd`); pulling the trigger waits for a workload that needs
+  it. Tracked in the backlog.
 
 *(Origin: the user's uniform-grid DDA ray-cast in `TestDraw`, adapted to the
 variable-size tree.)*

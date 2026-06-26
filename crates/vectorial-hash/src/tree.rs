@@ -1132,6 +1132,35 @@ mod tests {
     }
 
     #[test]
+    fn capsule_cull_matches_brute() {
+        // The 2D Capsule shape: cull must equal brute force (items within r of
+        // the segment), exercising its analytic classify_box pruning.
+        use crate::Capsule;
+        fn brute(p: Point, a: Point, b: Point) -> f64 {
+            let (abx, aby) = (b.x - a.x, b.y - a.y);
+            let (apx, apy) = (p.x - a.x, p.y - a.y);
+            let d = abx * abx + aby * aby;
+            let t = if d > 0.0 { ((apx * abx + apy * aby) / d).clamp(0.0, 1.0) } else { 0.0 };
+            let (dx, dy) = (apx - abx * t, apy - aby * t);
+            dx * dx + dy * dy
+        }
+        let mut x = 0x2552_AA33u64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        let pts: Vec<Pt> = (0..3000).map(|_| Pt(Point::new(rng() * 256.0, rng() * 256.0))).collect();
+        let mut tree = Tree::<Pt>::new(Rect::new(0.0, 0.0, 256.0, 256.0), 4);
+        for p in &pts { tree.insert(*p); }
+        for (ax, ay, bx, by, r) in [(10.0, 10.0, 240.0, 200.0, 5.0), (128.0, 0.0, 128.0, 256.0, 20.0), (0.0, 128.0, 256.0, 128.0, 3.0), (40.0, 220.0, 220.0, 40.0, 50.0)] {
+            let (a, b) = (Point::new(ax, ay), Point::new(bx, by));
+            let cap = Capsule::new(a, b, r);
+            let mut want: Vec<(u64, u64)> = pts.iter().filter(|p| brute(p.0, a, b) <= r * r).map(|p| (p.0.x.to_bits(), p.0.y.to_bits())).collect();
+            let mut got: Vec<(u64, u64)> = tree.cull(&cap).iter().map(|p| (p.0.x.to_bits(), p.0.y.to_bits())).collect();
+            want.sort();
+            got.sort();
+            assert_eq!(want, got, "Capsule cull != brute for segment ({ax},{ay})-({bx},{by}) r={r}");
+        }
+    }
+
+    #[test]
     fn raycast_first_matches_raycast_nearest() {
         // First-hit (with early-exit) must equal raycast's sorted-nearest, for
         // every neighbour method — early-exit changes the cost, not the answer.
