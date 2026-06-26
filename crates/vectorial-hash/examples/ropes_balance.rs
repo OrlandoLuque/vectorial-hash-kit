@@ -15,6 +15,9 @@
 //! is the rope maintenance cost. Cross it with the per-query win to settle
 //! whether ropes pay off for a given query : mutation ratio.
 
+// The `x < lo || x > hi` bounce test reads clearer than `!(lo..=hi).contains()`.
+#![allow(clippy::manual_range_contains)]
+
 use std::time::Instant;
 
 use vectorial_hash::{ItemRef, Point, Positioned, Rect, Tree};
