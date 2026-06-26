@@ -76,9 +76,11 @@ built. New bin `vectorial-hash-demos/src/bin/siege.rs`.
   library queries per unit: **`knn`** (nearest enemy *and* nearby friends in one
   pass), **boids** separation+cohesion flocking for ground melee (from those
   friends), the dragon's **`Sphere3` `cull`** AoE, and the archer's thick
-  **`raycast`** line-of-fire (first unit struck blocks the shot). **Still to
-  layer:** smoke blockers (dynamic-obstacle raycast), the remaining troop
-  queries (ballista pierce / catapult AoE / mage chain / healer), boids
+  **`raycast`** line-of-fire (first unit struck blocks the shot). Seven troop
+  types now, each a distinct query: + catapult (**wide `Sphere3` cull** AoE),
+  ballista (**all-hits `raycast`** pierce — doesn't stop at the first hit, vs the
+  archer), mage (**chained `knn`** lightning, 4 links). **Still to layer:** smoke
+  blockers (dynamic-obstacle raycast), healer (friendly `knn` + heal), boids
   *alignment*, bridges/forests/rivers, balance, and the wasm/Pages publish.
 
 **Thread-slider retrofit for the critters demos** (user, 2026-06-27) — the same

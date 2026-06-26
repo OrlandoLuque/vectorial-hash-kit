@@ -106,14 +106,15 @@ impl Faction {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Kind { Soldier, Archer, Knight, Dragon }
+enum Kind { Soldier, Archer, Knight, Dragon, Catapult, Mage, Ballista }
 impl Kind {
-    fn speed(self) -> f64 { match self { Kind::Soldier => 26.0, Kind::Archer => 22.0, Kind::Knight => 52.0, Kind::Dragon => 60.0 } }
-    fn max_hp(self) -> f64 { match self { Kind::Soldier => 100.0, Kind::Archer => 60.0, Kind::Knight => 180.0, Kind::Dragon => 1400.0 } }
-    fn reach(self) -> f64 { match self { Kind::Soldier => 9.0, Kind::Archer => 150.0, Kind::Knight => 12.0, Kind::Dragon => 60.0 } }
-    fn dmg(self) -> f64 { match self { Kind::Soldier => 14.0, Kind::Archer => 18.0, Kind::Knight => 30.0, Kind::Dragon => 22.0 } }
-    fn cooldown(self) -> f64 { match self { Kind::Soldier => 0.8, Kind::Archer => 1.1, Kind::Knight => 1.0, Kind::Dragon => 0.5 } }
-    fn radius(self) -> f32 { match self { Kind::Soldier => 3.0, Kind::Archer => 3.0, Kind::Knight => 4.2, Kind::Dragon => 11.0 } }
+    fn speed(self) -> f64 { match self { Kind::Soldier => 26.0, Kind::Archer => 22.0, Kind::Knight => 52.0, Kind::Dragon => 60.0, Kind::Catapult => 10.0, Kind::Mage => 20.0, Kind::Ballista => 13.0 } }
+    fn max_hp(self) -> f64 { match self { Kind::Soldier => 100.0, Kind::Archer => 60.0, Kind::Knight => 180.0, Kind::Dragon => 1400.0, Kind::Catapult => 160.0, Kind::Mage => 70.0, Kind::Ballista => 140.0 } }
+    /// Engagement range — for the ballista/catapult this is the firing range.
+    fn reach(self) -> f64 { match self { Kind::Soldier => 9.0, Kind::Archer => 150.0, Kind::Knight => 12.0, Kind::Dragon => 60.0, Kind::Catapult => 260.0, Kind::Mage => 120.0, Kind::Ballista => 240.0 } }
+    fn dmg(self) -> f64 { match self { Kind::Soldier => 14.0, Kind::Archer => 18.0, Kind::Knight => 30.0, Kind::Dragon => 22.0, Kind::Catapult => 30.0, Kind::Mage => 16.0, Kind::Ballista => 26.0 } }
+    fn cooldown(self) -> f64 { match self { Kind::Soldier => 0.8, Kind::Archer => 1.1, Kind::Knight => 1.0, Kind::Dragon => 0.5, Kind::Catapult => 2.4, Kind::Mage => 1.3, Kind::Ballista => 1.7 } }
+    fn radius(self) -> f32 { match self { Kind::Soldier => 3.0, Kind::Archer => 3.0, Kind::Knight => 4.2, Kind::Dragon => 11.0, Kind::Catapult => 5.5, Kind::Mage => 3.4, Kind::Ballista => 5.0 } }
     /// Ground units sit on the terrain; the dragon flies at a fixed altitude.
     fn altitude(self) -> f64 { match self { Kind::Dragon => 95.0, _ => 0.0 } }
 }
@@ -144,9 +145,16 @@ impl Positioned3 for IUnit { fn position(&self) -> Point3 { self.p } }
 // ----------------------------------------------------------------- spawning
 
 fn spawn_unit(rng: &mut Rng, faction: Faction) -> Unit {
-    // Roster mix: mostly foot soldiers, some archers, fewer knights, rare dragon.
+    // Roster mix: mostly foot soldiers, then archers/knights, a few siege engines
+    // and mages, a rare dragon.
     let roll = rng.unit();
-    let kind = if roll < 0.55 { Kind::Soldier } else if roll < 0.80 { Kind::Archer } else if roll < 0.985 { Kind::Knight } else { Kind::Dragon };
+    let kind = if roll < 0.42 { Kind::Soldier }
+        else if roll < 0.62 { Kind::Archer }
+        else if roll < 0.74 { Kind::Knight }
+        else if roll < 0.85 { Kind::Mage }
+        else if roll < 0.91 { Kind::Ballista }
+        else if roll < 0.98 { Kind::Catapult }
+        else { Kind::Dragon };
     let mut u = Unit {
         faction, kind,
         p: Point3::new(0.0, 0.0, 0.0),
@@ -243,6 +251,36 @@ fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>) {
                 if it.faction != u.faction { u.attacks.push((it.id, u.kind.dmg())); }
             }
         }
+        // Catapult: a lobbed boulder — a wide `Sphere3` AoE cull at the target
+        // spot, every enemy caught splashed (ground siege analogue of the dragon).
+        Kind::Catapult => {
+            let blast = Sphere3::new(tx, ty, tz, 26.0);
+            for it in index.cull(&blast) {
+                if it.faction != u.faction { u.attacks.push((it.id, u.kind.dmg())); }
+            }
+        }
+        // Ballista: a piercing bolt — an all-hits `raycast` that does NOT stop at
+        // the first unit; every enemy on the line is skewered. (Contrast the
+        // archer, who stops at the first hit.)
+        Kind::Ballista => {
+            let dir = Point3::new(tx - u.p.x, ty - u.p.y, tz - u.p.z);
+            let len = (dir.x * dir.x + dir.y * dir.y + dir.z * dir.z).sqrt().max(1e-6);
+            let ndir = Point3::new(dir.x / len, dir.y / len, dir.z / len);
+            for (_, it) in index.raycast(u.p, ndir, len + 30.0, 3.5) {
+                if it.id != id && it.faction != u.faction { u.attacks.push((it.id, u.kind.dmg())); }
+            }
+        }
+        // Mage chain-lightning: a `knn` from the strike point arcs to the nearest
+        // enemies — up to 4 links, each taking the bolt.
+        Kind::Mage => {
+            let mut links = 0;
+            for (_, it) in index.knn(Point3::new(tx, ty, tz), 10) {
+                if it.faction == u.faction || it.id == id { continue; }
+                u.attacks.push((it.id, u.kind.dmg()));
+                links += 1;
+                if links >= 4 { break; }
+            }
+        }
         // Archer line-of-fire: a thick raycast at the target. The *first* unit
         // struck takes the arrow — a friend in the way blocks the shot (real
         // line-of-sight, and a `raycast` showcase). The ray starts at the
@@ -311,6 +349,9 @@ fn faction_color(f: Faction, k: Kind) -> [f32; 4] {
         Kind::Dragon => [base[0] * 0.6 + 0.3, base[1] * 0.6 + 0.1, base[2] * 0.6, 1.0],
         Kind::Knight => [base[0] * 0.8 + 0.15, base[1] * 0.8 + 0.15, base[2] * 0.8 + 0.15, 1.0],
         Kind::Archer => [base[0] * 0.7, base[1] * 0.7 + 0.2, base[2] * 0.7, 1.0],
+        Kind::Catapult => [base[0] * 0.5 + 0.2, base[1] * 0.5 + 0.12, base[2] * 0.4, 1.0],
+        Kind::Ballista => [base[0] * 0.55 + 0.18, base[1] * 0.5 + 0.18, base[2] * 0.45, 1.0],
+        Kind::Mage => [base[0] * 0.5 + 0.25, base[1] * 0.5 + 0.25, base[2] * 0.5 + 0.45, 1.0],
         Kind::Soldier => [base[0], base[1], base[2], 1.0],
     }
 }
