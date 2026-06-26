@@ -75,6 +75,11 @@ Two cross-cutting choices that sit on top of the above:
   per-leaf tests, more nodes; larger = shallower, more brute per leaf. 8–16 is a
   good default; profile with the Criterion suite / regression gate
   (`benches/README.md`) if it matters.
+- **Measure your workload.** The decision maps rank the structures head-to-head
+  on a moving-points sim: `examples/decision2d.rs` (2D: binary / quad / morton)
+  and `critters3d_headless --sweep` (3D). Rough 2D read: **QuadTree** is the
+  all-rounder; **MortonGrid** (rebuilt each frame) wins **dense + high-churn**
+  scenes where the trees' `update` split/merge churn dominates.
 - **Don't reach for threads first.** Reads parallelise (`cull_many_par`),
   writes don't — the lever for write-heavy loops is `update_ref` + the right
   structure, not rayon. See [`PARALLEL.md`](PARALLEL.md).
