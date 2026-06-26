@@ -96,15 +96,23 @@ set, so the distance tricks pay much more there.
 So the optimisations confirm the division of labour: **distance-math wins land on
 the capsule (classify + narrowphase bound); the DDA is bound by the walk.**
 
-## Method choice (unchanged by the tuning)
+## Method choice — the scorecard
 
-- **Thin ray / first-hit** (LoS, picking, `radius` ≲ leaf): DDA — ~2× the capsule
-  *and* 90–100 % coverage, with front-to-back order enabling early-exit.
-- **Thick "all within r"**: capsule — exact, and its cost now tracks the answer
-  size. The thin DDA only *looks* fast there because it misses 70–98 % of the
-  hits (coverage column; its hit count plateaus as the corridor saturates).
-- **Ropes < Samet < Probe** on query time (identical walk) — the difference is
-  pure neighbour-finding: ropes O(1), Samet/Probe O(depth).
+The two methods came out **complementary, not rivals**: the DDA owns thin /
+first-hit, the capsule owns thick / all-hits.
+
+| Query | Use | Why |
+| --- | --- | --- |
+| **Thin ray, first hit** (LoS, picking) | **`Tree::raycast_first`** (DDA) | early-exit → **7–96×** the full corridor |
+| Thin ray, all hits | `Tree::raycast` (thin DDA) or capsule | close; DDA's corridor is tight |
+| **Thick ray, all within `r`** | **`cull(&Capsule)`** (descent) | exact; cost tracks the answer; recursion handles width |
+| Thick ray, first hit | `cull(&Capsule)` + min projection `t` | a dedicated flood would lose to the descent |
+
+- The thin DDA only *looks* fast on thick rays because it misses 70–98 % of the
+  hits (coverage; its hit count plateaus as the corridor saturates).
+- **Ropes < Samet < Probe** on query time (identical walk) — pure
+  neighbour-finding cost: ropes O(1), Samet/Probe O(depth) — but ropes cost
+  +45–53 % to maintain, so Samet is the default (see the ledger below).
 
 ## First-hit (early-exit) — `Tree::raycast_first`
 
@@ -227,6 +235,18 @@ same items; they differ in *direction*.
   the descent beats it for a connected band — `cull_walk` is for when you only
   have a seed and want a local region, not a root-down query.
 
+**Templates vs. analytic `classify_box` (why the capsule uses the latter).** The
+library's *templates* precompute a cell's In/Out/Maybe for a shape, indexed by
+cell size / angle / offset — they amortise across **many repeated queries of the
+same shape** (the demo's attack figures, which have no cheap analytic test). A
+capsule is the wrong fit: it's thin and **oriented**, so it would need a template
+*per angle*, a slightly-wrong angle misclassifies cells along the *whole* ray
+length, and "every hundredth of a degree" is a memory blow-up — while rays are
+usually one-shot at arbitrary angles, so the bank rarely hits. For a shape with a
+cheap exact test (circle, capsule) the right tool is the analytic `classify_box`
+(segment↔box distance) — exact pruning, no template, no per-query rasterisation.
+Templates are for the non-analytic, repeated-same-shape case.
+
 **AoS vs. SoA — memory layout.** *Array of Structs* stores records interleaved:
 `Vec<Point>` ⇒ `[x0,y0, x1,y1, …]`. *Struct of Arrays* stores each field
 contiguously: `xs=[x0,x1,…]`, `ys=[y0,y1,…]`. SoA puts all the `x`s next to each
@@ -236,6 +256,17 @@ other.
 on several values at once, using wide registers: SSE2 (128-bit) = 2×f64 or 4×f32
 per op; **AVX/AVX2** (256-bit) = 4×f64 / 8×f32; AVX-512 = 8×f64. So a SIMD
 multiply does 4 lanes in roughly the time of one scalar multiply.
+
+**Vendor / architecture portability.** SSE2 / AVX / AVX2 are part of the **x86-64
+ISA, shared by Intel *and* AMD** — both run them (AVX-512 is patchier: Intel
+on/off by line, AMD since Zen 4, so AVX2 is the safe "modern x86-64" target).
+Other architectures have *their own* SIMD — **ARM = NEON** (128-bit) + SVE/SVE2
+(Apple Silicon, phones, AWS Graviton), RISC-V = the Vector extension. The
+*instructions* differ, but the **technique is portable**: write the branchless
+SoA loop once and the compiler **auto-vectorises to whatever the target has** —
+SSE/AVX on x86, NEON/SVE on ARM. Only *hand-written* intrinsics are
+architecture-specific; the auto-vectorised path (what we rely on) just needs a
+rebuild per target, and `target-cpu=native` adapts to whatever chip you build on.
 
 **Why SoA + branchless ⇒ SIMD.** To do `x0..x3` in one SIMD load they must be
 contiguous — that's SoA (AoS would need a slow gather). And the loop must be
