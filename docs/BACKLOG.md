@@ -4,6 +4,65 @@ Future work queued for review. Nothing here is committed scope — prune,
 reprioritise, or drop freely. Items graduate into the per-crate roadmaps
 (e.g. `crates/vectorial-hash/README.md`) once picked up.
 
+## Overnight queue — round 3 (set 2026-06-26)
+
+The big **ray-cast thread graduated** (DDA leaf-walk 2D + 3D, capsule shapes
+with analytic `classify_box`/`classify_aabb`, `raycast_first` early-exit, exact
+thick band, ropes-maintenance ledger, SoA batch narrowphase, 2D `MortonGrid`,
+3D `Tree3::raycast_dda`, and 2D + 3D decision maps) — all in `docs/RAYCAST.md`.
+What's left, grouped. `[review]` = needs a human visual glance; rest is
+autonomously verifiable.
+
+**A. Ray-cast / structure follow-ups (continue the thread)**
+1. **`Octree3` DDA** — `raycast_dda` + `raycast_dda_first` on the 8-way octree
+   (Probe-style, like `Tree3`). Brute-force gated (⊆ capsule + first==nearest).
+2. **Nudge-free 3D walk** — real 3D neighbour-finding (Samet ascend-to-LCA, or
+   ropes) so the `Tree3`/`Octree3` DDA steps without the `locate`+epsilon nudge.
+   (The 2D ledger says ropes rarely pay upkeep → Samet first.)
+3. **Promote a 2D `Circle` `Shape` to the lib** (analytic `classify_box`, like
+   `Capsule`) — the examples each redefine a `Disc`; one lib primitive dedups
+   them and gives users a tight 2D circle cull.
+4. **Raycast in the Criterion suite + regression baseline** — add `raycast` /
+   `raycast_first` / capsule ops so perf regressions are tracked.
+
+**B. Correctness / robustness**
+5. **Property / fuzz tests** (proptest) — randomized insert/update/remove/cull/knn
+   vs brute force with shrinking, across all seven structures.
+6. **Serialization for all structures** — only `Tree3` has versioned serialize;
+   extend to `Tree`/`QuadTree`/`IntegerTree`/`Octree3`/`MortonGrid`/`MortonGrid3`.
+7. **Templates CI cleanup** — fix the ~21 clippy lints + make the fingerprint
+   test cross-platform (deterministic float formatting + sorted iteration), then
+   move templates/cli back into the **hard** CI gate (currently advisory).
+
+**C. Performance**
+8. **Morton multi-level linear octree** — coarse occupancy levels so a big-radius
+   cull skips empty blocks instead of scanning every fine cell (2D + 3D).
+9. **Parallel tree bulk-load** — sort-then-link build for static datasets
+   (`Tree`/`Tree3`), the parallel build the trees lack (Morton has `extend_par`).
+10. **SoA *permanent* leaf storage** — *low priority*: the batch kernel is done
+    and measured marginal (~1.0–1.26× end-to-end, descent-dominated); permanent
+    storage would only save the materialisation copy. Park unless a workload needs it.
+
+**D. Docs / DX**
+11. **Sync the lib README** — it predates the ray-cast surface, `MortonGrid` (2D),
+    `Capsule`, and now lists fewer structures than exist (seven). Refresh the
+    public-surface table + add a ray-cast paragraph.
+12. **Performance guides** — `target-cpu=native`, AoS/SoA + SIMD, threading, the
+    opt-in API story (deferred section below has the source material).
+
+**E. Demos / web [review]**
+13. **[review] `MortonGrid` (2D) in the `critters` demo** — add the flat grid to
+    the 2D structure toggle (+ optionally `IntegerTree` to `decision2d`).
+14. **[review] 2D k-NN / line-of-sight demo** — visualise k-NN and the ray-cast
+    first-hit (the DDA corridor) in the 2D `critters` demo.
+15. **[review] Web touch controls + stats HUD** — orbit/zoom by touch on the 3D
+    web demo; an FPS/stats overlay in the browser.
+16. **[review] 2D demo panel** — figure-size slider + port the 3D `Panel` into a
+    shared `src/panel.rs`.
+
+**Deferred (design / user-held)** — template not-found diagnostics + next-size-up
+fallback (rethink); crates.io publish (until more complete). See sections below.
+
 ## Overnight queue (set 2026-06-25) — ✅ all done
 
 1. ~~Morton / Z-order (linear octree)~~ — done (also now selectable in the
