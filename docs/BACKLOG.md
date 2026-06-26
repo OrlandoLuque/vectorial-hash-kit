@@ -80,15 +80,20 @@ visual glance the next morning; everything else is autonomously verifiable.
 6. **k-NN parity** — `knn` exists on `Tree3`/`Octree3`; add it to `Tree`,
    `QuadTree`, `IntegerTree`, and `MortonGrid3` (the latter ring-by-ring, shared
    with item 3). Brute-force gated.
-7. ~~**Ray-cast / segment query**~~ — **done (my approach; compare with the
-   user's tomorrow).** Modelled the ray as a **capsule**: a new `Segment3`
-   `Shape3` (segment `a`–`b` + radius `r`, exact point-to-segment distance), so
-   *every* structure's `cull` answers it. `Tree3::raycast(origin, dir, max_dist,
-   radius)` builds the capsule, culls, and returns `(t, &item)` sorted by
-   distance along the ray. It's a **thick** ray (point items need the radius to
-   register). Brute-force gated test. *Open design question for tomorrow: the
-   user's own ray approach — likely a DDA/cell-walk for a hard surface hit
-   rather than a capsule broadphase; compare the two.*
+7. ~~**Ray-cast / segment query**~~ — **done, both approaches + comparison.**
+   - **Capsule** (`Segment3` `Shape3` + `Tree3::raycast`, 3D): the ray as a
+     thickened segment over `cull`. Exact "items within r", reuses culling.
+   - **DDA leaf-walk** (`Tree::raycast(.., walk)`, 2D — the user's `TestDraw`
+     idea adapted to variable cells): Amanatides–Woo over the tree, walking only
+     the cells the centre ray crosses, neighbour step via selectable
+     `WalkNeighbors` (Samet/Probe/Ropes). Returns sorted hits + traversal stats.
+     The 3 methods agree (test); `examples/raycast_compare.rs` benchmarks them
+     vs the capsule. Findings (`docs/RAYCAST.md`): DDA ~8–15× faster on the thin
+     corridor; coverage falls with radius (97%→10%) so DDA=thin rays /
+     capsule=thick; ropes < samet < probe on query time (same walk, just
+     neighbour cost). **Open:** the maintenance side of ropes (build/update with
+     vs without) to settle the overall trade-off; and a thick-corridor exact
+     DDA + a hard `raycast_first` with early-exit.
 8. ~~**Frustum as a first-class `Shape3`**~~ — **done.** A view frustum is just
    6 half-spaces, i.e. a `Polyhedron3`; added `Polyhedron3::from_corners([Point3;
    8])` (near face then far face, bl/br/tr/tl) that derives the six inward face

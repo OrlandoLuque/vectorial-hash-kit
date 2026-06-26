@@ -134,6 +134,28 @@ pub(crate) fn knn_offer2<'a, T: Positioned>(heap: &mut std::collections::BinaryH
     }
 }
 
+/// Squared distance from `p` to the 2D segment `a`–`b` (clamped projection) —
+/// the thickness test for [`Tree::raycast`]. 2D analogue of `tree3`'s version.
+#[inline]
+pub(crate) fn seg_point_dist2_2d(p: Point, a: Point, b: Point) -> f64 {
+    let (abx, aby) = (b.x - a.x, b.y - a.y);
+    let (apx, apy) = (p.x - a.x, p.y - a.y);
+    let denom = abx * abx + aby * aby;
+    let t = if denom > 0.0 { ((apx * abx + apy * aby) / denom).clamp(0.0, 1.0) } else { 0.0 };
+    let (dx, dy) = (apx - abx * t, apy - aby * t);
+    dx * dx + dy * dy
+}
+
+/// Result of a [`Tree::raycast`] DDA walk: the hits (`(t, &item)` sorted by
+/// distance along the ray) plus traversal stats for the capsule-vs-DDA
+/// comparison — `leaves_visited` is the corridor size, `items_tested` the
+/// narrowphase cost.
+pub struct RaycastOut<'a, T> {
+    pub hits: Vec<(f64, &'a T)>,
+    pub leaves_visited: usize,
+    pub items_tested: usize,
+}
+
 pub struct Tree<T: Positioned> {
     nodes: Vec<Node<T>>,
     /// Slots in `nodes` freed by merge-ups, reused by the next `alloc`
@@ -634,6 +656,88 @@ impl<T: Positioned> Tree<T> {
     ///
     /// Reference: H. Samet, "Neighbor Finding Techniques for Images
     /// Represented by Quadtrees" (1982), adapted to a binary-split tree.
+    /// **DDA leaf-walk ray-cast** (the variable-cell Amanatides–Woo): walk the
+    /// leaves the ray `origin → origin + dir·max_t` crosses, front-to-back,
+    /// stepping to the neighbour across each exit edge via `walk` (Samet /
+    /// Probe / Ropes), collecting items within `radius` of the ray segment.
+    /// Returns hits sorted by distance along the ray + traversal stats.
+    ///
+    /// This is the **thin corridor** — only the cells the centre ray crosses.
+    /// Items within `radius` that fall in cells the centre line misses are not
+    /// seen (the precision/coverage trade-off vs the capsule `cull(&Segment…)`);
+    /// `radius == 0` is the pure line. `origin` must be inside the world bbox.
+    /// A prototype for benchmarking the neighbour strategies against the capsule.
+    pub fn raycast(&self, origin: Point, dir: Point, max_t: f64, radius: f64, walk: crate::culling::WalkNeighbors) -> RaycastOut<'_, T> {
+        let mut out = RaycastOut { hits: Vec::new(), leaves_visited: 0, items_tested: 0 };
+        let m = (dir.x * dir.x + dir.y * dir.y).sqrt();
+        if m == 0.0 || !self.get(self.root).bbox.contains(origin) {
+            return out;
+        }
+        let (ux, uy) = (dir.x / m, dir.y / m);
+        let end = Point::new(origin.x + ux * max_t, origin.y + uy * max_t);
+        let r2 = radius * radius;
+        let mut leaf = self.locate(origin);
+        let mut nbuf: Vec<NodeId> = Vec::new();
+        let mut guard = 0usize;
+        loop {
+            guard += 1;
+            if guard > self.nodes.len() * 4 + 16 {
+                break; // safety against a stuck walk on a degenerate edge case
+            }
+            out.leaves_visited += 1;
+            for it in &self.get(leaf).items {
+                out.items_tested += 1;
+                let p = it.position();
+                if seg_point_dist2_2d(p, origin, end) <= r2 {
+                    let t = ((p.x - origin.x) * ux + (p.y - origin.y) * uy).clamp(0.0, max_t);
+                    out.hits.push((t, it));
+                }
+            }
+            // Exit of this leaf: the nearer far-edge (slab test) → the side and t.
+            let lb = self.get(leaf).bbox;
+            let tx = if ux > 0.0 { (lb.x_max() - origin.x) / ux } else if ux < 0.0 { (lb.x - origin.x) / ux } else { f64::INFINITY };
+            let ty = if uy > 0.0 { (lb.y_max() - origin.y) / uy } else if uy < 0.0 { (lb.y - origin.y) / uy } else { f64::INFINITY };
+            let t_exit = tx.min(ty);
+            if t_exit >= max_t {
+                break; // the ray ends inside this leaf
+            }
+            let side = if tx <= ty {
+                if ux > 0.0 { Side::East } else { Side::West }
+            } else if uy > 0.0 {
+                Side::South
+            } else {
+                Side::North
+            };
+            let exit = Point::new(origin.x + ux * t_exit, origin.y + uy * t_exit);
+            nbuf.clear();
+            match walk {
+                crate::culling::WalkNeighbors::Samet => self.neighbors_samet(leaf, side, &mut nbuf),
+                crate::culling::WalkNeighbors::Probe => self.neighbors_probe(leaf, side, &mut nbuf),
+                #[cfg(feature = "neighbors")]
+                crate::culling::WalkNeighbors::Ropes => nbuf.extend_from_slice(self.neighbors_ropes(leaf, side)),
+            }
+            // The ray enters exactly the neighbour whose perpendicular extent
+            // straddles the exit point.
+            let next = nbuf
+                .iter()
+                .copied()
+                .find(|&n| {
+                    let cb = self.get(n).bbox;
+                    match side {
+                        Side::East | Side::West => cb.y <= exit.y && exit.y < cb.y_max(),
+                        Side::North | Side::South => cb.x <= exit.x && exit.x < cb.x_max(),
+                    }
+                })
+                .or_else(|| nbuf.first().copied());
+            match next {
+                Some(n) => leaf = n,
+                None => break, // reached the world border
+            }
+        }
+        out.hits.sort_by(|a, b| a.0.total_cmp(&b.0));
+        out
+    }
+
     pub fn neighbors_samet(&self, leaf: NodeId, side: Side, out: &mut Vec<NodeId>) {
         let mut node = leaf;
         let target = loop {
@@ -908,6 +1012,45 @@ mod tests {
                 for (a, b) in got.iter().zip(brute.iter()) {
                     assert!((a - b).abs() < 1e-9, "knn dist != brute k={k}: {a} vs {b}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn raycast_neighbor_methods_agree() {
+        // The DDA walk must be independent of how neighbours are found: Samet,
+        // Probe (and Ropes, with the feature) must visit the same leaf count and
+        // return the same hits, sorted by t. This is the core correctness signal
+        // for the variable-cell traversal.
+        use crate::WalkNeighbors;
+        let mut x = 0x9911_AABBu64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        let pts: Vec<Pt> = (0..1500).map(|_| Pt(Point::new(rng() * 256.0, rng() * 256.0))).collect();
+        let mut tree = Tree::<Pt>::new(Rect::new(0.0, 0.0, 256.0, 256.0), 3);
+        for p in &pts { tree.insert(*p); }
+        let rays = [
+            (Point::new(8.0, 8.0), Point::new(1.0, 0.7), 300.0, 6.0),
+            (Point::new(250.0, 10.0), Point::new(-1.0, 1.0), 300.0, 10.0),
+            (Point::new(128.0, 250.0), Point::new(0.05, -1.0), 260.0, 4.0),
+            (Point::new(10.0, 128.0), Point::new(1.0, 0.0), 240.0, 8.0),
+        ];
+        let key = |out: &crate::RaycastOut<Pt>| {
+            let mut v: Vec<(u64, u64)> = out.hits.iter().map(|(_, p)| (p.0.x.to_bits(), p.0.y.to_bits())).collect();
+            v.sort();
+            v
+        };
+        for (o, d, mt, r) in rays {
+            let a = tree.raycast(o, d, mt, r, WalkNeighbors::Samet);
+            let b = tree.raycast(o, d, mt, r, WalkNeighbors::Probe);
+            assert!(a.leaves_visited >= 1);
+            assert_eq!(a.leaves_visited, b.leaves_visited, "Samet/Probe visit a different number of leaves");
+            assert_eq!(key(&a), key(&b), "Samet and Probe disagree on the hit set");
+            for w in a.hits.windows(2) { assert!(w[0].0 <= w[1].0, "hits not sorted by t"); }
+            #[cfg(feature = "neighbors")]
+            {
+                let c = tree.raycast(o, d, mt, r, WalkNeighbors::Ropes);
+                assert_eq!(a.leaves_visited, c.leaves_visited, "Ropes visits a different number of leaves");
+                assert_eq!(key(&a), key(&c), "Ropes disagrees with Samet on the hit set");
             }
         }
     }

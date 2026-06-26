@@ -40,7 +40,7 @@ pub mod morton3;
 
 pub use geom::{Point, Rect};
 pub use template::{CellState, PlacedTemplate, TemplateGrid};
-pub use tree::{Node, NodeId, Positioned, Side, Tree, UpdateStrategy};
+pub use tree::{Node, NodeId, Positioned, RaycastOut, Side, Tree, UpdateStrategy};
 pub use culling::{Shape, WalkNeighbors};
 pub use quadtree::{QNode, QNodeId, QuadTree};
 pub use itree::{INode, INodeId, IPoint, IPositioned, IRect, IUpdateStrategy, IntegerTree};
