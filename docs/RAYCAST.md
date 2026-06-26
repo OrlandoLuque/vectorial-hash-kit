@@ -184,6 +184,31 @@ This is exactly why the library keeps `neighbors` **off by default**: the
 zero-storage finders (`neighbors_samet` / `neighbors_probe`) are the right
 default, and ropes are an opt-in for the query-bound, low-churn regime.
 
+## Narrowphase ceiling — SoA + SIMD (`narrowphase_simd`)
+
+How much could a **SoA leaf + branchless kernel** buy the per-item test? The tree
+runs the AoS branch-on-projection distance today; the SoA form
+(`t = clamp(dot·inv_len², 0, 1)`; `|ap − t·ab|²`) over `xs[]`/`ys[]` has no
+data-dependent branches, so LLVM auto-vectorises it. Microbench, 4 M points, one
+segment:
+
+```
+target            AoS ms   SoA ms   speedup
+default (SSE2)     16.2      2.6      6.3×
+target-cpu=native   1.57     1.22     1.3×
+```
+
+The win is **real but build-dependent**: on the default release target the
+branchy AoS doesn't vectorise, so SoA gives ~6×; with `-C target-cpu=native`
+(AVX2) the compiler vectorises *even the AoS branches*, so AoS itself drops ~10×
+and the SoA edge shrinks to ~1.3×. Two takeaways: (1) for portable binaries the
+SoA-leaf refactor is worth a lot (~6× narrowphase); (2) the cheapest win
+available *today*, with no code change, is building hot consumers with
+`target-cpu=native`. Either way it's only the narrowphase — in the full capsule
+cull the `classify_box` descent is the other half, so end-to-end gains are
+smaller (Amdahl). Wiring SoA into the leaf is the backlog's "SoA leaf storage +
+SIMD" item.
+
 ## Pitfall that nearly hid this
 
 The very first measurement had the capsule at ~12 ms and "concluded" the DDA was
@@ -199,9 +224,10 @@ or the tree can't prune it.
   unordered exact thick band is settled (descend, above); `raycast_first` is the
   thin ordered case; this would be the thick ordered case. Niche — for most
   thick queries you want all hits (descend) anyway.
-- **SoA + SIMD narrowphase** — needs the SoA leaf-storage backlog item; the
-  segment-aligned `|y'| ≤ r` test vectorises cleanly and is the remaining ceiling
-  for the capsule's per-item cost.
+- **SoA leaf storage** — to *realise* the narrowphase ceiling measured above
+  (~6× on the default target). The kernel and the win are proven
+  (`narrowphase_simd`); what's left is storing leaf positions SoA so the cull can
+  run it. The backlog's "SoA leaf storage + SIMD" item.
 
 *(Origin: the user's uniform-grid DDA ray-cast in `TestDraw`, adapted to the
 variable-size tree.)*
