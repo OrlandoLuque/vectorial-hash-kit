@@ -999,6 +999,24 @@ impl<T: Positioned3> Tree3<T> {
         shapes.par_iter().map(|s| self.cull(s)).collect()
     }
 
+    /// Batch k-NN — one result list per query point (`out[i]` for `queries[i]`).
+    /// Serial; see [`Tree3::knn_many_par`].
+    pub fn knn_many(&self, queries: &[Point3], k: usize) -> Vec<Vec<(f64, &T)>> {
+        queries.iter().map(|&q| self.knn(q, k)).collect()
+    }
+
+    /// Parallel batch k-NN — the independent queries fan out over rayon (feature
+    /// `parallel`). Like [`Tree3::cull_many_par`]: worth it for many queries over
+    /// a large index; see `docs/PARALLEL.md` for the crossover.
+    #[cfg(feature = "parallel")]
+    pub fn knn_many_par(&self, queries: &[Point3], k: usize) -> Vec<Vec<(f64, &T)>>
+    where
+        T: Sync,
+    {
+        use rayon::prelude::*;
+        queries.par_iter().map(|&q| self.knn(q, k)).collect()
+    }
+
     fn cull_recurse<'a, S: Shape3>(
         &'a self, id: Node3Id, shape: &S, fully_inside: bool, out: &mut Vec<&'a T>,
     ) {
@@ -1256,6 +1274,25 @@ mod tests {
             assert_eq!(want, got, "cull != brute for sphere ({cx},{cy},{cz}) r={r}");
         }
         let _ = brute(&pts, &Sphere3::new(0.0,0.0,0.0,10.0));
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn knn_many_par_matches_serial() {
+        let mut x = 0x9A3C_77E1u64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        let pts: Vec<P> = (0..5000).map(|_| P(Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0))).collect();
+        let mut tree = Tree3::<P>::new(Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0), 8);
+        for p in &pts { tree.insert(*p); }
+        let qs: Vec<Point3> = (0..200).map(|_| Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0)).collect();
+        let s = tree.knn_many(&qs, 8);
+        let p = tree.knn_many_par(&qs, 8);
+        assert_eq!(s.len(), p.len());
+        for (a, b) in s.iter().zip(p.iter()) {
+            let da: Vec<u64> = a.iter().map(|(d, _)| d.to_bits()).collect();
+            let db: Vec<u64> = b.iter().map(|(d, _)| d.to_bits()).collect();
+            assert_eq!(da, db, "knn_many_par distances differ from serial");
+        }
     }
 
     #[cfg(feature = "parallel")]

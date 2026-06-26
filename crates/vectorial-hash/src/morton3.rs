@@ -550,6 +550,21 @@ impl<T: Positioned3> MortonGrid3<T> {
         use rayon::prelude::*;
         shapes.par_iter().map(|s| self.cull(s)).collect()
     }
+
+    /// Batch k-NN — see [`crate::Tree3::knn_many`].
+    pub fn knn_many(&self, queries: &[Point3], k: usize) -> Vec<Vec<(f64, &T)>> {
+        queries.iter().map(|&q| self.knn(q, k)).collect()
+    }
+
+    /// Parallel batch k-NN — see [`crate::Tree3::knn_many_par`].
+    #[cfg(feature = "parallel")]
+    pub fn knn_many_par(&self, queries: &[Point3], k: usize) -> Vec<Vec<(f64, &T)>>
+    where
+        T: Sync,
+    {
+        use rayon::prelude::*;
+        queries.par_iter().map(|&q| self.knn(q, k)).collect()
+    }
 }
 
 #[cfg(test)]

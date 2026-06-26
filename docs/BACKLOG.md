@@ -56,6 +56,11 @@ built. New bin `vectorial-hash-demos/src/bin/siege.rs`.
   obstacles + raycast.
 - **Render**: reuse `critters3d`'s GPU instancing; one shape+colour per
   type/faction. Orbital camera.
+- **Publish to the web** (user, 2026-06-27) — also build `siege` for wasm and
+  deploy to the GitHub Pages site (like `critters`/`critters3d`): a card on
+  `docs/index.html` + `docs/siege.html` + `docs/siege.wasm`. wasm has no threads,
+  so the AI runs **serial** under `cfg(target_arch = "wasm32")` (the parallel
+  `par_iter` path is native-only). Build via `scripts/build-web.sh`.
 - **Phased (overnight = the foundation)**: terrain+camera+render → factions+spawn
   +advance → troop types+attacks → combat (damage/death/clash). Visual polish +
   balance is iterated with the user (the artistic side needs their eyes).

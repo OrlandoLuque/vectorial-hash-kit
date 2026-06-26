@@ -100,3 +100,40 @@ shape of work that actually parallelises (batch reads), with the crossover
 measured so you don't pay threads where they lose. Everything else is left
 serial because that's genuinely faster — or because making it parallel means a
 different algorithm, not a flag.
+
+## Per-unit AI — the parallel pattern for thousands of agents
+
+The biggest real-world win isn't a batch helper, it's the **per-unit fan-out**:
+in a simulation each agent runs its own read queries on the *shared* index every
+frame (target = `knn`, perception = `cull`, line-of-fire = `raycast`). Because
+every query is `&self` + `Sync` and the agents are mutated disjointly, the whole
+AI pass parallelises with one line and **no new API, no contention**:
+
+```rust
+units.par_iter_mut().for_each(|u| {
+    let target = index.knn(u.pos, 1);          // read-only on the shared index
+    let seen   = index.cull(&u.vision());      // …
+    u.decide(target, seen);                     // mutate this unit only
+});
+```
+
+Measured (`examples/parallel_ai.rs`, each unit doing `knn(4)` + a vision-sphere
+cull, 16 threads, interleaved min-of-30):
+
+```
+ units    serial ms   par ms   speedup
+ 5 000      5.5        0.52      10.4×
+ 20 000    31         2.4       12–14×
+ 80 000   166        14.4       11.5×
+ 200 000  573        50         11.5×
+```
+
+**~11–12× on 16 threads, flat from 5k to 200k agents** — near-linear (the gap to
+16× is memory bandwidth, not the algorithm). This is what lets the `siege` demo
+run a thousand+ units. The relocation pass (writes) stays serial — its lever is
+`update_ref`, not threads. `knn_many` / `knn_many_par` (and `cull_many_par`) are
+the batch convenience form for a *homogeneous* set of queries; the per-unit
+`par_iter` above is the general pattern when the queries differ per agent.
+
+(On wasm there are no threads — the same code runs serial under
+`cfg(target_arch = "wasm32")`; the web `siege` is single-threaded.)
