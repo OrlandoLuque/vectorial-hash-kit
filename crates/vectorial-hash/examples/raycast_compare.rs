@@ -175,66 +175,88 @@ fn gen_rays(n_rays: usize, world: f64, seed: u64) -> Vec<Ray> {
     }).collect()
 }
 
-/// Median-of-reps milliseconds for one whole ray batch (low-variance timing).
-fn time_ms<F: FnMut() -> usize>(reps: usize, mut f: F) -> f64 {
-    for _ in 0..2 { std::hint::black_box(f()); }
-    let mut best = f64::INFINITY;
-    for _ in 0..reps {
-        let t = Instant::now();
-        let acc = f();
-        let ms = t.elapsed().as_secs_f64() * 1e3;
-        std::hint::black_box(acc);
-        if ms < best { best = ms; }
+#[inline]
+fn endpoint(r: &Ray) -> Point { Point::new(r.o.x + r.d.x * r.len, r.o.y + r.d.y * r.len) }
+
+#[derive(Clone, Copy)]
+enum Method { Naive, Opt, Dda(WalkNeighbors) }
+
+/// One full ray-batch for a method; returns total hits (the blackholed work).
+fn run_batch(tree: &Tree<P>, rays: &[Ray], radius: f64, m: Method) -> usize {
+    match m {
+        Method::Naive => rays.iter().map(|r| tree.cull(&CapsuleNaive { a: r.o, b: endpoint(r), r: radius }).len()).sum(),
+        Method::Opt => rays.iter().map(|r| tree.cull(&Capsule2::new(r.o, endpoint(r), radius)).len()).sum(),
+        Method::Dda(w) => rays.iter().map(|r| tree.raycast(r.o, r.d, r.len, radius, w).hits.len()).sum(),
     }
-    best
+}
+
+/// **Interleaved** min/median-of-`rounds` ms per method. Each round times every
+/// method exactly once, **rotating the start order** so no method sits in a
+/// fixed position; a transient background load in any round therefore hits all
+/// methods, not one — keeping the *comparison* fair even on a busy machine. The
+/// `min` is the least-disturbed estimate; the `median` is reported alongside so
+/// contamination is visible (median ≫ min ⟹ the run was noisy).
+fn time_interleaved(rounds: usize, tree: &Tree<P>, rays: &[Ray], radius: f64, methods: &[Method]) -> Vec<(f64, f64)> {
+    let n = methods.len();
+    let mut samples: Vec<Vec<f64>> = vec![Vec::with_capacity(rounds); n];
+    for &m in methods { for _ in 0..2 { std::hint::black_box(run_batch(tree, rays, radius, m)); } }
+    for round in 0..rounds {
+        for k in 0..n {
+            let idx = (k + round) % n; // rotate start each round
+            let t = Instant::now();
+            let acc = run_batch(tree, rays, radius, methods[idx]);
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            std::hint::black_box(acc);
+            samples[idx].push(ms);
+        }
+    }
+    samples.into_iter().map(|mut v| { v.sort_by(|a, b| a.partial_cmp(b).unwrap()); (v[0], v[v.len() / 2]) }).collect()
 }
 
 const WORLD: f64 = 1024.0;
 const N_RAYS: usize = 64;
-const REPS: usize = 25;
+const ROUNDS: usize = 40;
 
 fn main() {
-    let methods: &[(&str, WalkNeighbors)] = &[
-        ("samet", WalkNeighbors::Samet),
-        ("probe", WalkNeighbors::Probe),
+    // DDA neighbour strategies (used for the walk stats + coverage).
+    let walks: &[WalkNeighbors] = &[
+        WalkNeighbors::Samet,
+        WalkNeighbors::Probe,
         #[cfg(feature = "neighbors")]
-        ("ropes", WalkNeighbors::Ropes),
+        WalkNeighbors::Ropes,
     ];
+    // Every timed method, fed to ONE interleaved timer so a background-load
+    // spike in any round is shared across all of them (fair comparison).
+    let mut timed = vec![Method::Naive, Method::Opt];
+    for &w in walks { timed.push(Method::Dda(w)); }
 
-    println!("ray-cast — exhaustive comparison | world={WORLD}² | {N_RAYS} rays × best-of-{REPS} | times = ms / whole batch");
+    println!("ray-cast — exhaustive comparison | world={WORLD}² | {N_RAYS} rays | interleaved min-of-{ROUNDS} (ms/batch)");
     #[cfg(not(feature = "neighbors"))]
     println!("(Ropes not compiled — re-run with --features neighbors to include it)");
-    println!("cap-naive = capsule, unoptimised classify/contains; cap-opt = optimised; speedup = naive/opt.\n");
+    println!("cap-naive/opt = capsule before/after the distance-math tuning. `noise` = worst median/min");
+    println!("across methods this row (≈1.0 clean; ≫1 means the machine was busy → re-run).\n");
 
     for &n in &[10_000usize, 50_000, 200_000] {
         for &il in &[8usize, 16] {
             let tree = build(n, il, WORLD, 1);
             let rays = gen_rays(N_RAYS, WORLD, 99);
             println!("── N={n}  item_limit={il} ──────────────────────────────────────────────");
-            println!("{:>6} | {:>9} {:>8} {:>7} | {:>8} {:>8} | {:>7} {:>8} {:>9}", "radius", "cap-naive", "cap-opt", "speedup", "dda best", "hits", "leaves", "tested", "coverage");
+            println!("{:>6} | {:>9} {:>8} {:>7} | {:>8} {:>8} | {:>7} {:>8} {:>8} {:>6}", "radius", "cap-naive", "cap-opt", "speedup", "dda best", "hits", "leaves", "tested", "cover", "noise");
             for &radius in &[2.0_f64, 8.0, 32.0, 128.0] {
-                // capsule (before / after) — same exact result, different cost.
-                let naive_ms = time_ms(REPS, || rays.iter().map(|r| { let b = Point::new(r.o.x + r.d.x * r.len, r.o.y + r.d.y * r.len); tree.cull(&CapsuleNaive { a: r.o, b, r: radius }).len() }).sum());
-                let opt_ms = time_ms(REPS, || rays.iter().map(|r| { let b = Point::new(r.o.x + r.d.x * r.len, r.o.y + r.d.y * r.len); tree.cull(&Capsule2::new(r.o, b, radius)).len() }).sum());
+                let stats = time_interleaved(ROUNDS, &tree, &rays, radius, &timed);
+                let (naive_min, opt_min) = (stats[0].0, stats[1].0);
+                let dda_min = stats[2..].iter().map(|s| s.0).fold(f64::INFINITY, f64::min);
+                // Contamination indicator: worst median/min ratio this row.
+                let noise = stats.iter().map(|&(mn, md)| if mn > 0.0 { md / mn } else { 1.0 }).fold(1.0_f64, f64::max);
 
-                // reference hit-sets (cap-opt is exact) for coverage.
+                // Exact reference (cap-opt) + DDA walk stats / coverage (deterministic).
                 let refsets: Vec<std::collections::HashSet<(u64, u64)>> = rays.iter().map(|r| {
-                    let b = Point::new(r.o.x + r.d.x * r.len, r.o.y + r.d.y * r.len);
-                    tree.cull(&Capsule2::new(r.o, b, radius)).iter().map(|p| key(p)).collect()
+                    tree.cull(&Capsule2::new(r.o, endpoint(r), radius)).iter().map(|p| key(p)).collect()
                 }).collect();
                 let cap_hits: usize = refsets.iter().map(|s| s.len()).sum();
-
-                // DDA: time each method, keep the best; stats + coverage (same walk).
-                let mut best_ms = f64::INFINITY;
-                let (mut leaves, mut tested) = (0usize, 0usize);
-                for &(_, walk) in methods {
-                    let ms = time_ms(REPS, || rays.iter().map(|r| tree.raycast(r.o, r.d, r.len, radius, walk).hits.len()).sum());
-                    if ms < best_ms { best_ms = ms; }
-                }
-                // walk stats + coverage (method-independent → one pass).
-                let (mut found, mut dda_hits) = (0usize, 0usize);
+                let (mut leaves, mut tested, mut found, mut dda_hits) = (0usize, 0usize, 0usize, 0usize);
                 for (r, rs) in rays.iter().zip(&refsets) {
-                    let out = tree.raycast(r.o, r.d, r.len, radius, methods[0].1);
+                    let out = tree.raycast(r.o, r.d, r.len, radius, walks[0]);
                     leaves += out.leaves_visited;
                     tested += out.items_tested;
                     dda_hits += out.hits.len();
@@ -242,8 +264,8 @@ fn main() {
                     found += rs.iter().filter(|k| got.contains(k)).count();
                 }
                 let cov = if cap_hits > 0 { 100.0 * found as f64 / cap_hits as f64 } else { 100.0 };
-                println!("{:>6.0} | {:>9.3} {:>8.3} {:>6.1}× | {:>8.3} {:>8} | {:>7} {:>8} {:>8.1}%",
-                    radius, naive_ms, opt_ms, naive_ms / opt_ms, best_ms, dda_hits, leaves / N_RAYS, tested / N_RAYS, cov);
+                println!("{:>6.0} | {:>9.3} {:>8.3} {:>6.1}× | {:>8.3} {:>8} | {:>7} {:>8} {:>7.1}% {:>6.2}",
+                    radius, naive_min, opt_min, naive_min / opt_min, dda_min, dda_hits, leaves / N_RAYS, tested / N_RAYS, cov, noise);
             }
             println!();
         }

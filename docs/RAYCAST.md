@@ -50,21 +50,33 @@ Distance/geometry is the hot path; both methods got the stable-Rust tricks:
 
 ## Measured — exhaustive (`--features neighbors`)
 
-world 1024², 64 rays (full-world length), best-of-25. Times = ms per whole
-batch. `cap-naive`/`cap-opt` are the same exact capsule, before/after the
-optimisations; `speedup = naive/opt`. `dda best` = fastest neighbour strategy
-(ropes). `coverage` = fraction of cap-opt's exact hits the thin DDA recovers.
+**Methodology (contamination-resistant).** This machine runs other processes, so
+the harness (a) times every method **interleaved** — each round times all methods
+once, rotating the start order, so a background-load spike in any round is shared
+across all of them rather than penalising whichever was being measured at the
+time; (b) reports the **min** of `ROUNDS=40` rounds (noise only adds time, so the
+minimum is the least-disturbed estimate); and (c) prints a **`noise`** column =
+worst `median/min` ratio in that row (≈1.0 clean; ≫1 ⟹ the machine was busy →
+re-run). The **speedup** is the stable headline — because naive and opt are
+measured interleaved, any load hits both equally and the ratio holds; absolute ms
+drift with machine load, the ratio does not. Two back-to-back runs agreed on the
+speedups to ±0.1×.
+
+world 1024², 64 rays (full-world length). Times = ms per whole batch.
+`cap-naive`/`cap-opt` = same exact capsule before/after the tuning; `dda best` =
+fastest neighbour strategy (ropes); `coverage` = fraction of cap-opt's exact hits
+the thin DDA recovers.
 
 ```
- N=10000  il=8       N=50000  il=8        N=200000 il=8
-r  naive  opt  ×  cov   naive  opt  ×  cov    naive  opt  ×  cov
-2  0.171 0.116 1.5 99%  0.635 0.409 1.6 97%   1.878 1.324 1.4 91%
-8  0.228 0.153 1.5 92%  1.077 0.711 1.5 74%   2.950 2.091 1.4 45%
-32 0.552 0.327 1.7 48%  1.810 1.320 1.4 22%   4.779 3.834 1.2 11%
-128 0.985 0.725 1.4 11% 3.372 2.919 1.2  5%  11.295 11.170 1.0  2%
+ N=10000  il=8        N=50000  il=8        N=200000  il=8
+r  naive  opt   ×  cov   naive  opt   ×  cov   naive   opt   ×  cov
+2  0.252 0.170 1.5 99%   0.738 0.508 1.5 97%   1.945  1.381 1.4 91%
+8  0.393 0.248 1.6 92%   1.140 0.771 1.5 74%   3.106  2.193 1.4 45%
+32 0.647 0.439 1.5 48%   1.825 1.311 1.4 22%   4.831  3.834 1.3 11%
+128 1.034 0.788 1.3 11%  3.328 2.941 1.1  5%  11.150 11.014 1.0  2%
 ```
 
-(`il=16` is similar: capsule speedups 1.1–2.1×; coverage a few points higher
+(`il=16` is similar: capsule speedups 1.1–1.6×; coverage a few points higher
 since fewer, fatter leaves.) DDA walk per ray: ~23/52/103 leaves and ~134/301/597
 items tested for N=10k/50k/200k — flat in radius (the corridor), identical across
 the three strategies.
