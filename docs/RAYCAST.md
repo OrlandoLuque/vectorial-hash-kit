@@ -106,6 +106,31 @@ the capsule (classify + narrowphase bound); the DDA is bound by the walk.**
 - **Ropes < Samet < Probe** on query time (identical walk) — the difference is
   pure neighbour-finding: ropes O(1), Samet/Probe O(depth).
 
+## First-hit (early-exit) — `Tree::raycast_first`
+
+The line-of-sight / picking query: the *nearest* item along the ray. Same DDA
+walk, but it keeps the best hit and **stops as soon as the next leaf starts
+beyond it** (entry `t` − `radius` slack > best `t`) — so it touches a handful of
+leaves instead of the whole corridor. Exact for thin rays; for thick rays it's
+the nearest hit *in the corridor* (the usual coverage caveat). Verified to return
+the same nearest hit as `raycast`.
+
+The early-exit payoff (N=200k, item_limit 8, full DDA vs first-hit, interleaved):
+
+```
+radius   full ms   first ms   speedup
+2        1.341     0.014      95.8×
+8        1.456     0.019      76.2×
+32       1.459     0.053      27.5×
+128      1.456     0.213       6.8×
+```
+
+For a thin ray in a dense scene the first hit is found almost immediately — two
+orders of magnitude faster than gathering the whole corridor. (The first-hit
+times are so small, ~14 µs, that their `noise` ratio is high — near timer
+resolution; the min still holds across runs.) This is the regime where the DDA
+decisively beats the capsule (which has no ordering and must gather everything).
+
 ## Pitfall that nearly hid this
 
 The very first measurement had the capsule at ~12 ms and "concluded" the DDA was
@@ -119,11 +144,12 @@ or the tree can't prune it.
 - **Does maintaining ropes pay off overall?** The query-side win (≈30–45 % vs
   Samet) is half the ledger; ropes are rewired on every split/merge. Next:
   measure build/`update` with vs without the `neighbors` feature and combine.
-- **Exact thick DDA** (widen the corridor with the distance test) and a hard
-  `raycast_first` (thin DDA + ±1 widen + early-exit). For thin rays the widen is
-  cheap and keeps the ordering; for fat rays its cost converges to the capsule
-  (full coverage of a radius-`r` band is inherently O(len·r·density) — no free
-  lunch), so there use the capsule.
+- **Exact thick DDA** — widen the corridor with the distance test (visit the
+  perpendicular neighbours within `r`). For thin rays the widen is ±1 and keeps
+  the ordering; for fat rays its cost converges to the capsule (full coverage of
+  a radius-`r` band is inherently O(len·r·density) — no free lunch), so there use
+  the capsule. *(`raycast_first` above is the thin early-exit; the thick widen is
+  the remaining piece.)*
 - **SoA + SIMD narrowphase** — needs the SoA leaf-storage backlog item; the
   segment-aligned `|y'| ≤ r` test vectorises cleanly and is the remaining ceiling
   for the capsule's per-item cost.

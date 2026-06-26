@@ -179,7 +179,7 @@ fn gen_rays(n_rays: usize, world: f64, seed: u64) -> Vec<Ray> {
 fn endpoint(r: &Ray) -> Point { Point::new(r.o.x + r.d.x * r.len, r.o.y + r.d.y * r.len) }
 
 #[derive(Clone, Copy)]
-enum Method { Naive, Opt, Dda(WalkNeighbors) }
+enum Method { Naive, Opt, Dda(WalkNeighbors), First(WalkNeighbors) }
 
 /// One full ray-batch for a method; returns total hits (the blackholed work).
 fn run_batch(tree: &Tree<P>, rays: &[Ray], radius: f64, m: Method) -> usize {
@@ -187,6 +187,7 @@ fn run_batch(tree: &Tree<P>, rays: &[Ray], radius: f64, m: Method) -> usize {
         Method::Naive => rays.iter().map(|r| tree.cull(&CapsuleNaive { a: r.o, b: endpoint(r), r: radius }).len()).sum(),
         Method::Opt => rays.iter().map(|r| tree.cull(&Capsule2::new(r.o, endpoint(r), radius)).len()).sum(),
         Method::Dda(w) => rays.iter().map(|r| tree.raycast(r.o, r.d, r.len, radius, w).hits.len()).sum(),
+        Method::First(w) => rays.iter().map(|r| tree.raycast_first(r.o, r.d, r.len, radius, w).is_some() as usize).sum(),
     }
 }
 
@@ -270,6 +271,19 @@ fn main() {
             println!();
         }
     }
+    // ── First-hit (early-exit) vs walking the whole corridor ──────────────────
+    println!("── first-hit (early-exit) vs full DDA corridor — N=200000 item_limit=8 ──");
+    println!("{:>6} | {:>9} {:>9} {:>8} | {:>6}", "radius", "full ms", "first ms", "speedup", "noise");
+    let tree = build(200_000, 8, WORLD, 1);
+    let rays = gen_rays(N_RAYS, WORLD, 99);
+    for &radius in &[2.0_f64, 8.0, 32.0, 128.0] {
+        let s = time_interleaved(ROUNDS, &tree, &rays, radius, &[Method::Dda(WalkNeighbors::Samet), Method::First(WalkNeighbors::Samet)]);
+        let noise = s.iter().map(|&(mn, md)| if mn > 0.0 { md / mn } else { 1.0 }).fold(1.0_f64, f64::max);
+        println!("{:>6.0} | {:>9.3} {:>9.3} {:>7.1}× | {:>6.2}", radius, s[0].0, s[1].0, s[0].0 / s[1].0, noise);
+    }
+    println!();
+
     println!("DDA hits/leaves/tested are per-ray-batch / per-ray; the walk (leaves/tested) is identical");
     println!("across samet/probe/ropes — only neighbour-finding time differs (ropes O(1) is fastest).");
+    println!("first-hit early-exits at the first cell with a hit → touches a handful of leaves, not the corridor.");
 }

@@ -696,49 +696,122 @@ impl<T: Positioned> Tree<T> {
                     out.hits.push((proj.clamp(0.0, max_t), it));
                 }
             }
-            // Exit of this leaf: the nearer far-edge (slab test) → the side and t.
-            let lb = self.get(leaf).bbox;
-            let tx = if ux > 0.0 { (lb.x_max() - origin.x) * inv_ux } else if ux < 0.0 { (lb.x - origin.x) * inv_ux } else { f64::INFINITY };
-            let ty = if uy > 0.0 { (lb.y_max() - origin.y) * inv_uy } else if uy < 0.0 { (lb.y - origin.y) * inv_uy } else { f64::INFINITY };
-            let t_exit = tx.min(ty);
-            if t_exit >= max_t {
-                break; // the ray ends inside this leaf
-            }
-            let side = if tx <= ty {
-                if ux > 0.0 { Side::East } else { Side::West }
-            } else if uy > 0.0 {
-                Side::South
-            } else {
-                Side::North
-            };
-            let exit = Point::new(origin.x + ux * t_exit, origin.y + uy * t_exit);
-            nbuf.clear();
-            match walk {
-                crate::culling::WalkNeighbors::Samet => self.neighbors_samet(leaf, side, &mut nbuf),
-                crate::culling::WalkNeighbors::Probe => self.neighbors_probe(leaf, side, &mut nbuf),
-                #[cfg(feature = "neighbors")]
-                crate::culling::WalkNeighbors::Ropes => nbuf.extend_from_slice(self.neighbors_ropes(leaf, side)),
-            }
-            // The ray enters exactly the neighbour whose perpendicular extent
-            // straddles the exit point.
-            let next = nbuf
-                .iter()
-                .copied()
-                .find(|&n| {
-                    let cb = self.get(n).bbox;
-                    match side {
-                        Side::East | Side::West => cb.y <= exit.y && exit.y < cb.y_max(),
-                        Side::North | Side::South => cb.x <= exit.x && exit.x < cb.x_max(),
-                    }
-                })
-                .or_else(|| nbuf.first().copied());
-            match next {
-                Some(n) => leaf = n,
-                None => break, // reached the world border
+            match self.ray_step(leaf, origin, ux, uy, inv_ux, inv_uy, max_t, walk, &mut nbuf) {
+                Some((_, n)) => leaf = n,
+                None => break, // ray ended in this leaf, or hit the world border
             }
         }
         out.hits.sort_by(|a, b| a.0.total_cmp(&b.0));
         out
+    }
+
+    /// One DDA step from `leaf`: the slab test gives the exit `t` and side, then
+    /// `walk` finds the neighbour the ray enters (the one whose perpendicular
+    /// extent straddles the exit point). Returns `(t_exit, next_leaf)`, or
+    /// `None` if the ray ends inside `leaf` (exit ≥ `max_t`) or crosses the
+    /// world border. `nbuf` is reused scratch. Shared by the ray-casts.
+    #[allow(clippy::too_many_arguments)]
+    fn ray_step(&self, leaf: NodeId, origin: Point, ux: f64, uy: f64, inv_ux: f64, inv_uy: f64, max_t: f64, walk: crate::culling::WalkNeighbors, nbuf: &mut Vec<NodeId>) -> Option<(f64, NodeId)> {
+        let lb = self.get(leaf).bbox;
+        let tx = if ux > 0.0 { (lb.x_max() - origin.x) * inv_ux } else if ux < 0.0 { (lb.x - origin.x) * inv_ux } else { f64::INFINITY };
+        let ty = if uy > 0.0 { (lb.y_max() - origin.y) * inv_uy } else if uy < 0.0 { (lb.y - origin.y) * inv_uy } else { f64::INFINITY };
+        let t_exit = tx.min(ty);
+        if t_exit >= max_t {
+            return None;
+        }
+        let side = if tx <= ty {
+            if ux > 0.0 { Side::East } else { Side::West }
+        } else if uy > 0.0 {
+            Side::South
+        } else {
+            Side::North
+        };
+        let exit = Point::new(origin.x + ux * t_exit, origin.y + uy * t_exit);
+        nbuf.clear();
+        match walk {
+            crate::culling::WalkNeighbors::Samet => self.neighbors_samet(leaf, side, nbuf),
+            crate::culling::WalkNeighbors::Probe => self.neighbors_probe(leaf, side, nbuf),
+            #[cfg(feature = "neighbors")]
+            crate::culling::WalkNeighbors::Ropes => nbuf.extend_from_slice(self.neighbors_ropes(leaf, side)),
+        }
+        let next = nbuf
+            .iter()
+            .copied()
+            .find(|&n| {
+                let cb = self.get(n).bbox;
+                match side {
+                    Side::East | Side::West => cb.y <= exit.y && exit.y < cb.y_max(),
+                    Side::North | Side::South => cb.x <= exit.x && exit.x < cb.x_max(),
+                }
+            })
+            .or_else(|| nbuf.first().copied());
+        next.map(|n| (t_exit, n))
+    }
+
+    /// **First hit** along the ray (nearest by distance along it) with
+    /// front-to-back **early-exit**. Walks the corridor keeping the nearest item
+    /// within `radius`, and stops as soon as the next leaf starts beyond the best
+    /// hit — its entry `t` minus the `radius` slack exceeds the best `t`, so
+    /// nothing ahead can be nearer. Exact for thin rays (`radius` ≲ leaf); for
+    /// thick rays it returns the nearest hit *in the corridor* (same coverage
+    /// caveat as [`Tree::raycast`]). `None` if nothing is hit. Typically touches
+    /// a handful of leaves vs the whole corridor — the line-of-sight / picking
+    /// query.
+    pub fn raycast_first(&self, origin: Point, dir: Point, max_t: f64, radius: f64, walk: crate::culling::WalkNeighbors) -> Option<(f64, &T)> {
+        let m = (dir.x * dir.x + dir.y * dir.y).sqrt();
+        if m == 0.0 || !self.get(self.root).bbox.contains(origin) {
+            return None;
+        }
+        let (ux, uy) = (dir.x / m, dir.y / m);
+        let end = Point::new(origin.x + ux * max_t, origin.y + uy * max_t);
+        let r2 = radius * radius;
+        let inv_ux = if ux != 0.0 { 1.0 / ux } else { 0.0 };
+        let inv_uy = if uy != 0.0 { 1.0 / uy } else { 0.0 };
+        let mut leaf = self.locate(origin);
+        let mut nbuf: Vec<NodeId> = Vec::new();
+        let mut best: Option<(f64, &T)> = None;
+        let mut t_enter = 0.0;
+        let mut guard = 0usize;
+        loop {
+            guard += 1;
+            if guard > self.nodes.len() * 4 + 16 {
+                break;
+            }
+            // Early-exit: this leaf (and every later one) begins beyond the best
+            // hit, so nothing ahead can be nearer.
+            if let Some((bt, _)) = best {
+                if t_enter - radius > bt {
+                    break;
+                }
+            }
+            for it in &self.get(leaf).items {
+                let p = it.position();
+                let (apx, apy) = (p.x - origin.x, p.y - origin.y);
+                let proj = apx * ux + apy * uy;
+                let d2 = if proj <= 0.0 {
+                    apx * apx + apy * apy
+                } else if proj >= max_t {
+                    let (bx, by) = (p.x - end.x, p.y - end.y);
+                    bx * bx + by * by
+                } else {
+                    (apx * apx + apy * apy) - proj * proj
+                };
+                if d2 <= r2 {
+                    let t = proj.clamp(0.0, max_t);
+                    if best.is_none_or(|(bt, _)| t < bt) {
+                        best = Some((t, it));
+                    }
+                }
+            }
+            match self.ray_step(leaf, origin, ux, uy, inv_ux, inv_uy, max_t, walk, &mut nbuf) {
+                Some((t_exit, n)) => {
+                    t_enter = t_exit;
+                    leaf = n;
+                }
+                None => break,
+            }
+        }
+        best
     }
 
     pub fn neighbors_samet(&self, leaf: NodeId, side: Side, out: &mut Vec<NodeId>) {
@@ -1054,6 +1127,37 @@ mod tests {
                 let c = tree.raycast(o, d, mt, r, WalkNeighbors::Ropes);
                 assert_eq!(a.leaves_visited, c.leaves_visited, "Ropes visits a different number of leaves");
                 assert_eq!(key(&a), key(&c), "Ropes disagrees with Samet on the hit set");
+            }
+        }
+    }
+
+    #[test]
+    fn raycast_first_matches_raycast_nearest() {
+        // First-hit (with early-exit) must equal raycast's sorted-nearest, for
+        // every neighbour method — early-exit changes the cost, not the answer.
+        // Compare distances (ties on identity are fine).
+        use crate::WalkNeighbors;
+        let mut x = 0x7733_1144u64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        let pts: Vec<Pt> = (0..2000).map(|_| Pt(Point::new(rng() * 256.0, rng() * 256.0))).collect();
+        let mut tree = Tree::<Pt>::new(Rect::new(0.0, 0.0, 256.0, 256.0), 3);
+        for p in &pts { tree.insert(*p); }
+        let rays = [
+            (Point::new(8.0, 8.0), Point::new(1.0, 0.7), 300.0, 6.0),
+            (Point::new(250.0, 10.0), Point::new(-1.0, 1.0), 300.0, 12.0),
+            (Point::new(128.0, 250.0), Point::new(0.05, -1.0), 260.0, 3.0),
+            (Point::new(10.0, 128.0), Point::new(1.0, 0.0), 240.0, 20.0),
+        ];
+        let walks = [WalkNeighbors::Samet, WalkNeighbors::Probe];
+        for (o, d, mt, r) in rays {
+            for &w in &walks {
+                let first = tree.raycast_first(o, d, mt, r, w);
+                let all = tree.raycast(o, d, mt, r, w);
+                match (first, all.hits.first()) {
+                    (None, None) => {}
+                    (Some((t1, _)), Some(&(t0, _))) => assert!((t1 - t0).abs() < 1e-9, "raycast_first t {t1} != raycast nearest t {t0}"),
+                    _ => panic!("raycast_first / raycast nearest disagree on hit/miss"),
+                }
             }
         }
     }
