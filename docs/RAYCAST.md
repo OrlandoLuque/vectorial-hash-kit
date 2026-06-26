@@ -156,6 +156,34 @@ DDA stays fastest (flat ~1.5 ms) but only at partial coverage. The one place the
 neighbour walk wins outright is ordered first-hit (`raycast_first`), where the
 early-exit beats both.
 
+## Do ropes pay off? (the maintenance ledger)
+
+Stored ropes make the neighbour walk ~30–45 % faster per query — but they're
+rewired on every split/merge. `examples/ropes_balance.rs` measures that upkeep,
+build + churn **with vs without** the `neighbors` feature (N=50k, item_limit 8,
+relocating every point per frame via `update_ref`):
+
+```
+                without ropes    with ropes    overhead
+build (50k inserts)   13.6 ms       19.6 ms      +45 %
+update / frame         3.70 ms       5.68 ms      +53 %
+```
+
+So ropes add **~45 % to build and ~53 % to per-frame relocation** — a real cost.
+The break-even: the maintenance adds ≈ 2 ms to a frame that relocates 50k points,
+while a neighbour-heavy query saves only single-digit µs each, so you need on the
+order of **hundreds of neighbour-queries per frame** to offset the churn. The
+verdict:
+
+- **Static / low-churn, very query-heavy** (build the ropes once, then fire many
+  rays / floods): ropes win — the upkeep is amortised.
+- **Churn-heavy with few queries** (the common game-loop case): **Samet** — zero
+  storage, O(depth), and you skip the 45–53 % maintenance tax entirely.
+
+This is exactly why the library keeps `neighbors` **off by default**: the
+zero-storage finders (`neighbors_samet` / `neighbors_probe`) are the right
+default, and ropes are an opt-in for the query-bound, low-churn regime.
+
 ## Pitfall that nearly hid this
 
 The very first measurement had the capsule at ~12 ms and "concluded" the DDA was
@@ -166,9 +194,6 @@ or the tree can't prune it.
 
 ## Open
 
-- **Does maintaining ropes pay off overall?** The query-side win (≈30–45 % vs
-  Samet) is half the ledger; ropes are rewired on every split/merge. Next:
-  measure build/`update` with vs without the `neighbors` feature and combine.
 - **Ordered thick first-hit** — the one ray-cast not yet built: a *front-to-back*
   widened walk (±1 perpendicular within `r`) that keeps the early-exit. The
   unordered exact thick band is settled (descend, above); `raycast_first` is the
