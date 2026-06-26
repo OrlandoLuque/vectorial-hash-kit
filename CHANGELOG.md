@@ -16,8 +16,14 @@ pre-1.0, so the public API may still change between minor versions.
 - **Parallel batch cull** behind the `parallel` feature: `cull_many` (serial,
   always available) and `cull_many_par` (rayon) on every structure. Measured
   crossover in [`docs/PARALLEL.md`](docs/PARALLEL.md).
-- **`MortonGrid3`** — a pointer-free Z-order linear grid (the fourth 3D
-  structure), with `cull`, `knn`, and Morton encode/decode helpers.
+- **Morton / Z-order linear grids** — `MortonGrid3` (3D) and `MortonGrid`
+  (**2D**, new): pointer-free flat spatial hashes with `cull`, `knn`
+  (ring-by-ring), `clear`, parallel `extend_par`, and Morton encode/decode.
+- **Ray-casting** — the DDA leaf-walk (`Tree::raycast` / `raycast_first`, 2D
+  variable-cell with selectable `WalkNeighbors`) and the Amanatides–Woo grid
+  walk (`MortonGrid`/`MortonGrid3::raycast` / `raycast_first`), plus the capsule
+  shapes (`Capsule` 2D, `Segment3` 3D with analytic `classify_box`/`classify_aabb`)
+  for the exact thick band. Full study + benchmarks in [`docs/RAYCAST.md`](docs/RAYCAST.md).
 - **Benchmarks + regression gate.** A Criterion suite (`benches/spatial.rs`) and
   a deterministic, committed-baseline regression gate
   (`examples/regression_gate.rs`, min-of-N + clock calibration) that can fail a
