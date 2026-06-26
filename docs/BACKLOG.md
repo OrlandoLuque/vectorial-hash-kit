@@ -82,9 +82,11 @@ built. New bin `vectorial-hash-demos/src/bin/siege.rs`.
   archer), mage (**chained `knn`** lightning, 4 links). Smoke = dynamic LoS
   blockers **done**: catapult/dragon strikes spawn puffs into their own `Tree3`
   (capped, aging out ~3.5s); archer/ballista `raycast_dda_first` it and a puff
-  in the line blocks the shot (same parallel-safe emit pattern). **Still to
-  layer:** healer (friendly `knn` + heal), boids *alignment*, bridges/forests/
-  rivers, balance, and the wasm/Pages publish.
+  in the line blocks the shot (same parallel-safe emit pattern). Healer **done**:
+  carries unit health in the index item, seeks its most-wounded comrade
+  (friendly `knn`), heals it as *negative* damage (capped at full HP in apply).
+  **Eight troop types, all eight a distinct query.** **Still to layer:** boids
+  *alignment*, bridges/forests/rivers, balance, and the wasm/Pages publish.
 
 **Thread-slider retrofit for the critters demos** (user, 2026-06-27) — the same
 live `num_threads` slider in `critters` (2D) and `critters3d` (3D), but it only

@@ -106,15 +106,17 @@ impl Faction {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Kind { Soldier, Archer, Knight, Dragon, Catapult, Mage, Ballista }
+enum Kind { Soldier, Archer, Knight, Dragon, Catapult, Mage, Ballista, Healer }
 impl Kind {
-    fn speed(self) -> f64 { match self { Kind::Soldier => 26.0, Kind::Archer => 22.0, Kind::Knight => 52.0, Kind::Dragon => 60.0, Kind::Catapult => 10.0, Kind::Mage => 20.0, Kind::Ballista => 13.0 } }
-    fn max_hp(self) -> f64 { match self { Kind::Soldier => 100.0, Kind::Archer => 60.0, Kind::Knight => 180.0, Kind::Dragon => 1400.0, Kind::Catapult => 160.0, Kind::Mage => 70.0, Kind::Ballista => 140.0 } }
-    /// Engagement range — for the ballista/catapult this is the firing range.
-    fn reach(self) -> f64 { match self { Kind::Soldier => 9.0, Kind::Archer => 150.0, Kind::Knight => 12.0, Kind::Dragon => 60.0, Kind::Catapult => 260.0, Kind::Mage => 120.0, Kind::Ballista => 240.0 } }
-    fn dmg(self) -> f64 { match self { Kind::Soldier => 14.0, Kind::Archer => 18.0, Kind::Knight => 30.0, Kind::Dragon => 22.0, Kind::Catapult => 30.0, Kind::Mage => 16.0, Kind::Ballista => 26.0 } }
-    fn cooldown(self) -> f64 { match self { Kind::Soldier => 0.8, Kind::Archer => 1.1, Kind::Knight => 1.0, Kind::Dragon => 0.5, Kind::Catapult => 2.4, Kind::Mage => 1.3, Kind::Ballista => 1.7 } }
-    fn radius(self) -> f32 { match self { Kind::Soldier => 3.0, Kind::Archer => 3.0, Kind::Knight => 4.2, Kind::Dragon => 11.0, Kind::Catapult => 5.5, Kind::Mage => 3.4, Kind::Ballista => 5.0 } }
+    fn speed(self) -> f64 { match self { Kind::Soldier => 26.0, Kind::Archer => 22.0, Kind::Knight => 52.0, Kind::Dragon => 60.0, Kind::Catapult => 10.0, Kind::Mage => 20.0, Kind::Ballista => 13.0, Kind::Healer => 24.0 } }
+    fn max_hp(self) -> f64 { match self { Kind::Soldier => 100.0, Kind::Archer => 60.0, Kind::Knight => 180.0, Kind::Dragon => 1400.0, Kind::Catapult => 160.0, Kind::Mage => 70.0, Kind::Ballista => 140.0, Kind::Healer => 90.0 } }
+    /// Engagement range — for the siege engines the firing range, for the healer
+    /// the heal range.
+    fn reach(self) -> f64 { match self { Kind::Soldier => 9.0, Kind::Archer => 150.0, Kind::Knight => 12.0, Kind::Dragon => 60.0, Kind::Catapult => 260.0, Kind::Mage => 120.0, Kind::Ballista => 240.0, Kind::Healer => 70.0 } }
+    /// Damage per strike — for the healer, the (positive) amount healed.
+    fn dmg(self) -> f64 { match self { Kind::Soldier => 14.0, Kind::Archer => 18.0, Kind::Knight => 30.0, Kind::Dragon => 22.0, Kind::Catapult => 30.0, Kind::Mage => 16.0, Kind::Ballista => 26.0, Kind::Healer => 24.0 } }
+    fn cooldown(self) -> f64 { match self { Kind::Soldier => 0.8, Kind::Archer => 1.1, Kind::Knight => 1.0, Kind::Dragon => 0.5, Kind::Catapult => 2.4, Kind::Mage => 1.3, Kind::Ballista => 1.7, Kind::Healer => 0.9 } }
+    fn radius(self) -> f32 { match self { Kind::Soldier => 3.0, Kind::Archer => 3.0, Kind::Knight => 4.2, Kind::Dragon => 11.0, Kind::Catapult => 5.5, Kind::Mage => 3.4, Kind::Ballista => 5.0, Kind::Healer => 3.2 } }
     /// Ground units sit on the terrain; the dragon flies at a fixed altitude.
     fn altitude(self) -> f64 { match self { Kind::Dragon => 95.0, _ => 0.0 } }
 }
@@ -140,7 +142,7 @@ impl Unit {
 /// Decoupled from `Unit` so the decide pass can hold `&Tree3<IUnit>` immutably
 /// while it mutates the `units` slice through `par_iter_mut`.
 #[derive(Clone, Copy)]
-struct IUnit { id: u32, faction: Faction, p: Point3 }
+struct IUnit { id: u32, faction: Faction, p: Point3, health: f32 }
 impl Positioned3 for IUnit { fn position(&self) -> Point3 { self.p } }
 
 // ----------------------------------------------------------------- smoke (LoS)
@@ -162,12 +164,13 @@ fn spawn_unit(rng: &mut Rng, faction: Faction) -> Unit {
     // Roster mix: mostly foot soldiers, then archers/knights, a few siege engines
     // and mages, a rare dragon.
     let roll = rng.unit();
-    let kind = if roll < 0.42 { Kind::Soldier }
-        else if roll < 0.62 { Kind::Archer }
-        else if roll < 0.74 { Kind::Knight }
-        else if roll < 0.85 { Kind::Mage }
-        else if roll < 0.91 { Kind::Ballista }
-        else if roll < 0.98 { Kind::Catapult }
+    let kind = if roll < 0.40 { Kind::Soldier }
+        else if roll < 0.58 { Kind::Archer }
+        else if roll < 0.70 { Kind::Knight }
+        else if roll < 0.80 { Kind::Mage }
+        else if roll < 0.88 { Kind::Healer }
+        else if roll < 0.93 { Kind::Ballista }
+        else if roll < 0.985 { Kind::Catapult }
         else { Kind::Dragon };
     let mut u = Unit {
         faction, kind,
@@ -221,7 +224,8 @@ fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>) {
     // One k-NN pass yields both the nearest enemy (targeting) and the nearby
     // friends used for flocking (separation + cohesion). k=16 reliably spans
     // both once the lines meet.
-    let mut target: Option<(Point3, u32, f64)> = None; // (pos, id, dist)
+    let mut target: Option<(Point3, u32, f64)> = None; // nearest enemy (pos, id, dist)
+    let mut heal: Option<(Point3, u32, f32, f64)> = None; // most-wounded friend (pos, id, health, dist)
     let (mut sep_x, mut sep_z) = (0.0, 0.0); // separation: away from close friends
     let (mut coh_x, mut coh_z, mut friends) = (0.0, 0.0, 0u32); // cohesion centroid
     for (d, it) in index.knn(u.p, 16) {
@@ -231,12 +235,23 @@ fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>) {
         } else {
             if d < SEP_RADIUS { let dd = d.max(1e-3); sep_x += (u.p.x - it.p.x) / dd; sep_z += (u.p.z - it.p.z) / dd; }
             coh_x += it.p.x; coh_z += it.p.z; friends += 1;
+            if it.health < 0.97 && heal.is_none_or(|(_, _, h, _)| it.health < h) { heal = Some((it.p, it.id, it.health, d)); }
         }
     }
 
-    let (tx, ty, tz, tdist) = match target {
-        Some((tp, _, d)) => (tp.x, tp.y, tp.z, d),
-        None => { let (cx, cz) = u.faction.other().castle(); (cx, u.p.y, cz, f64::INFINITY) }
+    // The healer seeks its most-wounded comrade (or, with none, drifts with the
+    // band); everyone else seeks the nearest enemy (or marches on the keep).
+    let (tx, ty, tz, tdist) = if u.kind == Kind::Healer {
+        match heal {
+            Some((p, _, _, d)) => (p.x, p.y, p.z, d),
+            None if friends > 0 => (coh_x / friends as f64, u.p.y, coh_z / friends as f64, f64::INFINITY),
+            None => { let (cx, cz) = u.faction.other().castle(); (cx, u.p.y, cz, f64::INFINITY) }
+        }
+    } else {
+        match target {
+            Some((tp, _, d)) => (tp.x, tp.y, tp.z, d),
+            None => { let (cx, cz) = u.faction.other().castle(); (cx, u.p.y, cz, f64::INFINITY) }
+        }
     };
 
     // Steering in direction space: seek the target, then (for ground melee that
@@ -316,6 +331,9 @@ fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>) {
                 break; // the first thing hit stops the arrow
             }
         }
+        // Healer: mend the most-wounded nearby comrade — a friendly `knn`, the
+        // heal applied as *negative* damage (capped at full HP in the apply pass).
+        Kind::Healer => { if let Some((_, hid, _, _)) = heal { u.attacks.push((hid, -u.kind.dmg())); } }
         // Soldier / knight: single melee strike on the k-NN target.
         _ => { if let Some((_, tid, _)) = target { u.attacks.push((tid, u.kind.dmg())); } }
     }
@@ -349,8 +367,10 @@ fn apply(units: &mut [Unit], smoke: &mut Vec<Puff>, rng: &mut Rng, dt: f64, now:
         }
     }
     for (u, d) in units.iter_mut().zip(dmg) {
-        if d > 0.0 && u.alive() {
-            u.hp -= d;
+        // d may be negative (a healer's mend); cap healing at full HP. Dead units
+        // are out of the index, so they can't be targeted or healed back.
+        if d != 0.0 && u.alive() {
+            u.hp = (u.hp - d).min(u.kind.max_hp());
             if u.hp <= 0.0 { u.respawn_at = now + 4.0; } // schedule a respawn
         }
     }
@@ -382,6 +402,7 @@ fn faction_color(f: Faction, k: Kind) -> [f32; 4] {
         Kind::Catapult => [base[0] * 0.5 + 0.2, base[1] * 0.5 + 0.12, base[2] * 0.4, 1.0],
         Kind::Ballista => [base[0] * 0.55 + 0.18, base[1] * 0.5 + 0.18, base[2] * 0.45, 1.0],
         Kind::Mage => [base[0] * 0.5 + 0.25, base[1] * 0.5 + 0.25, base[2] * 0.5 + 0.45, 1.0],
+        Kind::Healer => [0.85, 0.92, 0.80, 1.0], // pale, faction-neutral white-green
         Kind::Soldier => [base[0], base[1], base[2], 1.0],
     }
 }
@@ -518,7 +539,7 @@ async fn main() {
             // serial and cheap; the queries (decide) are the parallel part.
             index.clear();
             for (i, u) in units.iter().enumerate() {
-                if u.alive() { index.insert(IUnit { id: i as u32, faction: u.faction, p: u.p }); }
+                if u.alive() { index.insert(IUnit { id: i as u32, faction: u.faction, p: u.p, health: (u.hp / u.kind.max_hp()) as f32 }); }
             }
             // Rebuild the smoke index from last frame's live puffs.
             smoke_index.clear();
