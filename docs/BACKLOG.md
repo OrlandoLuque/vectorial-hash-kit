@@ -11,7 +11,28 @@ with analytic `classify_box`/`classify_aabb`, `raycast_first` early-exit, exact
 thick band, ropes-maintenance ledger, SoA batch narrowphase, 2D `MortonGrid`,
 3D `Tree3::raycast_dda`, and 2D + 3D decision maps) — all in `docs/RAYCAST.md`.
 What's left, grouped. `[review]` = needs a human visual glance; rest is
-autonomously verifiable.
+autonomously verifiable. User picked **"Todo (A–E)"** + the headline below.
+
+**★ HEADLINE — `siege` demo (procedural 3D medieval battlefield)** `[review]`
+The flagship showcase: nearly every battle mechanic *is* a spatial query we
+built. New bin `vectorial-hash-demos/src/bin/siege.rs`.
+- **Procedural terrain** — heightfield (noise) + streams/rivers with **bridges**
+  (index choke-points), **forests** (block line-of-sight), a central **volcano**
+  (hazard + landmark), **two castles in opposite corners** (per-faction spawns).
+- **Two factions** sally from the castles and clash in the middle; density
+  evolves sparse-corners → dense-melee (the decision map, live).
+- **Troop roster → library feature**: foot soldier = k-NN nearest enemy + short
+  cull; knight (cavalry) = **thick raycast** sweep along the charge; archer =
+  **`raycast_first`** (LoS + first hit), volleys via **`cull_many_par`**; ballista
+  = **all-hits raycast** (pierces a line); catapult = **sphere cull** AoE on
+  impact; mage = sphere cull + **chained k-NN** lightning; **dragon** (flies, 3D)
+  = **`Polyhedron3` cone / capsule** fire breath; healer = friendly k-NN. Plus
+  1k+ units relocating per frame = the `update_ref`/rebuild maintenance stress.
+- **Render**: reuse `critters3d`'s GPU instancing; one shape+colour per
+  type/faction. Orbital camera.
+- **Phased (overnight = the foundation)**: terrain+camera+render → factions+spawn
+  +advance → troop types+attacks → combat (damage/death/clash). Visual polish +
+  balance is iterated with the user (the artistic side needs their eyes).
 
 **A. Ray-cast / structure follow-ups (continue the thread)**
 1. **`Octree3` DDA** — `raycast_dda` + `raycast_dda_first` on the 8-way octree
