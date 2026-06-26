@@ -26,6 +26,9 @@ This file is the map; everything else is one click away.
 | [BENCHMARKS.md](BENCHMARKS.md) | Methodology and reproducible results for every `vh bench-*` command, with industry-context references. Five result sections (single-template, per-cell-size selection, descent vs neighbour walk, granularity-as-fallback, figure↔grid scale equivalence). |
 | [UPDATE_STRATEGIES.md](UPDATE_STRATEGIES.md) | Empirical comparison of `Tree::update` relocation strategies (Legacy / Lca / LcaRopes), cost of the `neighbors` feature, and the IntegerTree<T> bit-shift experiment. 135-cell formal sweep + IntegerTree head-to-head, item_limit×merge_limit tuning, cull_walk break-even, and quad-vs-binary, with verdict on the API defaults. |
 | [THREE_D.md](THREE_D.md) | 3D indexing: true 3D tree (`Tree3`, binary split, analytic sphere classification, 1×1×1 `VoxelRaster`) vs the author's projection-indexing idea (three 2D trees + exact narrowphase). Static time/precision comparison + the `critters3d_headless` dynamic workload. |
+| [PARALLEL.md](PARALLEL.md) | Where threads pay and where they don't: the `cull_many_par` batch crossover (measured), and the per-unit AI fan-out (`par_iter_mut`, ~11–12× on 16 threads) that the `siege` demo runs on. Reads parallelise; writes stay serial. |
+| [RAYCAST.md](RAYCAST.md) | Ray-casting across every structure: thin-ray DDA vs thick-capsule cull, the analytic `classify_box`/`classify_aabb` pruning hooks, the SoA + SIMD narrowphase, and the exhaustive anti-contamination benchmarks. |
+| [SIEGE.md](SIEGE.md) | The `siege` demo: a 3D battlefield where eight troop types each map onto a different index query (k-NN targeting, first-hit vs all-hits `raycast`, sphere-cull AoE, friendly-k-NN heal), with the parallel decide→serial-apply AI loop, boids formations, and smoke as a dynamic-obstacle raycast index. |
 
 ## Quality & correctness
 

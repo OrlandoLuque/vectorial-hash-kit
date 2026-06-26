@@ -50,7 +50,13 @@ cargo run -p vectorial-hash-demos --bin critters --release
 
 # same simulation, headless: per-operation statistics at CPU speed
 cargo run -p vectorial-hash-demos --bin critters_headless --release -- --mode both
+
+# siege: 3D battlefield where every troop type is a different index query —
+# parallel per-unit AI with a live thread-count slider (see docs/SIEGE.md)
+cargo run -p vectorial-hash-demos --bin siege --release
 ```
+
+Live demos (WebAssembly): <https://orlandoluque.github.io/vectorial-hash-kit/>
 
 ## Template generation modes
 
