@@ -137,3 +137,9 @@ the batch convenience form for a *homogeneous* set of queries; the per-unit
 
 (On wasm there are no threads — the same code runs serial under
 `cfg(target_arch = "wasm32")`; the web `siege` is single-threaded.)
+
+The `siege` demo makes this tangible: its AI pass runs inside a resizable
+`rayon::ThreadPool` and a **live thread-count slider** sets `num_threads` from 1
+to the core count while it runs, so the fps response *shows* the ~11–12× scaling
+(and that one query per frame wouldn't move it — the crossover, on screen). The
+slider is native-only; the web build hides it and runs the AI serially.

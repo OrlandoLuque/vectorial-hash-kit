@@ -22,3 +22,9 @@ parallel = ["vectorial-hash/parallel"]
 vectorial-hash = { workspace = true }
 vectorial-hash-templates = { workspace = true }
 macroquad = { workspace = true }
+
+# rayon powers the `siege` demo's per-unit AI fan-out (a live thread-count
+# slider). Native only — wasm has no OS threads, so the web build runs the same
+# AI pass serially under cfg(target_arch = "wasm32"). See docs/PARALLEL.md.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = "1"

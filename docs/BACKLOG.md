@@ -61,9 +61,28 @@ built. New bin `vectorial-hash-demos/src/bin/siege.rs`.
   `docs/index.html` + `docs/siege.html` + `docs/siege.wasm`. wasm has no threads,
   so the AI runs **serial** under `cfg(target_arch = "wasm32")` (the parallel
   `par_iter` path is native-only). Build via `scripts/build-web.sh`.
+- **Live thread-count slider** (user, 2026-06-27) — the demo runs the per-unit
+  AI inside a resizable `rayon::ThreadPool`; a screen-space slider sets
+  `num_threads` (1..=cores) live, so the fps response *shows* the parallel
+  scaling. Native only — hidden on wasm (no threads → serial). **Done** in the
+  foundation.
 - **Phased (overnight = the foundation)**: terrain+camera+render → factions+spawn
   +advance → troop types+attacks → combat (damage/death/clash). Visual polish +
   balance is iterated with the user (the artistic side needs their eyes).
+  **Foundation built (2026-06-27):** value-noise terrain + volcano, two castles,
+  Red/Blue armies (soldier/archer/knight/dragon) spawning + advancing + clashing,
+  per-unit AI (`knn` targeting + dragon `Sphere3` `cull` AoE) on the parallel
+  decide→serial-apply split, deaths + respawns, instanced render, orbit camera,
+  thread slider. **Still to layer:** archer `raycast` LoS, boids formations,
+  smoke blockers, the remaining troop queries (ballista/catapult/mage/healer),
+  bridges/forests/rivers, balance, and the wasm/Pages publish.
+
+**Thread-slider retrofit for the critters demos** (user, 2026-06-27) — the same
+live `num_threads` slider in `critters` (2D) and `critters3d` (3D), but it only
+*moves* in the **combat** mode (one `cull` per critter = many queries/frame →
+`cull_many_par` inside the sized pool). In *observe* mode (a single vision cull)
+threads can't help — and that contrast is the point: the slider makes the
+measured crossover (`PARALLEL.md`) visible. Native only; hidden on wasm.
 
 **A. Ray-cast / structure follow-ups (continue the thread)**
 1. **`Octree3` DDA** — `raycast_dda` + `raycast_dda_first` on the 8-way octree

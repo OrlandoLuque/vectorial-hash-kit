@@ -236,8 +236,10 @@ pub struct Sims {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Default)]
 pub enum CullStrategy {
     /// `Tree::cull` (the default): template-driven hierarchical descent.
+    #[default]
     Descent,
     /// `Tree::cull_walk` with [`WalkNeighbors::Samet`]: walk by reading
     /// parent pointers, no extra storage.
@@ -251,9 +253,6 @@ pub enum CullStrategy {
     WalkRopes,
 }
 
-impl Default for CullStrategy {
-    fn default() -> Self { CullStrategy::Descent }
-}
 
 impl Sims {
     pub fn new(mode: Mode, world: VRect, split: usize, merge: usize) -> Self {

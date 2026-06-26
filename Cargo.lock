@@ -1091,6 +1091,7 @@ name = "vectorial-hash-demos"
 version = "0.1.0"
 dependencies = [
  "macroquad",
+ "rayon",
  "vectorial-hash",
  "vectorial-hash-templates",
 ]
