@@ -97,6 +97,16 @@ impl Shape for CapsuleNaive {
     }
 }
 
+/// The lib `Capsule` but with the SoA batch narrowphase **off** (per-point) —
+/// same `classify_box`, so an A/B of just the narrowphase kernel.
+struct CapsulePP(Capsule);
+impl Shape for CapsulePP {
+    fn bounding_box(&self) -> Rect { self.0.bounding_box() }
+    fn contains_point(&self, p: Point) -> bool { self.0.contains_point(p) }
+    fn classify_box(&self, b: &Rect) -> Option<CellState> { self.0.classify_box(b) }
+    // wants_batch defaults false → the per-point path.
+}
+
 // ------------------------------------------------------------------- harness
 struct Ray { o: Point, d: Point, len: f64 }
 
@@ -118,13 +128,14 @@ fn gen_rays(n_rays: usize, world: f64, seed: u64) -> Vec<Ray> {
 fn endpoint(r: &Ray) -> Point { Point::new(r.o.x + r.d.x * r.len, r.o.y + r.d.y * r.len) }
 
 #[derive(Clone, Copy)]
-enum Method { Naive, Opt, Dda(WalkNeighbors), First(WalkNeighbors), Walk(WalkNeighbors) }
+enum Method { Naive, Opt, OptPp, Dda(WalkNeighbors), First(WalkNeighbors), Walk(WalkNeighbors) }
 
 /// One full ray-batch for a method; returns total hits (the blackholed work).
 fn run_batch(tree: &Tree<P>, rays: &[Ray], radius: f64, m: Method) -> usize {
     match m {
         Method::Naive => rays.iter().map(|r| tree.cull(&CapsuleNaive { a: r.o, b: endpoint(r), r: radius }).len()).sum(),
         Method::Opt => rays.iter().map(|r| tree.cull(&Capsule::new(r.o, endpoint(r), radius)).len()).sum(),
+        Method::OptPp => rays.iter().map(|r| tree.cull(&CapsulePP(Capsule::new(r.o, endpoint(r), radius))).len()).sum(),
         Method::Dda(w) => rays.iter().map(|r| tree.raycast(r.o, r.d, r.len, radius, w).hits.len()).sum(),
         Method::First(w) => rays.iter().map(|r| tree.raycast_first(r.o, r.d, r.len, radius, w).is_some() as usize).sum(),
         // Exact thick band via the neighbour flood (cull_walk seeded at the ray
@@ -251,6 +262,21 @@ fn main() {
         println!("{:>6.0} | {:>9.3} {:>9.3} | {:>9.3} | {:>7.1}%", radius, descent, walk_best, thin, cov);
     }
     println!();
+
+    // ── SoA batch narrowphase: per-point vs vectorised, on big leaves ─────────
+    println!("── SoA batch narrowphase (Capsule cull): per-point vs batch kernel — N=200000 ──");
+    println!("{:>5} {:>7} | {:>10} {:>10} {:>8} | {:>6}", "il", "radius", "per-pt ms", "batch ms", "speedup", "noise");
+    for &il in &[16usize, 64, 256] {
+        let tree = build(200_000, il, WORLD, 1);
+        let rays = gen_rays(N_RAYS, WORLD, 99);
+        for &radius in &[8.0_f64, 32.0, 128.0] {
+            let s = time_interleaved(ROUNDS, &tree, &rays, radius, &[Method::OptPp, Method::Opt]);
+            let noise = s.iter().map(|&(mn, md)| if mn > 0.0 { md / mn } else { 1.0 }).fold(1.0_f64, f64::max);
+            println!("{:>5} {:>7.0} | {:>10.3} {:>10.3} {:>7.2}× | {:>6.2}", il, radius, s[0].0, s[1].0, s[0].0 / s[1].0, noise);
+        }
+    }
+    println!("(High item_limit = bigger leaves = more per-item work = where SoA pays. Build with");
+    println!(" RUSTFLAGS=\"-C target-cpu=native\" to AVX-vectorise both → the gap shrinks.)\n");
 
     println!("DDA hits/leaves/tested are per-ray-batch / per-ray; the walk (leaves/tested) is identical");
     println!("across samet/probe/ropes — only neighbour-finding time differs (ropes O(1) is fastest).");

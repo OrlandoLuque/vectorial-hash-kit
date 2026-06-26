@@ -206,16 +206,38 @@ default (SSE2)     16.2      2.6      6.3×
 target-cpu=native   1.57     1.22     1.3×
 ```
 
-The win is **real but build-dependent**: on the default release target the
+The microbench win is **real but build-dependent**: on the default target the
 branchy AoS doesn't vectorise, so SoA gives ~6×; with `-C target-cpu=native`
-(AVX2) the compiler vectorises *even the AoS branches*, so AoS itself drops ~10×
-and the SoA edge shrinks to ~1.3×. Two takeaways: (1) for portable binaries the
-SoA-leaf refactor is worth a lot (~6× narrowphase); (2) the cheapest win
-available *today*, with no code change, is building hot consumers with
-`target-cpu=native`. Either way it's only the narrowphase — in the full capsule
-cull the `classify_box` descent is the other half, so end-to-end gains are
-smaller (Amdahl). Wiring SoA into the leaf is the backlog's "SoA leaf storage +
-SIMD" item.
+(AVX2) the compiler vectorises *even the AoS branches*, so AoS drops ~10× and the
+SoA edge shrinks to ~1.3×.
+
+### Implemented + measured end-to-end (the reality check)
+
+It's wired in: `Shape::wants_batch()` + `Shape::contains_batch()` (opt-in,
+default off → zero change for every other shape), and `Capsule` overrides them
+with the branchless kernel; the cull's leaf narrowphase runs it over a
+thread-local SoA scratch. Measured on the **full** capsule cull (N=200k, vs the
+same capsule with the per-point path):
+
+```
+              default target        target-cpu=native
+item_limit  r=8   r=32  r=128     r=8   r=32  r=128
+16          1.00  1.02  1.03      1.00  1.02  1.03
+64          1.05  1.01  0.99      1.12  1.08  1.05
+256         1.13  1.01  0.99      1.26  1.11  1.08
+```
+
+So end-to-end it's **~1.0–1.26×**, *far* below the 6.3× microbench. Two reasons:
+the narrowphase is only **part** of the cull — the `classify_box` descent is the
+other half (**Amdahl**); and the SoA materialisation (bbox pre-filter + copy into
+scratch) is scalar overhead. It only helps with **big leaves** (high
+`item_limit`, where per-item work dominates) and **thin radii** (where the
+narrowphase out-weighs the descent), and even then modestly. Conclusion: the
+batch kernel is kept (it's free when unused and a small win on big leaves), but
+the **dominant lever is the descent, not the narrowphase** — and the cheapest
+real win remains `-C target-cpu=native`. A *permanent* SoA leaf store (vs the
+scratch) would only save the copy, which isn't the bottleneck, so it stays
+deferred.
 
 ## Concepts (glossary)
 
@@ -311,15 +333,11 @@ or the tree can't prune it.
       .map(|it| { let p = it.position(); /* project onto the ray */ (t_of(p), it) })
       .min_by(|x, y| x.0.total_cmp(&y.0));
   ```
-- **SoA leaf storage** — the *free* win is documented: build hot consumers with
-  `-C target-cpu=native` (see Concepts), which auto-vectorises the existing AoS
-  narrowphase ~10×. The full SoA-leaf refactor (to win on portable, generic-target
-  builds) stays deferred on purpose: its payoff is **build-dependent** (~6× on the
-  default target, ~1.3× with native) and only material for **many-items-per-leaf**
-  structures (high `item_limit` / the Morton grid), at the cost of a core
-  data-structure change + a parallel position array. The kernel and ceiling are
-  proven (`narrowphase_simd`); pulling the trigger waits for a workload that needs
-  it. Tracked in the backlog.
+- **SoA narrowphase** — *done* as an opt-in batch kernel (`wants_batch` /
+  `contains_batch`, used by `Capsule`); measured **~1.0–1.26× end-to-end**
+  (above), the descent dominates. The *free* win for any hot consumer remains
+  `-C target-cpu=native`. A permanent SoA leaf store stays deferred — it would
+  only save the materialisation copy, which isn't the bottleneck.
 
 *(Origin: the user's uniform-grid DDA ray-cast in `TestDraw`, adapted to the
 variable-size tree.)*

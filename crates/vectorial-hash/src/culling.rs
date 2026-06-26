@@ -86,6 +86,24 @@ pub trait Shape {
         let _ = b;
         None
     }
+
+    /// Opt into the **SoA batch narrowphase**: when `true`, the leaf-level
+    /// per-item test runs [`Shape::contains_batch`] over contiguous position
+    /// arrays instead of `contains_point` one at a time. Default `false` — only
+    /// analytic shapes with a branchless, auto-vectorising kernel (e.g.
+    /// [`Capsule`]) benefit, and only on leaves with many items; everything else
+    /// keeps the exact current path (zero behaviour change).
+    fn wants_batch(&self) -> bool { false }
+
+    /// Batch `contains_point` over SoA position arrays `xs`/`ys` (parallel),
+    /// writing a hit mask of length `xs.len()` into `out`. The default loops
+    /// `contains_point`; analytic shapes override with a **branchless** kernel
+    /// that LLVM auto-vectorises (SoA + no data-dependent branch → SIMD). Only
+    /// consulted when [`Shape::wants_batch`] is `true`.
+    fn contains_batch(&self, xs: &[f64], ys: &[f64], out: &mut Vec<bool>) {
+        out.clear();
+        out.extend(xs.iter().zip(ys).map(|(&x, &y)| self.contains_point(Point::new(x, y))));
+    }
 }
 
 /// A **2D capsule**: the segment `a`–`b` thickened by radius `r`. As a [`Shape`]
@@ -169,6 +187,20 @@ impl Shape for Capsule {
         }
         Some(CellState::Maybe)
     }
+    fn wants_batch(&self) -> bool { true }
+    fn contains_batch(&self, xs: &[f64], ys: &[f64], out: &mut Vec<bool>) {
+        out.clear();
+        out.resize(xs.len(), false);
+        // Branchless clamped-projection distance (no cap branches) — same result
+        // as `contains_point`, but the tight zip loop auto-vectorises (SIMD).
+        let (ax, ay, abx, aby, inv, r2) = (self.a.x, self.a.y, self.abx, self.aby, self.inv_len2, self.r2);
+        for ((&x, &y), o) in xs.iter().zip(ys).zip(out.iter_mut()) {
+            let (apx, apy) = (x - ax, y - ay);
+            let t = ((apx * abx + apy * aby) * inv).clamp(0.0, 1.0);
+            let (dx, dy) = (apx - abx * t, apy - aby * t);
+            *o = dx * dx + dy * dy <= r2;
+        }
+    }
 }
 
 /// Per-execution cache: one resolved template per distinct cell size.
@@ -180,12 +212,49 @@ pub(crate) type SizeCache = HashMap<(u64, u64), Option<PlacedTemplate>>;
 /// bbox pre-filter (closed bounds — the figure boundary belongs to the
 /// figure), then the 1×1 raster when available (exact geometry only on
 /// boundary pixels).
+/// Reusable SoA batch-narrowphase scratch: `xs`, `ys`, the hit-mask, and the
+/// original item indices of the bbox-prefiltered points.
+type SoaScratch = (Vec<f64>, Vec<f64>, Vec<bool>, Vec<u32>);
+
+thread_local! {
+    // Per-thread scratch — no allocation per leaf, no cross-thread sharing.
+    static SOA_SCRATCH: std::cell::RefCell<SoaScratch> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new())) };
+}
+
 pub(crate) fn collect_matching_items<'a, T: Positioned, S: Shape>(
     items: &'a [T],
     shape: &S,
     shape_bbox: &Rect,
     out: &mut Vec<&'a T>,
 ) {
+    // SoA batch path — opt-in (analytic shapes with a vectorising kernel). The
+    // bbox pre-filter still runs (scalar), then the kernel tests the survivors
+    // contiguously. Only taken when there's no per-item raster.
+    if shape.wants_batch() && shape.point_template().is_none() {
+        SOA_SCRATCH.with(|cell| {
+            let (xs, ys, mask, idx) = &mut *cell.borrow_mut();
+            xs.clear();
+            ys.clear();
+            idx.clear();
+            for (i, it) in items.iter().enumerate() {
+                let p = it.position();
+                if shape_bbox.contains_closed(p) {
+                    xs.push(p.x);
+                    ys.push(p.y);
+                    idx.push(i as u32);
+                }
+            }
+            shape.contains_batch(xs, ys, mask);
+            for (j, &hit) in mask.iter().enumerate() {
+                if hit {
+                    out.push(&items[idx[j] as usize]);
+                }
+            }
+        });
+        return;
+    }
+
     let point_grid = shape.point_template();
     for it in items {
         let p = it.position();
