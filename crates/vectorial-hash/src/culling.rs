@@ -70,6 +70,22 @@ pub trait Shape {
     fn point_template(&self) -> Option<&PlacedTemplate> {
         None
     }
+
+    /// Optional **analytic** classification of an axis-aligned node box against
+    /// the shape: `In` (box fully inside → take all its items, no per-point
+    /// test), `Out` (fully outside → prune the subtree) or `Maybe` (straddles →
+    /// descend). Default `None` falls back to the template / bbox-overlap path.
+    ///
+    /// Implement it for shapes with a cheap exact box test (circle, capsule, …):
+    /// the cull then prunes **tightly without a precomputed template**, and the
+    /// tree's recursion handles arbitrary shape "thickness" for free — it only
+    /// descends the nodes the shape actually reaches, coarse in the interior and
+    /// fine at the boundary, with no manual neighbour chasing. Takes precedence
+    /// over the template path when it returns `Some`.
+    fn classify_box(&self, b: &Rect) -> Option<CellState> {
+        let _ = b;
+        None
+    }
 }
 
 /// Per-execution cache: one resolved template per distinct cell size.
@@ -230,6 +246,12 @@ pub(crate) fn classify_child<S: Shape>(
     child_bbox: &Rect,
     sizes: &mut SizeCache,
 ) -> CellState {
+    // 0. Analytic box classification (circle / capsule / …) — tight distance
+    //    pruning with no template; takes precedence when the shape provides it.
+    if let Some(state) = shape.classify_box(child_bbox) {
+        return state;
+    }
+
     // 1. Per-cell-size template, resolved once per size per execution. The
     //    node bbox is exactly one cell of the global virtual grid of its own
     //    size, so its centre reads the matching template cell directly.

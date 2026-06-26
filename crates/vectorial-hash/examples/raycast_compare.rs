@@ -9,8 +9,9 @@
 //! ```
 //!
 //! Two ray-casts answer "items within `radius` of the ray":
-//! - **capsule**: `Tree::cull(&Capsule)` — exact, descends the segment's fat
-//!   AABB (visits off-corridor cells; gathers everything, unordered).
+//! - **capsule**: `Tree::cull(&Capsule)` — exact; `Capsule2` implements an
+//!   analytic `classify_box` (segment↔box distance) so the cull prunes to the
+//!   radius-`r` band (the tree recursion handles thickness). Unordered.
 //! - **DDA**: `Tree::raycast(.., walk)` — walks only the cells the centre line
 //!   crosses, front-to-back, stepping via Samet / Probe / Ropes.
 //!
@@ -20,7 +21,7 @@
 
 use std::time::Instant;
 
-use vectorial_hash::{Point, Positioned, Rect, Shape, Tree, WalkNeighbors};
+use vectorial_hash::{CellState, Point, Positioned, Rect, Shape, Tree, WalkNeighbors};
 
 struct Rng(u64);
 impl Rng {
@@ -45,7 +46,48 @@ fn seg_dist2(p: Point, a: Point, b: Point) -> f64 {
     dx * dx + dy * dy
 }
 
-/// A 2D capsule (segment + radius) as a `Shape`: the cull-based ray-cast.
+/// Does segment `a`–`b` intersect the box? (Liang–Barsky slab clip.)
+fn seg_hits_box(a: Point, b: Point, r: &Rect) -> bool {
+    let (dx, dy) = (b.x - a.x, b.y - a.y);
+    let (mut t0, mut t1) = (0.0_f64, 1.0_f64);
+    for &(p, q) in &[(-dx, a.x - r.x), (dx, r.x_max() - a.x), (-dy, a.y - r.y), (dy, r.y_max() - a.y)] {
+        if p == 0.0 {
+            if q < 0.0 { return false; } // parallel and outside this slab
+        } else {
+            let s = q / p;
+            if p < 0.0 {
+                if s > t1 { return false; }
+                if s > t0 { t0 = s; }
+            } else {
+                if s < t0 { return false; }
+                if s < t1 { t1 = s; }
+            }
+        }
+    }
+    true
+}
+
+/// Exact squared min distance between segment `a`–`b` and the box (0 if they
+/// intersect). For two disjoint convex sets the closest pair is vertex↔edge, so
+/// it's the min over {each endpoint clamped into the box} ∪ {each box corner to
+/// the segment}.
+fn seg_box_min_dist2(a: Point, b: Point, r: &Rect) -> f64 {
+    if seg_hits_box(a, b, r) { return 0.0; }
+    let mut m = f64::INFINITY;
+    for p in [a, b] {
+        let cx = p.x.clamp(r.x, r.x_max());
+        let cy = p.y.clamp(r.y, r.y_max());
+        m = m.min((p.x - cx).powi(2) + (p.y - cy).powi(2));
+    }
+    for c in [Point::new(r.x, r.y), Point::new(r.x_max(), r.y), Point::new(r.x, r.y_max()), Point::new(r.x_max(), r.y_max())] {
+        m = m.min(seg_dist2(c, a, b));
+    }
+    m
+}
+
+/// A 2D capsule (segment + radius) as a `Shape`, with an exact analytic
+/// `classify_box` so the cull descent prunes to the radius-`r` band (the "tree
+/// recursion handles thickness" path — no fat-AABB sweep).
 struct Capsule2 { a: Point, b: Point, r: f64 }
 impl Shape for Capsule2 {
     fn bounding_box(&self) -> Rect {
@@ -56,6 +98,22 @@ impl Shape for Capsule2 {
         Rect::new(lx, ly, hx - lx, hy - ly)
     }
     fn contains_point(&self, p: Point) -> bool { seg_dist2(p, self.a, self.b) <= self.r * self.r }
+    fn classify_box(&self, b: &Rect) -> Option<CellState> {
+        let r2 = self.r * self.r;
+        if seg_box_min_dist2(self.a, self.b, b) > r2 {
+            return Some(CellState::Out); // whole box farther than r → prune
+        }
+        // Distance-to-segment is convex, so its max over the box is at a corner.
+        let far2 = [Point::new(b.x, b.y), Point::new(b.x_max(), b.y), Point::new(b.x, b.y_max()), Point::new(b.x_max(), b.y_max())]
+            .iter()
+            .map(|&c| seg_dist2(c, self.a, self.b))
+            .fold(0.0_f64, f64::max);
+        if far2 <= r2 {
+            Some(CellState::In) // farthest corner within r → whole box inside
+        } else {
+            Some(CellState::Maybe)
+        }
+    }
 }
 
 const WORLD: f64 = 1024.0;

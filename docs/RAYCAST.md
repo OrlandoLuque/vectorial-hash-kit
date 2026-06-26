@@ -9,9 +9,13 @@ pick per use-case (and decide whether maintaining ropes pays off).
 **Capsule** (`Tree3::raycast` / `Segment3` in 3D; `Capsule2` over `Tree::cull`
 in the 2D prototype). Model the ray as a segment thickened by `radius` and run a
 normal `cull`. Exact for "every item within `radius` of the ray", reuses all the
-culling machinery — but it descends the segment's **fat axis-aligned bounding
-box**, so it visits cells well off the ray (worst at the ends and on diagonals)
-and returns everything unordered.
+culling machinery. The key is an analytic **`classify_box`** (segment↔box
+distance: `>r` → prune, farthest corner `<r` → take whole subtree, else
+descend): the tree recursion then visits **only the radius-`r` band**, coarse
+nodes in the interior and fine only at the boundary — it handles arbitrary
+"thickness" for free, no manual neighbour chasing. *(Without `classify_box` the
+cull falls back to the segment's fat AABB and is ~8× slower — see the pitfall
+note below.)*
 
 **DDA leaf-walk** (`Tree::raycast(origin, dir, max_t, radius, walk)`, 2D). The
 variable-cell **Amanatides–Woo** traversal: walk only the leaves the centre ray
@@ -27,36 +31,46 @@ bounds instead of a constant `tDelta`, and "next cell" is the neighbour leaf
 
 ## Measured (`examples/raycast_compare.rs`)
 
-world 1024², N=50 000, item_limit 8, 128 rays × 60 reps, `--features neighbors`:
+world 1024², N=50 000, item_limit 8, 128 rays × 60 reps, `--features neighbors`,
+capsule **with** the analytic `classify_box`:
 
 ```
-method      radius |   total ms     hits |   leaves    tested   coverage
-capsule          2 |    12.31      10984 |        -         - 100% (ref)
-DDA/samet        2 |     1.17      10631 |       52       308      96.8%
-DDA/probe        2 |     1.48      10631 |       52       308      96.8%
-DDA/ropes        2 |     0.82      10631 |       52       308      96.8%
-capsule          8 |    10.83      44368 |        -         - 100% (ref)
-DDA/*            8 |   1.1–1.8     32377 |       52       308      73.0%
-capsule         24 |    14.47     137444 |        -         - 100% (ref)
-DDA/*           24 |   1.1–1.8     39478 |       52       308      28.7%
-capsule         64 |    16.57     392368 |        -         - 100% (ref)
-DDA/*           64 |   1.1–1.8     39478 |       52       308      10.1%
+method      radius |  total ms     hits |  leaves   tested   coverage
+capsule          2 |    1.54      10984 |       -        - 100% (ref)
+DDA/samet        2 |    1.12      10631 |      52      308      96.8%
+DDA/probe        2 |    1.43      10631 |      52      308      96.8%
+DDA/ropes        2 |    0.71      10631 |      52      308      96.8%
+capsule          8 |    2.38      44368 |       -        - 100% (ref)
+DDA/ropes        8 |    1.09      32377 |      52      308      73.0%
+capsule         24 |    3.72     137444 |       -        - 100% (ref)
+DDA/ropes       24 |    1.09      39478 |      52      308      28.7%
+capsule         64 |    5.13     392368 |       -        - 100% (ref)
+DDA/ropes       64 |    1.07      39478 |      52      308      10.1%
 ```
 
 Reading it:
 
-- **DDA is ~8–15× faster.** The thin corridor (52 leaves, 308 narrowphase tests)
-  is a fraction of the capsule's fat-AABB descent. For "what does this ray hit
-  first" (line-of-sight, picking) it's the clear winner — and front-to-back order
-  gives a natural early-exit the capsule can't.
-- **Coverage falls as the ray thickens.** At `radius` 2 the centre corridor
-  recovers 96.8% of the capsule's exact hits; by `radius` 64 only 10%. Items
-  within a fat radius live in cells the centre line never enters, so the thin
-  walk misses them (its hit count even plateaus — the corridor saturates). The
-  capsule stays exact. **So: DDA for thin rays, capsule for thick "all within r".**
-- **Ropes < Samet < Probe on query time** (≈0.8 / 1.2 / 1.5 ms), with an
+- **The capsule scales with the answer, as it should.** With `classify_box` it
+  visits only the band, so its cost tracks the hit count (1.5 ms @ 11 k hits →
+  5 ms @ 392 k). It is **exact** at every radius.
+- **The DDA's flat cost is a thin-ray win and a thick-ray mirage.** For a thin
+  ray (`radius` 2) it's ~2× the capsule *and* 97 % coverage — a real choice
+  (faster vs exact). For thick rays it only looks fast because it's **missing
+  70–90 % of the hits** (coverage 29 %, 10 %; its hit count even plateaus as the
+  corridor saturates). **So: DDA for thin rays / first-hit, capsule for thick
+  "all within r".**
+- **Ropes < Samet < Probe on query time** (≈0.7 / 1.1 / 1.4 ms), with an
   *identical* walk (same 52/308) — the difference is purely neighbour-finding:
   ropes O(1), Samet/Probe O(depth). On the query side ropes wins ~30–45%.
+
+### Pitfall that nearly hid this
+
+The first measurement had the capsule at **12 ms** and "concluded" the DDA was
+8–15× faster. The capsule's `Shape` had **no `classify_box`**, so the cull fell
+back to the segment's fat AABB and swept far more than the band. Adding the
+analytic classify (segment↔box distance) dropped it to **1.5 ms** and flipped
+the conclusion. Lesson: an analytic shape *must* implement `classify_box`, or
+the tree can't prune it and the recursion can't do its job.
 
 ## Open: does maintaining ropes pay off *overall*?
 
