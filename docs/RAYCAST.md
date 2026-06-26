@@ -131,6 +131,31 @@ times are so small, ~14 µs, that their `noise` ratio is high — near timer
 resolution; the min still holds across runs.) This is the regime where the DDA
 decisively beats the capsule (which has no ordering and must gather everything).
 
+## Exact thick band — descend, don't flood
+
+The thin DDA's coverage gap is fixable by widening the corridor with the distance
+test. That widened, exact band already exists in the library as **`cull_walk`** —
+a neighbour flood seeded at the ray origin, pruned by the capsule's `classify_box`
+(any `WalkNeighbors` strategy). It gives the same exact result as the descent
+`cull`. Measured (N=200k, item_limit 8, interleaved):
+
+```
+radius   descent(cull)   flood-walk   thin DDA   walk coverage
+2        1.306           2.170        1.378      100.0%
+8        2.057           3.862        1.505      100.0%
+32       3.696          10.161        1.546      100.0%
+128     10.413          40.406        1.625      100.0%
+```
+
+The flood-walk is **exact (100%)** but **2–4× slower than the descent**, widening
+with radius — it re-finds neighbours (O(depth) per step for Samet/Probe) and
+carries visited-set bookkeeping, where the descent prunes hierarchically in one
+pass. So the rule stands, now measured: **for "all within `r`", descend (the
+capsule `cull`); the neighbour flood is exact but not the way to do it.** The thin
+DDA stays fastest (flat ~1.5 ms) but only at partial coverage. The one place the
+neighbour walk wins outright is ordered first-hit (`raycast_first`), where the
+early-exit beats both.
+
 ## Pitfall that nearly hid this
 
 The very first measurement had the capsule at ~12 ms and "concluded" the DDA was
@@ -144,12 +169,11 @@ or the tree can't prune it.
 - **Does maintaining ropes pay off overall?** The query-side win (≈30–45 % vs
   Samet) is half the ledger; ropes are rewired on every split/merge. Next:
   measure build/`update` with vs without the `neighbors` feature and combine.
-- **Exact thick DDA** — widen the corridor with the distance test (visit the
-  perpendicular neighbours within `r`). For thin rays the widen is ±1 and keeps
-  the ordering; for fat rays its cost converges to the capsule (full coverage of
-  a radius-`r` band is inherently O(len·r·density) — no free lunch), so there use
-  the capsule. *(`raycast_first` above is the thin early-exit; the thick widen is
-  the remaining piece.)*
+- **Ordered thick first-hit** — the one ray-cast not yet built: a *front-to-back*
+  widened walk (±1 perpendicular within `r`) that keeps the early-exit. The
+  unordered exact thick band is settled (descend, above); `raycast_first` is the
+  thin ordered case; this would be the thick ordered case. Niche — for most
+  thick queries you want all hits (descend) anyway.
 - **SoA + SIMD narrowphase** — needs the SoA leaf-storage backlog item; the
   segment-aligned `|y'| ≤ r` test vectorises cleanly and is the remaining ceiling
   for the capsule's per-item cost.

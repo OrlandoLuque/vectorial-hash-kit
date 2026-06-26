@@ -179,7 +179,7 @@ fn gen_rays(n_rays: usize, world: f64, seed: u64) -> Vec<Ray> {
 fn endpoint(r: &Ray) -> Point { Point::new(r.o.x + r.d.x * r.len, r.o.y + r.d.y * r.len) }
 
 #[derive(Clone, Copy)]
-enum Method { Naive, Opt, Dda(WalkNeighbors), First(WalkNeighbors) }
+enum Method { Naive, Opt, Dda(WalkNeighbors), First(WalkNeighbors), Walk(WalkNeighbors) }
 
 /// One full ray-batch for a method; returns total hits (the blackholed work).
 fn run_batch(tree: &Tree<P>, rays: &[Ray], radius: f64, m: Method) -> usize {
@@ -188,6 +188,10 @@ fn run_batch(tree: &Tree<P>, rays: &[Ray], radius: f64, m: Method) -> usize {
         Method::Opt => rays.iter().map(|r| tree.cull(&Capsule2::new(r.o, endpoint(r), radius)).len()).sum(),
         Method::Dda(w) => rays.iter().map(|r| tree.raycast(r.o, r.d, r.len, radius, w).hits.len()).sum(),
         Method::First(w) => rays.iter().map(|r| tree.raycast_first(r.o, r.d, r.len, radius, w).is_some() as usize).sum(),
+        // Exact thick band via the neighbour flood (cull_walk seeded at the ray
+        // origin) — the "widened DDA": same result as the descent cull, found by
+        // walking instead of descending, with the selectable neighbour method.
+        Method::Walk(w) => rays.iter().map(|r| tree.cull_walk(&Capsule2::new(r.o, endpoint(r), radius), r.o, w).len()).sum(),
     }
 }
 
@@ -280,6 +284,32 @@ fn main() {
         let s = time_interleaved(ROUNDS, &tree, &rays, radius, &[Method::Dda(WalkNeighbors::Samet), Method::First(WalkNeighbors::Samet)]);
         let noise = s.iter().map(|&(mn, md)| if mn > 0.0 { md / mn } else { 1.0 }).fold(1.0_f64, f64::max);
         println!("{:>6.0} | {:>9.3} {:>9.3} {:>7.1}× | {:>6.2}", radius, s[0].0, s[1].0, s[0].0 / s[1].0, noise);
+    }
+    println!();
+
+    // ── Exact thick band: descent cull vs neighbour flood (cull_walk) ─────────
+    println!("── exact thick band: descent (cull) vs flood-walk (cull_walk) — N=200000 il=8 ──");
+    println!("{:>6} | {:>9} {:>9} | {:>9} | {:>8}", "radius", "descent", "walk best", "thin dda", "walk cov");
+    let tree = build(200_000, 8, WORLD, 1);
+    let rays = gen_rays(N_RAYS, WORLD, 99);
+    for &radius in &[2.0_f64, 8.0, 32.0, 128.0] {
+        let mut timed = vec![Method::Opt];
+        for &w in walks { timed.push(Method::Walk(w)); }
+        timed.push(Method::Dda(WalkNeighbors::Samet));
+        let s = time_interleaved(ROUNDS, &tree, &rays, radius, &timed);
+        let descent = s[0].0;
+        let walk_best = s[1..1 + walks.len()].iter().map(|x| x.0).fold(f64::INFINITY, f64::min);
+        let thin = s[1 + walks.len()].0;
+        // Coverage: flood-walk vs the exact descent — should be 100%.
+        let (mut found, mut total) = (0usize, 0usize);
+        for r in &rays {
+            let refset: std::collections::HashSet<(u64, u64)> = tree.cull(&Capsule2::new(r.o, endpoint(r), radius)).iter().map(|p| key(p)).collect();
+            let got: std::collections::HashSet<(u64, u64)> = tree.cull_walk(&Capsule2::new(r.o, endpoint(r), radius), r.o, walks[0]).iter().map(|p| key(p)).collect();
+            total += refset.len();
+            found += refset.iter().filter(|k| got.contains(k)).count();
+        }
+        let cov = if total > 0 { 100.0 * found as f64 / total as f64 } else { 100.0 };
+        println!("{:>6.0} | {:>9.3} {:>9.3} | {:>9.3} | {:>7.1}%", radius, descent, walk_best, thin, cov);
     }
     println!();
 
