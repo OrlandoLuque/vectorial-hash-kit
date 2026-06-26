@@ -13,7 +13,22 @@ thick band, ropes-maintenance ledger, SoA batch narrowphase, 2D `MortonGrid`,
 What's left, grouped. `[review]` = needs a human visual glance; rest is
 autonomously verifiable. User picked **"Todo (A–E)"** + the headline below.
 
-**★ HEADLINE — `siege` demo (procedural 3D medieval battlefield)** `[review]`
+**ORDER (user, 2026-06-27): multithreading FIRST, then `siege`, then the rest.**
+
+**★ PHASE 0 — Multithreading (before the demo).** The `siege` demo is the heavy
+parallel consumer (1k+ units, each doing read queries on the shared index per
+frame). Lay the parallel infra first so the demo is multithreaded from the start:
+- **Parallel per-unit AI pattern** — `units.par_iter_mut().for_each(|u| { … read
+  index … })`: reads are `&self` + `Sync`, units mutated disjointly → safe, no new
+  API needed. Confirm + document it (this is the demo's lever).
+- **Parallel batch `knn` / `raycast`** (the read-fan-out, like `cull_many_par`).
+- **Parallel tree bulk-load** (sort-then-link) for fast per-frame rebuilds (C9).
+- **Properly benchmarked + tested** (user, 2026-06-27): interleaved min-of-N vs
+  the serial path (the `raycast_compare` anti-contamination methodology — rotate
+  order, min, `noise` column, two runs), and correctness tests (parallel result
+  == serial). Document the crossover (when threads pay vs the fork overhead).
+
+**★ PHASE 1 — `siege` demo (procedural 3D medieval battlefield)** `[review]`
 The flagship showcase: nearly every battle mechanic *is* a spatial query we
 built. New bin `vectorial-hash-demos/src/bin/siege.rs`.
 - **Procedural terrain** — heightfield (noise) + streams/rivers with **bridges**
@@ -28,6 +43,17 @@ built. New bin `vectorial-hash-demos/src/bin/siege.rs`.
   impact; mage = sphere cull + **chained k-NN** lightning; **dragon** (flies, 3D)
   = **`Polyhedron3` cone / capsule** fire breath; healer = friendly k-NN. Plus
   1k+ units relocating per frame = the `update_ref`/rebuild maintenance stress.
+- **Unit AI** (user, 2026-06-27) — a per-unit state machine: advance → acquire
+  target (k-NN nearest enemy in range) → attack (the type's query) → morale /
+  flee / regroup. Emergent but simple; runs in the parallel per-unit loop.
+- **Formations = boids** (user: "el de las abejas" = Reynolds **flocking**:
+  separation + alignment + cohesion) — *another* index showcase, each boid
+  queries its neighbours via **k-NN / radius cull**. Cavalry & soldiers flock;
+  archers hold rigid ranks.
+- **Smoke = dynamic line-of-sight blockers** (user) — smoke clouds (catapult
+  impact, mage spell) in a separate index; an archer's `raycast` that hits smoke
+  before the target → no LoS, temporary (the cloud dissipates). Dynamic
+  obstacles + raycast.
 - **Render**: reuse `critters3d`'s GPU instancing; one shape+colour per
   type/faction. Orbital camera.
 - **Phased (overnight = the foundation)**: terrain+camera+render → factions+spawn
