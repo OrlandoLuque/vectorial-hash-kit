@@ -31,3 +31,9 @@ gltf = { version = "1.4", default-features = false, features = ["import", "utils
 # AI pass serially under cfg(target_arch = "wasm32"). See docs/PARALLEL.md.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rayon = "1"
+# The `siege_wgpu` comparison binary (low-level wgpu renderer). Native only.
+wgpu = "0.20"
+winit = "0.29"
+pollster = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
+glam = "0.27"
