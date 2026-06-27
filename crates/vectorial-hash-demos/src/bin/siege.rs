@@ -29,7 +29,7 @@ use macroquad::prelude::*;
 use rayon::prelude::*;
 use vectorial_hash::{Aabb, Point3, Positioned3, Sphere3, Tree3};
 use vectorial_hash_demos::instanced3d::{EffectInstance, InstancedRenderer, ModelGpu};
-use vectorial_hash_demos::model::load_glb_clip;
+use vectorial_hash_demos::model::{load_glb, load_glb_clip};
 
 // ---------------------------------------------------------------- world config
 
@@ -723,19 +723,6 @@ fn build_terrain_chunks() -> Vec<Mesh> {
     meshes
 }
 
-fn draw_castles() {
-    for f in [Faction::Red, Faction::Blue] {
-        let (cx, cz) = f.castle();
-        let h = terrain_height(cx, cz);
-        let col = match f { Faction::Red => Color::new(0.6, 0.18, 0.16, 1.0), Faction::Blue => Color::new(0.16, 0.28, 0.62, 1.0) };
-        // Keep + four corner towers.
-        draw_cube(vec3(cx as f32, (h + 22.0) as f32, cz as f32), vec3(46.0, 44.0, 46.0), None, col);
-        for (ox, oz) in [(-26.0, -26.0), (26.0, -26.0), (-26.0, 26.0), (26.0, 26.0)] {
-            draw_cube(vec3((cx + ox) as f32, (h + 30.0) as f32, (cz + oz) as f32), vec3(14.0, 60.0, 14.0), None, col);
-        }
-    }
-}
-
 /// Wooden bridge decks across the river (a plank + two rails per crossing).
 fn draw_bridges() {
     let deck = Color::new(0.36, 0.24, 0.13, 1.0);
@@ -877,6 +864,12 @@ async fn main() {
         body_radius[1][Kind::Knight.index()] = hr;
         cpu.iter().map(|m| renderer.upload_model(gl.quad_context, &m.vertices, &m.indices)).collect()
     };
+    // Castle model (static) for the two faction keeps, replacing the cube blocks.
+    let castle = {
+        let gl = unsafe { get_internal_gl() };
+        let m = load_glb(include_bytes!("../../assets/siege/models/castle.glb"));
+        renderer.upload_model(gl.quad_context, &m.vertices, &m.indices)
+    };
 
     let terrain_chunks = build_terrain_chunks(); // static — built once, drawn each frame
     let mut now = 0.0f64; // simulation clock
@@ -1004,8 +997,7 @@ async fn main() {
         let mvp = cam.matrix();
 
         for m in &terrain_chunks { draw_mesh(m); }
-        draw_castles();
-        draw_bridges();
+        draw_bridges(); // castles are drawn as instanced models in the gl block below
         draw_effects(&effects, now);
 
         // Units → one instanced draw per (faction, kind), using its glTF model.
@@ -1059,6 +1051,15 @@ async fn main() {
             for (fr, gpu) in horse.iter().enumerate() {
                 renderer.draw_models(gl.quad_context, gpu, &horses[fr], mvp, light); // cavalry mounts
             }
+            // Castles — one model per faction keep, facing the map centre.
+            let mut castle_inst = Vec::with_capacity(2);
+            for f in [Faction::Red, Faction::Blue] {
+                let (cx, cz) = f.castle();
+                let yaw = (WORLD * 0.5 - cx).atan2(WORLD * 0.5 - cz) as f32;
+                let m = Mat4::from_translation(vec3(cx as f32, terrain_height(cx, cz) as f32, cz as f32)) * Mat4::from_rotation_y(yaw) * Mat4::from_scale(Vec3::splat(62.0));
+                castle_inst.push(EffectInstance::new(m, faction_tint(f)));
+            }
+            renderer.draw_models(gl.quad_context, &castle, &castle_inst, mvp, light);
         }
         // Projectiles: small spheres arcing through the air (cannonballs / lava).
         for pr in &projectiles {
