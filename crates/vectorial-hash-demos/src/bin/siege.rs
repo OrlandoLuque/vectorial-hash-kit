@@ -140,6 +140,7 @@ struct Unit {
     vel: (f64, f64, f64),
     attacks: Vec<(u32, f64)>, // (target unit id, damage) — many for AoE (dragon)
     emit: Option<Point3>, // strike point that should spawn a smoke puff this frame
+    fx: Vec<Fx>, // visible effects this unit produced this frame
 }
 impl Unit {
     fn alive(&self) -> bool { self.hp > 0.0 }
@@ -165,6 +166,26 @@ const SMOKE_CAP: usize = 240; // hard cap on live puffs
 struct Puff { p: Point3, born: f64 }
 impl Positioned3 for Puff { fn position(&self) -> Point3 { self.p } }
 
+// ------------------------------------------------------------- visual effects
+
+/// A transient combat effect — the *visible* part of an attack (the queries
+/// resolve instantly, so without these the fight is invisible). Spawned with the
+/// same parallel-safe pattern as smoke: `decide` pushes into the unit's own `fx`
+/// list, the serial `apply` stamps a birth time and moves them to the global
+/// pool, the render fades them by age.
+#[derive(Clone, Copy)]
+enum FxKind { Arrow, Bolt, Lightning, Ring, Spark }
+#[derive(Clone, Copy)]
+struct Fx { kind: FxKind, a: Vec3, b: Vec3, born: f64 }
+impl Fx {
+    fn new(kind: FxKind, a: Vec3, b: Vec3) -> Fx { Fx { kind, a, b, born: 0.0 } }
+    fn life(kind: FxKind) -> f64 { match kind { FxKind::Arrow | FxKind::Bolt => 0.14, FxKind::Lightning => 0.10, FxKind::Ring => 0.45, FxKind::Spark => 0.30 } }
+}
+const FX_CAP: usize = 4000; // hard cap on live effects
+
+/// `Point3` → macroquad `Vec3`.
+fn v3(p: Point3) -> Vec3 { vec3(p.x as f32, p.y as f32, p.z as f32) }
+
 // ----------------------------------------------------------------- spawning
 
 fn spawn_unit(rng: &mut Rng, faction: Faction) -> Unit {
@@ -188,6 +209,7 @@ fn spawn_unit(rng: &mut Rng, faction: Faction) -> Unit {
         vel: (0.0, 0.0, 0.0),
         attacks: Vec::new(),
         emit: None,
+        fx: Vec::new(),
     };
     place_at_castle(rng, &mut u);
     u
@@ -226,6 +248,7 @@ fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>) {
     u.vel = (0.0, 0.0, 0.0);
     u.attacks.clear();
     u.emit = None;
+    u.fx.clear();
     if !u.alive() { return; }
 
     // One k-NN pass yields both the nearest enemy (targeting) and the nearby
@@ -290,6 +313,9 @@ fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>) {
                 if it.faction != u.faction { u.attacks.push((it.id, u.kind.dmg())); }
             }
             u.emit = Some(Point3::new(tx, ty, tz));
+            let c = Point3::new(tx, ty, tz);
+            u.fx.push(Fx::new(FxKind::Ring, v3(c), v3(c)));
+            u.fx.push(Fx::new(FxKind::Bolt, v3(u.p), v3(c))); // breath stream from the dragon
         }
         // Catapult: a lobbed boulder — a wide `Sphere3` AoE cull at the target
         // spot (ground siege analogue of the dragon), kicking up smoke on impact.
@@ -299,6 +325,7 @@ fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>) {
                 if it.faction != u.faction { u.attacks.push((it.id, u.kind.dmg())); }
             }
             u.emit = Some(Point3::new(tx, ty, tz));
+            u.fx.push(Fx::new(FxKind::Ring, v3(Point3::new(tx, ty, tz)), v3(Point3::new(tx, ty, tz))));
         }
         // Ballista: a piercing bolt — an all-hits `raycast` that does NOT stop at
         // the first unit; every enemy on the line is skewered. (Contrast the
@@ -311,14 +338,18 @@ fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>) {
             for (_, it) in index.raycast(u.p, ndir, len + 30.0, 3.5) {
                 if it.id != id && it.faction != u.faction { u.attacks.push((it.id, u.kind.dmg())); }
             }
+            u.fx.push(Fx::new(FxKind::Bolt, v3(u.p), v3(Point3::new(tx, ty, tz))));
         }
         // Mage chain-lightning: a `knn` from the strike point arcs to the nearest
         // enemies — up to 4 links, each taking the bolt.
         Kind::Mage => {
             let mut links = 0;
+            let mut from = u.p; // the arc hops shooter → enemy → enemy …
             for (_, it) in index.knn(Point3::new(tx, ty, tz), 10) {
                 if it.faction == u.faction || it.id == id { continue; }
                 u.attacks.push((it.id, u.kind.dmg()));
+                u.fx.push(Fx::new(FxKind::Lightning, v3(from), v3(it.p)));
+                from = it.p;
                 links += 1;
                 if links >= 4 { break; }
             }
@@ -335,12 +366,18 @@ fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>) {
             for (_, it) in index.raycast(u.p, ndir, len + 4.0, 3.0) {
                 if it.id == id { continue; }
                 if it.faction != u.faction { u.attacks.push((it.id, u.kind.dmg())); }
+                u.fx.push(Fx::new(FxKind::Arrow, v3(u.p), v3(it.p))); // arrow to whatever it hit
                 break; // the first thing hit stops the arrow
             }
         }
         // Healer: mend the most-wounded nearby comrade — a friendly `knn`, the
         // heal applied as *negative* damage (capped at full HP in the apply pass).
-        Kind::Healer => { if let Some((_, hid, _, _)) = heal { u.attacks.push((hid, -u.kind.dmg())); } }
+        Kind::Healer => {
+            if let Some((p, hid, _, _)) = heal {
+                u.attacks.push((hid, -u.kind.dmg()));
+                u.fx.push(Fx::new(FxKind::Spark, v3(p), v3(p)));
+            }
+        }
         // Soldier / knight: single melee strike on the k-NN target.
         _ => { if let Some((_, tid, _)) = target { u.attacks.push((tid, u.kind.dmg())); } }
     }
@@ -349,10 +386,11 @@ fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>) {
 // ----------------------------------------------------------------- AI: apply
 
 /// Serial resolution of one frame's intents: move units, apply accumulated
-/// damage, kill the fallen, respawn the dead, and turn smoke emissions into
-/// puffs (aging out the old ones). Reads every unit's `vel`/`attacks`/`emit`
-/// (written by `decide`) and is the only place cross-unit writes happen.
-fn apply(units: &mut [Unit], smoke: &mut Vec<Puff>, rng: &mut Rng, dt: f64, now: f64) {
+/// damage, kill the fallen, respawn the dead, turn smoke emissions into puffs and
+/// collect this frame's visual effects (aging out the old ones). Reads every
+/// unit's `vel`/`attacks`/`emit`/`fx` (written by `decide`) and is the only place
+/// cross-unit writes happen.
+fn apply(units: &mut [Unit], smoke: &mut Vec<Puff>, effects: &mut Vec<Fx>, rng: &mut Rng, dt: f64, now: f64) {
     // 1) movement + cooldown tick (each unit, independent).
     for u in units.iter_mut() {
         if !u.alive() { continue; }
@@ -396,6 +434,14 @@ fn apply(units: &mut [Unit], smoke: &mut Vec<Puff>, rng: &mut Rng, dt: f64, now:
         }
     }
     smoke.retain(|s| now - s.born < SMOKE_LIFE);
+
+    // 5) visual effects — stamp birth time, collect, age out (cap to bound work).
+    for u in units.iter() {
+        for f in &u.fx {
+            if effects.len() < FX_CAP { effects.push(Fx { born: now, ..*f }); }
+        }
+    }
+    effects.retain(|f| now - f.born < Fx::life(f.kind));
 }
 
 // ----------------------------------------------------------------- rendering
@@ -480,6 +526,33 @@ fn draw_castles() {
     }
 }
 
+/// Draw the transient combat effects (the visible part of each attack): arrow /
+/// bolt / lightning streaks, a healer's spark, and an expanding AoE ring. Immediate
+/// 3D lines, faded by age.
+fn draw_effects(effects: &[Fx], now: f64) {
+    for f in effects {
+        let age = ((now - f.born) / Fx::life(f.kind)).clamp(0.0, 1.0) as f32;
+        match f.kind {
+            FxKind::Arrow => draw_line_3d(f.a, f.b, Color::new(0.96, 0.90, 0.45, 1.0)),
+            FxKind::Bolt => draw_line_3d(f.a, f.b, Color::new(1.0, 0.58, 0.16, 1.0)),
+            FxKind::Lightning => draw_line_3d(f.a, f.b, Color::new(0.62, 0.86, 1.0, 1.0)),
+            FxKind::Spark => draw_line_3d(f.a, f.a + vec3(0.0, 7.0, 0.0), Color::new(0.40, 1.0, 0.55, 1.0)),
+            FxKind::Ring => {
+                let r = 8.0 + 26.0 * age; // expanding shockwave
+                let col = Color::new(1.0, 0.45, 0.12, 1.0 - age);
+                let n = 22;
+                let mut prev = f.a + vec3(r, 1.5, 0.0);
+                for i in 1..=n {
+                    let t = i as f32 / n as f32 * std::f32::consts::TAU;
+                    let p = f.a + vec3(r * t.cos(), 1.5, r * t.sin());
+                    draw_line_3d(prev, p, col);
+                    prev = p;
+                }
+            }
+        }
+    }
+}
+
 /// A minimal screen-space slider for the live thread count (native only — wasm
 /// has no threads). Draggable handle; updates `*value` in `1..=max` and sets
 /// `*dragging` so the caller can suppress camera-orbit while the slider is held.
@@ -518,6 +591,7 @@ async fn main() {
     let mut index = Tree3::<IUnit>::new(world, 8);
     // Smoke lives in its own index so archer/ballista shots can raycast it.
     let mut smoke: Vec<Puff> = Vec::new();
+    let mut effects: Vec<Fx> = Vec::new(); // transient combat visuals
     let mut smoke_index = Tree3::<Puff>::new(world, 8);
     let mut smoke_instances: Vec<Instance> = Vec::new();
 
@@ -601,7 +675,7 @@ async fn main() {
             }
             #[cfg(target_arch = "wasm32")]
             for i in 0..units.len() { decide(&mut units[i], i as u32, &index, &smoke_index); }
-            apply(&mut units, &mut smoke, &mut rng, dt, now);
+            apply(&mut units, &mut smoke, &mut effects, &mut rng, dt, now);
         }
 
         // ----- render 3D -----
@@ -620,6 +694,7 @@ async fn main() {
 
         for m in &terrain_chunks { draw_mesh(m); }
         draw_castles();
+        draw_effects(&effects, now);
 
         // Units as one instanced draw call.
         instances.clear();
