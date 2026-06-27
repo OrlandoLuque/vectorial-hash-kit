@@ -115,6 +115,67 @@ fn step(units: &mut [Unit], index: &mut Tree3<IUnit>, rng: &mut Rng, dt: f64, no
     }
 }
 
+// ============================================================ terrain
+
+fn hash2(x: i32, z: i32) -> f64 {
+    let mut h = (x as u32).wrapping_mul(0x1659_5e3d).wrapping_add((z as u32).wrapping_mul(0x27d4_eb2f));
+    h ^= h >> 15; h = h.wrapping_mul(0x85eb_ca6b); h ^= h >> 13;
+    (h & 0x00ff_ffff) as f64 / 0x00ff_ffff as f64
+}
+fn vnoise(x: f64, z: f64) -> f64 {
+    let (xi, zi) = (x.floor() as i32, z.floor() as i32);
+    let (fx, fz) = (x - xi as f64, z - zi as f64);
+    let (sx, sz) = (fx * fx * (3.0 - 2.0 * fx), fz * fz * (3.0 - 2.0 * fz));
+    let a = hash2(xi, zi); let b = hash2(xi + 1, zi);
+    let c = hash2(xi, zi + 1); let d = hash2(xi + 1, zi + 1);
+    let ab = a + (b - a) * sx; let cd = c + (d - c) * sx;
+    ab + (cd - ab) * sz
+}
+/// Hills + a central volcano cone (matches the macroquad siege's terrain).
+fn terrain_height(x: f64, z: f64) -> f64 {
+    let s = 1.0 / 150.0;
+    let mut h = vnoise(x * s, z * s) * 42.0 + vnoise(x * s * 2.7, z * s * 2.7) * 15.0;
+    let (cx, cz) = (WORLD * 0.5, WORLD * 0.5);
+    let d = ((x - cx) * (x - cx) + (z - cz) * (z - cz)).sqrt();
+    if d < 160.0 { h += (160.0 - d) * 0.6; if d < 26.0 { h -= (26.0 - d) * 1.2; } }
+    h
+}
+fn terrain_color(h: f64) -> [f32; 3] {
+    if h < 6.0 { [0.12, 0.28, 0.45] } else if h < 10.0 { [0.62, 0.56, 0.34] }
+    else if h < 55.0 { [0.20, 0.42, 0.18] } else if h < 90.0 { [0.38, 0.34, 0.30] }
+    else { [0.82, 0.84, 0.88] }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct TVertex { pos: [f32; 3], normal: [f32; 3], color: [f32; 4] }
+
+/// Build the terrain as a single triangle mesh (u32 indices — wgpu has no small
+/// drawcall cap, so one mesh is fine). Normals from finite differences.
+fn build_terrain() -> (Vec<TVertex>, Vec<u32>) {
+    const RES: usize = 180;
+    let step = WORLD / RES as f64;
+    let (mut v, mut idx) = (Vec::with_capacity((RES + 1) * (RES + 1)), Vec::new());
+    for iz in 0..=RES {
+        for ix in 0..=RES {
+            let (x, z) = (ix as f64 * step, iz as f64 * step);
+            let h = terrain_height(x, z);
+            let hx = terrain_height(x + step, z) - terrain_height(x - step, z);
+            let hz = terrain_height(x, z + step) - terrain_height(x, z - step);
+            let n = Vec3::new((-hx / (2.0 * step)) as f32, 1.0, (-hz / (2.0 * step)) as f32).normalize();
+            v.push(TVertex { pos: [x as f32, h as f32, z as f32], normal: n.to_array(), color: { let c = terrain_color(h); [c[0], c[1], c[2], 1.0] } });
+        }
+    }
+    let w = (RES + 1) as u32;
+    for iz in 0..RES as u32 {
+        for ix in 0..RES as u32 {
+            let a = iz * w + ix;
+            idx.extend_from_slice(&[a, a + w, a + 1, a + 1, a + w, a + w + 1]);
+        }
+    }
+    (v, idx)
+}
+
 // ============================================================ gpu types
 
 #[repr(C)]
@@ -164,6 +225,10 @@ struct State {
     vbuf: wgpu::Buffer,
     ibuf: wgpu::Buffer,
     nidx: u32,
+    terrain_pipeline: wgpu::RenderPipeline,
+    terrain_vbuf: wgpu::Buffer,
+    terrain_ibuf: wgpu::Buffer,
+    terrain_nidx: u32,
     inst_buf: wgpu::Buffer,
     cam_buf: wgpu::Buffer,
     cam_bg: wgpu::BindGroup,
@@ -225,6 +290,22 @@ impl State {
             multiview: None,
         });
 
+        // Terrain: a single colour+normal mesh, its own pipeline (no instancing).
+        let (tv, ti) = build_terrain();
+        let terrain_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("ter-v"), contents: bytemuck::cast_slice(&tv), usage: wgpu::BufferUsages::VERTEX });
+        let terrain_ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("ter-i"), contents: bytemuck::cast_slice(&ti), usage: wgpu::BufferUsages::INDEX });
+        let terrain_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("ter-shader"), source: wgpu::ShaderSource::Wgsl(TERRAIN_SHADER.into()) });
+        let terrain_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("ter-pipe"),
+            layout: Some(&pipe_layout),
+            vertex: wgpu::VertexState { module: &terrain_shader, entry_point: "vs", compilation_options: Default::default(), buffers: &[wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<TVertex>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4] }] },
+            fragment: Some(wgpu::FragmentState { module: &terrain_shader, entry_point: "fs", compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })] }),
+            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState { format: wgpu::TextureFormat::Depth32Float, depth_write_enabled: true, depth_compare: wgpu::CompareFunction::Less, stencil: Default::default(), bias: Default::default() }),
+            multisample: Default::default(),
+            multiview: None,
+        });
+
         let depth = make_depth(&device, &config);
         let mut rng = Rng::new(0x51E6E);
         let units = spawn_army(&mut rng);
@@ -232,6 +313,7 @@ impl State {
 
         State {
             surface, device, queue, config, pipeline, vbuf, ibuf, nidx: ci.len() as u32, inst_buf,
+            terrain_pipeline, terrain_vbuf, terrain_ibuf, terrain_nidx: ti.len() as u32,
             cam_buf, cam_bg, depth, units, index, rng, now: 0.0, last: Instant::now(),
             yaw: 0.9, pitch: 0.7, dist: 760.0, dragging: false, last_mouse: (0.0, 0.0),
             instances: Vec::with_capacity(inst_cap),
@@ -261,12 +343,12 @@ impl State {
         self.now += dt;
         step(&mut self.units, &mut self.index, &mut self.rng, dt, self.now);
 
-        // ground + units → instances
+        // units → instances, standing on the terrain
         self.instances.clear();
-        self.instances.push(Instance { pos: [(WORLD * 0.5) as f32, -1.0, (WORLD * 0.5) as f32], _pad: 0.0, scale: [WORLD as f32, 2.0, WORLD as f32], _pad2: 0.0, color: [0.22, 0.40, 0.20, 1.0] });
         for u in &self.units {
             if u.hp <= 0.0 { continue; }
-            self.instances.push(Instance { pos: [u.p.x as f32, 3.0, u.p.z as f32], _pad: 0.0, scale: [4.0, 6.0, 4.0], _pad2: 0.0, color: faction_color(u.fac, u.hp) });
+            let y = terrain_height(u.p.x, u.p.z) as f32 + 3.0;
+            self.instances.push(Instance { pos: [u.p.x as f32, y, u.p.z as f32], _pad: 0.0, scale: [4.0, 6.0, 4.0], _pad2: 0.0, color: faction_color(u.fac, u.hp) });
         }
         self.queue.write_buffer(&self.inst_buf, 0, bytemuck::cast_slice(&self.instances));
         let cam = self.camera();
@@ -282,6 +364,13 @@ impl State {
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &self.depth, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }),
                 timestamp_writes: None, occlusion_query_set: None,
             });
+            // terrain (single mesh)
+            pass.set_pipeline(&self.terrain_pipeline);
+            pass.set_bind_group(0, &self.cam_bg, &[]);
+            pass.set_vertex_buffer(0, self.terrain_vbuf.slice(..));
+            pass.set_index_buffer(self.terrain_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..self.terrain_nidx, 0, 0..1);
+            // units (instanced cubes)
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.cam_bg, &[]);
             pass.set_vertex_buffer(0, self.vbuf.slice(..));
@@ -313,6 +402,23 @@ fn vs(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>,
     let diff = max(dot(normalize(n), normalize(cam.light.xyz)), 0.0);
     let sh = 0.35 + 0.65 * diff;
     o.color = vec4<f32>(icolor.rgb * sh, icolor.a);
+    return o;
+}
+@fragment
+fn fs(in: VOut) -> @location(0) vec4<f32> { return in.color; }
+"#;
+
+const TERRAIN_SHADER: &str = r#"
+struct Camera { vp: mat4x4<f32>, light: vec4<f32> };
+@group(0) @binding(0) var<uniform> cam: Camera;
+struct VOut { @builtin(position) clip: vec4<f32>, @location(0) color: vec4<f32> };
+@vertex
+fn vs(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>, @location(2) col: vec4<f32>) -> VOut {
+    var o: VOut;
+    o.clip = cam.vp * vec4<f32>(p, 1.0);
+    let diff = max(dot(normalize(n), normalize(cam.light.xyz)), 0.0);
+    let sh = 0.40 + 0.60 * diff;
+    o.color = vec4<f32>(col.rgb * sh, 1.0);
     return o;
 }
 @fragment
