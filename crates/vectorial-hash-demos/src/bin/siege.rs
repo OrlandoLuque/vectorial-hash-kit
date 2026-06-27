@@ -167,6 +167,16 @@ impl Kind {
     /// All eight kinds, in `index()` order — the render groups units by this.
     const ALL: [Kind; 8] = [Kind::Soldier, Kind::Archer, Kind::Knight, Kind::Dragon, Kind::Catapult, Kind::Mage, Kind::Ballista, Kind::Healer];
     fn index(self) -> usize { match self { Kind::Soldier => 0, Kind::Archer => 1, Kind::Knight => 2, Kind::Dragon => 3, Kind::Catapult => 4, Kind::Mage => 5, Kind::Ballista => 6, Kind::Healer => 7 } }
+    /// Per-model orientation + size corrections — some Quaternius models face a
+/// different axis or read over/undersized. Returns (yaw offset in radians, scale
+/// multiplier).
+    fn model_tweak(self, f: Faction) -> (f32, f32) {
+        match (f, self) {
+            (Faction::Blue, Kind::Mage) => (-std::f32::consts::FRAC_PI_2, 0.55), // slime: faces +X, reads big
+            _ => (0.0, 1.0),
+        }
+    }
+
     /// Visual model height in world units (the model is normalised to height 1).
     /// Per-kind because some models read bigger than their collision sphere.
     fn model_height(self) -> f32 {
@@ -708,7 +718,8 @@ async fn main() {
         for &f in &[Faction::Red, Faction::Blue] {
             for &k in &Kind::ALL {
                 let m = load_glb(model_for(f, k));
-                body_radius[f.index()][k.index()] = (m.footprint * k.model_height()) as f64;
+                let (_, sc) = k.model_tweak(f);
+                body_radius[f.index()][k.index()] = (m.footprint * k.model_height() * sc) as f64;
                 v.push(((f, k), renderer.upload_model(gl.quad_context, &m.vertices, &m.indices)));
             }
         }
@@ -852,7 +863,9 @@ async fn main() {
             if !u.alive() { continue; }
             match u.faction { Faction::Red => red += 1, Faction::Blue => blue += 1 }
             let feet_y = (u.p.y - u.kind.radius() as f64) as f32; // drop sphere centre to ground
-            let h = u.kind.model_height();
+            let (yaw_off, sc) = u.kind.model_tweak(u.faction);
+            let h = u.kind.model_height() * sc;
+            let yaw = u.face + yaw_off;
             let base = vec3(u.p.x as f32, feet_y, u.p.z as f32) + anim_offset(u, now, h);
             let tint = faction_tint(u.faction);
             let (fi, ki) = (u.faction.index(), u.kind.index());
@@ -861,10 +874,10 @@ async fn main() {
                 let horse_m = Mat4::from_translation(base) * Mat4::from_rotation_y(u.face) * Mat4::from_scale(Vec3::splat(hh));
                 horses.push(EffectInstance::new(horse_m, tint));
                 // Rider on the horse's back, a bit smaller.
-                let rider = Mat4::from_translation(base + vec3(0.0, hh * 0.5, 0.0)) * Mat4::from_rotation_y(u.face) * Mat4::from_scale(Vec3::splat(hh * 0.72));
+                let rider = Mat4::from_translation(base + vec3(0.0, hh * 0.5, 0.0)) * Mat4::from_rotation_y(yaw) * Mat4::from_scale(Vec3::splat(hh * 0.72));
                 buckets[fi][ki].push(EffectInstance::new(rider, tint));
             } else {
-                let m = Mat4::from_translation(base) * Mat4::from_rotation_y(u.face) * Mat4::from_scale(Vec3::splat(h));
+                let m = Mat4::from_translation(base) * Mat4::from_rotation_y(yaw) * Mat4::from_scale(Vec3::splat(h));
                 buckets[fi][ki].push(EffectInstance::new(m, tint));
             }
         }
