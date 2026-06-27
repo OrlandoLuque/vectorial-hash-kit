@@ -328,10 +328,10 @@ fn place_at_castle(rng: &mut Rng, u: &mut Unit) {
     u.respawn_at = f64::INFINITY;
 }
 
-fn spawn_army(rng: &mut Rng) -> Vec<Unit> {
-    let mut units = Vec::with_capacity(PER_FACTION * 2);
-    for _ in 0..PER_FACTION { units.push(spawn_unit(rng, Faction::Red)); }
-    for _ in 0..PER_FACTION { units.push(spawn_unit(rng, Faction::Blue)); }
+fn spawn_army(rng: &mut Rng, per_faction: usize) -> Vec<Unit> {
+    let mut units = Vec::with_capacity(per_faction * 2);
+    for _ in 0..per_faction { units.push(spawn_unit(rng, Faction::Red)); }
+    for _ in 0..per_faction { units.push(spawn_unit(rng, Faction::Blue)); }
     units
 }
 
@@ -697,24 +697,24 @@ fn draw_effects(effects: &[Fx], now: f64) {
     }
 }
 
-/// A minimal screen-space slider for the live thread count (native only — wasm
-/// has no threads). Draggable handle; updates `*value` in `1..=max` and sets
-/// `*dragging` so the caller can suppress camera-orbit while the slider is held.
-#[cfg(not(target_arch = "wasm32"))]
-fn thread_slider(x: f32, y: f32, w: f32, value: &mut usize, max: usize, dragging: &mut bool) {
+/// A minimal screen-space slider over an integer range `min..=max`. Draggable
+/// handle; updates `*value` and sets `*dragging` so the caller can suppress
+/// camera-orbit while it's held.
+#[allow(clippy::too_many_arguments)]
+fn int_slider(x: f32, y: f32, w: f32, label: &str, value: &mut usize, min: usize, max: usize, dragging: &mut bool) {
     draw_rectangle(x, y - 3.0, w, 6.0, Color::new(0.30, 0.30, 0.36, 1.0));
-    let t = if max > 1 { (*value - 1) as f32 / (max - 1) as f32 } else { 0.0 };
-    let hx = x + t * w;
+    let span = (max - min).max(1) as f32;
+    let hx = x + ((*value).saturating_sub(min) as f32 / span) * w;
     draw_circle(hx, y, 9.0, WHITE);
     let (mx, my) = mouse_position();
     let over = mx >= x - 12.0 && mx <= x + w + 12.0 && (my - y).abs() < 16.0;
     if is_mouse_button_pressed(MouseButton::Left) && over { *dragging = true; }
     if !is_mouse_button_down(MouseButton::Left) { *dragging = false; }
-    if *dragging && max > 1 {
+    if *dragging {
         let nt = ((mx - x) / w).clamp(0.0, 1.0);
-        *value = (1.0 + nt * (max - 1) as f32).round() as usize;
+        *value = min + (nt * span).round() as usize;
     }
-    draw_text(format!("threads: {value} / {max}"), x, y - 14.0, 20.0, WHITE);
+    draw_text(format!("{label}: {value}"), x, y - 14.0, 20.0, WHITE);
 }
 
 fn window_conf() -> Conf {
@@ -735,7 +735,10 @@ async fn main() {
         .unwrap_or_else(|| (macroquad::miniquad::date::now() * 1000.0) as u64);
     let _ = MAP_SEED.set((seed % 100_000) as f64 * 0.01);
     let mut rng = Rng::new(seed | 1);
-    let mut units = spawn_army(&mut rng);
+    let mut per_faction = PER_FACTION; // live army size per side (population slider)
+    let mut cur_pop = per_faction;
+    let mut pop_drag = false;
+    let mut units = spawn_army(&mut rng, per_faction);
     let world = Aabb::new(0.0, 0.0, 0.0, WORLD, SKY, WORLD);
     let mut index = Tree3::<IUnit>::new(world, 8);
     // Smoke lives in its own index so archer/ballista shots can raycast it.
@@ -819,7 +822,7 @@ async fn main() {
     loop {
         // ----- input: orbit / zoom / controls -----
         let mp = mouse_position();
-        if is_mouse_button_down(MouseButton::Left) && !slider_drag {
+        if is_mouse_button_down(MouseButton::Left) && !slider_drag && !pop_drag {
             yaw += (mp.0 - last_mouse.0) * 0.01;
             pitch = (pitch + (mp.1 - last_mouse.1) * 0.01).clamp(0.05, 1.50);
         }
@@ -827,10 +830,12 @@ async fn main() {
         let wheel = mouse_wheel().1;
         if wheel != 0.0 { dist = (dist - wheel * 0.5).clamp(200.0, 1600.0); }
         if is_key_pressed(KeyCode::P) { paused = !paused; }
-        if is_key_pressed(KeyCode::RightBracket) || is_key_pressed(KeyCode::LeftBracket) {
-            // (live army resize hook — rebuild from the current seed; placeholder
-            // until a population slider lands)
-            units = spawn_army(&mut rng);
+        // Rebuild the army when the population slider changed (or on `[`/`]`).
+        if is_key_pressed(KeyCode::RightBracket) { per_faction = (per_faction + 100).min(2000); }
+        if is_key_pressed(KeyCode::LeftBracket) { per_faction = per_faction.saturating_sub(100).max(20); }
+        if per_faction != cur_pop {
+            units = spawn_army(&mut rng, per_faction);
+            cur_pop = per_faction;
         }
 
         let dt = (get_frame_time() as f64).min(0.05); // clamp huge hitches
@@ -986,11 +991,13 @@ async fn main() {
         draw_text(format!("fps {}", get_fps()), 16.0, 54.0, 22.0, LIGHTGRAY);
         draw_text(format!("Red {red}"), 16.0, 80.0, 24.0, Color::new(0.95, 0.4, 0.35, 1.0));
         draw_text(format!("Blue {blue}"), 16.0, 104.0, 24.0, Color::new(0.45, 0.6, 1.0, 1.0));
+        // Live population slider (per faction) — the spatial-index stress lever.
+        int_slider(20.0, 150.0, 220.0, "army/side", &mut per_faction, 20, 2000, &mut pop_drag);
         // Live thread-count slider drives the parallel AI pass (native only).
         #[cfg(not(target_arch = "wasm32"))]
-        thread_slider(20.0, 150.0, 220.0, &mut n_threads, max_threads, &mut slider_drag);
+        int_slider(20.0, 192.0, 220.0, "threads", &mut n_threads, 1, max_threads, &mut slider_drag);
         draw_text(
-            "drag: orbit  scroll: zoom  P: pause  [ ]: rebuild",
+            "drag: orbit  scroll: zoom  P: pause  [ ]: \u{00b1}pop",
             16.0, screen_height() - 18.0, 20.0, LIGHTGRAY,
         );
         if paused { draw_text("PAUSED", screen_width() * 0.5 - 50.0, 40.0, 36.0, YELLOW); }
