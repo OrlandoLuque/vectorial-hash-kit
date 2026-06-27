@@ -36,6 +36,7 @@ use vectorial_hash_demos::model::load_glb;
 const WORLD: f64 = 800.0; // battlefield is WORLD × WORLD in the ground plane
 const SKY: f64 = 260.0; // index height — heights reach ~150, the dragon flies
 const PER_FACTION: usize = 500; // units each side spawns with (tunable live)
+const ATK_ANIM_LEN: f32 = 0.28; // attack-lunge animation duration (seconds)
 
 // ------------------------------------------------------------------------- rng
 
@@ -171,6 +172,8 @@ struct Unit {
     emit: Option<Point3>, // strike point that should spawn a smoke puff this frame
     fx: Vec<Fx>, // visible effects this unit produced this frame
     face: f32, // heading (radians about Y) for orienting the model
+    phase: f32, // per-unit animation phase offset (so they don't bob in sync)
+    atk_anim: f32, // attack-lunge countdown (seconds), set when the unit strikes
 }
 impl Unit {
     fn alive(&self) -> bool { self.hp > 0.0 }
@@ -241,6 +244,8 @@ fn spawn_unit(rng: &mut Rng, faction: Faction) -> Unit {
         emit: None,
         fx: Vec::new(),
         face: 0.0,
+        phase: rng.range(0.0, std::f64::consts::TAU) as f32,
+        atk_anim: 0.0,
     };
     place_at_castle(rng, &mut u);
     u
@@ -444,8 +449,11 @@ fn apply(units: &mut [Unit], smoke: &mut Vec<Puff>, effects: &mut Vec<Fx>, rng: 
         // Face the direction of travel (for orienting the model); keep the last
         // heading while stopped.
         if u.vel.0 * u.vel.0 + u.vel.2 * u.vel.2 > 1.0 { u.face = (u.vel.0 as f32).atan2(u.vel.2 as f32); }
-        // Reload after a shot (an AoE that caught nobody still fired).
-        if !u.attacks.is_empty() || u.emit.is_some() { u.cooldown = u.kind.cooldown(); }
+        // Reload after a shot (an AoE that caught nobody still fired) and kick off
+        // the attack-lunge animation; otherwise let the lunge decay.
+        let fired = !u.attacks.is_empty() || u.emit.is_some();
+        if fired { u.cooldown = u.kind.cooldown(); }
+        u.atk_anim = if fired { ATK_ANIM_LEN } else { (u.atk_anim - dt as f32).max(0.0) };
     }
 
     // 2) damage resolution — gather first (immutable borrow), then apply.
@@ -495,6 +503,19 @@ fn apply(units: &mut [Unit], smoke: &mut Vec<Puff>, effects: &mut Vec<Fx>, rng: 
 /// clearly as Red or Blue.
 fn faction_tint(f: Faction) -> [f32; 4] {
     match f { Faction::Red => [0.88, 0.16, 0.12, 0.34], Faction::Blue => [0.14, 0.34, 0.95, 0.34] }
+}
+
+/// Procedural "animation" offset for a unit's model this frame (cheap, scales to
+/// the whole army — no skeletal skinning): a walk-bounce while moving (idle
+/// breathe when stopped) plus a forward lunge during an attack. `h` is the
+/// model height; returns a world-space translation to add to the unit's base.
+fn anim_offset(u: &Unit, now: f64, h: f32) -> Vec3 {
+    let moving = u.vel.0 * u.vel.0 + u.vel.2 * u.vel.2 > 1.0;
+    let t = now as f32 * 9.0 + u.phase;
+    let bob = if moving { t.sin().abs() * 0.09 * h } else { (now as f32 * 1.6 + u.phase).sin() * 0.02 * h };
+    let prog = if u.atk_anim > 0.0 { 1.0 - u.atk_anim / ATK_ANIM_LEN } else { 0.0 };
+    let lunge = (prog * std::f32::consts::PI).sin() * h * 0.16;
+    vec3(0.0, bob, 0.0) + vec3(u.face.sin(), 0.0, u.face.cos()) * lunge
 }
 
 /// Build the terrain once as smooth triangle `Mesh` **chunks**. Each vertex sits
@@ -760,17 +781,17 @@ async fn main() {
             if !u.alive() { continue; }
             match u.faction { Faction::Red => red += 1, Faction::Blue => blue += 1 }
             let feet_y = (u.p.y - u.kind.radius() as f64) as f32; // drop sphere centre to ground
-            let base = vec3(u.p.x as f32, feet_y, u.p.z as f32);
+            let h = u.kind.model_height();
+            let base = vec3(u.p.x as f32, feet_y, u.p.z as f32) + anim_offset(u, now, h);
             let tint = faction_tint(u.faction);
             if u.kind == Kind::Knight {
-                let hh = u.kind.model_height(); // horse height
+                let hh = h; // horse height (= knight model height)
                 let horse_m = Mat4::from_translation(base) * Mat4::from_rotation_y(u.face) * Mat4::from_scale(Vec3::splat(hh));
                 horses.push(EffectInstance::new(horse_m, tint));
                 // Rider on the horse's back, a bit smaller.
                 let rider = Mat4::from_translation(base + vec3(0.0, hh * 0.5, 0.0)) * Mat4::from_rotation_y(u.face) * Mat4::from_scale(Vec3::splat(hh * 0.72));
                 buckets[Kind::Knight.index()].push(EffectInstance::new(rider, tint));
             } else {
-                let h = u.kind.model_height();
                 let m = Mat4::from_translation(base) * Mat4::from_rotation_y(u.face) * Mat4::from_scale(Vec3::splat(h));
                 buckets[u.kind.index()].push(EffectInstance::new(m, tint));
             }
