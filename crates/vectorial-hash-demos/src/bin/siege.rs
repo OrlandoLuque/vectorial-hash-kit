@@ -35,7 +35,6 @@ use vectorial_hash_demos::instanced3d::{Instance, InstancedRenderer, Mode};
 const WORLD: f64 = 800.0; // battlefield is WORLD × WORLD in the ground plane
 const SKY: f64 = 260.0; // index height — heights reach ~150, the dragon flies
 const PER_FACTION: usize = 500; // units each side spawns with (tunable live)
-const TILES: usize = 32; // terrain render resolution (TILES × TILES quads)
 
 // ------------------------------------------------------------------------- rng
 
@@ -83,17 +82,25 @@ fn terrain_height(x: f64, z: f64) -> f64 {
     h
 }
 
-/// Surface colour by elevation (water → sand → grass → rock → snow), with the
-/// volcano summit glowing. Returns a macroquad `Color`.
-fn terrain_color(x: f64, z: f64, h: f64) -> Color {
+/// Surface colour at a point, plus an `emissive` flag (true = lava, drawn
+/// full-bright, ignoring terrain shading). Elevation ramp water → sand → grass
+/// → rock → snow, with a glowing crater pool and a lava flow down one flank.
+fn terrain_surface(x: f64, z: f64, h: f64) -> (Color, bool) {
     let (cx, cz) = (WORLD * 0.5, WORLD * 0.5);
-    let near_volcano = ((x - cx) * (x - cx) + (z - cz) * (z - cz)).sqrt() < 150.0;
-    if near_volcano && h > 70.0 { return Color::new(0.45, 0.10, 0.06, 1.0); } // lava rock
-    if h < 6.0 { return Color::new(0.12, 0.28, 0.45, 1.0); } // water
-    if h < 10.0 { return Color::new(0.62, 0.56, 0.34, 1.0); } // sand
-    if h < 60.0 { return Color::new(0.20, 0.42, 0.18, 1.0); } // grass
-    if h < 95.0 { return Color::new(0.38, 0.34, 0.30, 1.0); } // rock
-    Color::new(0.82, 0.84, 0.88, 1.0) // snow
+    let (px, pz) = (x - cx, z - cz);
+    let d = (px * px + pz * pz).sqrt();
+    if d < 30.0 { return (Color::new(1.0, 0.46, 0.10, 1.0), true); } // crater pool
+    // Lava river: a narrow azimuth wedge flowing down one slope of the cone.
+    let mut dang = (pz.atan2(px) - (-2.1)).abs();
+    if dang > std::f64::consts::PI { dang = std::f64::consts::TAU - dang; }
+    if d < 165.0 && dang < 0.15 { return (Color::new(0.96, 0.34, 0.07, 1.0), true); }
+    if d < 150.0 && h > 70.0 { return (Color::new(0.30, 0.11, 0.08, 1.0), false); } // scorched rock
+    let c = if h < 6.0 { Color::new(0.12, 0.28, 0.45, 1.0) } // water
+        else if h < 10.0 { Color::new(0.62, 0.56, 0.34, 1.0) } // sand
+        else if h < 60.0 { Color::new(0.20, 0.42, 0.18, 1.0) } // grass
+        else if h < 95.0 { Color::new(0.38, 0.34, 0.30, 1.0) } // rock
+        else { Color::new(0.82, 0.84, 0.88, 1.0) }; // snow
+    (c, false)
 }
 
 // ----------------------------------------------------------------- unit model
@@ -407,25 +414,57 @@ fn faction_color(f: Faction, k: Kind) -> [f32; 4] {
     }
 }
 
-/// Draw the terrain as a grid of flat coloured tiles. Coarse (immediate-mode
-/// `draw_cube` per tile) but adequate for a backdrop; a baked `Mesh` is the next
-/// optimisation if this becomes the bottleneck.
-fn draw_terrain() {
-    let step = WORLD / TILES as f64;
-    for iz in 0..TILES {
-        for ix in 0..TILES {
-            let x = (ix as f64 + 0.5) * step;
-            let z = (iz as f64 + 0.5) * step;
-            let h = terrain_height(x, z);
-            let c = terrain_color(x, z, h);
-            draw_cube(
-                vec3(x as f32, (h * 0.5) as f32, z as f32),
-                vec3(step as f32, h.max(2.0) as f32, step as f32),
-                None,
-                c,
-            );
+/// Build the terrain once as smooth triangle `Mesh` **chunks**. Each vertex sits
+/// at its true height (so the surface is continuous, not stepped like the old
+/// per-tile cubes), and **lambert shading is baked into the vertex colour** — the
+/// slope normal dotted with a sun direction — because macroquad's `draw_mesh` is
+/// unlit. That shading is what makes the relief readable when the terrain is
+/// otherwise one flat green. Lava (crater + flow) is emissive: drawn full-bright.
+///
+/// Chunked because macroquad clamps any single drawcall at 10 000 verts / 5 000
+/// indices; a 6×6 grid of 25-cell chunks (676 verts / 3 750 indices each) stays
+/// under both caps.
+fn build_terrain_chunks() -> Vec<Mesh> {
+    const RES: usize = 150;
+    const CHUNK: usize = 25; // cells/side: (CHUNK+1)²=676 verts, CHUNK²·6=3 750 indices
+    let step = WORLD / RES as f64;
+    let light = vec3(-0.45, 0.84, -0.30).normalize();
+    let nchunks = RES / CHUNK;
+    let mut meshes = Vec::with_capacity(nchunks * nchunks);
+    for cz in 0..nchunks {
+        for cx in 0..nchunks {
+            let (ix0, iz0) = (cx * CHUNK, cz * CHUNK);
+            let mut vertices = Vec::with_capacity((CHUNK + 1) * (CHUNK + 1));
+            for jz in 0..=CHUNK {
+                for jx in 0..=CHUNK {
+                    let (x, z) = ((ix0 + jx) as f64 * step, (iz0 + jz) as f64 * step);
+                    let h = terrain_height(x, z);
+                    // Heightfield normal via central differences.
+                    let hx = terrain_height(x + step, z) - terrain_height(x - step, z);
+                    let hz = terrain_height(x, z + step) - terrain_height(x, z - step);
+                    let n = vec3((-hx / (2.0 * step)) as f32, 1.0, (-hz / (2.0 * step)) as f32).normalize();
+                    let (base, emissive) = terrain_surface(x, z, h);
+                    let col = if emissive {
+                        base
+                    } else {
+                        let b = 0.32 + 0.68 * n.dot(light).max(0.0); // ambient + diffuse
+                        Color::new(base.r * b, base.g * b, base.b * b, 1.0)
+                    };
+                    vertices.push(Vertex::new(x as f32, h as f32, z as f32, 0.0, 0.0, col));
+                }
+            }
+            let w = (CHUNK + 1) as u16;
+            let mut indices: Vec<u16> = Vec::with_capacity(CHUNK * CHUNK * 6);
+            for jz in 0..CHUNK as u16 {
+                for jx in 0..CHUNK as u16 {
+                    let a = jz * w + jx;
+                    indices.extend_from_slice(&[a, a + w, a + 1, a + 1, a + w, a + w + 1]);
+                }
+            }
+            meshes.push(Mesh { vertices, indices, texture: None });
         }
     }
+    meshes
 }
 
 fn draw_castles() {
@@ -494,6 +533,7 @@ async fn main() {
         InstancedRenderer::new(gl.quad_context)
     };
 
+    let terrain_chunks = build_terrain_chunks(); // static — built once, drawn each frame
     let mut now = 0.0f64; // simulation clock
     let mut paused = false;
     let mut instances: Vec<Instance> = Vec::with_capacity(units.len());
@@ -578,7 +618,7 @@ async fn main() {
         let cam_right = fwd.cross(vec3(0.0, 1.0, 0.0)).normalize();
         let cam_up = cam_right.cross(fwd).normalize();
 
-        draw_terrain();
+        for m in &terrain_chunks { draw_mesh(m); }
         draw_castles();
 
         // Units as one instanced draw call.

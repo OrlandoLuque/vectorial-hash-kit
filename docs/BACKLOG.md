@@ -87,8 +87,25 @@ built. New bin `vectorial-hash-demos/src/bin/siege.rs`.
   (friendly `knn`), heals it as *negative* damage (capped at full HP in apply).
   **Eight troop types, all eight a distinct query.** **Published to the web**
   (2026-06-27): `docs/siege.html` + `docs/siege.wasm` (626 K) + index card; the
-  wasm AI runs serial (no threads). **Still to layer:** boids *alignment*,
-  bridges/forests/rivers, balance, projectile travel time, baked terrain mesh.
+  wasm AI runs serial (no threads).
+
+**Siege visual pass (user feedback, 2026-06-27 — they ran it).** Terrain was
+flat-shaded per-tile cubes ("semicubes", no lighting → couldn't read the relief).
+**Done:** a smooth chunked heightfield `Mesh` with **lambert shading baked into
+the vertex colours** (macroquad `draw_mesh` is unlit), 6×6 chunks under the 5 000-
+index drawcall cap; glowing crater pool + a lava flow down one flank. **Still to
+layer (the rest of the feedback):**
+- **Visible attacks/effects** — combat is hitscan, so arrows/boulders/fire/
+  lightning/heal are invisible. Add transient effects (decide records the event
+  → render a brief streak/burst, like the smoke emit pattern): arrow/bolt streaks
+  (`draw_line_3d`), catapult/dragon AoE rings, mage lightning zigzags, heal spark.
+- **Distinct unit models** — all eight types render as spheres. Either procedural
+  low-poly meshes per type (instanced via `draw_effects`, CC0/no assets, wasm-
+  clean) or downloaded **CC0** models (Kenney / Quaternius / Poly Pizza). User's
+  aesthetic call — pending their answer.
+- Real **rivers/forests/bridges** (what looked like "residual rivers at the edge"
+  is just low water-coloured tiles; no rivers are generated yet), boids
+  *alignment*, balance, projectile travel time.
 
 **Thread-slider retrofit for the critters demos** (user, 2026-06-27) — the same
 live `num_threads` slider in `critters` (2D) and `critters3d` (3D), but it only
