@@ -24,7 +24,7 @@ vectorial-hash-templates = { workspace = true }
 macroquad = { workspace = true }
 # glTF (.glb) model loading for the siege demo (Quaternius CC0 kits). Pure Rust,
 # so it builds for wasm too. `import` decodes embedded buffers + textures.
-gltf = { version = "1.4", default-features = false, features = ["import", "utils"] }
+gltf = { version = "1.4", default-features = false, features = ["import", "utils", "names"] }
 
 # rayon powers the `siege` demo's per-unit AI fan-out (a live thread-count
 # slider). Native only — wasm has no OS threads, so the web build runs the same

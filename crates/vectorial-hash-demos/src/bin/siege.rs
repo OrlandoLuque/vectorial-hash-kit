@@ -29,7 +29,7 @@ use macroquad::prelude::*;
 use rayon::prelude::*;
 use vectorial_hash::{Aabb, Point3, Positioned3, Sphere3, Tree3};
 use vectorial_hash_demos::instanced3d::{EffectInstance, InstancedRenderer, ModelGpu};
-use vectorial_hash_demos::model::load_glb;
+use vectorial_hash_demos::model::load_glb_animated;
 
 // ---------------------------------------------------------------- world config
 
@@ -43,6 +43,7 @@ const SKY: f64 = 260.0; // index height — heights reach ~150, the dragon flies
 const PER_FACTION: usize = 500; // units each side spawns with (tunable live)
 const ATK_ANIM_LEN: f32 = 0.28; // attack-lunge animation duration (seconds)
 const LAVA_DPS: f64 = 45.0; // damage per second to a ground unit standing in lava
+const ANIM_FRAMES: usize = 8; // baked skeletal-animation frames per model
 
 // ------------------------------------------------------------------------- rng
 
@@ -543,6 +544,15 @@ fn faction_tint(f: Faction) -> [f32; 4] {
     match f { Faction::Red => [0.90, 0.20, 0.14, 0.22], Faction::Blue => [0.30, 0.45, 1.0, 0.22] }
 }
 
+/// Which baked animation frame this unit shows now — the clip loops, faster
+/// while moving, de-synced per unit by its phase. Static models (`nf` ≤ 1) → 0.
+fn anim_frame(u: &Unit, now: f64, nf: usize) -> usize {
+    if nf <= 1 { return 0; }
+    let speed = (u.vel.0 * u.vel.0 + u.vel.2 * u.vel.2).sqrt() as f32;
+    let rate = 1.4 + speed * 0.05; // loops per second
+    (((now as f32 * rate + u.phase * std::f32::consts::FRAC_1_PI * 0.5) * nf as f32) as usize) % nf
+}
+
 /// Procedural "animation" offset for a unit's model this frame (cheap, scales to
 /// the whole army — no skeletal skinning): a walk-bounce while moving (idle
 /// breathe when stopped) plus a forward lunge during an attack. `h` is the
@@ -712,28 +722,31 @@ async fn main() {
     // × render height, so the space a unit occupies (separation) matches what's
     // drawn. Indexed [faction][kind].
     let mut body_radius = [[4.0f64; 8]; 2];
-    let models: Vec<((Faction, Kind), ModelGpu)> = {
+    let mut frames_per = [[1usize; 8]; 2]; // baked-frame count per (faction, kind)
+    let models: Vec<((Faction, Kind), Vec<ModelGpu>)> = {
         let gl = unsafe { get_internal_gl() };
         let mut v = Vec::with_capacity(16);
         for &f in &[Faction::Red, Faction::Blue] {
             for &k in &Kind::ALL {
-                let m = load_glb(model_for(f, k));
+                let cpu = load_glb_animated(model_for(f, k), ANIM_FRAMES); // baked skeletal frames
                 let (_, sc) = k.model_tweak(f);
-                body_radius[f.index()][k.index()] = (m.footprint * k.model_height() * sc) as f64;
-                v.push(((f, k), renderer.upload_model(gl.quad_context, &m.vertices, &m.indices)));
+                body_radius[f.index()][k.index()] = (cpu[0].footprint * k.model_height() * sc) as f64;
+                frames_per[f.index()][k.index()] = cpu.len();
+                let gpus = cpu.iter().map(|m| renderer.upload_model(gl.quad_context, &m.vertices, &m.indices)).collect();
+                v.push(((f, k), gpus));
             }
         }
         v
     };
     // The knight is cavalry: the rider model is raised onto this (shared) horse,
     // which is bigger than the rider — so the knight's footprint is the horse's.
-    let horse = {
+    let horse: Vec<ModelGpu> = {
         let gl = unsafe { get_internal_gl() };
-        let m = load_glb(include_bytes!("../../assets/siege/models/horse.glb"));
-        let hr = (m.footprint * Kind::Knight.model_height()) as f64;
+        let cpu = load_glb_animated(include_bytes!("../../assets/siege/models/horse.glb"), ANIM_FRAMES);
+        let hr = (cpu[0].footprint * Kind::Knight.model_height()) as f64;
         body_radius[0][Kind::Knight.index()] = hr;
         body_radius[1][Kind::Knight.index()] = hr;
-        renderer.upload_model(gl.quad_context, &m.vertices, &m.indices)
+        cpu.iter().map(|m| renderer.upload_model(gl.quad_context, &m.vertices, &m.indices)).collect()
     };
 
     let terrain_chunks = build_terrain_chunks(); // static — built once, drawn each frame
@@ -856,8 +869,11 @@ async fn main() {
         // Group live units into [faction][kind] buckets of model matrices
         // (place · face · scale, plus the procedural animation offset). Knights
         // are cavalry: a horse at the feet + the rider raised onto its back.
-        let mut buckets: [[Vec<EffectInstance>; 8]; 2] = std::array::from_fn(|_| std::array::from_fn(|_| Vec::new()));
-        let mut horses: Vec<EffectInstance> = Vec::new();
+        // [faction][kind][frame] instance buckets — units split by which baked
+        // animation frame they show this instant, so each frame instances together.
+        let mut buckets: [[Vec<Vec<EffectInstance>>; 8]; 2] =
+            std::array::from_fn(|fi| std::array::from_fn(|ki| vec![Vec::new(); frames_per[fi][ki]]));
+        let mut horses: Vec<Vec<EffectInstance>> = vec![Vec::new(); horse.len()];
         let (mut red, mut blue) = (0usize, 0usize);
         for u in units.iter() {
             if !u.alive() { continue; }
@@ -869,23 +885,30 @@ async fn main() {
             let base = vec3(u.p.x as f32, feet_y, u.p.z as f32) + anim_offset(u, now, h);
             let tint = faction_tint(u.faction);
             let (fi, ki) = (u.faction.index(), u.kind.index());
+            let frame = anim_frame(u, now, frames_per[fi][ki]);
             if u.kind == Kind::Knight {
                 let hh = h; // horse height (= knight model height)
                 let horse_m = Mat4::from_translation(base) * Mat4::from_rotation_y(u.face) * Mat4::from_scale(Vec3::splat(hh));
-                horses.push(EffectInstance::new(horse_m, tint));
+                horses[anim_frame(u, now, horse.len())].push(EffectInstance::new(horse_m, tint));
                 // Rider on the horse's back, a bit smaller.
                 let rider = Mat4::from_translation(base + vec3(0.0, hh * 0.5, 0.0)) * Mat4::from_rotation_y(yaw) * Mat4::from_scale(Vec3::splat(hh * 0.72));
-                buckets[fi][ki].push(EffectInstance::new(rider, tint));
+                buckets[fi][ki][frame].push(EffectInstance::new(rider, tint));
             } else {
                 let m = Mat4::from_translation(base) * Mat4::from_rotation_y(yaw) * Mat4::from_scale(Vec3::splat(h));
-                buckets[fi][ki].push(EffectInstance::new(m, tint));
+                buckets[fi][ki][frame].push(EffectInstance::new(m, tint));
             }
         }
         {
             let gl = unsafe { get_internal_gl() };
             let light = vec3(-0.45, 0.84, -0.30).normalize();
-            for ((f, k), gpu) in &models { renderer.draw_models(gl.quad_context, gpu, &buckets[f.index()][k.index()], mvp, light); }
-            renderer.draw_models(gl.quad_context, &horse, &horses, mvp, light); // cavalry mounts
+            for ((f, k), gpus) in &models {
+                for (frame, gpu) in gpus.iter().enumerate() {
+                    renderer.draw_models(gl.quad_context, gpu, &buckets[f.index()][k.index()][frame], mvp, light);
+                }
+            }
+            for (frame, gpu) in horse.iter().enumerate() {
+                renderer.draw_models(gl.quad_context, gpu, &horses[frame], mvp, light); // cavalry mounts
+            }
         }
         // Smoke: each cloud is a few translucent billows that rise, spread and
         // fade as they age — so it reads as smoke yet you still see the fight
