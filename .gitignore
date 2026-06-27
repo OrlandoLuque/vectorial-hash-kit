@@ -10,3 +10,9 @@
 # Local project handoff notes for Claude sessions (not committed by request).
 /CLAUDE.md
 /target/pub/
+
+# siege demo: raw model-kit downloads. We extract the few .glb we actually use
+# and commit those; the bulky zips and the dedup scratch folder stay local.
+crates/vectorial-hash-demos/assets/siege/*.zip
+crates/vectorial-hash-demos/assets/siege/quitar o repes/
+crates/vectorial-hash-demos/assets/siege/Fish.zip

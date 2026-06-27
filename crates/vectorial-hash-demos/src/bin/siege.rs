@@ -235,8 +235,6 @@ fn spawn_army(rng: &mut Rng) -> Vec<Unit> {
 
 // ----------------------------------------------------------------- AI: decide
 
-const SEP_RADIUS: f64 = 11.0; // boids: friends closer than this push apart
-
 /// One unit's per-frame brain — *read-only* on the shared index, writes only
 /// into `u`'s own `vel`/`attacks`. This is the body that fans out over rayon
 /// (`par_iter_mut`): each unit reads the shared index and mutates only itself.
@@ -256,14 +254,22 @@ fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>) {
     // both once the lines meet.
     let mut target: Option<(Point3, u32, f64)> = None; // nearest enemy (pos, id, dist)
     let mut heal: Option<(Point3, u32, f32, f64)> = None; // most-wounded friend (pos, id, health, dist)
-    let (mut sep_x, mut sep_z) = (0.0, 0.0); // separation: away from close friends
+    let (mut sep_x, mut sep_z) = (0.0, 0.0); // separation push (from ANY neighbour)
     let (mut coh_x, mut coh_z, mut friends) = (0.0, 0.0, 0u32); // cohesion centroid
+    let sep_dist = u.kind.radius() as f64 * 2.2; // personal space ≈ body diameter
     for (d, it) in index.knn(u.p, 16) {
         if it.id == id { continue; }
+        // Separation from ANY neighbour (friend or foe) inside personal space,
+        // weighted by closeness (0 at the edge, strong on contact) so no two
+        // bodies overlap. The same one k-NN drives targeting, cohesion AND this.
+        if d < sep_dist {
+            let (dd, w) = (d.max(1e-3), 1.0 - d / sep_dist);
+            sep_x += (u.p.x - it.p.x) / dd * w;
+            sep_z += (u.p.z - it.p.z) / dd * w;
+        }
         if it.faction != u.faction {
             if target.is_none() { target = Some((it.p, it.id, d)); }
         } else {
-            if d < SEP_RADIUS { let dd = d.max(1e-3); sep_x += (u.p.x - it.p.x) / dd; sep_z += (u.p.z - it.p.z) / dd; }
             coh_x += it.p.x; coh_z += it.p.z; friends += 1;
             if it.health < 0.97 && heal.is_none_or(|(_, _, h, _)| it.health < h) { heal = Some((it.p, it.id, it.health, d)); }
         }
@@ -284,23 +290,29 @@ fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>) {
         }
     };
 
-    // Steering in direction space: seek the target, then (for ground melee that
-    // fight shoulder-to-shoulder) add boids separation + cohesion so they hold a
-    // loose formation instead of stacking. Normalise, then scale by speed.
+    // Velocity = seek (scaled by approach — zero once in reach) + separation
+    // (ALWAYS applied, even while stopped and fighting, so bodies never overlap)
+    // + gentle cohesion for ground-melee formations, capped so separation can't
+    // fling a unit away.
     let seek = (tx - u.p.x, tz - u.p.z);
     let slen = (seek.0 * seek.0 + seek.1 * seek.1).sqrt().max(1e-6);
-    let (mut dx, mut dz) = (seek.0 / slen, seek.1 / slen);
-    if matches!(u.kind, Kind::Soldier | Kind::Knight) && friends > 0 {
-        dx += sep_x * 0.5; dz += sep_z * 0.5; // push out of crowding
-        let (cx, cz) = (coh_x / friends as f64 - u.p.x, coh_z / friends as f64 - u.p.z);
-        let cl = (cx * cx + cz * cz).sqrt().max(1e-6);
-        dx += cx / cl * 0.25; dz += cz / cl * 0.25; // drift toward the band's centre
-    }
-    let dlen = (dx * dx + dz * dz).sqrt().max(1e-6);
-    let dy = if u.kind == Kind::Dragon { (ty - u.p.y).clamp(-1.0, 1.0) } else { 0.0 };
     let speed = u.kind.speed();
     let approach = if tdist < u.kind.reach() * 0.8 { 0.0 } else { speed };
-    u.vel = (dx / dlen * approach, dy * approach, dz / dlen * approach);
+    let (mut vx, mut vz) = (seek.0 / slen * approach, seek.1 / slen * approach);
+    if u.kind != Kind::Dragon {
+        vx += sep_x * speed * 0.7; // separation, always on → no overlapping bodies
+        vz += sep_z * speed * 0.7;
+    }
+    if matches!(u.kind, Kind::Soldier | Kind::Knight) && friends > 0 {
+        let (cx, cz) = (coh_x / friends as f64 - u.p.x, coh_z / friends as f64 - u.p.z);
+        let cl = (cx * cx + cz * cz).sqrt().max(1e-6);
+        vx += cx / cl * speed * 0.12; vz += cz / cl * speed * 0.12; // cohesion
+    }
+    let vl = (vx * vx + vz * vz).sqrt();
+    let cap = speed * 1.5;
+    if vl > cap { let s = cap / vl; vx *= s; vz *= s; }
+    let dy = if u.kind == Kind::Dragon { (ty - u.p.y).clamp(-1.0, 1.0) } else { 0.0 };
+    u.vel = (vx, dy * approach, vz);
 
     // Attacking: only when in reach and off cooldown.
     if u.cooldown > 0.0 || tdist > u.kind.reach() { return; }
