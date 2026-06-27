@@ -121,6 +121,31 @@ enum Faction { Red, Blue }
 impl Faction {
     fn other(self) -> Faction { match self { Faction::Red => Faction::Blue, Faction::Blue => Faction::Red } }
     fn castle(self) -> (f64, f64) { match self { Faction::Red => (90.0, 90.0), Faction::Blue => (WORLD - 90.0, WORLD - 90.0) } }
+    fn index(self) -> usize { match self { Faction::Red => 0, Faction::Blue => 1 } }
+}
+
+/// The `.glb` model for a (faction, kind): **Red = pirates**, **Blue = undead**.
+/// Quaternius CC0 (Witch is CC-BY) — see assets/siege/CREDITS.md. Some models
+/// are shared across factions (dragon, cannon) and told apart by the tint.
+fn model_for(f: Faction, k: Kind) -> &'static [u8] {
+    use Faction::{Blue, Red};
+    match (f, k) {
+        // Pirates (Red)
+        (Red, Kind::Soldier) => include_bytes!("../../assets/siege/models/anne.glb"),
+        (Red, Kind::Archer) => include_bytes!("../../assets/siege/models/sharky.glb"),
+        (Red, Kind::Knight) => include_bytes!("../../assets/siege/models/pirate_captain.glb"),
+        (Red, Kind::Mage) => include_bytes!("../../assets/siege/models/witch.glb"),
+        (Red, Kind::Healer) => include_bytes!("../../assets/siege/models/henry.glb"),
+        // Undead (Blue)
+        (Blue, Kind::Soldier) => include_bytes!("../../assets/siege/models/zombie.glb"),
+        (Blue, Kind::Archer) => include_bytes!("../../assets/siege/models/skeleton_a.glb"),
+        (Blue, Kind::Knight) => include_bytes!("../../assets/siege/models/skeleton_sword.glb"),
+        (Blue, Kind::Mage) => include_bytes!("../../assets/siege/models/slime.glb"),
+        (Blue, Kind::Healer) => include_bytes!("../../assets/siege/models/bat.glb"),
+        // Shared
+        (_, Kind::Dragon) => include_bytes!("../../assets/siege/models/dragon.glb"),
+        (_, Kind::Catapult) | (_, Kind::Ballista) => include_bytes!("../../assets/siege/models/cannon.glb"),
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -142,20 +167,6 @@ impl Kind {
     /// All eight kinds, in `index()` order — the render groups units by this.
     const ALL: [Kind; 8] = [Kind::Soldier, Kind::Archer, Kind::Knight, Kind::Dragon, Kind::Catapult, Kind::Mage, Kind::Ballista, Kind::Healer];
     fn index(self) -> usize { match self { Kind::Soldier => 0, Kind::Archer => 1, Kind::Knight => 2, Kind::Dragon => 3, Kind::Catapult => 4, Kind::Mage => 5, Kind::Ballista => 6, Kind::Healer => 7 } }
-    /// The `.glb` model for this kind (Quaternius CC0; Witch is CC-BY — see
-    /// assets/siege/CREDITS.md). Two artillery kinds share the cannon for now.
-    fn model_bytes(self) -> &'static [u8] {
-        match self {
-            Kind::Soldier => include_bytes!("../../assets/siege/models/anne.glb"),
-            Kind::Archer => include_bytes!("../../assets/siege/models/sharky.glb"),
-            Kind::Knight => include_bytes!("../../assets/siege/models/pirate_captain.glb"),
-            Kind::Dragon => include_bytes!("../../assets/siege/models/dragon.glb"),
-            Kind::Catapult => include_bytes!("../../assets/siege/models/cannon.glb"),
-            Kind::Mage => include_bytes!("../../assets/siege/models/witch.glb"),
-            Kind::Ballista => include_bytes!("../../assets/siege/models/cannon.glb"),
-            Kind::Healer => include_bytes!("../../assets/siege/models/henry.glb"),
-        }
-    }
     /// Visual model height in world units (the model is normalised to height 1).
     /// Per-kind because some models read bigger than their collision sphere.
     fn model_height(self) -> f32 {
@@ -288,7 +299,7 @@ fn spawn_army(rng: &mut Rng) -> Vec<Unit> {
 /// Three library queries, one per concern: **k-NN** finds the nearest enemy
 /// (targeting) *and* the nearby friends (boids); the dragon's AoE is a sphere
 /// **`cull`**; the archer's line-of-fire is a thick **`raycast`**.
-fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>, body_radius: &[f64; 8]) {
+fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>, body_radius: &[[f64; 8]; 2]) {
     u.vel = (0.0, 0.0, 0.0);
     u.attacks.clear();
     u.emit = None;
@@ -302,7 +313,7 @@ fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>, body
     let mut heal: Option<(Point3, u32, f32, f64)> = None; // most-wounded friend (pos, id, health, dist)
     let (mut sep_x, mut sep_z) = (0.0, 0.0); // separation push (from ANY neighbour)
     let (mut coh_x, mut coh_z, mut friends) = (0.0, 0.0, 0u32); // cohesion centroid
-    let sep_dist = body_radius[u.kind.index()] * 2.0; // two bodies of this size shan't overlap
+    let sep_dist = body_radius[u.faction.index()][u.kind.index()] * 2.0; // two bodies of this size shan't overlap
     for (d, it) in index.knn(u.p, 16) {
         if it.id == id { continue; }
         // Separation from ANY neighbour (friend or foe) inside personal space,
@@ -519,7 +530,7 @@ fn apply(units: &mut [Unit], smoke: &mut Vec<Puff>, effects: &mut Vec<Fx>, rng: 
 /// model's own colours toward this, so even dark models (knights, dragons) read
 /// clearly as Red or Blue.
 fn faction_tint(f: Faction) -> [f32; 4] {
-    match f { Faction::Red => [0.88, 0.16, 0.12, 0.34], Faction::Blue => [0.14, 0.34, 0.95, 0.34] }
+    match f { Faction::Red => [0.90, 0.20, 0.14, 0.22], Faction::Blue => [0.30, 0.45, 1.0, 0.22] }
 }
 
 /// Procedural "animation" offset for a unit's model this frame (cheap, scales to
@@ -686,25 +697,31 @@ async fn main() {
         InstancedRenderer::new(gl.quad_context)
     };
 
-    // Load + upload each kind's glTF model once (Quaternius CC0, Witch CC-BY).
-    // While loading, derive each kind's world-space body radius from the model's
-    // own XZ footprint × its render height — so the space a unit occupies (for
-    // separation) matches what's actually drawn, instead of a guessed sphere.
-    let mut body_radius = [4.0f64; 8];
-    let models: Vec<(Kind, ModelGpu)> = {
+    // Load + upload a glTF model per (faction, kind) — pirates vs undead. While
+    // loading, derive each one's world-space body radius from its own XZ footprint
+    // × render height, so the space a unit occupies (separation) matches what's
+    // drawn. Indexed [faction][kind].
+    let mut body_radius = [[4.0f64; 8]; 2];
+    let models: Vec<((Faction, Kind), ModelGpu)> = {
         let gl = unsafe { get_internal_gl() };
-        Kind::ALL.iter().map(|&k| {
-            let m = load_glb(k.model_bytes());
-            body_radius[k.index()] = (m.footprint * k.model_height()) as f64;
-            (k, renderer.upload_model(gl.quad_context, &m.vertices, &m.indices))
-        }).collect()
+        let mut v = Vec::with_capacity(16);
+        for &f in &[Faction::Red, Faction::Blue] {
+            for &k in &Kind::ALL {
+                let m = load_glb(model_for(f, k));
+                body_radius[f.index()][k.index()] = (m.footprint * k.model_height()) as f64;
+                v.push(((f, k), renderer.upload_model(gl.quad_context, &m.vertices, &m.indices)));
+            }
+        }
+        v
     };
-    // The knight is cavalry: the rider model is raised onto this horse. The horse
-    // is bigger than the rider, so the knight's footprint is the horse's.
+    // The knight is cavalry: the rider model is raised onto this (shared) horse,
+    // which is bigger than the rider — so the knight's footprint is the horse's.
     let horse = {
         let gl = unsafe { get_internal_gl() };
         let m = load_glb(include_bytes!("../../assets/siege/models/horse.glb"));
-        body_radius[Kind::Knight.index()] = (m.footprint * Kind::Knight.model_height()) as f64;
+        let hr = (m.footprint * Kind::Knight.model_height()) as f64;
+        body_radius[0][Kind::Knight.index()] = hr;
+        body_radius[1][Kind::Knight.index()] = hr;
         renderer.upload_model(gl.quad_context, &m.vertices, &m.indices)
     };
 
@@ -824,10 +841,11 @@ async fn main() {
         draw_castles();
         draw_effects(&effects, now);
 
-        // Units → one instanced draw per kind, using its glTF model. Group the
-        // live units into per-kind buckets of model matrices (place · face · scale).
-        // Knights are cavalry: a horse at the feet + the rider raised onto its back.
-        let mut buckets: [Vec<EffectInstance>; 8] = std::array::from_fn(|_| Vec::new());
+        // Units → one instanced draw per (faction, kind), using its glTF model.
+        // Group live units into [faction][kind] buckets of model matrices
+        // (place · face · scale, plus the procedural animation offset). Knights
+        // are cavalry: a horse at the feet + the rider raised onto its back.
+        let mut buckets: [[Vec<EffectInstance>; 8]; 2] = std::array::from_fn(|_| std::array::from_fn(|_| Vec::new()));
         let mut horses: Vec<EffectInstance> = Vec::new();
         let (mut red, mut blue) = (0usize, 0usize);
         for u in units.iter() {
@@ -837,22 +855,23 @@ async fn main() {
             let h = u.kind.model_height();
             let base = vec3(u.p.x as f32, feet_y, u.p.z as f32) + anim_offset(u, now, h);
             let tint = faction_tint(u.faction);
+            let (fi, ki) = (u.faction.index(), u.kind.index());
             if u.kind == Kind::Knight {
                 let hh = h; // horse height (= knight model height)
                 let horse_m = Mat4::from_translation(base) * Mat4::from_rotation_y(u.face) * Mat4::from_scale(Vec3::splat(hh));
                 horses.push(EffectInstance::new(horse_m, tint));
                 // Rider on the horse's back, a bit smaller.
                 let rider = Mat4::from_translation(base + vec3(0.0, hh * 0.5, 0.0)) * Mat4::from_rotation_y(u.face) * Mat4::from_scale(Vec3::splat(hh * 0.72));
-                buckets[Kind::Knight.index()].push(EffectInstance::new(rider, tint));
+                buckets[fi][ki].push(EffectInstance::new(rider, tint));
             } else {
                 let m = Mat4::from_translation(base) * Mat4::from_rotation_y(u.face) * Mat4::from_scale(Vec3::splat(h));
-                buckets[u.kind.index()].push(EffectInstance::new(m, tint));
+                buckets[fi][ki].push(EffectInstance::new(m, tint));
             }
         }
         {
             let gl = unsafe { get_internal_gl() };
             let light = vec3(-0.45, 0.84, -0.30).normalize();
-            for (k, gpu) in &models { renderer.draw_models(gl.quad_context, gpu, &buckets[k.index()], mvp, light); }
+            for ((f, k), gpu) in &models { renderer.draw_models(gl.quad_context, gpu, &buckets[f.index()][k.index()], mvp, light); }
             renderer.draw_models(gl.quad_context, &horse, &horses, mvp, light); // cavalry mounts
         }
         // Smoke: each cloud is a few translucent billows that rise, spread and
