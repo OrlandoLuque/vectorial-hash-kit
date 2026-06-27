@@ -177,6 +177,101 @@ pub fn load_glb_clip(bytes: &[u8], n_frames: usize, prefs: &[&str]) -> Vec<Model
     }).collect()
 }
 
+/// One vertex for GPU skinning: rest position + normal + up to 4 joint indices
+/// and weights. `repr(C)` to match the wgpu vertex attributes.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct SkinVertex {
+    pub pos: [f32; 3],
+    pub normal: [f32; 3],
+    pub joints: [u32; 4],
+    pub weights: [f32; 4],
+}
+
+/// A model prepared for **GPU skinning**: the un-skinned mesh (rest pose + joint
+/// indices/weights) plus the animation's **joint matrices baked per frame**
+/// (`n_frames × num_joints`, normalisation folded in). The GPU vertex shader skins
+/// `Σ wᵢ · jointMatrix[frame·J + jointᵢ] · pos` — per-instance animation, no CPU
+/// vertex skinning at all.
+pub struct SkinnedModel {
+    pub vertices: Vec<SkinVertex>,
+    pub indices: Vec<u32>,
+    pub joint_frames: Vec<[[f32; 4]; 4]>, // n_frames * num_joints, column-major mat4
+    pub num_joints: usize,
+    pub n_frames: usize,
+}
+
+/// Load a `.glb` for GPU skinning: rest mesh + per-frame joint matrices (chosen
+/// clip via `prefs`). Returns `None` if the model has no skin/animation.
+pub fn load_glb_skinned(bytes: &[u8], n_frames: usize, prefs: &[&str]) -> Option<SkinnedModel> {
+    let (doc, buffers, _images) = gltf::import_slice(bytes).ok()?;
+    let skin = doc.skins().next()?;
+    let anim = pick_animation(&doc, prefs)?;
+    let (parent, order) = build_hierarchy(&doc);
+    let dur = anim_duration(&anim, &buffers).max(1e-3);
+
+    let joints: Vec<usize> = skin.joints().map(|j| j.index()).collect();
+    let invbind: Vec<Mat4> = skin
+        .reader(|b| buffers.get(b.index()).map(|x| &x.0[..]))
+        .read_inverse_bind_matrices()
+        .map(|it| it.map(|m| Mat4::from_cols_array_2d(&m)).collect())
+        .unwrap_or_else(|| vec![Mat4::IDENTITY; joints.len()]);
+
+    // Rest mesh (positions/normals/joints/weights) from the skinned primitive(s).
+    let (mut verts, mut indices) = (Vec::new(), Vec::new());
+    for node in doc.nodes() {
+        if node.skin().is_none() { continue; }
+        let Some(mesh) = node.mesh() else { continue };
+        for prim in mesh.primitives() {
+            let reader = prim.reader(|b| buffers.get(b.index()).map(|x| &x.0[..]));
+            let pos: Vec<[f32; 3]> = match reader.read_positions() { Some(p) => p.collect(), None => continue };
+            let nor: Vec<[f32; 3]> = reader.read_normals().map(|n| n.collect()).unwrap_or_default();
+            let jn: Vec<[u16; 4]> = reader.read_joints(0).map(|j| j.into_u16().collect()).unwrap_or_default();
+            let wt: Vec<[f32; 4]> = reader.read_weights(0).map(|w| w.into_f32().collect()).unwrap_or_default();
+            let base = verts.len() as u32;
+            for (i, p) in pos.iter().enumerate() {
+                let j = jn.get(i).copied().unwrap_or([0; 4]);
+                let w = wt.get(i).copied().unwrap_or([1.0, 0.0, 0.0, 0.0]);
+                verts.push(SkinVertex { pos: *p, normal: nor.get(i).copied().unwrap_or([0.0, 1.0, 0.0]), joints: [j[0] as u32, j[1] as u32, j[2] as u32, j[3] as u32], weights: w });
+            }
+            match reader.read_indices() {
+                Some(it) => { for x in it.into_u32() { indices.push(base + x); } }
+                None => { for k in 0..pos.len() as u32 { indices.push(base + k); } }
+            }
+        }
+    }
+    if verts.is_empty() { return None; }
+
+    // Normalisation (centre XZ, feet to 0, unit height) from frame 0's skinned
+    // bounds, folded into every joint matrix so the rest mesh stays raw.
+    let g0 = pose_globals(&doc, &buffers, &anim, 0.0, &parent, &order);
+    let jmat0: Vec<Mat4> = joints.iter().enumerate().map(|(k, &jn)| g0[jn] * invbind[k]).collect();
+    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+    for v in &verts {
+        let (mut sp, mut ws) = (Vec3::ZERO, 0.0f32);
+        for i in 0..4 {
+            let w = v.weights[i];
+            if w > 0.0 { sp += w * jmat0[v.joints[i] as usize].transform_point3(Vec3::from_array(v.pos)); ws += w; }
+        }
+        let p = if ws > 1e-4 { sp / ws } else { Vec3::from_array(v.pos) };
+        lo[0] = lo[0].min(p.x); lo[1] = lo[1].min(p.y); lo[2] = lo[2].min(p.z);
+        hi[0] = hi[0].max(p.x); hi[1] = hi[1].max(p.y); hi[2] = hi[2].max(p.z);
+    }
+    let (cx, cz) = ((lo[0] + hi[0]) * 0.5, (lo[2] + hi[2]) * 0.5);
+    let scale = 1.0 / (hi[1] - lo[1]).max(1e-4);
+    let norm = Mat4::from_scale(Vec3::splat(scale)) * Mat4::from_translation(Vec3::new(-cx, -lo[1], -cz));
+
+    let mut joint_frames = Vec::with_capacity(n_frames * joints.len());
+    for f in 0..n_frames {
+        let t = dur * f as f32 / n_frames as f32;
+        let g = pose_globals(&doc, &buffers, &anim, t, &parent, &order);
+        for (k, &jn) in joints.iter().enumerate() {
+            joint_frames.push((norm * g[jn] * invbind[k]).to_cols_array_2d());
+        }
+    }
+    Some(SkinnedModel { vertices: verts, indices, joint_frames, num_joints: joints.len(), n_frames })
+}
+
 /// Choose the clip whose name best matches `prefs` (priority-ordered substrings,
 /// case-insensitive), else the first animation.
 fn pick_animation<'a>(doc: &'a gltf::Document, prefs: &[&str]) -> Option<gltf::Animation<'a>> {
