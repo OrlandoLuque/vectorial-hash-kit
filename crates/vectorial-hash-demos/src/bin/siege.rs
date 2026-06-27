@@ -76,8 +76,23 @@ fn vnoise(x: f64, z: f64) -> f64 {
     ab + (cd - ab) * sz
 }
 
-/// Terrain height at a world (x,z): two octaves of hills plus a central volcano
-/// cone. Deterministic and cheap — called per terrain tile and per unit step.
+/// How strongly a point sits in the river channel: 1 at the centre line, 0 past
+/// the banks, faded to 0 near the volcano so the river doesn't carve the cone.
+/// The river meanders (seeded), running roughly along Z, off to one side.
+fn river_factor(x: f64, z: f64) -> f64 {
+    let o = map_seed();
+    let rx = WORLD * 0.32 + (z * 0.011 + o).sin() * 95.0 + (z * 0.004 + o).cos() * 45.0; // meander
+    let d = (x - rx).abs();
+    let w = 44.0;
+    if d >= w { return 0.0; }
+    let t = 1.0 - d / w; // 0 at bank, 1 at centre
+    let dc = ((x - WORLD * 0.5).powi(2) + (z - WORLD * 0.5).powi(2)).sqrt();
+    let vol_mask = (dc / 220.0).clamp(0.0, 1.0); // 0 at volcano, 1 far away
+    t * t * vol_mask
+}
+
+/// Terrain height at a world (x,z): two octaves of hills, a central volcano cone,
+/// and a carved river channel. Deterministic — called per terrain tile + unit step.
 fn terrain_height(x: f64, z: f64) -> f64 {
     let s = 1.0 / 150.0;
     let o = map_seed(); // per-run noise offset → a different map each run
@@ -90,6 +105,9 @@ fn terrain_height(x: f64, z: f64) -> f64 {
         h += cone;
         if d < 28.0 { h -= (28.0 - d) * 1.2; } // crater
     }
+    // River: pull the height down toward (and below) the water line in the channel.
+    let r = river_factor(x, z);
+    if r > 0.0 { h = h * (1.0 - r) - r * 5.0; }
     h
 }
 
