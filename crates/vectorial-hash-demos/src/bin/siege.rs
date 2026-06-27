@@ -28,7 +28,8 @@ use macroquad::prelude::*;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use vectorial_hash::{Aabb, Point3, Positioned3, Sphere3, Tree3};
-use vectorial_hash_demos::instanced3d::{Instance, InstancedRenderer, Mode};
+use vectorial_hash_demos::instanced3d::{EffectInstance, InstancedRenderer, ModelGpu};
+use vectorial_hash_demos::model::load_glb;
 
 // ---------------------------------------------------------------- world config
 
@@ -126,6 +127,26 @@ impl Kind {
     fn radius(self) -> f32 { match self { Kind::Soldier => 3.0, Kind::Archer => 3.0, Kind::Knight => 4.2, Kind::Dragon => 11.0, Kind::Catapult => 5.5, Kind::Mage => 3.4, Kind::Ballista => 5.0, Kind::Healer => 3.2 } }
     /// Ground units sit on the terrain; the dragon flies at a fixed altitude.
     fn altitude(self) -> f64 { match self { Kind::Dragon => 95.0, _ => 0.0 } }
+
+    /// All eight kinds, in `index()` order — the render groups units by this.
+    const ALL: [Kind; 8] = [Kind::Soldier, Kind::Archer, Kind::Knight, Kind::Dragon, Kind::Catapult, Kind::Mage, Kind::Ballista, Kind::Healer];
+    fn index(self) -> usize { match self { Kind::Soldier => 0, Kind::Archer => 1, Kind::Knight => 2, Kind::Dragon => 3, Kind::Catapult => 4, Kind::Mage => 5, Kind::Ballista => 6, Kind::Healer => 7 } }
+    /// The `.glb` model for this kind (Quaternius CC0; Witch is CC-BY — see
+    /// assets/siege/CREDITS.md). Two artillery kinds share the cannon for now.
+    fn model_bytes(self) -> &'static [u8] {
+        match self {
+            Kind::Soldier => include_bytes!("../../assets/siege/models/anne.glb"),
+            Kind::Archer => include_bytes!("../../assets/siege/models/sharky.glb"),
+            Kind::Knight => include_bytes!("../../assets/siege/models/pirate_captain.glb"),
+            Kind::Dragon => include_bytes!("../../assets/siege/models/dragon.glb"),
+            Kind::Catapult => include_bytes!("../../assets/siege/models/cannon.glb"),
+            Kind::Mage => include_bytes!("../../assets/siege/models/witch.glb"),
+            Kind::Ballista => include_bytes!("../../assets/siege/models/cannon.glb"),
+            Kind::Healer => include_bytes!("../../assets/siege/models/henry.glb"),
+        }
+    }
+    /// Visual model height in world units (the model is normalised to height 1).
+    fn model_height(self) -> f32 { self.radius() * 2.6 }
 }
 
 struct Unit {
@@ -141,6 +162,7 @@ struct Unit {
     attacks: Vec<(u32, f64)>, // (target unit id, damage) — many for AoE (dragon)
     emit: Option<Point3>, // strike point that should spawn a smoke puff this frame
     fx: Vec<Fx>, // visible effects this unit produced this frame
+    face: f32, // heading (radians about Y) for orienting the model
 }
 impl Unit {
     fn alive(&self) -> bool { self.hp > 0.0 }
@@ -210,6 +232,7 @@ fn spawn_unit(rng: &mut Rng, faction: Faction) -> Unit {
         attacks: Vec::new(),
         emit: None,
         fx: Vec::new(),
+        face: 0.0,
     };
     place_at_castle(rng, &mut u);
     u
@@ -412,6 +435,9 @@ fn apply(units: &mut [Unit], smoke: &mut Vec<Puff>, effects: &mut Vec<Fx>, rng: 
         let ground = terrain_height(nx, nz) + u.kind.radius() as f64;
         let ny = if u.kind == Kind::Dragon { (terrain_height(nx, nz) + u.kind.altitude()).max(ground) } else { ground };
         u.p = Point3::new(nx, ny, nz);
+        // Face the direction of travel (for orienting the model); keep the last
+        // heading while stopped.
+        if u.vel.0 * u.vel.0 + u.vel.2 * u.vel.2 > 1.0 { u.face = (u.vel.0 as f32).atan2(u.vel.2 as f32); }
         // Reload after a shot (an AoE that caught nobody still fired).
         if !u.attacks.is_empty() || u.emit.is_some() { u.cooldown = u.kind.cooldown(); }
     }
@@ -458,18 +484,10 @@ fn apply(units: &mut [Unit], smoke: &mut Vec<Puff>, effects: &mut Vec<Fx>, rng: 
 
 // ----------------------------------------------------------------- rendering
 
-fn faction_color(f: Faction, k: Kind) -> [f32; 4] {
-    let base = match f { Faction::Red => [0.85, 0.22, 0.18], Faction::Blue => [0.22, 0.40, 0.90] };
-    match k {
-        Kind::Dragon => [base[0] * 0.6 + 0.3, base[1] * 0.6 + 0.1, base[2] * 0.6, 1.0],
-        Kind::Knight => [base[0] * 0.8 + 0.15, base[1] * 0.8 + 0.15, base[2] * 0.8 + 0.15, 1.0],
-        Kind::Archer => [base[0] * 0.7, base[1] * 0.7 + 0.2, base[2] * 0.7, 1.0],
-        Kind::Catapult => [base[0] * 0.5 + 0.2, base[1] * 0.5 + 0.12, base[2] * 0.4, 1.0],
-        Kind::Ballista => [base[0] * 0.55 + 0.18, base[1] * 0.5 + 0.18, base[2] * 0.45, 1.0],
-        Kind::Mage => [base[0] * 0.5 + 0.25, base[1] * 0.5 + 0.25, base[2] * 0.5 + 0.45, 1.0],
-        Kind::Healer => [0.85, 0.92, 0.80, 1.0], // pale, faction-neutral white-green
-        Kind::Soldier => [base[0], base[1], base[2], 1.0],
-    }
+/// A subtle per-faction tint multiplied over the model's own colours — keeps the
+/// model recognisable while leaning Red/Blue so the two armies read apart.
+fn faction_tint(f: Faction) -> [f32; 4] {
+    match f { Faction::Red => [1.0, 0.80, 0.78, 1.0], Faction::Blue => [0.80, 0.86, 1.0, 1.0] }
 }
 
 /// Build the terrain once as smooth triangle `Mesh` **chunks**. Each vertex sits
@@ -605,7 +623,6 @@ async fn main() {
     let mut smoke: Vec<Puff> = Vec::new();
     let mut effects: Vec<Fx> = Vec::new(); // transient combat visuals
     let mut smoke_index = Tree3::<Puff>::new(world, 8);
-    let mut smoke_instances: Vec<Instance> = Vec::new();
 
     // Camera orbit state — looking down on the battlefield centre.
     let mut yaw: f32 = 0.9;
@@ -619,10 +636,18 @@ async fn main() {
         InstancedRenderer::new(gl.quad_context)
     };
 
+    // Load + upload each kind's glTF model once (Quaternius CC0, Witch CC-BY).
+    let models: Vec<(Kind, ModelGpu)> = {
+        let gl = unsafe { get_internal_gl() };
+        Kind::ALL.iter().map(|&k| {
+            let m = load_glb(k.model_bytes());
+            (k, renderer.upload_model(gl.quad_context, &m.vertices, &m.indices))
+        }).collect()
+    };
+
     let terrain_chunks = build_terrain_chunks(); // static — built once, drawn each frame
     let mut now = 0.0f64; // simulation clock
     let mut paused = false;
-    let mut instances: Vec<Instance> = Vec::with_capacity(units.len());
 
     // Live thread-count control (native). The decide pass runs inside a rayon
     // pool sized by the slider; dragging the slider blocks camera-orbit.
@@ -700,38 +725,37 @@ async fn main() {
         let cam = Camera3D { position: eye, up: vec3(0.0, 1.0, 0.0), target: observer, ..Default::default() };
         set_camera(&cam);
         let mvp = cam.matrix();
-        let fwd = (observer - eye).normalize();
-        let cam_right = fwd.cross(vec3(0.0, 1.0, 0.0)).normalize();
-        let cam_up = cam_right.cross(fwd).normalize();
 
         for m in &terrain_chunks { draw_mesh(m); }
         draw_castles();
         draw_effects(&effects, now);
 
-        // Units as one instanced draw call.
-        instances.clear();
+        // Units → one instanced draw per kind, using its glTF model. Group the
+        // live units into per-kind buckets of model matrices (place · face · scale).
+        let mut buckets: [Vec<EffectInstance>; 8] = std::array::from_fn(|_| Vec::new());
         let (mut red, mut blue) = (0usize, 0usize);
         for u in units.iter() {
             if !u.alive() { continue; }
             match u.faction { Faction::Red => red += 1, Faction::Blue => blue += 1 }
-            instances.push(Instance::new(
-                vec3(u.p.x as f32, u.p.y as f32, u.p.z as f32),
-                u.kind.radius(),
-                faction_color(u.faction, u.kind),
-            ));
-        }
-        // Smoke as a second instanced batch — grey puffs that grow as they age.
-        smoke_instances.clear();
-        for s in &smoke {
-            let age = ((now - s.born) / SMOKE_LIFE).clamp(0.0, 1.0) as f32;
-            let r = SMOKE_R as f32 * (0.55 + 0.45 * age);
-            let g = 0.78 - 0.15 * age; // darkens slightly as it thins
-            smoke_instances.push(Instance::new(vec3(s.p.x as f32, s.p.y as f32, s.p.z as f32), r, [g, g, g + 0.02, 0.6]));
+            let h = u.kind.model_height();
+            let feet_y = (u.p.y - u.kind.radius() as f64) as f32; // drop sphere centre to ground
+            let m = Mat4::from_translation(vec3(u.p.x as f32, feet_y, u.p.z as f32))
+                * Mat4::from_rotation_y(u.face)
+                * Mat4::from_scale(Vec3::splat(h));
+            buckets[u.kind.index()].push(EffectInstance::new(m, faction_tint(u.faction)));
         }
         {
             let gl = unsafe { get_internal_gl() };
-            renderer.draw(gl.quad_context, Mode::Spheres, &instances, mvp, cam_right, cam_up);
-            renderer.draw(gl.quad_context, Mode::Spheres, &smoke_instances, mvp, cam_right, cam_up);
+            let light = vec3(-0.45, 0.84, -0.30).normalize();
+            for (k, gpu) in &models { renderer.draw_models(gl.quad_context, gpu, &buckets[k.index()], mvp, light); }
+        }
+        // Smoke: very translucent immediate spheres (macroquad blends alpha), so
+        // the fight stays visible inside the cloud. Fades as it thins.
+        for s in &smoke {
+            let age = ((now - s.born) / SMOKE_LIFE).clamp(0.0, 1.0) as f32;
+            let r = SMOKE_R as f32 * (0.55 + 0.45 * age);
+            let a = 0.16 * (1.0 - age) + 0.03;
+            draw_sphere(vec3(s.p.x as f32, s.p.y as f32, s.p.z as f32), r, None, Color::new(0.82, 0.82, 0.86, a));
         }
 
         // ----- HUD -----

@@ -9,5 +9,6 @@
 //! point renderer (raw miniquad) used by the `critters3d` demo.
 
 pub mod instanced3d;
+pub mod model;
 pub mod sim;
 pub mod time;

@@ -92,6 +92,16 @@ impl EffectInstance {
     }
 }
 
+/// GPU handle for one uploaded model mesh (vertex + index buffers). Build once
+/// per model type with [`InstancedRenderer::upload_model`]; draw many instances
+/// of it per frame with [`InstancedRenderer::draw_models`].
+#[derive(Clone, Copy)]
+pub struct ModelGpu {
+    vbuf: BufferId,
+    ibuf: BufferId,
+    nidx: i32,
+}
+
 pub struct InstancedRenderer {
     sphere_pipe: Pipeline,
     sphere_vbuf: BufferId,
@@ -114,6 +124,10 @@ pub struct InstancedRenderer {
     drop_wire_nidx: i32,
     effect_inst_buf: BufferId,
     effect_inst_cap: usize,
+    // Solid lit models (glTF): one pipeline, a shared per-instance buffer.
+    model_pipe: Pipeline,
+    model_inst_buf: BufferId,
+    model_inst_cap: usize,
 }
 
 impl InstancedRenderer {
@@ -232,6 +246,28 @@ impl InstancedRenderer {
             },
         );
 
+        // --- solid lit model pipeline (glTF meshes), instanced ---
+        let model_shader = ctx
+            .new_shader(ShaderSource::Glsl { vertex: MODEL_VS, fragment: SPHERE_FS }, sphere_meta())
+            .expect("model instanced shader compiles");
+        let model_pipe = ctx.new_pipeline(
+            &layouts,
+            &[
+                VertexAttribute::with_buffer("in_pos", VertexFormat::Float3, 0),
+                VertexAttribute::with_buffer("in_normal", VertexFormat::Float3, 0),
+                VertexAttribute::with_buffer("in_vcolor", VertexFormat::Float4, 0),
+                VertexAttribute::with_buffer("in_m0", VertexFormat::Float4, 1),
+                VertexAttribute::with_buffer("in_m1", VertexFormat::Float4, 1),
+                VertexAttribute::with_buffer("in_m2", VertexFormat::Float4, 1),
+                VertexAttribute::with_buffer("in_m3", VertexFormat::Float4, 1),
+                VertexAttribute::with_buffer("in_tint", VertexFormat::Float4, 1),
+            ],
+            model_shader,
+            params,
+        );
+        let model_inst_cap = 2048usize;
+        let model_inst_buf = ctx.new_buffer(BufferType::VertexBuffer, BufferUsage::Stream, BufferSource::empty::<EffectInstance>(model_inst_cap));
+
         Self {
             sphere_pipe,
             sphere_vbuf,
@@ -253,6 +289,9 @@ impl InstancedRenderer {
             drop_wire_nidx,
             effect_inst_buf,
             effect_inst_cap,
+            model_pipe,
+            model_inst_buf,
+            model_inst_cap,
         }
     }
 
@@ -347,6 +386,37 @@ impl InstancedRenderer {
         let u = EffectUniforms { mvp: mvp.to_cols_array() };
         ctx.apply_uniforms(UniformsSource::table(&u));
         ctx.draw(0, nidx, instances.len() as i32);
+    }
+
+    /// Upload one model mesh to the GPU once; returns a handle to instance it.
+    pub fn upload_model(&self, ctx: &mut dyn RenderingBackend, vertices: &[crate::model::ModelVertex], indices: &[u16]) -> ModelGpu {
+        let vbuf = ctx.new_buffer(BufferType::VertexBuffer, BufferUsage::Immutable, BufferSource::slice(vertices));
+        let ibuf = ctx.new_buffer(BufferType::IndexBuffer, BufferUsage::Immutable, BufferSource::slice(indices));
+        ModelGpu { vbuf, ibuf, nidx: indices.len() as i32 }
+    }
+
+    /// Draw every `instances` entry of one model in a single instanced call —
+    /// solid triangles, diffuse-lit from `light_dir`, each instance placed by its
+    /// model matrix and multiplied by its tint colour.
+    pub fn draw_models(&mut self, ctx: &mut dyn RenderingBackend, model: &ModelGpu, instances: &[EffectInstance], mvp: Mat4, light_dir: Vec3) {
+        if instances.is_empty() {
+            return;
+        }
+        if instances.len() > self.model_inst_cap {
+            ctx.delete_buffer(self.model_inst_buf);
+            self.model_inst_cap = (instances.len() * 2).next_power_of_two();
+            self.model_inst_buf = ctx.new_buffer(BufferType::VertexBuffer, BufferUsage::Stream, BufferSource::empty::<EffectInstance>(self.model_inst_cap));
+        }
+        ctx.buffer_update(self.model_inst_buf, BufferSource::slice(instances));
+        ctx.apply_pipeline(&self.model_pipe);
+        ctx.apply_bindings(&Bindings {
+            vertex_buffers: vec![model.vbuf, self.model_inst_buf],
+            index_buffer: model.ibuf,
+            images: vec![],
+        });
+        let u = SphereUniforms { mvp: mvp.to_cols_array(), light_dir: light_dir.to_array() };
+        ctx.apply_uniforms(UniformsSource::table(&u));
+        ctx.draw(0, model.nidx, instances.len() as i32);
     }
 }
 
@@ -570,5 +640,30 @@ precision mediump float;
 varying lowp vec4 v_color;
 void main() {
     gl_FragColor = v_color;
+}
+"#;
+
+// Solid model: per-instance model matrix (in_m0..in_m3) places it; the normal is
+// rotated into world space for a cheap diffuse term; per-vertex base colour ×
+// per-instance tint. Fragment is SPHERE_FS (passthrough of v_color).
+const MODEL_VS: &str = r#"#version 100
+attribute vec3 in_pos;
+attribute vec3 in_normal;
+attribute vec4 in_vcolor;
+attribute vec4 in_m0;
+attribute vec4 in_m1;
+attribute vec4 in_m2;
+attribute vec4 in_m3;
+attribute vec4 in_tint;
+uniform mat4 mvp;
+uniform vec3 light_dir;
+varying lowp vec4 v_color;
+void main() {
+    mat4 model = mat4(in_m0, in_m1, in_m2, in_m3);
+    gl_Position = mvp * model * vec4(in_pos, 1.0);
+    vec3 n = normalize((model * vec4(in_normal, 0.0)).xyz);
+    float diff = max(dot(n, normalize(light_dir)), 0.0);
+    float sh = 0.40 + 0.60 * diff;
+    v_color = vec4(in_vcolor.rgb * in_tint.rgb * sh, in_vcolor.a * in_tint.a);
 }
 "#;
