@@ -236,6 +236,7 @@ struct Unit {
     vel: (f64, f64, f64),
     attacks: Vec<(u32, f64)>, // (target unit id, damage) — many for AoE (dragon)
     emit: Option<Point3>, // strike point that should spawn a smoke puff this frame
+    fire: Option<Point3>, // catapult: target point to lob a projectile at this frame
     fx: Vec<Fx>, // visible effects this unit produced this frame
     face: f32, // heading (radians about Y) for orienting the model
     phase: f32, // per-unit animation phase offset (so they don't bob in sync)
@@ -285,18 +286,35 @@ const FX_CAP: usize = 4000; // hard cap on live effects
 /// `Point3` → macroquad `Vec3`.
 fn v3(p: Point3) -> Vec3 { vec3(p.x as f32, p.y as f32, p.z as f32) }
 
+// ------------------------------------------------------------- projectiles
+
+const PROJ_GRAVITY: f64 = 220.0; // ballistic arc gravity (world units / s²)
+const ARTY_STANDOFF: f64 = 95.0; // artillery keeps at least this far from the enemy
+
+#[derive(Clone, Copy, PartialEq)]
+enum ProjKind { Cannon, LavaRock }
+
+/// A ballistic projectile (cannonball / lava bomb) — arcs under gravity and on
+/// landing does a `Sphere3` AoE. Travel time makes the shot visible.
+struct Projectile { p: Point3, v: (f64, f64, f64), kind: ProjKind, faction: Faction, dmg: f64, r: f64 }
+
+/// Launch velocity for a ballistic arc from `a` to `t` over flight time `tf`.
+fn arc_velocity(a: Point3, t: Point3, tf: f64) -> (f64, f64, f64) {
+    ((t.x - a.x) / tf, (t.y - a.y) / tf + 0.5 * PROJ_GRAVITY * tf, (t.z - a.z) / tf)
+}
+
 // ----------------------------------------------------------------- spawning
 
 fn spawn_unit(rng: &mut Rng, faction: Faction) -> Unit {
     // Roster mix: mostly foot soldiers, then archers/knights, a few siege engines
     // and mages, a rare dragon.
     let roll = rng.unit();
-    let kind = if roll < 0.40 { Kind::Soldier }
-        else if roll < 0.58 { Kind::Archer }
-        else if roll < 0.70 { Kind::Knight }
-        else if roll < 0.80 { Kind::Mage }
-        else if roll < 0.88 { Kind::Healer }
-        else if roll < 0.93 { Kind::Ballista }
+    let kind = if roll < 0.44 { Kind::Soldier }
+        else if roll < 0.64 { Kind::Archer }
+        else if roll < 0.76 { Kind::Knight }
+        else if roll < 0.86 { Kind::Mage }
+        else if roll < 0.94 { Kind::Healer }
+        else if roll < 0.965 { Kind::Ballista } // siege engines are now rare
         else if roll < 0.985 { Kind::Catapult }
         else { Kind::Dragon };
     let mut u = Unit {
@@ -308,6 +326,7 @@ fn spawn_unit(rng: &mut Rng, faction: Faction) -> Unit {
         vel: (0.0, 0.0, 0.0),
         attacks: Vec::new(),
         emit: None,
+        fire: None,
         fx: Vec::new(),
         face: 0.0,
         phase: rng.range(0.0, std::f64::consts::TAU) as f32,
@@ -348,6 +367,7 @@ fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>, body
     u.vel = (0.0, 0.0, 0.0);
     u.attacks.clear();
     u.emit = None;
+    u.fire = None;
     u.fx.clear();
     if !u.alive() { return; }
 
@@ -400,7 +420,11 @@ fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>, body
     // The dragon engages by HORIZONTAL distance (`slen`) — it flies far above the
     // ground, so a 3D check would never let it reach ground troops.
     let engage = if u.kind == Kind::Dragon { slen } else { tdist };
-    let approach = if engage < u.kind.reach() * 0.8 { 0.0 } else { speed };
+    // Artillery kites to keep a standoff (bombard from range, not melee); everyone
+    // else closes until in reach.
+    let approach = if matches!(u.kind, Kind::Catapult | Kind::Ballista) {
+        if engage < ARTY_STANDOFF { -speed } else if engage > u.kind.reach() * 0.9 { speed } else { 0.0 }
+    } else if engage < u.kind.reach() * 0.8 { 0.0 } else { speed };
     let (mut vx, mut vz) = (seek.0 / slen * approach, seek.1 / slen * approach);
     // Separation always on, for every kind (dragons included — they were piling
     // up): the personal space now comes from each model's real footprint.
@@ -431,16 +455,10 @@ fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>, body
             u.fx.push(Fx::new(FxKind::Ring, v3(c), v3(c)));
             u.fx.push(Fx::new(FxKind::Bolt, v3(u.p), v3(c))); // breath stream from the dragon
         }
-        // Catapult: a lobbed boulder — a wide `Sphere3` AoE cull at the target
-        // spot (ground siege analogue of the dragon), kicking up smoke on impact.
-        Kind::Catapult => {
-            let blast = Sphere3::new(tx, ty, tz, 26.0);
-            for it in index.cull(&blast) {
-                if it.faction != u.faction { u.attacks.push((it.id, u.kind.dmg())); }
-            }
-            u.emit = Some(Point3::new(tx, ty, tz));
-            u.fx.push(Fx::new(FxKind::Ring, v3(Point3::new(tx, ty, tz)), v3(Point3::new(tx, ty, tz))));
-        }
+        // Catapult: lob a real boulder — record the target so the apply pass
+        // launches an arcing projectile that does the AoE on impact (visible
+        // travel time, instead of an instant hidden blast).
+        Kind::Catapult => { u.fire = Some(Point3::new(tx, terrain_height(tx, tz), tz)); }
         // Ballista: a piercing bolt — an all-hits `raycast` that does NOT stop at
         // the first unit; every enemy on the line is skewered. (Contrast the
         // archer, who stops at the first hit.) Smoke blocks the line.
@@ -504,7 +522,7 @@ fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>, body
 /// collect this frame's visual effects (aging out the old ones). Reads every
 /// unit's `vel`/`attacks`/`emit`/`fx` (written by `decide`) and is the only place
 /// cross-unit writes happen.
-fn apply(units: &mut [Unit], smoke: &mut Vec<Puff>, effects: &mut Vec<Fx>, rng: &mut Rng, dt: f64, now: f64) {
+fn apply(units: &mut [Unit], smoke: &mut Vec<Puff>, effects: &mut Vec<Fx>, projectiles: &mut Vec<Projectile>, rng: &mut Rng, dt: f64, now: f64) {
     // 1) movement + cooldown tick (each unit, independent).
     for u in units.iter_mut() {
         if !u.alive() { continue; }
@@ -519,7 +537,7 @@ fn apply(units: &mut [Unit], smoke: &mut Vec<Puff>, effects: &mut Vec<Fx>, rng: 
         if u.vel.0 * u.vel.0 + u.vel.2 * u.vel.2 > 1.0 { u.face = (u.vel.0 as f32).atan2(u.vel.2 as f32); }
         // Reload after a shot (an AoE that caught nobody still fired) and kick off
         // the attack-lunge animation; otherwise let the lunge decay.
-        let fired = !u.attacks.is_empty() || u.emit.is_some();
+        let fired = !u.attacks.is_empty() || u.emit.is_some() || u.fire.is_some();
         if fired { u.cooldown = u.kind.cooldown(); }
         u.atk_anim = if fired { ATK_ANIM_LEN } else { (u.atk_anim - dt as f32).max(0.0) };
         // Lava burns: a ground unit standing on emissive terrain takes damage.
@@ -567,6 +585,38 @@ fn apply(units: &mut [Unit], smoke: &mut Vec<Puff>, effects: &mut Vec<Fx>, rng: 
         }
     }
     effects.retain(|f| now - f.born < Fx::life(f.kind));
+
+    // 6) projectiles — launch lobbed shots, fly them, resolve impacts.
+    for u in units.iter() {
+        if let Some(t) = u.fire {
+            let d = ((t.x - u.p.x).powi(2) + (t.z - u.p.z).powi(2)).sqrt();
+            let tf = (d / 120.0).clamp(0.8, 2.5); // flight time → arc height
+            projectiles.push(Projectile { p: u.p, v: arc_velocity(u.p, t, tf), kind: ProjKind::Cannon, faction: u.faction, dmg: Kind::Catapult.dmg() * 1.4, r: 30.0 });
+        }
+    }
+    let mut impacts: Vec<(Point3, Faction, f64, f64, ProjKind)> = Vec::new();
+    projectiles.retain_mut(|pr| {
+        pr.v.1 -= PROJ_GRAVITY * dt;
+        pr.p = Point3::new(pr.p.x + pr.v.0 * dt, pr.p.y + pr.v.1 * dt, pr.p.z + pr.v.2 * dt);
+        let ground = terrain_height(pr.p.x, pr.p.z);
+        let out = pr.p.x < 0.0 || pr.p.x > WORLD || pr.p.z < 0.0 || pr.p.z > WORLD;
+        if pr.p.y <= ground || out {
+            if !out { impacts.push((Point3::new(pr.p.x, ground, pr.p.z), pr.faction, pr.dmg, pr.r, pr.kind)); }
+            false
+        } else { true }
+    });
+    for (ip, fac, dmg, r, kind) in impacts {
+        for u in units.iter_mut() {
+            // Cannonballs hit the firer's enemies; lava bombs scorch everyone.
+            let hits = u.alive() && u.kind.altitude() == 0.0 && (kind == ProjKind::LavaRock || u.faction != fac);
+            if hits {
+                let d2 = (u.p.x - ip.x).powi(2) + (u.p.z - ip.z).powi(2);
+                if d2 < r * r { u.hp -= dmg; if u.hp <= 0.0 { u.respawn_at = now + 4.0; } }
+            }
+        }
+        if smoke.len() < SMOKE_CAP { smoke.push(Puff { p: Point3::new(ip.x, ip.y + 8.0, ip.z), born: now }); }
+        effects.push(Fx { kind: FxKind::Ring, a: v3(ip), b: v3(ip), born: now });
+    }
 }
 
 // ----------------------------------------------------------------- rendering
@@ -744,6 +794,7 @@ async fn main() {
     // Smoke lives in its own index so archer/ballista shots can raycast it.
     let mut smoke: Vec<Puff> = Vec::new();
     let mut effects: Vec<Fx> = Vec::new(); // transient combat visuals
+    let mut projectiles: Vec<Projectile> = Vec::new(); // arcing cannonballs / lava bombs
     let mut smoke_index = Tree3::<Puff>::new(world, 8);
 
     // Camera orbit state — looking down on the battlefield centre.
@@ -868,7 +919,7 @@ async fn main() {
             }
             #[cfg(target_arch = "wasm32")]
             for i in 0..units.len() { decide(&mut units[i], i as u32, &index, &smoke_index, &body_radius); }
-            apply(&mut units, &mut smoke, &mut effects, &mut rng, dt, now);
+            apply(&mut units, &mut smoke, &mut effects, &mut projectiles, &mut rng, dt, now);
 
             // Volcano: a constant smoke plume from the crater, plus an occasional
             // eruption — a lava spray (orange streaks) + a smoke burst + a ring.
@@ -896,6 +947,17 @@ async fn main() {
                     if smoke.len() < SMOKE_CAP {
                         smoke.push(Puff { p: Point3::new(vcx + rng.range(-22.0, 22.0), vcy + rng.range(0.0, 16.0), vcz + rng.range(-22.0, 22.0)), born: now });
                     }
+                }
+                // Spit real arcing lava bombs that land out on the slopes + scorch
+                // whoever's there (uses the projectile system).
+                let crater = Point3::new(vcx, vcy, vcz);
+                for _ in 0..6 {
+                    let ang = rng.range(0.0, std::f64::consts::TAU);
+                    let dist = rng.range(80.0, 230.0);
+                    let land = Point3::new((vcx + ang.cos() * dist).clamp(4.0, WORLD - 4.0), 0.0, (vcz + ang.sin() * dist).clamp(4.0, WORLD - 4.0));
+                    let land = Point3::new(land.x, terrain_height(land.x, land.z), land.z);
+                    let tf = rng.range(1.6, 2.6);
+                    projectiles.push(Projectile { p: crater, v: arc_velocity(crater, land, tf), kind: ProjKind::LavaRock, faction: Faction::Red, dmg: 60.0, r: 26.0 });
                 }
             }
         }
@@ -966,6 +1028,14 @@ async fn main() {
             for (fr, gpu) in horse.iter().enumerate() {
                 renderer.draw_models(gl.quad_context, gpu, &horses[fr], mvp, light); // cavalry mounts
             }
+        }
+        // Projectiles: small spheres arcing through the air (cannonballs / lava).
+        for pr in &projectiles {
+            let (col, rad) = match pr.kind {
+                ProjKind::Cannon => (Color::new(0.16, 0.15, 0.17, 1.0), 3.6),
+                ProjKind::LavaRock => (Color::new(1.0, 0.45, 0.10, 1.0), 4.2),
+            };
+            draw_sphere(v3(pr.p), rad, None, col);
         }
         // Smoke: each cloud is a few translucent billows that rise, spread and
         // fade as they age — so it reads as smoke yet you still see the fight
