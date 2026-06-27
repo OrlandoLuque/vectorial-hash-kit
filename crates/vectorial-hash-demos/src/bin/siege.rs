@@ -29,7 +29,7 @@ use macroquad::prelude::*;
 use rayon::prelude::*;
 use vectorial_hash::{Aabb, Point3, Positioned3, Sphere3, Tree3};
 use vectorial_hash_demos::instanced3d::{EffectInstance, InstancedRenderer, ModelGpu};
-use vectorial_hash_demos::model::load_glb_animated;
+use vectorial_hash_demos::model::load_glb_clip;
 
 // ---------------------------------------------------------------- world config
 
@@ -41,10 +41,25 @@ fn map_seed() -> f64 { *MAP_SEED.get_or_init(|| 0.0) }
 const WORLD: f64 = 800.0; // battlefield is WORLD × WORLD in the ground plane
 const SKY: f64 = 260.0; // index height — heights reach ~150, the dragon flies
 const PER_FACTION: usize = 500; // units each side spawns with (tunable live)
-const ATK_ANIM_LEN: f32 = 0.28; // attack-lunge animation duration (seconds)
+const ATK_ANIM_LEN: f32 = 0.45; // attack-clip / lunge play window (seconds)
 const LAVA_DPS: f64 = 45.0; // damage per second to a ground unit standing in lava
-const ANIM_FRAMES: usize = 12; // baked skeletal-animation frames per model (smoothness)
+const ANIM_FRAMES: usize = 12; // baked movement-clip frames per model (smoothness)
+const ATTACK_FRAMES: usize = 6; // baked attack-clip frames (one-shot, fewer = fewer draws)
 const ANIM_GROUPS: usize = 5; // units share a frame within a phase group (caps draw calls)
+// Clip name preferences (priority-ordered substrings) — movement, attack, idle.
+const MOVE_PREFS: &[&str] = &["walk", "run", "flying", "fly", "move"];
+const ATTACK_PREFS: &[&str] = &["attack", "sword", "slash", "cast", "shoot", "punch", "bite", "kick"];
+const IDLE_PREFS: &[&str] = &["idle"];
+
+/// Per-(faction,kind) baked clips: movement (or idle for riders) + attack.
+struct UnitAnim { mov: Vec<ModelGpu>, atk: Vec<ModelGpu> }
+
+/// Which frame of the one-shot attack clip to show (plays once over the attack).
+fn attack_frame(atk_anim: f32, nf: usize) -> usize {
+    if nf <= 1 { return 0; }
+    let prog = (1.0 - atk_anim / ATK_ANIM_LEN).clamp(0.0, 0.999);
+    (prog * nf as f32) as usize
+}
 
 // ------------------------------------------------------------------------- rng
 
@@ -745,18 +760,25 @@ async fn main() {
     // × render height, so the space a unit occupies (separation) matches what's
     // drawn. Indexed [faction][kind].
     let mut body_radius = [[4.0f64; 8]; 2];
-    let mut frames_per = [[1usize; 8]; 2]; // baked-frame count per (faction, kind)
-    let models: Vec<((Faction, Kind), Vec<ModelGpu>)> = {
+    let mut frames_mov = [[1usize; 8]; 2]; // movement-clip frame count per (f, k)
+    let mut frames_atk = [[1usize; 8]; 2]; // attack-clip frame count per (f, k)
+    let models: Vec<((Faction, Kind), UnitAnim)> = {
         let gl = unsafe { get_internal_gl() };
         let mut v = Vec::with_capacity(16);
         for &f in &[Faction::Red, Faction::Blue] {
             for &k in &Kind::ALL {
-                let cpu = load_glb_animated(model_for(f, k), ANIM_FRAMES); // baked skeletal frames
+                // Riders sit on the horse → their "movement" clip is the idle (no
+                // running legs); everyone else walks/runs/flies.
+                let mov_prefs = if k == Kind::Knight { IDLE_PREFS } else { MOVE_PREFS };
+                let mov_cpu = load_glb_clip(model_for(f, k), ANIM_FRAMES, mov_prefs);
+                let atk_cpu = load_glb_clip(model_for(f, k), ATTACK_FRAMES, ATTACK_PREFS);
                 let (_, sc) = k.model_tweak(f);
-                body_radius[f.index()][k.index()] = (cpu[0].footprint * k.model_height() * sc) as f64;
-                frames_per[f.index()][k.index()] = cpu.len();
-                let gpus = cpu.iter().map(|m| renderer.upload_model(gl.quad_context, &m.vertices, &m.indices)).collect();
-                v.push(((f, k), gpus));
+                body_radius[f.index()][k.index()] = (mov_cpu[0].footprint * k.model_height() * sc) as f64;
+                frames_mov[f.index()][k.index()] = mov_cpu.len();
+                frames_atk[f.index()][k.index()] = atk_cpu.len();
+                let mov = mov_cpu.iter().map(|m| renderer.upload_model(gl.quad_context, &m.vertices, &m.indices)).collect();
+                let atk = atk_cpu.iter().map(|m| renderer.upload_model(gl.quad_context, &m.vertices, &m.indices)).collect();
+                v.push(((f, k), UnitAnim { mov, atk }));
             }
         }
         v
@@ -765,7 +787,7 @@ async fn main() {
     // which is bigger than the rider — so the knight's footprint is the horse's.
     let horse: Vec<ModelGpu> = {
         let gl = unsafe { get_internal_gl() };
-        let cpu = load_glb_animated(include_bytes!("../../assets/siege/models/horse.glb"), ANIM_FRAMES);
+        let cpu = load_glb_clip(include_bytes!("../../assets/siege/models/horse.glb"), ANIM_FRAMES, MOVE_PREFS);
         let hr = (cpu[0].footprint * Kind::Knight.model_height()) as f64;
         body_radius[0][Kind::Knight.index()] = hr;
         body_radius[1][Kind::Knight.index()] = hr;
@@ -894,8 +916,13 @@ async fn main() {
         // are cavalry: a horse at the feet + the rider raised onto its back.
         // [faction][kind][frame] instance buckets — units split by which baked
         // animation frame they show this instant, so each frame instances together.
-        let mut buckets: [[Vec<Vec<EffectInstance>>; 8]; 2] =
-            std::array::from_fn(|fi| std::array::from_fn(|ki| vec![Vec::new(); frames_per[fi][ki]]));
+        // Separate movement and attack clips: a unit that's mid-attack shows the
+        // attack clip, else the movement (or idle, for riders) clip. Buckets are
+        // [faction][kind][frame] per clip.
+        let mut mov_b: [[Vec<Vec<EffectInstance>>; 8]; 2] =
+            std::array::from_fn(|fi| std::array::from_fn(|ki| vec![Vec::new(); frames_mov[fi][ki]]));
+        let mut atk_b: [[Vec<Vec<EffectInstance>>; 8]; 2] =
+            std::array::from_fn(|fi| std::array::from_fn(|ki| vec![Vec::new(); frames_atk[fi][ki]]));
         let mut horses: Vec<Vec<EffectInstance>> = vec![Vec::new(); horse.len()];
         let (mut red, mut blue) = (0usize, 0usize);
         for u in units.iter() {
@@ -908,29 +935,31 @@ async fn main() {
             let base = vec3(u.p.x as f32, feet_y, u.p.z as f32) + anim_offset(u, now, h);
             let tint = faction_tint(u.faction);
             let (fi, ki) = (u.faction.index(), u.kind.index());
-            let frame = anim_frame(u, now, frames_per[fi][ki]);
-            if u.kind == Kind::Knight {
+            let inst = if u.kind == Kind::Knight {
                 let hh = h; // horse height (= knight model height)
                 let horse_m = Mat4::from_translation(base) * Mat4::from_rotation_y(u.face) * Mat4::from_scale(Vec3::splat(hh));
                 horses[anim_frame(u, now, horse.len())].push(EffectInstance::new(horse_m, tint));
-                // Rider on the horse's back, a bit smaller.
                 let rider = Mat4::from_translation(base + vec3(0.0, hh * 0.5, 0.0)) * Mat4::from_rotation_y(yaw) * Mat4::from_scale(Vec3::splat(hh * 0.72));
-                buckets[fi][ki][frame].push(EffectInstance::new(rider, tint));
+                EffectInstance::new(rider, tint)
             } else {
                 let m = Mat4::from_translation(base) * Mat4::from_rotation_y(yaw) * Mat4::from_scale(Vec3::splat(h));
-                buckets[fi][ki][frame].push(EffectInstance::new(m, tint));
+                EffectInstance::new(m, tint)
+            };
+            if u.atk_anim > 0.0 {
+                atk_b[fi][ki][attack_frame(u.atk_anim, frames_atk[fi][ki])].push(inst);
+            } else {
+                mov_b[fi][ki][anim_frame(u, now, frames_mov[fi][ki])].push(inst);
             }
         }
         {
             let gl = unsafe { get_internal_gl() };
             let light = vec3(-0.45, 0.84, -0.30).normalize();
-            for ((f, k), gpus) in &models {
-                for (frame, gpu) in gpus.iter().enumerate() {
-                    renderer.draw_models(gl.quad_context, gpu, &buckets[f.index()][k.index()][frame], mvp, light);
-                }
+            for ((f, k), anim) in &models {
+                for (fr, gpu) in anim.mov.iter().enumerate() { renderer.draw_models(gl.quad_context, gpu, &mov_b[f.index()][k.index()][fr], mvp, light); }
+                for (fr, gpu) in anim.atk.iter().enumerate() { renderer.draw_models(gl.quad_context, gpu, &atk_b[f.index()][k.index()][fr], mvp, light); }
             }
-            for (frame, gpu) in horse.iter().enumerate() {
-                renderer.draw_models(gl.quad_context, gpu, &horses[frame], mvp, light); // cavalry mounts
+            for (fr, gpu) in horse.iter().enumerate() {
+                renderer.draw_models(gl.quad_context, gpu, &horses[fr], mvp, light); // cavalry mounts
             }
         }
         // Smoke: each cloud is a few translucent billows that rise, spread and

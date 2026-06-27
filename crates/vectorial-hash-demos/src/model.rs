@@ -138,14 +138,16 @@ fn normalise(verts: &mut [ModelVertex]) -> f32 {
 
 // ------------------------------------------------------- skeletal animation
 
-/// Load a `.glb` and **bake** a skeletal animation into `n_frames` static frames
-/// — CPU skinning done once here, never per frame. Picks a Walk/Run/Idle clip
-/// (else the first). If the model has no skin or no animation it returns a single
+/// Load a `.glb` and **bake** a skeletal animation clip into `n_frames` static
+/// frames — CPU skinning done once here, never per frame. `prefs` is a
+/// priority-ordered list of substrings to choose the clip by name (e.g.
+/// `["walk","run"]` for movement, `["attack","sword"]` for an attack). Falls back
+/// to the first clip; if the model has no skin / no animation, returns a single
 /// static frame. All frames share frame-0's normalisation so the model doesn't
-/// pulse in size; `indices` and `footprint` are identical across frames.
-pub fn load_glb_animated(bytes: &[u8], n_frames: usize) -> Vec<ModelCpu> {
+/// pulse; `indices` and `footprint` are identical across frames.
+pub fn load_glb_clip(bytes: &[u8], n_frames: usize, prefs: &[&str]) -> Vec<ModelCpu> {
     let (doc, buffers, images) = gltf::import_slice(bytes).expect("glb parse");
-    let anim = pick_animation(&doc);
+    let anim = pick_animation(&doc, prefs);
     if doc.skins().next().is_none() || anim.is_none() || n_frames < 2 {
         return vec![load_glb(bytes)]; // static fallback (props, or un-rigged)
     }
@@ -175,12 +177,13 @@ pub fn load_glb_animated(bytes: &[u8], n_frames: usize) -> Vec<ModelCpu> {
     }).collect()
 }
 
-/// Prefer a Walk/Run/Idle/Move clip, else the first animation.
-fn pick_animation(doc: &gltf::Document) -> Option<gltf::Animation<'_>> {
-    let rank = |n: &str| ["walk", "run", "idle", "move"].iter().position(|p| n.to_lowercase().contains(p)).unwrap_or(98);
+/// Choose the clip whose name best matches `prefs` (priority-ordered substrings,
+/// case-insensitive), else the first animation.
+fn pick_animation<'a>(doc: &'a gltf::Document, prefs: &[&str]) -> Option<gltf::Animation<'a>> {
+    let rank = |n: &str| { let l = n.to_lowercase(); prefs.iter().position(|p| l.contains(p)).unwrap_or(prefs.len()) };
     let mut best: Option<(usize, gltf::Animation)> = None;
     for a in doc.animations() {
-        let r = a.name().map(rank).unwrap_or(99);
+        let r = a.name().map(rank).unwrap_or(prefs.len() + 1);
         if best.as_ref().is_none_or(|(br, _)| r < *br) { best = Some((r, a)); }
     }
     best.map(|(_, a)| a)
@@ -342,7 +345,7 @@ mod tests {
     /// the frames actually differ (the skin is moving, not a frozen T-pose).
     #[test]
     fn bakes_animation() {
-        let frames = super::load_glb_animated(include_bytes!("../assets/siege/models/skeleton_a.glb"), 8);
+        let frames = super::load_glb_clip(include_bytes!("../assets/siege/models/skeleton_a.glb"), 8, &["walk"]);
         assert!(frames.len() > 1, "expected baked frames, got {}", frames.len());
         for f in &frames {
             assert!(!f.vertices.is_empty() && !f.indices.is_empty());
