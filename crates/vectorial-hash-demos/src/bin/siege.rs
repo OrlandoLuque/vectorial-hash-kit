@@ -146,7 +146,15 @@ impl Kind {
         }
     }
     /// Visual model height in world units (the model is normalised to height 1).
-    fn model_height(self) -> f32 { self.radius() * 2.6 }
+    /// Per-kind because some models read bigger than their collision sphere.
+    fn model_height(self) -> f32 {
+        match self {
+            Kind::Catapult | Kind::Ballista => self.radius() * 1.7, // chunky cannon model
+            Kind::Knight => self.radius() * 2.3, // horse + rider; keep it trim
+            Kind::Dragon => self.radius() * 2.2,
+            _ => self.radius() * 2.6,
+        }
+    }
 }
 
 struct Unit {
@@ -265,7 +273,7 @@ fn spawn_army(rng: &mut Rng) -> Vec<Unit> {
 /// Three library queries, one per concern: **k-NN** finds the nearest enemy
 /// (targeting) *and* the nearby friends (boids); the dragon's AoE is a sphere
 /// **`cull`**; the archer's line-of-fire is a thick **`raycast`**.
-fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>) {
+fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>, body_radius: &[f64; 8]) {
     u.vel = (0.0, 0.0, 0.0);
     u.attacks.clear();
     u.emit = None;
@@ -279,7 +287,7 @@ fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>) {
     let mut heal: Option<(Point3, u32, f32, f64)> = None; // most-wounded friend (pos, id, health, dist)
     let (mut sep_x, mut sep_z) = (0.0, 0.0); // separation push (from ANY neighbour)
     let (mut coh_x, mut coh_z, mut friends) = (0.0, 0.0, 0u32); // cohesion centroid
-    let sep_dist = u.kind.radius() as f64 * 2.2; // personal space ≈ body diameter
+    let sep_dist = body_radius[u.kind.index()] * 2.0; // two bodies of this size shan't overlap
     for (d, it) in index.knn(u.p, 16) {
         if it.id == id { continue; }
         // Separation from ANY neighbour (friend or foe) inside personal space,
@@ -298,19 +306,17 @@ fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>) {
         }
     }
 
-    // The healer seeks its most-wounded comrade (or, with none, drifts with the
-    // band); everyone else seeks the nearest enemy (or marches on the keep).
-    let (tx, ty, tz, tdist) = if u.kind == Kind::Healer {
-        match heal {
-            Some((p, _, _, d)) => (p.x, p.y, p.z, d),
-            None if friends > 0 => (coh_x / friends as f64, u.p.y, coh_z / friends as f64, f64::INFINITY),
-            None => { let (cx, cz) = u.faction.other().castle(); (cx, u.p.y, cz, f64::INFINITY) }
-        }
-    } else {
-        match target {
-            Some((tp, _, d)) => (tp.x, tp.y, tp.z, d),
-            None => { let (cx, cz) = u.faction.other().castle(); (cx, u.p.y, cz, f64::INFINITY) }
-        }
+    // The healer peels off to its most-wounded comrade; with nobody hurt it
+    // advances WITH the army (toward the nearest enemy / the enemy keep) rather
+    // than drifting to the friend centroid — which made healers clump and jitter
+    // instead of moving. Everyone else just seeks the nearest enemy.
+    let advance = match target {
+        Some((tp, _, d)) => (tp.x, tp.y, tp.z, d),
+        None => { let (cx, cz) = u.faction.other().castle(); (cx, u.p.y, cz, f64::INFINITY) }
+    };
+    let (tx, ty, tz, tdist) = match (u.kind, heal) {
+        (Kind::Healer, Some((p, _, _, d))) => (p.x, p.y, p.z, d),
+        _ => advance,
     };
 
     // Velocity = seek (scaled by approach — zero once in reach) + separation
@@ -322,10 +328,10 @@ fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>) {
     let speed = u.kind.speed();
     let approach = if tdist < u.kind.reach() * 0.8 { 0.0 } else { speed };
     let (mut vx, mut vz) = (seek.0 / slen * approach, seek.1 / slen * approach);
-    if u.kind != Kind::Dragon {
-        vx += sep_x * speed * 0.7; // separation, always on → no overlapping bodies
-        vz += sep_z * speed * 0.7;
-    }
+    // Separation always on, for every kind (dragons included — they were piling
+    // up): the personal space now comes from each model's real footprint.
+    vx += sep_x * speed * 0.7;
+    vz += sep_z * speed * 0.7;
     if matches!(u.kind, Kind::Soldier | Kind::Knight) && friends > 0 {
         let (cx, cz) = (coh_x / friends as f64 - u.p.x, coh_z / friends as f64 - u.p.z);
         let cl = (cx * cx + cz * cz).sqrt().max(1e-6);
@@ -484,10 +490,11 @@ fn apply(units: &mut [Unit], smoke: &mut Vec<Puff>, effects: &mut Vec<Fx>, rng: 
 
 // ----------------------------------------------------------------- rendering
 
-/// A subtle per-faction tint multiplied over the model's own colours — keeps the
-/// model recognisable while leaning Red/Blue so the two armies read apart.
+/// Per-faction team colour + blend amount (alpha). The shader `mix()`es the
+/// model's own colours toward this, so even dark models (knights, dragons) read
+/// clearly as Red or Blue.
 fn faction_tint(f: Faction) -> [f32; 4] {
-    match f { Faction::Red => [1.0, 0.80, 0.78, 1.0], Faction::Blue => [0.80, 0.86, 1.0, 1.0] }
+    match f { Faction::Red => [0.88, 0.16, 0.12, 0.34], Faction::Blue => [0.14, 0.34, 0.95, 0.34] }
 }
 
 /// Build the terrain once as smooth triangle `Mesh` **chunks**. Each vertex sits
@@ -637,17 +644,24 @@ async fn main() {
     };
 
     // Load + upload each kind's glTF model once (Quaternius CC0, Witch CC-BY).
+    // While loading, derive each kind's world-space body radius from the model's
+    // own XZ footprint × its render height — so the space a unit occupies (for
+    // separation) matches what's actually drawn, instead of a guessed sphere.
+    let mut body_radius = [4.0f64; 8];
     let models: Vec<(Kind, ModelGpu)> = {
         let gl = unsafe { get_internal_gl() };
         Kind::ALL.iter().map(|&k| {
             let m = load_glb(k.model_bytes());
+            body_radius[k.index()] = (m.footprint * k.model_height()) as f64;
             (k, renderer.upload_model(gl.quad_context, &m.vertices, &m.indices))
         }).collect()
     };
-    // The knight is cavalry: the rider model is raised onto this horse.
+    // The knight is cavalry: the rider model is raised onto this horse. The horse
+    // is bigger than the rider, so the knight's footprint is the horse's.
     let horse = {
         let gl = unsafe { get_internal_gl() };
         let m = load_glb(include_bytes!("../../assets/siege/models/horse.glb"));
+        body_radius[Kind::Knight.index()] = (m.footprint * Kind::Knight.model_height()) as f64;
         renderer.upload_model(gl.quad_context, &m.vertices, &m.indices)
     };
 
@@ -713,11 +727,11 @@ async fn main() {
                     pool = rayon::ThreadPoolBuilder::new().num_threads(n_threads).build().unwrap();
                     cur_threads = n_threads;
                 }
-                let (idx, smk) = (&index, &smoke_index);
-                pool.install(|| units.par_iter_mut().enumerate().for_each(|(i, u)| decide(u, i as u32, idx, smk)));
+                let (idx, smk, br) = (&index, &smoke_index, &body_radius);
+                pool.install(|| units.par_iter_mut().enumerate().for_each(|(i, u)| decide(u, i as u32, idx, smk, br)));
             }
             #[cfg(target_arch = "wasm32")]
-            for i in 0..units.len() { decide(&mut units[i], i as u32, &index, &smoke_index); }
+            for i in 0..units.len() { decide(&mut units[i], i as u32, &index, &smoke_index, &body_radius); }
             apply(&mut units, &mut smoke, &mut effects, &mut rng, dt, now);
         }
 
@@ -753,7 +767,7 @@ async fn main() {
                 let horse_m = Mat4::from_translation(base) * Mat4::from_rotation_y(u.face) * Mat4::from_scale(Vec3::splat(hh));
                 horses.push(EffectInstance::new(horse_m, tint));
                 // Rider on the horse's back, a bit smaller.
-                let rider = Mat4::from_translation(base + vec3(0.0, hh * 0.5, 0.0)) * Mat4::from_rotation_y(u.face) * Mat4::from_scale(Vec3::splat(hh * 0.8));
+                let rider = Mat4::from_translation(base + vec3(0.0, hh * 0.5, 0.0)) * Mat4::from_rotation_y(u.face) * Mat4::from_scale(Vec3::splat(hh * 0.72));
                 buckets[Kind::Knight.index()].push(EffectInstance::new(rider, tint));
             } else {
                 let h = u.kind.model_height();

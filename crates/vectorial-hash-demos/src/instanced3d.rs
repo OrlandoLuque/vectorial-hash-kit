@@ -664,6 +664,9 @@ void main() {
     vec3 n = normalize((model * vec4(in_normal, 0.0)).xyz);
     float diff = max(dot(n, normalize(light_dir)), 0.0);
     float sh = 0.40 + 0.60 * diff;
-    v_color = vec4(in_vcolor.rgb * in_tint.rgb * sh, in_vcolor.a * in_tint.a);
+    // in_tint.rgb is the faction colour, in_tint.a the blend amount — mix (not
+    // multiply) so even very dark models pick up a visible team tint.
+    vec3 c = mix(in_vcolor.rgb, in_tint.rgb, in_tint.a);
+    v_color = vec4(c * sh, in_vcolor.a);
 }
 "#;

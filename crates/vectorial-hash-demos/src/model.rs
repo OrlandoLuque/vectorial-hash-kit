@@ -29,6 +29,10 @@ pub struct ModelVertex {
 pub struct ModelCpu {
     pub vertices: Vec<ModelVertex>,
     pub indices: Vec<u16>,
+    /// XZ footprint half-extent in normalised units (height = 1) — `0.5 ×
+    /// max(width, depth)`. Multiply by the model's world height to get the
+    /// world-space body radius (what the model actually occupies on the ground).
+    pub footprint: f32,
 }
 
 /// Parse a `.glb` byte slice into a normalised [`ModelCpu`]. Panics on a parse
@@ -44,8 +48,8 @@ pub fn load_glb(bytes: &[u8]) -> ModelCpu {
             visit(&node, Mat4::IDENTITY, &buffers, &images, &mut verts, &mut indices);
         }
     }
-    normalise(&mut verts);
-    ModelCpu { vertices: verts, indices }
+    let footprint = normalise(&mut verts);
+    ModelCpu { vertices: verts, indices, footprint }
 }
 
 fn visit(
@@ -72,8 +76,8 @@ fn visit(
             let tex = pbr.base_color_texture().and_then(|info| images.get(info.texture().source().index()));
 
             let base = verts.len() as u16;
-            for i in 0..positions.len() {
-                let p = world.transform_point3(Vec3::from_array(positions[i]));
+            for (i, pos) in positions.iter().enumerate() {
+                let p = world.transform_point3(Vec3::from_array(*pos));
                 let n = normals.get(i).map(|n| (normal_mat * Vec4::from((Vec3::from_array(*n), 0.0))).truncate().normalize_or_zero()).unwrap_or(Vec3::Y);
                 let col = match (tex, uvs.get(i)) {
                     (Some(img), Some(uv)) => mul4(sample(img, *uv), factor),
@@ -109,9 +113,10 @@ fn sample(img: &gltf::image::Data, uv: [f32; 2]) -> [f32; 4] {
 
 fn mul4(a: [f32; 4], b: [f32; 4]) -> [f32; 4] { [a[0] * b[0], a[1] * b[1], a[2] * b[2], a[3] * b[3]] }
 
-/// Centre on XZ, drop feet to `y = 0`, scale to unit height.
-fn normalise(verts: &mut [ModelVertex]) {
-    if verts.is_empty() { return; }
+/// Centre on XZ, drop feet to `y = 0`, scale to unit height. Returns the XZ
+/// footprint half-extent (`0.5 × max(width, depth)`) in the normalised space.
+fn normalise(verts: &mut [ModelVertex]) -> f32 {
+    if verts.is_empty() { return 0.5; }
     let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
     for v in verts.iter() {
         for k in 0..3 { lo[k] = lo[k].min(v.pos[k]); hi[k] = hi[k].max(v.pos[k]); }
@@ -125,6 +130,7 @@ fn normalise(verts: &mut [ModelVertex]) {
         v.pos[1] = (v.pos[1] - lo[1]) * s;
         v.pos[2] = (v.pos[2] - cz) * s;
     }
+    0.5 * ((hi[0] - lo[0]).max(hi[2] - lo[2])) * s
 }
 
 #[cfg(test)]
