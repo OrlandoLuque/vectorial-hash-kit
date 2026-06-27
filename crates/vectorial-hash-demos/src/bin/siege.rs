@@ -802,13 +802,22 @@ async fn main() {
             for (k, gpu) in &models { renderer.draw_models(gl.quad_context, gpu, &buckets[k.index()], mvp, light); }
             renderer.draw_models(gl.quad_context, &horse, &horses, mvp, light); // cavalry mounts
         }
-        // Smoke: very translucent immediate spheres (macroquad blends alpha), so
-        // the fight stays visible inside the cloud. Fades as it thins.
+        // Smoke: each cloud is a few translucent billows that rise, spread and
+        // fade as they age — so it reads as smoke yet you still see the fight
+        // through it. Deterministic offsets (from the spawn point) keep each puff
+        // stable frame to frame.
         for s in &smoke {
             let age = ((now - s.born) / SMOKE_LIFE).clamp(0.0, 1.0) as f32;
-            let r = SMOKE_R as f32 * (0.55 + 0.45 * age);
-            let a = 0.16 * (1.0 - age) + 0.03;
-            draw_sphere(vec3(s.p.x as f32, s.p.y as f32, s.p.z as f32), r, None, Color::new(0.82, 0.82, 0.86, a));
+            let base_r = SMOKE_R as f32 * (0.42 + 0.55 * age);
+            let centre = vec3(s.p.x as f32, s.p.y as f32 + age * 22.0, s.p.z as f32); // rises
+            let seed = (s.p.x * 0.13 + s.p.z * 0.71) as f32;
+            for k in 0..3 {
+                let a = seed + k as f32 * 2.39996; // ~golden-angle spread
+                let off = vec3(a.sin(), (a * 1.7).sin() * 0.35 + 0.25, a.cos()) * base_r * 0.55;
+                let rr = base_r * (0.5 + 0.22 * (a * 2.1).cos().abs());
+                let alpha = (0.12 * (1.0 - age) + 0.02) * if k == 0 { 1.2 } else { 0.85 };
+                draw_sphere(centre + off, rr, None, Color::new(0.80, 0.80, 0.85, alpha));
+            }
         }
 
         // ----- HUD -----
