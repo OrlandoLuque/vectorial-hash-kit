@@ -37,6 +37,7 @@ const WORLD: f64 = 800.0; // battlefield is WORLD × WORLD in the ground plane
 const SKY: f64 = 260.0; // index height — heights reach ~150, the dragon flies
 const PER_FACTION: usize = 500; // units each side spawns with (tunable live)
 const ATK_ANIM_LEN: f32 = 0.28; // attack-lunge animation duration (seconds)
+const LAVA_DPS: f64 = 45.0; // damage per second to a ground unit standing in lava
 
 // ------------------------------------------------------------------------- rng
 
@@ -126,8 +127,9 @@ impl Kind {
     fn dmg(self) -> f64 { match self { Kind::Soldier => 14.0, Kind::Archer => 18.0, Kind::Knight => 30.0, Kind::Dragon => 22.0, Kind::Catapult => 30.0, Kind::Mage => 16.0, Kind::Ballista => 26.0, Kind::Healer => 24.0 } }
     fn cooldown(self) -> f64 { match self { Kind::Soldier => 0.8, Kind::Archer => 1.1, Kind::Knight => 1.0, Kind::Dragon => 0.5, Kind::Catapult => 2.4, Kind::Mage => 1.3, Kind::Ballista => 1.7, Kind::Healer => 0.9 } }
     fn radius(self) -> f32 { match self { Kind::Soldier => 3.0, Kind::Archer => 3.0, Kind::Knight => 4.2, Kind::Dragon => 11.0, Kind::Catapult => 5.5, Kind::Mage => 3.4, Kind::Ballista => 5.0, Kind::Healer => 3.2 } }
-    /// Ground units sit on the terrain; the dragon flies at a fixed altitude.
-    fn altitude(self) -> f64 { match self { Kind::Dragon => 95.0, _ => 0.0 } }
+    /// Ground units sit on the terrain; the dragon flies at a fixed altitude
+    /// (low enough to menace the ground — it engages by horizontal distance).
+    fn altitude(self) -> f64 { match self { Kind::Dragon => 46.0, _ => 0.0 } }
 
     /// All eight kinds, in `index()` order — the render groups units by this.
     const ALL: [Kind; 8] = [Kind::Soldier, Kind::Archer, Kind::Knight, Kind::Dragon, Kind::Catapult, Kind::Mage, Kind::Ballista, Kind::Healer];
@@ -331,7 +333,10 @@ fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>, body
     let seek = (tx - u.p.x, tz - u.p.z);
     let slen = (seek.0 * seek.0 + seek.1 * seek.1).sqrt().max(1e-6);
     let speed = u.kind.speed();
-    let approach = if tdist < u.kind.reach() * 0.8 { 0.0 } else { speed };
+    // The dragon engages by HORIZONTAL distance (`slen`) — it flies far above the
+    // ground, so a 3D check would never let it reach ground troops.
+    let engage = if u.kind == Kind::Dragon { slen } else { tdist };
+    let approach = if engage < u.kind.reach() * 0.8 { 0.0 } else { speed };
     let (mut vx, mut vz) = (seek.0 / slen * approach, seek.1 / slen * approach);
     // Separation always on, for every kind (dragons included — they were piling
     // up): the personal space now comes from each model's real footprint.
@@ -345,11 +350,10 @@ fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>, body
     let vl = (vx * vx + vz * vz).sqrt();
     let cap = speed * 1.5;
     if vl > cap { let s = cap / vl; vx *= s; vz *= s; }
-    let dy = if u.kind == Kind::Dragon { (ty - u.p.y).clamp(-1.0, 1.0) } else { 0.0 };
-    u.vel = (vx, dy * approach, vz);
+    u.vel = (vx, 0.0, vz); // the dragon's altitude is pinned in the apply pass
 
     // Attacking: only when in reach and off cooldown.
-    if u.cooldown > 0.0 || tdist > u.kind.reach() { return; }
+    if u.cooldown > 0.0 || engage > u.kind.reach() { return; }
     match u.kind {
         // Dragon fire-breath: an area cull — every enemy in the blast takes a hit,
         // and the scorched ground belches a smoke cloud (a new LoS blocker).
@@ -454,6 +458,11 @@ fn apply(units: &mut [Unit], smoke: &mut Vec<Puff>, effects: &mut Vec<Fx>, rng: 
         let fired = !u.attacks.is_empty() || u.emit.is_some();
         if fired { u.cooldown = u.kind.cooldown(); }
         u.atk_anim = if fired { ATK_ANIM_LEN } else { (u.atk_anim - dt as f32).max(0.0) };
+        // Lava burns: a ground unit standing on emissive terrain takes damage.
+        if u.kind.altitude() == 0.0 && terrain_surface(nx, nz, terrain_height(nx, nz)).1 {
+            u.hp -= LAVA_DPS * dt;
+            if u.hp <= 0.0 { u.respawn_at = now + 4.0; }
+        }
     }
 
     // 2) damage resolution — gather first (immutable borrow), then apply.
