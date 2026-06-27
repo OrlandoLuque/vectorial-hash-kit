@@ -43,7 +43,8 @@ const SKY: f64 = 260.0; // index height — heights reach ~150, the dragon flies
 const PER_FACTION: usize = 500; // units each side spawns with (tunable live)
 const ATK_ANIM_LEN: f32 = 0.28; // attack-lunge animation duration (seconds)
 const LAVA_DPS: f64 = 45.0; // damage per second to a ground unit standing in lava
-const ANIM_FRAMES: usize = 8; // baked skeletal-animation frames per model
+const ANIM_FRAMES: usize = 12; // baked skeletal-animation frames per model (smoothness)
+const ANIM_GROUPS: usize = 5; // units share a frame within a phase group (caps draw calls)
 
 // ------------------------------------------------------------------------- rng
 
@@ -544,13 +545,16 @@ fn faction_tint(f: Faction) -> [f32; 4] {
     match f { Faction::Red => [0.90, 0.20, 0.14, 0.22], Faction::Blue => [0.30, 0.45, 1.0, 0.22] }
 }
 
-/// Which baked animation frame this unit shows now — the clip loops, faster
-/// while moving, de-synced per unit by its phase. Static models (`nf` ≤ 1) → 0.
+/// Which baked animation frame this unit shows now — the clip loops at a fixed
+/// rate, the units split into `ANIM_GROUPS` phase groups. Quantising the phase to
+/// groups means at most `ANIM_GROUPS` distinct frames are on screen per model at
+/// once, so the draw-call count is bounded regardless of the army size (while the
+/// clip stays smooth over time via the frame count). Static models (`nf`≤1) → 0.
 fn anim_frame(u: &Unit, now: f64, nf: usize) -> usize {
     if nf <= 1 { return 0; }
-    let speed = (u.vel.0 * u.vel.0 + u.vel.2 * u.vel.2).sqrt() as f32;
-    let rate = 1.4 + speed * 0.05; // loops per second
-    (((now as f32 * rate + u.phase * std::f32::consts::FRAC_1_PI * 0.5) * nf as f32) as usize) % nf
+    let group = ((u.phase * std::f32::consts::FRAC_1_PI * 0.5) * ANIM_GROUPS as f32) as usize % ANIM_GROUPS;
+    let off = group as f32 / ANIM_GROUPS as f32; // this group's phase in the loop
+    (((now as f32 * 1.6 + off) * nf as f32) as usize) % nf
 }
 
 /// Procedural "animation" offset for a unit's model this frame (cheap, scales to
@@ -560,7 +564,8 @@ fn anim_frame(u: &Unit, now: f64, nf: usize) -> usize {
 fn anim_offset(u: &Unit, now: f64, h: f32) -> Vec3 {
     let moving = u.vel.0 * u.vel.0 + u.vel.2 * u.vel.2 > 1.0;
     let t = now as f32 * 9.0 + u.phase;
-    let bob = if moving { t.sin().abs() * 0.09 * h } else { (now as f32 * 1.6 + u.phase).sin() * 0.02 * h };
+    // Small now that the skeleton itself animates — just a touch of extra life.
+    let bob = if moving { t.sin().abs() * 0.03 * h } else { (now as f32 * 1.6 + u.phase).sin() * 0.015 * h };
     let prog = if u.atk_anim > 0.0 { 1.0 - u.atk_anim / ATK_ANIM_LEN } else { 0.0 };
     let lunge = (prog * std::f32::consts::PI).sin() * h * 0.16;
     vec3(0.0, bob, 0.0) + vec3(u.face.sin(), 0.0, u.face.cos()) * lunge
@@ -919,7 +924,7 @@ async fn main() {
             let base_r = SMOKE_R as f32 * (0.42 + 0.55 * age);
             let centre = vec3(s.p.x as f32, s.p.y as f32 + age * 22.0, s.p.z as f32); // rises
             let seed = (s.p.x * 0.13 + s.p.z * 0.71) as f32;
-            for k in 0..3 {
+            for k in 0..2 {
                 let a = seed + k as f32 * 2.39996; // ~golden-angle spread
                 let off = vec3(a.sin(), (a * 1.7).sin() * 0.35 + 0.25, a.cos()) * base_r * 0.55;
                 let rr = base_r * (0.5 + 0.22 * (a * 2.1).cos().abs());
