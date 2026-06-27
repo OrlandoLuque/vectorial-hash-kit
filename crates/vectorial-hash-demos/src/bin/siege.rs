@@ -644,6 +644,12 @@ async fn main() {
             (k, renderer.upload_model(gl.quad_context, &m.vertices, &m.indices))
         }).collect()
     };
+    // The knight is cavalry: the rider model is raised onto this horse.
+    let horse = {
+        let gl = unsafe { get_internal_gl() };
+        let m = load_glb(include_bytes!("../../assets/siege/models/horse.glb"));
+        renderer.upload_model(gl.quad_context, &m.vertices, &m.indices)
+    };
 
     let terrain_chunks = build_terrain_chunks(); // static — built once, drawn each frame
     let mut now = 0.0f64; // simulation clock
@@ -732,22 +738,34 @@ async fn main() {
 
         // Units → one instanced draw per kind, using its glTF model. Group the
         // live units into per-kind buckets of model matrices (place · face · scale).
+        // Knights are cavalry: a horse at the feet + the rider raised onto its back.
         let mut buckets: [Vec<EffectInstance>; 8] = std::array::from_fn(|_| Vec::new());
+        let mut horses: Vec<EffectInstance> = Vec::new();
         let (mut red, mut blue) = (0usize, 0usize);
         for u in units.iter() {
             if !u.alive() { continue; }
             match u.faction { Faction::Red => red += 1, Faction::Blue => blue += 1 }
-            let h = u.kind.model_height();
             let feet_y = (u.p.y - u.kind.radius() as f64) as f32; // drop sphere centre to ground
-            let m = Mat4::from_translation(vec3(u.p.x as f32, feet_y, u.p.z as f32))
-                * Mat4::from_rotation_y(u.face)
-                * Mat4::from_scale(Vec3::splat(h));
-            buckets[u.kind.index()].push(EffectInstance::new(m, faction_tint(u.faction)));
+            let base = vec3(u.p.x as f32, feet_y, u.p.z as f32);
+            let tint = faction_tint(u.faction);
+            if u.kind == Kind::Knight {
+                let hh = u.kind.model_height(); // horse height
+                let horse_m = Mat4::from_translation(base) * Mat4::from_rotation_y(u.face) * Mat4::from_scale(Vec3::splat(hh));
+                horses.push(EffectInstance::new(horse_m, tint));
+                // Rider on the horse's back, a bit smaller.
+                let rider = Mat4::from_translation(base + vec3(0.0, hh * 0.5, 0.0)) * Mat4::from_rotation_y(u.face) * Mat4::from_scale(Vec3::splat(hh * 0.8));
+                buckets[Kind::Knight.index()].push(EffectInstance::new(rider, tint));
+            } else {
+                let h = u.kind.model_height();
+                let m = Mat4::from_translation(base) * Mat4::from_rotation_y(u.face) * Mat4::from_scale(Vec3::splat(h));
+                buckets[u.kind.index()].push(EffectInstance::new(m, tint));
+            }
         }
         {
             let gl = unsafe { get_internal_gl() };
             let light = vec3(-0.45, 0.84, -0.30).normalize();
             for (k, gpu) in &models { renderer.draw_models(gl.quad_context, gpu, &buckets[k.index()], mvp, light); }
+            renderer.draw_models(gl.quad_context, &horse, &horses, mvp, light); // cavalry mounts
         }
         // Smoke: very translucent immediate spheres (macroquad blends alpha), so
         // the fight stays visible inside the cloud. Fades as it thins.
