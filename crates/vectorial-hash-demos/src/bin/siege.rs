@@ -43,6 +43,7 @@ const SKY: f64 = 260.0; // index height — heights reach ~150, the dragon flies
 const PER_FACTION: usize = 500; // units each side spawns with (tunable live)
 const ATK_ANIM_LEN: f32 = 0.45; // attack-clip / lunge play window (seconds)
 const LAVA_DPS: f64 = 45.0; // damage per second to a ground unit standing in lava
+const WATER_LEVEL: f64 = 6.0; // terrain below this is water (units wade slowly)
 const ANIM_FRAMES: usize = 12; // baked movement-clip frames per model (smoothness)
 const ATTACK_FRAMES: usize = 6; // baked attack-clip frames (one-shot, fewer = fewer draws)
 const ANIM_GROUPS: usize = 5; // units share a frame within a phase group (caps draw calls)
@@ -91,13 +92,26 @@ fn vnoise(x: f64, z: f64) -> f64 {
     ab + (cd - ab) * sz
 }
 
+/// The river's centre-line x at a given z (it meanders along Z, seeded).
+fn river_center_x(z: f64) -> f64 {
+    let o = map_seed();
+    WORLD * 0.32 + (z * 0.011 + o).sin() * 95.0 + (z * 0.004 + o).cos() * 45.0
+}
+
+/// Z positions of the bridges across the river (away from the volcano band).
+const BRIDGE_Z: [f64; 4] = [120.0, 260.0, 540.0, 680.0];
+const BRIDGE_HALF_W: f64 = 48.0; // spans the river channel
+const BRIDGE_HALF_D: f64 = 12.0; // deck depth along Z
+
+/// Is (x,z) on a bridge deck? (so the unit crosses dry instead of wading.)
+fn on_bridge(x: f64, z: f64) -> bool {
+    BRIDGE_Z.iter().any(|&bz| (z - bz).abs() < BRIDGE_HALF_D && (x - river_center_x(bz)).abs() < BRIDGE_HALF_W)
+}
+
 /// How strongly a point sits in the river channel: 1 at the centre line, 0 past
 /// the banks, faded to 0 near the volcano so the river doesn't carve the cone.
-/// The river meanders (seeded), running roughly along Z, off to one side.
 fn river_factor(x: f64, z: f64) -> f64 {
-    let o = map_seed();
-    let rx = WORLD * 0.32 + (z * 0.011 + o).sin() * 95.0 + (z * 0.004 + o).cos() * 45.0; // meander
-    let d = (x - rx).abs();
+    let d = (x - river_center_x(z)).abs();
     let w = 44.0;
     if d >= w { return 0.0; }
     let t = 1.0 - d / w; // 0 at bank, 1 at centre
@@ -527,8 +541,10 @@ fn apply(units: &mut [Unit], smoke: &mut Vec<Puff>, effects: &mut Vec<Fx>, proje
     for u in units.iter_mut() {
         if !u.alive() { continue; }
         u.cooldown = (u.cooldown - dt).max(0.0);
-        let nx = (u.p.x + u.vel.0 * dt).clamp(2.0, WORLD - 2.0);
-        let nz = (u.p.z + u.vel.2 * dt).clamp(2.0, WORLD - 2.0);
+        // Wading: ground units slow right down in the river/water (a soft obstacle).
+        let wade = if u.kind.altitude() == 0.0 && terrain_height(u.p.x, u.p.z) < WATER_LEVEL && !on_bridge(u.p.x, u.p.z) { 0.4 } else { 1.0 };
+        let nx = (u.p.x + u.vel.0 * dt * wade).clamp(2.0, WORLD - 2.0);
+        let nz = (u.p.z + u.vel.2 * dt * wade).clamp(2.0, WORLD - 2.0);
         let ground = terrain_height(nx, nz) + u.kind.radius() as f64;
         let ny = if u.kind == Kind::Dragon { (terrain_height(nx, nz) + u.kind.altitude()).max(ground) } else { ground };
         u.p = Point3::new(nx, ny, nz);
@@ -716,6 +732,20 @@ fn draw_castles() {
         draw_cube(vec3(cx as f32, (h + 22.0) as f32, cz as f32), vec3(46.0, 44.0, 46.0), None, col);
         for (ox, oz) in [(-26.0, -26.0), (26.0, -26.0), (-26.0, 26.0), (26.0, 26.0)] {
             draw_cube(vec3((cx + ox) as f32, (h + 30.0) as f32, (cz + oz) as f32), vec3(14.0, 60.0, 14.0), None, col);
+        }
+    }
+}
+
+/// Wooden bridge decks across the river (a plank + two rails per crossing).
+fn draw_bridges() {
+    let deck = Color::new(0.36, 0.24, 0.13, 1.0);
+    let rail = Color::new(0.28, 0.18, 0.10, 1.0);
+    for &bz in &BRIDGE_Z {
+        let bx = river_center_x(bz);
+        let y = 9.0f32;
+        draw_cube(vec3(bx as f32, y, bz as f32), vec3((BRIDGE_HALF_W * 2.0) as f32, 2.5, (BRIDGE_HALF_D * 2.0) as f32), None, deck);
+        for s in [-1.0, 1.0] {
+            draw_cube(vec3(bx as f32, y + 3.0, (bz + s * BRIDGE_HALF_D) as f32), vec3((BRIDGE_HALF_W * 2.0) as f32, 4.0, 1.5), None, rail);
         }
     }
 }
@@ -975,6 +1005,7 @@ async fn main() {
 
         for m in &terrain_chunks { draw_mesh(m); }
         draw_castles();
+        draw_bridges();
         draw_effects(&effects, now);
 
         // Units → one instanced draw per (faction, kind), using its glTF model.
