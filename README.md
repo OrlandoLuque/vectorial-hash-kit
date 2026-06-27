@@ -52,8 +52,12 @@ cargo run -p vectorial-hash-demos --bin critters --release
 cargo run -p vectorial-hash-demos --bin critters_headless --release -- --mode both
 
 # siege: 3D battlefield where every troop type is a different index query —
-# parallel per-unit AI with a live thread-count slider (see docs/SIEGE.md)
+# pirates vs undead, animated glTF models, parallel per-unit AI (see docs/SIEGE.md)
 cargo run -p vectorial-hash-demos --bin siege --release
+
+# siege_wgpu: the same battle rendered with wgpu (modern GPU stack) — real GPU
+# skeletal skinning, to compare with the macroquad version
+cargo run -p vectorial-hash-demos --bin siege_wgpu --release
 ```
 
 Live demos (WebAssembly): <https://orlandoluque.github.io/vectorial-hash-kit/>

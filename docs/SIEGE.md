@@ -1,22 +1,27 @@
 # Siege — every battle mechanic is a spatial query
 
-`siege` is the flagship 3D demo: a procedurally-generated medieval battlefield
-where two castles sally their armies and clash in the middle, continuously
-(the fallen respawn from their keep). It exists to make one point concrete —
-**almost every decision a unit makes is one query against a single shared
-`Tree3`** — and to be the heavy parallel consumer that the per-unit AI fan-out
-([PARALLEL.md](PARALLEL.md) § "Per-unit AI") was built for.
+`siege` is the flagship 3D demo: a procedurally-generated battlefield (random
+each run) where two factions — **🏴‍☠️ pirates vs 🧟 undead** — sally their armies
+and clash, continuously (the fallen respawn from their keep). It exists to make
+one point concrete — **almost every decision a unit makes is one query against a
+single shared `Tree3`** — and to be the heavy parallel consumer that the per-unit
+AI fan-out ([PARALLEL.md](PARALLEL.md) § "Per-unit AI") was built for. The units
+are real **Quaternius (CC0) glTF models with baked skeletal animation** (see
+[Rendering](#look--world) below and `assets/siege/CREDITS.md`).
 
 ```bash
-cargo run -p vectorial-hash-demos --bin siege --release
+cargo run -p vectorial-hash-demos --bin siege --release        # macroquad
+cargo run -p vectorial-hash-demos --bin siege_wgpu --release   # wgpu (comparison)
 ```
 
 Live (single-threaded wasm build): <https://orlandoluque.github.io/vectorial-hash-kit/siege.html>
 
-- drag left mouse: orbit · scroll: zoom · `P`: pause · `[` / `]`: rebuild armies
-- **thread slider** (top-left, native only): set the rayon pool size *live* and
-  watch the fps response — the parallel scaling, on screen. wasm has no threads,
-  so the web build hides it and runs the AI serially.
+- drag left mouse: orbit · scroll: zoom · `P`: pause · `[` / `]`: ± population
+- **population slider** (top-left): army size per side — the spatial-index stress
+  lever (20…2000 each).
+- **thread slider** (native only): set the rayon pool size *live* and watch the
+  fps response — the parallel scaling, on screen. wasm has no threads, so the web
+  build hides it and runs the AI serially.
 
 ## The roster — eight troop types, eight queries
 
@@ -70,10 +75,49 @@ rebuild dominates ([THREE_D.md](THREE_D.md) § `ItemRef`).
   target blocks the shot. A second, churning index that exists only to be
   ray-tested — the dynamic-obstacle case.
 
-## Terrain
+## Terrain & world
 
-A two-octave value-noise heightfield with a central volcano cone (and a crater),
-coloured by elevation (water / sand / grass / rock / snow + lava). Two castles in
-opposite corners anchor the spawns. Rendered as a coarse grid of cubes today; a
-baked mesh, plus rivers/bridges/forests as real choke-points and LoS cover, are
-queued in [BACKLOG.md](BACKLOG.md).
+A two-octave value-noise heightfield (**different every run** — a seeded offset;
+`$SIEGE_SEED=N` reproduces one) with a central **volcano** cone + crater, rendered
+as a smooth lit triangle mesh (lambert shading baked into the vertex colours so
+the relief reads), coloured by elevation (water/sand/grass/rock/snow) with an
+**emissive lava** crater + flow. Living hazards:
+
+- **Lava** burns ground units that stand in it; the flying dragon is immune.
+- **Rivers** are carved into the height field (a seeded meander); ground units
+  **wade** at 0.4× speed in the water — a soft obstacle — unless on a **bridge**.
+- The **volcano** breathes a constant smoke plume and **erupts** every ~9–16 s:
+  a lava spray + smoke burst + real arcing **lava bombs** (the projectile system)
+  that land on the slopes and scorch whoever's there.
+
+## Look & world
+
+- **Models.** Each (faction, kind) is a real **Quaternius glTF model** (CC0; the
+  Witch is CC-BY — `assets/siege/CREDITS.md`): pirates = Anne / Sharky / Pirate
+  Captain / Henry / Witch; undead = Zombie / Skeletons / Slime / Bat; shared
+  Dragon + Cannon, told apart by a faction tint. The **knight is cavalry** (rider
+  on a horse).
+- **Skeletal animation, baked.** macroquad's WebGL1 can't do GPU skinning, so the
+  loader **bakes** each clip into N static frames (CPU skinning once at load) and
+  the render picks the frame per unit — walk while moving, the **attack** clip
+  while striking, idle for mounted riders. Units split into a few phase groups so
+  the draw-call count stays bounded regardless of army size.
+- **Projectiles.** Catapults lob a visible arcing cannonball (travel time → AoE
+  on impact); the volcano spits lava bombs through the same system.
+
+## The wgpu twin (`siege_wgpu`)
+
+A second binary renders the same kind of battle with **wgpu** (modern low-level
+GPU stack) instead of macroquad, to compare — and to reach the thing macroquad's
+WebGL1 stack can't: **real GPU skeletal skinning**. The rest mesh + a storage
+buffer of all the animation's per-frame bone matrices are uploaded once; the WGSL
+vertex shader skins `Σ wᵢ · bone[frame·J + jointᵢ] · pos` per instance, so
+thousands of units animate on the GPU with zero per-frame CPU skinning. Native
+only for now. Both binaries share the glTF loader (`model`) and the `Tree3` index.
+
+## Terrain — next
+
+A **voxel** terrain (alterable: cannon/volcano craters), greedy-meshed with baked
+vertex AO + height/slope colour ramps, is the next big step — design + technique
+notes in [MAP_DESIGN.md](MAP_DESIGN.md). Other queued polish (boids alignment,
+forests as LoS cover, path-to-bridge AI, balance) is in [BACKLOG.md](BACKLOG.md).
