@@ -33,6 +33,11 @@ use vectorial_hash_demos::model::load_glb;
 
 // ---------------------------------------------------------------- world config
 
+/// Per-run map seed — offsets the terrain noise so each run is a different map.
+/// Set once at startup (from the wall clock, or `$SIEGE_SEED`); 0 in tests.
+static MAP_SEED: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+fn map_seed() -> f64 { *MAP_SEED.get_or_init(|| 0.0) }
+
 const WORLD: f64 = 800.0; // battlefield is WORLD × WORLD in the ground plane
 const SKY: f64 = 260.0; // index height — heights reach ~150, the dragon flies
 const PER_FACTION: usize = 500; // units each side spawns with (tunable live)
@@ -73,7 +78,8 @@ fn vnoise(x: f64, z: f64) -> f64 {
 /// cone. Deterministic and cheap — called per terrain tile and per unit step.
 fn terrain_height(x: f64, z: f64) -> f64 {
     let s = 1.0 / 150.0;
-    let mut h = vnoise(x * s, z * s) * 45.0 + vnoise(x * s * 2.7, z * s * 2.7) * 16.0;
+    let o = map_seed(); // per-run noise offset → a different map each run
+    let mut h = vnoise(x * s + o, z * s + o * 0.7) * 45.0 + vnoise(x * s * 2.7 + o, z * s * 2.7 + o) * 16.0;
     // Volcano: a cone rising near the centre, with a crater dip at the very top.
     let (cx, cz) = (WORLD * 0.5, WORLD * 0.5);
     let d = ((x - cx) * (x - cx) + (z - cz) * (z - cz)).sqrt();
@@ -93,8 +99,10 @@ fn terrain_surface(x: f64, z: f64, h: f64) -> (Color, bool) {
     let (px, pz) = (x - cx, z - cz);
     let d = (px * px + pz * pz).sqrt();
     if d < 30.0 { return (Color::new(1.0, 0.46, 0.10, 1.0), true); } // crater pool
-    // Lava river: a narrow azimuth wedge flowing down one slope of the cone.
-    let mut dang = (pz.atan2(px) - (-2.1)).abs();
+    // Lava river: a narrow azimuth wedge flowing down one slope of the cone
+    // (a different flank each run).
+    let flow_dir = -2.1 + (map_seed() * 0.9).sin() * 1.8;
+    let mut dang = (pz.atan2(px) - flow_dir).abs();
     if dang > std::f64::consts::PI { dang = std::f64::consts::TAU - dang; }
     if d < 165.0 && dang < 0.15 { return (Color::new(0.96, 0.34, 0.07, 1.0), true); }
     if d < 150.0 && h > 70.0 { return (Color::new(0.30, 0.11, 0.08, 1.0), false); } // scorched rock
@@ -652,7 +660,12 @@ fn window_conf() -> Conf {
 
 #[macroquad::main(window_conf)]
 async fn main() {
-    let mut rng = Rng::new(0x5_1E6E);
+    // Per-run seed: $SIEGE_SEED (reproducible) or the wall clock (varies). Drives
+    // both the map (terrain noise offset) and the army composition.
+    let seed = std::env::var("SIEGE_SEED").ok().and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or_else(|| (macroquad::miniquad::date::now() * 1000.0) as u64);
+    let _ = MAP_SEED.set((seed % 100_000) as f64 * 0.01);
+    let mut rng = Rng::new(seed | 1);
     let mut units = spawn_army(&mut rng);
     let world = Aabb::new(0.0, 0.0, 0.0, WORLD, SKY, WORLD);
     let mut index = Tree3::<IUnit>::new(world, 8);
@@ -698,6 +711,8 @@ async fn main() {
     let terrain_chunks = build_terrain_chunks(); // static — built once, drawn each frame
     let mut now = 0.0f64; // simulation clock
     let mut paused = false;
+    let mut volcano_smoke_t = 0.0f64; // next crater-puff time
+    let mut volcano_erupt_t = 7.0f64; // next eruption time
 
     // Live thread-count control (native). The decide pass runs inside a rayon
     // pool sized by the slider; dragging the slider blocks camera-orbit.
@@ -763,6 +778,35 @@ async fn main() {
             #[cfg(target_arch = "wasm32")]
             for i in 0..units.len() { decide(&mut units[i], i as u32, &index, &smoke_index, &body_radius); }
             apply(&mut units, &mut smoke, &mut effects, &mut rng, dt, now);
+
+            // Volcano: a constant smoke plume from the crater, plus an occasional
+            // eruption — a lava spray (orange streaks) + a smoke burst + a ring.
+            let (vcx, vcz) = (WORLD * 0.5, WORLD * 0.5);
+            let vcy = terrain_height(vcx, vcz) + 6.0;
+            volcano_smoke_t -= dt;
+            if volcano_smoke_t <= 0.0 {
+                volcano_smoke_t = 0.35;
+                if smoke.len() < SMOKE_CAP {
+                    smoke.push(Puff { p: Point3::new(vcx + rng.range(-12.0, 12.0), vcy, vcz + rng.range(-12.0, 12.0)), born: now });
+                }
+            }
+            volcano_erupt_t -= dt;
+            if volcano_erupt_t <= 0.0 {
+                volcano_erupt_t = rng.range(9.0, 16.0);
+                let c = vec3(vcx as f32, vcy as f32, vcz as f32);
+                effects.push(Fx { kind: FxKind::Ring, a: c, b: c, born: now });
+                for _ in 0..16 {
+                    let ang = rng.range(0.0, std::f64::consts::TAU) as f32;
+                    let (up, out) = (rng.range(30.0, 65.0) as f32, rng.range(6.0, 48.0) as f32);
+                    let tip = c + vec3(ang.cos() * out, up, ang.sin() * out);
+                    effects.push(Fx { kind: FxKind::Bolt, a: c, b: tip, born: now }); // lava streak
+                }
+                for _ in 0..7 {
+                    if smoke.len() < SMOKE_CAP {
+                        smoke.push(Puff { p: Point3::new(vcx + rng.range(-22.0, 22.0), vcy + rng.range(0.0, 16.0), vcz + rng.range(-22.0, 22.0)), born: now });
+                    }
+                }
+            }
         }
 
         // ----- render 3D -----
