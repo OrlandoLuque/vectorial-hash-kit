@@ -89,23 +89,38 @@ built. New bin `vectorial-hash-demos/src/bin/siege.rs`.
   (2026-06-27): `docs/siege.html` + `docs/siege.wasm` (626 K) + index card; the
   wasm AI runs serial (no threads).
 
-**Siege visual pass (user feedback, 2026-06-27 — they ran it).** Terrain was
-flat-shaded per-tile cubes ("semicubes", no lighting → couldn't read the relief).
-**Done:** a smooth chunked heightfield `Mesh` with **lambert shading baked into
-the vertex colours** (macroquad `draw_mesh` is unlit), 6×6 chunks under the 5 000-
-index drawcall cap; glowing crater pool + a lava flow down one flank. **Still to
-layer (the rest of the feedback):**
-- **Visible attacks/effects** — combat is hitscan, so arrows/boulders/fire/
-  lightning/heal are invisible. Add transient effects (decide records the event
-  → render a brief streak/burst, like the smoke emit pattern): arrow/bolt streaks
-  (`draw_line_3d`), catapult/dragon AoE rings, mage lightning zigzags, heal spark.
-- **Distinct unit models** — all eight types render as spheres. Either procedural
-  low-poly meshes per type (instanced via `draw_effects`, CC0/no assets, wasm-
-  clean) or downloaded **CC0** models (Kenney / Quaternius / Poly Pizza). User's
-  aesthetic call — pending their answer.
-- Real **rivers/forests/bridges** (what looked like "residual rivers at the edge"
-  is just low water-coloured tiles; no rivers are generated yet), boids
-  *alignment*, balance, projectile travel time.
+**Siege — status (2026-06-28, after the rebuild night).** The 2026-06-27 visual
+feedback is all addressed and several more rounds landed. **Done:**
+- **Look.** Smooth lit heightfield → now a **voxel (blocky) terrain** by default
+  (flat-top cells + cliff walls + baked corner AO + the quad-flip fix;
+  `$SIEGE_SMOOTH=1` for the old mesh). Glowing crater + lava flow carried over.
+- **Visible combat.** Transient `Fx` effects (arrow/bolt streaks, AoE rings,
+  lightning, heal sparks) + a **projectile system** (arcing cannonballs with
+  travel time; volcano lava bombs) — combat reads now.
+- **Real models + animation.** Every (faction, kind) is a **Quaternius glTF
+  model** (pirates Red vs undead Blue), with **baked skeletal animation**
+  (walk / attack / idle-for-riders), cavalry, and a **Castle model** per keep.
+- **World.** Procedural **rivers** carved into the height (units wade at 0.4×),
+  **bridges** at the crossings, lava burns ground units, the volcano erupts.
+- **Controls.** A **population slider** (army size per side) beside the thread
+  slider. Random map each run.
+- **wgpu twin.** A second binary (`siege_wgpu`) renders the battle with wgpu and
+  **real GPU skeletal skinning** (the thing macroquad's WebGL1 can't) — see
+  SIEGE.md. Native only so far.
+
+**Siege — remaining (next session, needs the user's eyes):**
+- **Voxel *alteration*** — the heights are a grid, so make it live mutable state:
+  carve craters on cannon/volcano impacts (lower cells in a radius + remesh the
+  dirty chunks), and **snap unit feet to the block tops** (decide first whether
+  the stair-step pops look right vs. the current smooth-float). Couples together;
+  do after the user judges the voxel look (cell size, etc.).
+- **`siege_wgpu` parity + web.** Lift the shared sim into a lib module so the two
+  binaries can't drift; bring the 8 kinds + effects to the wgpu side; then
+  **publish `siege_wgpu` to the web** (wasm-bindgen + WebGPU/WebGL2 — toolchain
+  work, user asked for it twice).
+- **Slim `siege.wasm`** (~10 MB; fetch-load the glTF models via `load_file`
+  instead of `include_bytes!`).
+- Boids **alignment**, forests as LoS cover, path-to-bridge AI, balance.
 
 **Thread-slider retrofit for the critters demos** (user, 2026-06-27) — the same
 live `num_threads` slider in `critters` (2D) and `critters3d` (3D), but it only

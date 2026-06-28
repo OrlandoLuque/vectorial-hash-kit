@@ -5,6 +5,15 @@ battlefield that is both **designed well** (rivers as choke-points, bridges,
 biomes shaping the fight) and **gorgeous** on macroquad's WebGL1 / ES 1.00 stack
 (and reusable on the wgpu road). Voxel terrain (alterable) is the chosen base.
 
+> **Status (2026-06-28).** Moves 2–4 are **landed** in `siege.rs`
+> (`build_voxel_chunks`): blocky flat-top cells + cliff walls, **baked corner AO
+> with the quad-flip fix** (move 2), the **height colour ramp** (move 3), chunked
+> under the drawcall cap. Rivers + bridges are in (carved channel, wade speed,
+> bridge decks). **Still research-only:** true greedy meshing (move 1 — current
+> mesher is per-cell culled faces, not merged quads), runtime **alteration**
+> (crater carving — the cells are already a grid, so it's a remesh-dirty-chunks
+> step), and the slope ramp / translucent water plane. See BACKLOG "Siege".
+
 ## The 5 highest-leverage moves (priority order)
 
 1. **Blocky voxels (culled → greedy-meshed cubes), not smooth.** On WebGL1 with
