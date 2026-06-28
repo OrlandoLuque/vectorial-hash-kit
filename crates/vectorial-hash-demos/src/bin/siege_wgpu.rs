@@ -36,6 +36,8 @@ use vectorial_hash_demos::siege_sim::{
     Projectile, Puff, Rng, Unit, Volcano, ANIM_FRAMES, MOVE_PREFS, PER_FACTION, SKY, WORLD,
 };
 
+const MAX_POP: usize = 2000; // max army/side the [ ] keys allow (instance-buffer cap)
+
 // ============================================================ terrain
 
 #[repr(C)]
@@ -65,6 +67,69 @@ fn build_terrain() -> (Vec<TVertex>, Vec<u32>) {
         for ix in 0..RES as u32 {
             let a = iz * w + ix;
             idx.extend_from_slice(&[a, a + w, a + 1, a + 1, a + w, a + w + 1]);
+        }
+    }
+    (v, idx)
+}
+
+/// Voxel (blocky) terrain — the wgpu twin of the macroquad `build_voxel_chunks`:
+/// each ~10-unit cell is a flat-topped prism at its true height with vertical
+/// cliff walls to lower neighbours, per-corner baked AO (darker where taller
+/// neighbours crowd a corner) folded into the vertex colour. wgpu has no drawcall
+/// cap, so it's one mesh with u32 indices. Normals (up for tops, sideways for
+/// walls) feed the shader's lambert; emissive lava cells get alpha=0.
+fn build_voxel_terrain() -> (Vec<TVertex>, Vec<u32>) {
+    const VRES: usize = 80;
+    let step = WORLD / VRES as f64;
+    let heights: Vec<f64> = (0..VRES * VRES).map(|k| terrain_height(((k % VRES) as f64 + 0.5) * step, ((k / VRES) as f64 + 0.5) * step)).collect();
+    let hc = |i: i32, j: i32| -> f64 { if i < 0 || j < 0 || i >= VRES as i32 || j >= VRES as i32 { -1000.0 } else { heights[j as usize * VRES + i as usize] } };
+    let (mut v, mut idx): (Vec<TVertex>, Vec<u32>) = (Vec::new(), Vec::new());
+    for j in 0..VRES {
+        for i in 0..VRES {
+            let (ii, jj) = (i as i32, j as i32);
+            let h = hc(ii, jj);
+            let (x0, z0) = (i as f64 * step, j as f64 * step);
+            let (x1, z1) = (x0 + step, z0 + step);
+            let (base, emissive) = terrain_surface(x0 + step * 0.5, z0 + step * 0.5, h);
+            let a = if emissive { 0.0 } else { 1.0 };
+            // Per-corner AO from taller neighbours (matches the macroquad mesher).
+            let ao = |dx: i32, dz: i32| -> f32 {
+                if emissive { return 1.0; }
+                let up = h + step * 0.5;
+                let (s1, s2) = (hc(ii + dx, jj) > up, hc(ii, jj + dz) > up);
+                let sc = hc(ii + dx, jj + dz) > up;
+                1.0 - 0.16 * (s1 as i32 + s2 as i32 + (sc && (s1 || s2)) as i32) as f32
+            };
+            let corners = [(x0, z0, ao(-1, -1)), (x1, z0, ao(1, -1)), (x1, z1, ao(1, 1)), (x0, z1, ao(-1, 1))];
+            let bi = v.len() as u32;
+            for (vx, vz, k) in corners {
+                v.push(TVertex { pos: [vx as f32, h as f32, vz as f32], normal: [0.0, 1.0, 0.0], color: [base[0] * k, base[1] * k, base[2] * k, a] });
+            }
+            // Quad-flip so AO interpolates along the brighter diagonal.
+            if corners[0].2 + corners[2].2 >= corners[1].2 + corners[3].2 {
+                idx.extend_from_slice(&[bi, bi + 1, bi + 2, bi, bi + 2, bi + 3]);
+            } else {
+                idx.extend_from_slice(&[bi + 1, bi + 2, bi + 3, bi + 1, bi + 3, bi]);
+            }
+            // Cliff walls down to any lower neighbour.
+            for (dx, dz, e0, e1, nrm) in [
+                (-1i32, 0i32, (x0, z1), (x0, z0), [-1.0f32, 0.0, 0.0]),
+                (1, 0, (x1, z0), (x1, z1), [1.0, 0.0, 0.0]),
+                (0, -1, (x0, z0), (x1, z0), [0.0, 0.0, -1.0]),
+                (0, 1, (x1, z1), (x0, z1), [0.0, 0.0, 1.0]),
+            ] {
+                let hn = hc(ii + dx, jj + dz);
+                if hn < h - 0.01 {
+                    let bottom = hn.max(-25.0) as f32;
+                    let si = v.len() as u32;
+                    let col = [base[0] * 0.78, base[1] * 0.78, base[2] * 0.78, a];
+                    v.push(TVertex { pos: [e0.0 as f32, h as f32, e0.1 as f32], normal: nrm, color: col });
+                    v.push(TVertex { pos: [e1.0 as f32, h as f32, e1.1 as f32], normal: nrm, color: col });
+                    v.push(TVertex { pos: [e1.0 as f32, bottom, e1.1 as f32], normal: nrm, color: col });
+                    v.push(TVertex { pos: [e0.0 as f32, bottom, e0.1 as f32], normal: nrm, color: col });
+                    idx.extend_from_slice(&[si, si + 1, si + 2, si, si + 2, si + 3]);
+                }
+            }
         }
     }
     (v, idx)
@@ -154,6 +219,8 @@ struct State {
     red: usize,  // live Red units (for the window-title HUD)
     blue: usize, // live Blue units
     fps: f32,    // smoothed frames/second
+    smooth: bool, // terrain mode: false = voxel (default), true = smooth heightfield
+    pop: usize,  // army size per side (live, via the [ ] keys)
     rng: Rng,
     now: f64,
     last: Instant,
@@ -185,7 +252,9 @@ impl State {
         // GPU skinning: one shared bind-group layout + pipeline, then one model per
         // distinct (faction,kind) glb. The instance buffer is shared — units are
         // bucketed by model each frame.
-        let inst_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("skin-inst"), size: (PER_FACTION * 2 * std::mem::size_of::<SkinInstance>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        // Sized for the max army the [ ] keys allow (2000/side), so growing the
+        // population never needs a buffer resize.
+        let inst_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("skin-inst"), size: (MAX_POP * 2 * std::mem::size_of::<SkinInstance>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let skin_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("skin-l"),
             entries: &[
@@ -231,8 +300,10 @@ impl State {
             }
         }
 
-        // Terrain: a single colour+normal mesh, its own pipeline (no instancing).
-        let (tv, ti) = build_terrain();
+        // Terrain: voxel (blocky) by default; $SIEGE_SMOOTH=1 or the `V` key
+        // switches to the smooth heightfield. A single mesh + its own pipeline.
+        let smooth = std::env::var("SIEGE_SMOOTH").is_ok();
+        let (tv, ti) = if smooth { build_terrain() } else { build_voxel_terrain() };
         let terrain_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("ter-v"), contents: bytemuck::cast_slice(&tv), usage: wgpu::BufferUsages::VERTEX });
         let terrain_ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("ter-i"), contents: bytemuck::cast_slice(&ti), usage: wgpu::BufferUsages::INDEX });
         let terrain_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("ter-shader"), source: wgpu::ShaderSource::Wgsl(TERRAIN_SHADER.into()) });
@@ -280,7 +351,8 @@ impl State {
         let seed = std::env::var("SIEGE_SEED").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0x51E6E);
         set_map_seed((seed % 100_000) as f64 * 0.01);
         let mut rng = Rng::new(seed | 1);
-        let units = spawn_army(&mut rng, PER_FACTION);
+        let pop = PER_FACTION;
+        let units = spawn_army(&mut rng, pop);
         let index = Tree3::<IUnit>::new(Aabb::new(0.0, 0.0, 0.0, WORLD, SKY, WORLD), 8);
 
         State {
@@ -292,7 +364,7 @@ impl State {
             cam_buf, cam_bg, depth, units, index,
             smoke: Vec::new(), effects: Vec::new(), projectiles: Vec::new(),
             volcano: Volcano::new(), body_radius: default_body_radius(), paused: false,
-            red: 0, blue: 0, fps: 0.0,
+            red: 0, blue: 0, fps: 0.0, smooth, pop,
             rng, now: 0.0, last: Instant::now(),
             yaw: 0.9, pitch: 0.7, dist: 760.0, dragging: false, last_mouse: (0.0, 0.0),
             skin_instances: Vec::with_capacity(PER_FACTION * 2),
@@ -305,6 +377,20 @@ impl State {
             self.surface.configure(&self.device, &self.config);
             self.depth = make_depth(&self.device, &self.config);
         }
+    }
+
+    /// Rebuild the terrain mesh for the current `smooth` mode (V key).
+    fn rebuild_terrain(&mut self) {
+        let (tv, ti) = if self.smooth { build_terrain() } else { build_voxel_terrain() };
+        self.terrain_vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("ter-v"), contents: bytemuck::cast_slice(&tv), usage: wgpu::BufferUsages::VERTEX });
+        self.terrain_ibuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("ter-i"), contents: bytemuck::cast_slice(&ti), usage: wgpu::BufferUsages::INDEX });
+        self.terrain_nidx = ti.len() as u32;
+    }
+
+    /// Respawn both armies at a new per-side size (the [ ] keys).
+    fn set_population(&mut self, pop: usize) {
+        self.pop = pop.clamp(20, MAX_POP);
+        self.units = spawn_army(&mut self.rng, self.pop);
     }
 
     fn camera(&self) -> CameraUniform {
@@ -562,7 +648,13 @@ async fn run() {
                     WindowEvent::CloseRequested => elwt.exit(),
                     WindowEvent::Resized(s) => st.resize(s.width, s.height),
                     WindowEvent::MouseInput { button: MouseButton::Left, state, .. } => st.dragging = state == ElementState::Pressed,
-                    WindowEvent::KeyboardInput { event: KeyEvent { physical_key: PhysicalKey::Code(KeyCode::KeyP), state: ElementState::Pressed, .. }, .. } => st.paused = !st.paused,
+                    WindowEvent::KeyboardInput { event: KeyEvent { physical_key: PhysicalKey::Code(code), state: ElementState::Pressed, .. }, .. } => match code {
+                        KeyCode::KeyP => st.paused = !st.paused,
+                        KeyCode::KeyV => { st.smooth = !st.smooth; st.rebuild_terrain(); } // voxel ↔ smooth
+                        KeyCode::BracketRight => { let p = st.pop + 100; st.set_population(p); }
+                        KeyCode::BracketLeft => { let p = st.pop.saturating_sub(100); st.set_population(p); }
+                        _ => {}
+                    },
                     WindowEvent::CursorMoved { position, .. } => {
                         if st.dragging {
                             st.yaw += (position.x - st.last_mouse.0) as f32 * 0.01;
