@@ -186,6 +186,7 @@ pub struct SkinVertex {
     pub normal: [f32; 3],
     pub joints: [u32; 4],
     pub weights: [f32; 4],
+    pub color: [f32; 4], // material base colour (so GPU-skinned units aren't flat)
 }
 
 /// A model prepared for **GPU skinning**: the un-skinned mesh (rest pose + joint
@@ -204,7 +205,7 @@ pub struct SkinnedModel {
 /// Load a `.glb` for GPU skinning: rest mesh + per-frame joint matrices (chosen
 /// clip via `prefs`). Returns `None` if the model has no skin/animation.
 pub fn load_glb_skinned(bytes: &[u8], n_frames: usize, prefs: &[&str]) -> Option<SkinnedModel> {
-    let (doc, buffers, _images) = gltf::import_slice(bytes).ok()?;
+    let (doc, buffers, images) = gltf::import_slice(bytes).ok()?;
     let skin = doc.skins().next()?;
     let anim = pick_animation(&doc, prefs)?;
     let (parent, order) = build_hierarchy(&doc);
@@ -228,11 +229,18 @@ pub fn load_glb_skinned(bytes: &[u8], n_frames: usize, prefs: &[&str]) -> Option
             let nor: Vec<[f32; 3]> = reader.read_normals().map(|n| n.collect()).unwrap_or_default();
             let jn: Vec<[u16; 4]> = reader.read_joints(0).map(|j| j.into_u16().collect()).unwrap_or_default();
             let wt: Vec<[f32; 4]> = reader.read_weights(0).map(|w| w.into_f32().collect()).unwrap_or_default();
+            let uvs: Vec<[f32; 2]> = reader.read_tex_coords(0).map(|t| t.into_f32().collect()).unwrap_or_default();
+            // Material base colour (texture × factor, else factor) — so the GPU-
+            // skinned units carry their real colours, not a flat tint.
+            let pbr = prim.material().pbr_metallic_roughness();
+            let factor = pbr.base_color_factor();
+            let tex = pbr.base_color_texture().and_then(|info| images.get(info.texture().source().index()));
             let base = verts.len() as u32;
             for (i, p) in pos.iter().enumerate() {
                 let j = jn.get(i).copied().unwrap_or([0; 4]);
                 let w = wt.get(i).copied().unwrap_or([1.0, 0.0, 0.0, 0.0]);
-                verts.push(SkinVertex { pos: *p, normal: nor.get(i).copied().unwrap_or([0.0, 1.0, 0.0]), joints: [j[0] as u32, j[1] as u32, j[2] as u32, j[3] as u32], weights: w });
+                let color = match (tex, uvs.get(i)) { (Some(img), Some(uv)) => mul4(sample(img, *uv), factor), _ => factor };
+                verts.push(SkinVertex { pos: *p, normal: nor.get(i).copied().unwrap_or([0.0, 1.0, 0.0]), joints: [j[0] as u32, j[1] as u32, j[2] as u32, j[3] as u32], weights: w, color });
             }
             match reader.read_indices() {
                 Some(it) => { for x in it.into_u32() { indices.push(base + x); } }
@@ -270,6 +278,19 @@ pub fn load_glb_skinned(bytes: &[u8], n_frames: usize, prefs: &[&str]) -> Option
         }
     }
     Some(SkinnedModel { vertices: verts, indices, joint_frames, num_joints: joints.len(), n_frames })
+}
+
+/// Load a `.glb` for GPU skinning, with a **static fallback** for un-rigged props
+/// (e.g. the cannon): one identity joint, one frame, every vertex weighted to it.
+/// So a single skinned pipeline can render every unit *and* prop uniformly.
+pub fn load_unit_model(bytes: &[u8], n_frames: usize, prefs: &[&str]) -> SkinnedModel {
+    if let Some(m) = load_glb_skinned(bytes, n_frames, prefs) { return m; }
+    let m = load_glb(bytes); // normalised static mesh (pos / normal / colour)
+    let vertices = m.vertices.iter().map(|v| SkinVertex {
+        pos: v.pos, normal: v.normal, color: v.color, joints: [0; 4], weights: [1.0, 0.0, 0.0, 0.0],
+    }).collect();
+    let indices = m.indices.iter().map(|&i| i as u32).collect();
+    SkinnedModel { vertices, indices, joint_frames: vec![Mat4::IDENTITY.to_cols_array_2d()], num_joints: 1, n_frames: 1 }
 }
 
 /// Choose the clip whose name best matches `prefs` (priority-ordered substrings,

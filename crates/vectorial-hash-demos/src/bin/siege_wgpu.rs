@@ -31,9 +31,9 @@ use vectorial_hash::{Aabb, Tree3};
 // two renderers stay in lockstep — see `siege_sim`. This file is wgpu render-only.
 use rayon::prelude::*;
 use vectorial_hash_demos::siege_sim::{
-    apply, decide, default_body_radius, faction_tint, set_map_seed, spawn_army, terrain_height,
-    terrain_surface, volcano_step, Faction, Fx, IUnit, Projectile, Puff, Rng, Unit, Volcano,
-    PER_FACTION, SKY, WORLD,
+    apply, decide, default_body_radius, faction_tint, model_for, set_map_seed, spawn_army,
+    terrain_height, terrain_surface, volcano_step, Faction, Fx, IUnit, Kind, Projectile, Puff, Rng,
+    Unit, Volcano, ANIM_FRAMES, MOVE_PREFS, PER_FACTION, SKY, WORLD,
 };
 
 // ============================================================ terrain
@@ -83,11 +83,29 @@ struct CameraUniform { vp: [[f32; 4]; 4], light: [f32; 4] }
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct SkinInstance { model: [[f32; 4]; 4], color: [f32; 4], frame_base: u32, _pad: [u32; 3] }
 
-/// Per-unit instance tint: the shared faction colour, dimmed as the unit loses HP.
-fn faction_color(f: Faction, hp_frac: f64) -> [f32; 4] {
-    let shade = (0.45 + 0.55 * hp_frac.clamp(0.0, 1.0)) as f32;
-    let t = faction_tint(f);
-    [t[0] * shade, t[1] * shade, t[2] * shade, 1.0]
+/// A GPU-resident unit model: rest mesh + per-frame bone matrices + its own bind
+/// group (camera + this model's bone storage buffer). One per distinct `.glb`.
+struct GpuModel {
+    vbuf: wgpu::Buffer,
+    ibuf: wgpu::Buffer,
+    nidx: u32,
+    bind: wgpu::BindGroup,
+    num_joints: u32,
+    n_frames: u32,
+}
+
+/// Load a unit `.glb` to the GPU for skinning (static fallback for props like the
+/// cannon). The bind group keeps the bone buffer alive, so it can drop here.
+fn build_gpu_model(device: &wgpu::Device, cam_buf: &wgpu::Buffer, layout: &wgpu::BindGroupLayout, bytes: &[u8]) -> GpuModel {
+    let m = vectorial_hash_demos::model::load_unit_model(bytes, ANIM_FRAMES, MOVE_PREFS);
+    let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("skin-v"), contents: bytemuck::cast_slice(&m.vertices), usage: wgpu::BufferUsages::VERTEX });
+    let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("skin-i"), contents: bytemuck::cast_slice(&m.indices), usage: wgpu::BufferUsages::INDEX });
+    let bone_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("bones"), contents: bytemuck::cast_slice(&m.joint_frames), usage: wgpu::BufferUsages::STORAGE });
+    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("skin-bg"), layout, entries: &[
+        wgpu::BindGroupEntry { binding: 0, resource: cam_buf.as_entire_binding() },
+        wgpu::BindGroupEntry { binding: 1, resource: bone_buf.as_entire_binding() },
+    ] });
+    GpuModel { vbuf, ibuf, nidx: m.indices.len() as u32, bind, num_joints: m.num_joints as u32, n_frames: m.n_frames as u32 }
 }
 
 // ============================================================ renderer
@@ -97,15 +115,12 @@ struct State {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    // GPU-skinned units
+    // GPU-skinned units: one shared pipeline, one model per distinct (faction,kind)
+    // glb, a shared instance buffer (units bucketed by model each frame).
     skin_pipeline: wgpu::RenderPipeline,
-    skin_vbuf: wgpu::Buffer,
-    skin_ibuf: wgpu::Buffer,
-    skin_nidx: u32,
-    skin_inst_buf: wgpu::Buffer,
-    skin_bg: wgpu::BindGroup,
-    num_joints: u32,
-    n_frames: u32,
+    models: Vec<GpuModel>,
+    model_idx: [[usize; 8]; 2], // [faction][kind] → models index
+    inst_buf: wgpu::Buffer,
     terrain_pipeline: wgpu::RenderPipeline,
     terrain_vbuf: wgpu::Buffer,
     terrain_ibuf: wgpu::Buffer,
@@ -150,15 +165,10 @@ impl State {
         let cam_bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("cam-bg"), layout: &cam_layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: cam_buf.as_entire_binding() }] });
         let pipe_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("pl"), bind_group_layouts: &[&cam_layout], push_constant_ranges: &[] });
 
-        // GPU-skinned unit model: rest mesh + a storage buffer of per-frame bone
-        // matrices. The vertex shader skins on the GPU per instance.
-        let skinned = vectorial_hash_demos::model::load_glb_skinned(include_bytes!("../../assets/siege/models/skeleton_a.glb"), 12, &["walk", "run"]).expect("skinned model");
-        let (num_joints, n_frames) = (skinned.num_joints as u32, skinned.n_frames as u32);
-        let skin_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("skin-v"), contents: bytemuck::cast_slice(&skinned.vertices), usage: wgpu::BufferUsages::VERTEX });
-        let skin_ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("skin-i"), contents: bytemuck::cast_slice(&skinned.indices), usage: wgpu::BufferUsages::INDEX });
-        let skin_nidx = skinned.indices.len() as u32;
-        let bone_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("bones"), contents: bytemuck::cast_slice(&skinned.joint_frames), usage: wgpu::BufferUsages::STORAGE });
-        let skin_inst_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("skin-inst"), size: (PER_FACTION * 2 * std::mem::size_of::<SkinInstance>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        // GPU skinning: one shared bind-group layout + pipeline, then one model per
+        // distinct (faction,kind) glb. The instance buffer is shared — units are
+        // bucketed by model each frame.
+        let inst_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("skin-inst"), size: (PER_FACTION * 2 * std::mem::size_of::<SkinInstance>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let skin_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("skin-l"),
             entries: &[
@@ -166,7 +176,6 @@ impl State {
                 wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
             ],
         });
-        let skin_bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("skin-bg"), layout: &skin_layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: cam_buf.as_entire_binding() }, wgpu::BindGroupEntry { binding: 1, resource: bone_buf.as_entire_binding() }] });
         let skin_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("skin-shader"), source: wgpu::ShaderSource::Wgsl(SKIN_SHADER.into()) });
         let skin_pipe_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("skin-pl"), bind_group_layouts: &[&skin_layout], push_constant_ranges: &[] });
         let skin_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -177,7 +186,7 @@ impl State {
                 entry_point: "vs",
                 compilation_options: Default::default(),
                 buffers: &[
-                    wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<vectorial_hash_demos::model::SkinVertex>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Uint32x4, 3 => Float32x4] },
+                    wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<vectorial_hash_demos::model::SkinVertex>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Uint32x4, 3 => Float32x4, 10 => Float32x4] },
                     wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<SkinInstance>() as u64, step_mode: wgpu::VertexStepMode::Instance, attributes: &wgpu::vertex_attr_array![4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4, 8 => Float32x4, 9 => Uint32] },
                 ],
             },
@@ -187,6 +196,23 @@ impl State {
             multisample: Default::default(),
             multiview: None,
         });
+
+        // One GpuModel per distinct (faction,kind) glb — the dragon and the cannon
+        // are shared across factions, deduped by the byte-slice pointer.
+        let mut models: Vec<GpuModel> = Vec::new();
+        let mut model_idx = [[0usize; 8]; 2];
+        let mut seen: Vec<(*const u8, usize)> = Vec::new();
+        for f in Faction::ALL {
+            for k in Kind::ALL {
+                let bytes = model_for(f, k);
+                let ptr = bytes.as_ptr();
+                let idx = match seen.iter().find(|(p, _)| *p == ptr) {
+                    Some(&(_, i)) => i,
+                    None => { let i = models.len(); models.push(build_gpu_model(&device, &cam_buf, &skin_layout, bytes)); seen.push((ptr, i)); i }
+                };
+                model_idx[f.index()][k.index()] = idx;
+            }
+        }
 
         // Terrain: a single colour+normal mesh, its own pipeline (no instancing).
         let (tv, ti) = build_terrain();
@@ -214,7 +240,7 @@ impl State {
 
         State {
             surface, device, queue, config,
-            skin_pipeline, skin_vbuf, skin_ibuf, skin_nidx, skin_inst_buf, skin_bg, num_joints, n_frames,
+            skin_pipeline, models, model_idx, inst_buf,
             terrain_pipeline, terrain_vbuf, terrain_ibuf, terrain_nidx: ti.len() as u32,
             cam_buf, cam_bg, depth, units, index,
             smoke: Vec::new(), effects: Vec::new(), projectiles: Vec::new(),
@@ -262,22 +288,31 @@ impl State {
             volcano_step(&mut self.volcano, &mut self.smoke, &mut self.effects, &mut self.projectiles, &mut self.rng, dt, self.now);
         }
 
-        // Units → GPU-skinned instances: a model matrix (place · face · scale on
-        // the terrain) + tint + the bone-frame base for the unit's current frame.
-        // (Single shared model for now — per-kind/faction models are the next step.)
-        self.skin_instances.clear();
-        let nf = self.n_frames.max(1);
-        let scale = glam::Vec3::splat(9.0); // model height
+        // Units → GPU-skinned instances, bucketed by model so each distinct glb
+        // draws in one call. Per-model frame_base uses that model's own joint +
+        // frame count; the instance colour is the faction tint (the shader mixes
+        // the model's own colours toward it). Model height varies by kind.
+        let mut buckets: Vec<Vec<SkinInstance>> = (0..self.models.len()).map(|_| Vec::new()).collect();
         for (i, u) in self.units.iter().enumerate() {
             if !u.alive() { continue; }
+            let mi = self.model_idx[u.faction.index()][u.kind.index()];
+            let m = &self.models[mi];
             let y = (terrain_height(u.p.x, u.p.z) + u.kind.altitude()) as f32; // feet on terrain (dragon flies)
-            let model = glam::Mat4::from_translation(glam::Vec3::new(u.p.x as f32, y, u.p.z as f32)) * glam::Mat4::from_rotation_y(u.face) * glam::Mat4::from_scale(scale);
-            // phase-grouped frame (same trick as the macroquad version)
-            let group = (i as u32 % 5) as f32 / 5.0;
+            let model = glam::Mat4::from_translation(glam::Vec3::new(u.p.x as f32, y, u.p.z as f32)) * glam::Mat4::from_rotation_y(u.face) * glam::Mat4::from_scale(glam::Vec3::splat(u.kind.model_height()));
+            let nf = m.n_frames.max(1);
+            let group = (i as u32 % 5) as f32 / 5.0; // phase-grouped frame (as macroquad)
             let frame = (((self.now as f32 * 1.6 + group) * nf as f32) as u32) % nf;
-            self.skin_instances.push(SkinInstance { model: model.to_cols_array_2d(), color: faction_color(u.faction, u.hp / u.kind.max_hp()), frame_base: frame * self.num_joints, _pad: [0; 3] });
+            buckets[mi].push(SkinInstance { model: model.to_cols_array_2d(), color: faction_tint(u.faction), frame_base: frame * m.num_joints, _pad: [0; 3] });
         }
-        self.queue.write_buffer(&self.skin_inst_buf, 0, bytemuck::cast_slice(&self.skin_instances));
+        // Flatten into the shared instance buffer, remembering each model's range.
+        self.skin_instances.clear();
+        let mut ranges: Vec<(u32, u32)> = Vec::with_capacity(buckets.len());
+        for b in &buckets {
+            let start = self.skin_instances.len() as u32;
+            self.skin_instances.extend_from_slice(b);
+            ranges.push((start, self.skin_instances.len() as u32));
+        }
+        self.queue.write_buffer(&self.inst_buf, 0, bytemuck::cast_slice(&self.skin_instances));
         let cam = self.camera();
         self.queue.write_buffer(&self.cam_buf, 0, bytemuck::cast_slice(&[cam]));
 
@@ -297,13 +332,17 @@ impl State {
             pass.set_vertex_buffer(0, self.terrain_vbuf.slice(..));
             pass.set_index_buffer(self.terrain_ibuf.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..self.terrain_nidx, 0, 0..1);
-            // units (GPU-skinned models, instanced)
+            // units — one GPU-skinned draw per distinct model, instances bucketed.
             pass.set_pipeline(&self.skin_pipeline);
-            pass.set_bind_group(0, &self.skin_bg, &[]);
-            pass.set_vertex_buffer(0, self.skin_vbuf.slice(..));
-            pass.set_vertex_buffer(1, self.skin_inst_buf.slice(..));
-            pass.set_index_buffer(self.skin_ibuf.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..self.skin_nidx, 0, 0..self.skin_instances.len() as u32);
+            pass.set_vertex_buffer(1, self.inst_buf.slice(..));
+            for (mi, m) in self.models.iter().enumerate() {
+                let (s, e) = ranges[mi];
+                if s == e { continue; }
+                pass.set_bind_group(0, &m.bind, &[]);
+                pass.set_vertex_buffer(0, m.vbuf.slice(..));
+                pass.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..m.nidx, 0, s..e);
+            }
         }
         self.queue.submit(Some(enc.finish()));
         frame.present();
@@ -327,8 +366,9 @@ struct Camera { vp: mat4x4<f32>, light: vec4<f32> };
 struct VOut { @builtin(position) clip: vec4<f32>, @location(0) color: vec4<f32> };
 @vertex
 fn vs(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>, @location(2) joints: vec4<u32>, @location(3) weights: vec4<f32>,
+      @location(10) vcolor: vec4<f32>,
       @location(4) m0: vec4<f32>, @location(5) m1: vec4<f32>, @location(6) m2: vec4<f32>, @location(7) m3: vec4<f32>,
-      @location(8) icolor: vec4<f32>, @location(9) frame_base: u32) -> VOut {
+      @location(8) tint: vec4<f32>, @location(9) frame_base: u32) -> VOut {
     let model = mat4x4<f32>(m0, m1, m2, m3);
     var sp = vec3<f32>(0.0);
     var sn = vec3<f32>(0.0);
@@ -346,7 +386,10 @@ fn vs(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>, @location(2) joints:
     let nn = normalize((model * vec4<f32>(sn, 0.0)).xyz);
     let diff = max(dot(nn, normalize(cam.light.xyz)), 0.0);
     let sh = 0.40 + 0.60 * diff;
-    o.color = vec4<f32>(icolor.rgb * sh, 1.0);
+    // The model's own colour, nudged toward the faction tint by the tint's alpha
+    // (so even dark models read clearly as Red / Blue) — matches the macroquad mix.
+    let base = mix(vcolor.rgb, tint.rgb, tint.a);
+    o.color = vec4<f32>(base * sh, 1.0);
     return o;
 }
 @fragment
