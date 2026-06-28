@@ -32,8 +32,8 @@ use vectorial_hash::{Aabb, Tree3};
 use rayon::prelude::*;
 use vectorial_hash_demos::siege_sim::{
     apply, decide, default_body_radius, faction_tint, model_for, set_map_seed, spawn_army,
-    terrain_height, terrain_surface, volcano_step, Faction, Fx, IUnit, Kind, Projectile, Puff, Rng,
-    Unit, Volcano, ANIM_FRAMES, MOVE_PREFS, PER_FACTION, SKY, WORLD,
+    terrain_height, terrain_surface, volcano_step, Faction, Fx, FxKind, IUnit, Kind, ProjKind,
+    Projectile, Puff, Rng, Unit, Volcano, ANIM_FRAMES, MOVE_PREFS, PER_FACTION, SKY, WORLD,
 };
 
 // ============================================================ terrain
@@ -83,6 +83,12 @@ struct CameraUniform { vp: [[f32; 4]; 4], light: [f32; 4] }
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct SkinInstance { model: [[f32; 4]; 4], color: [f32; 4], frame_base: u32, _pad: [u32; 3] }
 
+/// One coloured line-segment endpoint — for the combat effects (arrow / bolt /
+/// lightning / ring / spark) and the projectile markers, drawn as a LineList.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct LVertex { pos: [f32; 3], color: [f32; 4] }
+
 /// A GPU-resident unit model: rest mesh + per-frame bone matrices + its own bind
 /// group (camera + this model's bone storage buffer). One per distinct `.glb`.
 struct GpuModel {
@@ -121,6 +127,14 @@ struct State {
     models: Vec<GpuModel>,
     model_idx: [[usize; 8]; 2], // [faction][kind] → models index
     inst_buf: wgpu::Buffer,
+    // The two faction keeps: a static castle model, two instances.
+    castle_model: GpuModel,
+    castle_inst_buf: wgpu::Buffer,
+    // Combat effects + projectile markers, drawn as coloured line segments.
+    line_pipeline: wgpu::RenderPipeline,
+    line_buf: wgpu::Buffer,
+    line_cap: usize,
+    line_verts: Vec<LVertex>,
     terrain_pipeline: wgpu::RenderPipeline,
     terrain_vbuf: wgpu::Buffer,
     terrain_ibuf: wgpu::Buffer,
@@ -230,6 +244,34 @@ impl State {
             multiview: None,
         });
 
+        // Castle model (static) for the two keeps — two fixed instances, facing
+        // the map centre, tinted by faction. Reuses the skin pipeline (1 identity
+        // joint via the static fallback).
+        let castle_model = build_gpu_model(&device, &cam_buf, &skin_layout, include_bytes!("../../assets/siege/models/castle.glb"));
+        let castle_inst: Vec<SkinInstance> = Faction::ALL.iter().map(|&f| {
+            let (cx, cz) = f.castle();
+            let yaw = ((WORLD * 0.5 - cx) as f32).atan2((WORLD * 0.5 - cz) as f32);
+            let m = glam::Mat4::from_translation(glam::Vec3::new(cx as f32, terrain_height(cx, cz) as f32, cz as f32)) * glam::Mat4::from_rotation_y(yaw) * glam::Mat4::from_scale(glam::Vec3::splat(62.0));
+            SkinInstance { model: m.to_cols_array_2d(), color: faction_tint(f), frame_base: 0, _pad: [0; 3] }
+        }).collect();
+        let castle_inst_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("castle-inst"), contents: bytemuck::cast_slice(&castle_inst), usage: wgpu::BufferUsages::VERTEX });
+
+        // Line pipeline for combat effects + projectile markers (LineList, unlit,
+        // alpha-blended, depth-tested but not depth-writing).
+        let line_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("line-shader"), source: wgpu::ShaderSource::Wgsl(LINE_SHADER.into()) });
+        let line_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("line-pipe"),
+            layout: Some(&pipe_layout),
+            vertex: wgpu::VertexState { module: &line_shader, entry_point: "vs", compilation_options: Default::default(), buffers: &[wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<LVertex>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4] }] },
+            fragment: Some(wgpu::FragmentState { module: &line_shader, entry_point: "fs", compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::LineList, cull_mode: None, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState { format: wgpu::TextureFormat::Depth32Float, depth_write_enabled: false, depth_compare: wgpu::CompareFunction::Less, stencil: Default::default(), bias: Default::default() }),
+            multisample: Default::default(),
+            multiview: None,
+        });
+        let line_cap = 8192usize;
+        let line_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("line-v"), size: (line_cap * std::mem::size_of::<LVertex>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+
         let depth = make_depth(&device, &config);
         // Per-run seed (reproducible via $SIEGE_SEED) drives the shared map + army.
         let seed = std::env::var("SIEGE_SEED").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0x51E6E);
@@ -241,6 +283,8 @@ impl State {
         State {
             surface, device, queue, config,
             skin_pipeline, models, model_idx, inst_buf,
+            castle_model, castle_inst_buf,
+            line_pipeline, line_buf, line_cap, line_verts: Vec::new(),
             terrain_pipeline, terrain_vbuf, terrain_ibuf, terrain_nidx: ti.len() as u32,
             cam_buf, cam_bg, depth, units, index,
             smoke: Vec::new(), effects: Vec::new(), projectiles: Vec::new(),
@@ -316,6 +360,51 @@ impl State {
         let cam = self.camera();
         self.queue.write_buffer(&self.cam_buf, 0, bytemuck::cast_slice(&[cam]));
 
+        // Combat effects + projectile markers → coloured line segments (built into
+        // a detached Vec so the loops can read self.effects/self.projectiles).
+        let mut lv = std::mem::take(&mut self.line_verts);
+        lv.clear();
+        let push = |v: &mut Vec<LVertex>, a: glam::Vec3, b: glam::Vec3, c: [f32; 4]| {
+            v.push(LVertex { pos: a.to_array(), color: c });
+            v.push(LVertex { pos: b.to_array(), color: c });
+        };
+        for f in &self.effects {
+            let age = ((self.now - f.born) / Fx::life(f.kind)).clamp(0.0, 1.0) as f32;
+            let (a, b) = (glam::Vec3::from_array(f.a), glam::Vec3::from_array(f.b));
+            match f.kind {
+                FxKind::Arrow => push(&mut lv, a, b, [0.96, 0.90, 0.45, 1.0]),
+                FxKind::Bolt => push(&mut lv, a, b, [1.0, 0.58, 0.16, 1.0]),
+                FxKind::Lightning => push(&mut lv, a, b, [0.62, 0.86, 1.0, 1.0]),
+                FxKind::Spark => push(&mut lv, a, a + glam::Vec3::Y * 7.0, [0.40, 1.0, 0.55, 1.0]),
+                FxKind::Ring => {
+                    let (r, col, n) = (8.0 + 26.0 * age, [1.0, 0.45, 0.12, 1.0 - age], 20);
+                    let mut prev = a + glam::Vec3::new(r, 1.5, 0.0);
+                    for i in 1..=n {
+                        let t = i as f32 / n as f32 * std::f32::consts::TAU;
+                        let p = a + glam::Vec3::new(r * t.cos(), 1.5, r * t.sin());
+                        push(&mut lv, prev, p, col);
+                        prev = p;
+                    }
+                }
+            }
+        }
+        for pr in &self.projectiles {
+            let c = glam::Vec3::new(pr.p.x as f32, pr.p.y as f32, pr.p.z as f32);
+            let col = match pr.kind { ProjKind::Cannon => [0.08, 0.08, 0.08, 1.0], ProjKind::LavaRock => [1.0, 0.45, 0.10, 1.0] };
+            let r = 2.2;
+            push(&mut lv, c - glam::Vec3::X * r, c + glam::Vec3::X * r, col);
+            push(&mut lv, c - glam::Vec3::Y * r, c + glam::Vec3::Y * r, col);
+            push(&mut lv, c - glam::Vec3::Z * r, c + glam::Vec3::Z * r, col);
+        }
+        self.line_verts = lv;
+        // Grow the line buffer if this frame overflows it.
+        if self.line_verts.len() > self.line_cap {
+            self.line_cap = (self.line_verts.len() * 2).next_power_of_two();
+            self.line_buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("line-v"), size: (self.line_cap * std::mem::size_of::<LVertex>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        }
+        if !self.line_verts.is_empty() { self.queue.write_buffer(&self.line_buf, 0, bytemuck::cast_slice(&self.line_verts)); }
+        let line_n = self.line_verts.len() as u32;
+
         let frame = match self.surface.get_current_texture() { Ok(f) => f, Err(_) => return };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
@@ -342,6 +431,20 @@ impl State {
                 pass.set_vertex_buffer(0, m.vbuf.slice(..));
                 pass.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..m.nidx, 0, s..e);
+            }
+            // castles — the static model, two instances (one per keep).
+            let cm = &self.castle_model;
+            pass.set_bind_group(0, &cm.bind, &[]);
+            pass.set_vertex_buffer(0, cm.vbuf.slice(..));
+            pass.set_vertex_buffer(1, self.castle_inst_buf.slice(..));
+            pass.set_index_buffer(cm.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..cm.nidx, 0, 0..2);
+            // combat effects + projectile markers (alpha-blended lines, drawn last).
+            if line_n > 0 {
+                pass.set_pipeline(&self.line_pipeline);
+                pass.set_bind_group(0, &self.cam_bg, &[]);
+                pass.set_vertex_buffer(0, self.line_buf.slice(..));
+                pass.draw(0..line_n, 0..1);
             }
         }
         self.queue.submit(Some(enc.finish()));
@@ -408,6 +511,22 @@ fn vs(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>, @location(2) col: ve
     // alpha < 0.5 flags an emissive (lava) cell → draw it full-bright.
     let sh = select(0.40 + 0.60 * diff, 1.0, col.a < 0.5);
     o.color = vec4<f32>(col.rgb * sh, 1.0);
+    return o;
+}
+@fragment
+fn fs(in: VOut) -> @location(0) vec4<f32> { return in.color; }
+"#;
+
+// Unlit coloured lines for the combat effects + projectile markers.
+const LINE_SHADER: &str = r#"
+struct Camera { vp: mat4x4<f32>, light: vec4<f32> };
+@group(0) @binding(0) var<uniform> cam: Camera;
+struct VOut { @builtin(position) clip: vec4<f32>, @location(0) color: vec4<f32> };
+@vertex
+fn vs(@location(0) p: vec3<f32>, @location(1) color: vec4<f32>) -> VOut {
+    var o: VOut;
+    o.clip = cam.vp * vec4<f32>(p, 1.0);
+    o.color = color;
     return o;
 }
 @fragment
