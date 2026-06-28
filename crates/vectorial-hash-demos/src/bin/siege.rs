@@ -400,7 +400,7 @@ async fn main() {
             // serial and cheap; the queries (decide) are the parallel part.
             index.clear();
             for (i, u) in units.iter().enumerate() {
-                if u.alive() { index.insert(IUnit { id: i as u32, faction: u.faction, p: u.p, health: (u.hp / u.kind.max_hp()) as f32 }); }
+                if u.alive() { index.insert(IUnit { id: i as u32, faction: u.faction, p: u.p, health: (u.hp / u.kind.max_hp()) as f32, face: u.face }); }
             }
             // Rebuild the smoke index from last frame's live puffs.
             smoke_index.clear();

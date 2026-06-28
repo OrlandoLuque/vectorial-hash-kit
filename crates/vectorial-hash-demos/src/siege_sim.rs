@@ -269,7 +269,7 @@ impl Unit {
 /// Decoupled from `Unit` so the decide pass can hold `&Tree3<IUnit>` immutably
 /// while it mutates the `units` slice.
 #[derive(Clone, Copy)]
-pub struct IUnit { pub id: u32, pub faction: Faction, pub p: Point3, pub health: f32 }
+pub struct IUnit { pub id: u32, pub faction: Faction, pub p: Point3, pub health: f32, pub face: f32 }
 impl Positioned3 for IUnit { fn position(&self) -> Point3 { self.p } }
 
 // ----------------------------------------------------------------- smoke (LoS)
@@ -396,6 +396,7 @@ pub fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>, 
     let mut heal: Option<(Point3, u32, f32, f64)> = None; // most-wounded friend (pos, id, health, dist)
     let (mut sep_x, mut sep_z) = (0.0, 0.0); // separation push (from ANY neighbour)
     let (mut coh_x, mut coh_z, mut friends) = (0.0, 0.0, 0u32); // cohesion centroid
+    let (mut ali_x, mut ali_z) = (0.0f64, 0.0f64); // alignment: sum of friends' heading vectors
     let sep_dist = body_radius[u.faction.index()][u.kind.index()] * 2.0; // two bodies of this size shan't overlap
     for (d, it) in index.knn(u.p, 16) {
         if it.id == id { continue; }
@@ -408,6 +409,7 @@ pub fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>, 
             if target.is_none() { target = Some((it.p, it.id, d)); }
         } else {
             coh_x += it.p.x; coh_z += it.p.z; friends += 1;
+            ali_x += (it.face.sin()) as f64; ali_z += (it.face.cos()) as f64; // heading as a unit vector
             if it.health < 0.97 && heal.is_none_or(|(_, _, h, _)| it.health < h) { heal = Some((it.p, it.id, it.health, d)); }
         }
     }
@@ -441,6 +443,10 @@ pub fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>, 
         let (cx, cz) = (coh_x / friends as f64 - u.p.x, coh_z / friends as f64 - u.p.z);
         let cl = (cx * cx + cz * cz).sqrt().max(1e-6);
         vx += cx / cl * speed * 0.12; vz += cz / cl * speed * 0.12; // cohesion
+        // Alignment: steer toward the friends' average heading, so a band advances
+        // as a coherent line instead of a milling crowd (the third boids rule).
+        let al = (ali_x * ali_x + ali_z * ali_z).sqrt();
+        if al > 1e-3 { vx += ali_x / al * speed * 0.10; vz += ali_z / al * speed * 0.10; }
     }
     let vl = (vx * vx + vz * vz).sqrt();
     let cap = speed * 1.5;
@@ -730,7 +736,7 @@ mod tests {
             now += 0.05;
             index.clear();
             for (i, u) in units.iter().enumerate() {
-                if u.alive() { index.insert(IUnit { id: i as u32, faction: u.faction, p: u.p, health: (u.hp / u.kind.max_hp()) as f32 }); }
+                if u.alive() { index.insert(IUnit { id: i as u32, faction: u.faction, p: u.p, health: (u.hp / u.kind.max_hp()) as f32, face: u.face }); }
             }
             let mut smoke_index = Tree3::<Puff>::new(smoke_bounds, 8);
             for s in &smoke { smoke_index.insert(*s); }

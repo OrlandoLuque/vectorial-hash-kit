@@ -320,7 +320,7 @@ impl State {
             // Rebuild the unit index from live positions each frame.
             self.index.clear();
             for (i, u) in self.units.iter().enumerate() {
-                if u.alive() { self.index.insert(IUnit { id: i as u32, faction: u.faction, p: u.p, health: (u.hp / u.kind.max_hp()) as f32 }); }
+                if u.alive() { self.index.insert(IUnit { id: i as u32, faction: u.faction, p: u.p, health: (u.hp / u.kind.max_hp()) as f32, face: u.face }); }
             }
             // Smoke index (LoS blockers) for the archer / ballista raycasts.
             let mut smoke_index = Tree3::<Puff>::new(Aabb::new(0.0, 0.0, 0.0, WORLD, SKY, WORLD), 8);
