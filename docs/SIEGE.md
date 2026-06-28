@@ -16,7 +16,8 @@ cargo run -p vectorial-hash-demos --bin siege_wgpu --release   # wgpu (compariso
 
 Live (single-threaded wasm build): <https://orlandoluque.github.io/vectorial-hash-kit/siege.html>
 
-- drag left mouse: orbit · scroll: zoom · `P`: pause · `[` / `]`: ± population
+- drag left mouse: orbit · scroll: zoom · `P`: pause · `[` / `]`: ± population ·
+  `V`: voxel ↔ smooth terrain (both binaries)
 - **population slider** (top-left): army size per side — the spatial-index stress
   lever (20…2000 each).
 - **thread slider** (native only): set the rayon pool size *live* and watch the
@@ -107,17 +108,25 @@ the relief reads), coloured by elevation (water/sand/grass/rock/snow) with an
 
 ## The wgpu twin (`siege_wgpu`)
 
-A second binary renders the same kind of battle with **wgpu** (modern low-level
-GPU stack) instead of macroquad, to compare — and to reach the thing macroquad's
-WebGL1 stack can't: **real GPU skeletal skinning**. The rest mesh + a storage
-buffer of all the animation's per-frame bone matrices are uploaded once; the WGSL
-vertex shader skins `Σ wᵢ · bone[frame·J + jointᵢ] · pos` per instance, so
-thousands of units animate on the GPU with zero per-frame CPU skinning. Native
-only for now. Both binaries share the glTF loader (`model`) and the `Tree3` index.
+A second binary renders the **same battle** with **wgpu** (modern low-level GPU
+stack) instead of macroquad, to compare — and to reach the thing macroquad's
+WebGL1 stack can't: **real GPU skeletal skinning**. Per distinct model the rest
+mesh + a storage buffer of all the animation's per-frame bone matrices are
+uploaded once; the WGSL vertex shader skins `Σ wᵢ · bone[frame·J + jointᵢ] · pos`
+per instance, so thousands of units animate on the GPU with zero per-frame CPU
+skinning. The model's own colours are mixed toward the faction tint in-shader.
 
-## Terrain — next
+Crucially, the whole **simulation is shared** — both binaries run the exact same
+`siege_sim` (units, decide→apply, projectiles, the volcano), so they can't drift.
+The wgpu side is at functional parity: the real per-(faction,kind) models (static
+fallback for the cannon/castle), combat effects + projectile markers (a LineList
+pipeline), the voxel terrain + `V` smooth/voxel switch, `[` `]` population, pause,
+and HUD stats in the window title. Native only (wgpu/winit aren't in the wasm
+demo build); a web build is queued ([BACKLOG.md](BACKLOG.md)).
 
-A **voxel** terrain (alterable: cannon/volcano craters), greedy-meshed with baked
-vertex AO + height/slope colour ramps, is the next big step — design + technique
-notes in [MAP_DESIGN.md](MAP_DESIGN.md). Other queued polish (boids alignment,
-forests as LoS cover, path-to-bridge AI, balance) is in [BACKLOG.md](BACKLOG.md).
+## Still queued
+
+Web-publishing the wgpu twin (wasm-bindgen + WebGPU) and slimming `siege.wasm`
+(fetch-loaded models), bridge decks + path-to-bridge AI on the wgpu side, forests
+as LoS cover, and balance. The voxel-terrain technique notes live in
+[MAP_DESIGN.md](MAP_DESIGN.md); the live queue is [BACKLOG.md](BACKLOG.md).

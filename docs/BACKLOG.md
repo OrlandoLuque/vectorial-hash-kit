@@ -108,19 +108,25 @@ feedback is all addressed and several more rounds landed. **Done:**
   **real GPU skeletal skinning** (the thing macroquad's WebGL1 can't) — see
   SIEGE.md. Native only so far.
 
-**Siege — remaining (next session, needs the user's eyes):**
-- **Voxel *alteration*** — the heights are a grid, so make it live mutable state:
-  carve craters on cannon/volcano impacts (lower cells in a radius + remesh the
-  dirty chunks), and **snap unit feet to the block tops** (decide first whether
-  the stair-step pops look right vs. the current smooth-float). Couples together;
-  do after the user judges the voxel look (cell size, etc.).
-- **`siege_wgpu` parity + web.** Lift the shared sim into a lib module so the two
-  binaries can't drift; bring the 8 kinds + effects to the wgpu side; then
-  **publish `siege_wgpu` to the web** (wasm-bindgen + WebGPU/WebGL2 — toolchain
-  work, user asked for it twice).
-- **Slim `siege.wasm`** (~10 MB; fetch-load the glTF models via `load_file`
-  instead of `include_bytes!`).
-- Boids **alignment**, forests as LoS cover, path-to-bridge AI, balance.
+**Siege — 2026-06-29 parity night (landed).** The wgpu twin went from a skeleton
+to a real parity demo, plus several queued items: the whole sim **lifted into a
+shared `siege_sim` lib module** (both binaries can't drift); the **cannon-facing
+fix** (artillery aims forward while kiting); the wgpu binary now runs the shared
+sim with **real per-(faction,kind) GPU-skinned models** (static fallback for the
+cannon/castle), **combat effects + projectile markers** (LineList), **castles**,
+the **voxel terrain + `V` smooth/voxel switch**, `[ ]` **population**, **pause**,
+and **HUD stats** in the title. macroquad got **boids alignment**, a "who's
+leading" HUD line, and **alterable voxel terrain** (impact craters + the live `V`
+switch). A 2D **`Circle` shape** was promoted to the lib (analytic `classify_box`
++ SoA batch, brute-force gated). Web republished.
+
+**Siege — still remaining:**
+- **`siege_wgpu` on the web** (wasm-bindgen + WebGPU/WebGL2 — toolchain work, user
+  asked twice) and **slim `siege.wasm`** (fetch-load the glTF models).
+- **wgpu world polish**: bridge decks + path-to-bridge AI, optional unit-feet snap
+  to voxel tops (user chose smooth-float for now; keep it a switch).
+- **Forests as LoS cover** (trees block arrows/bolts via a raycast index, like
+  smoke) + a **balance** pass (use the HUD).
 
 **Thread-slider retrofit for the critters demos** (user, 2026-06-27) — the same
 live `num_threads` slider in `critters` (2D) and `critters3d` (3D), but it only
