@@ -11,4 +11,7 @@
 pub mod instanced3d;
 pub mod model;
 pub mod sim;
+/// Shared, graphics-free simulation for the `siege` demo — used by both the
+/// macroquad and wgpu binaries so the two renderers can't drift apart.
+pub mod siege_sim;
 pub mod time;

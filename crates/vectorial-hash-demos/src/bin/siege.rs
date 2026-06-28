@@ -27,634 +27,30 @@
 use macroquad::prelude::*;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
-use vectorial_hash::{Aabb, Point3, Positioned3, Sphere3, Tree3};
+use vectorial_hash::{Aabb, Point3, Tree3};
 use vectorial_hash_demos::instanced3d::{EffectInstance, InstancedRenderer, ModelGpu};
 use vectorial_hash_demos::model::{load_glb, load_glb_clip};
+// The whole simulation — Unit/Kind/Faction, decide/apply, terrain, projectiles,
+// effects, the volcano, the model→bytes map — lives in the shared `siege_sim`
+// module so this macroquad renderer and the wgpu one stay in lockstep. This file
+// is render-only (macroquad mesh/draw code, the main loop, the UI).
+use vectorial_hash_demos::siege_sim::*;
 
-// ---------------------------------------------------------------- world config
+// --------------------------------------------------------------- render config
 
-/// Per-run map seed — offsets the terrain noise so each run is a different map.
-/// Set once at startup (from the wall clock, or `$SIEGE_SEED`); 0 in tests.
-static MAP_SEED: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-fn map_seed() -> f64 { *MAP_SEED.get_or_init(|| 0.0) }
-
-const WORLD: f64 = 800.0; // battlefield is WORLD × WORLD in the ground plane
-const SKY: f64 = 260.0; // index height — heights reach ~150, the dragon flies
-const PER_FACTION: usize = 500; // units each side spawns with (tunable live)
-const ATK_ANIM_LEN: f32 = 0.45; // attack-clip / lunge play window (seconds)
-const LAVA_DPS: f64 = 45.0; // damage per second to a ground unit standing in lava
-const WATER_LEVEL: f64 = 6.0; // terrain below this is water (units wade slowly)
-const ANIM_FRAMES: usize = 12; // baked movement-clip frames per model (smoothness)
-const ATTACK_FRAMES: usize = 6; // baked attack-clip frames (one-shot, fewer = fewer draws)
-const ANIM_GROUPS: usize = 5; // units share a frame within a phase group (caps draw calls)
-// Clip name preferences (priority-ordered substrings) — movement, attack, idle.
-const MOVE_PREFS: &[&str] = &["walk", "run", "flying", "fly", "move"];
-const ATTACK_PREFS: &[&str] = &["attack", "sword", "slash", "cast", "shoot", "punch", "bite", "kick"];
-const IDLE_PREFS: &[&str] = &["idle"];
+/// `Point3` → macroquad `Vec3` (for drawing sim positions).
+fn v3(p: Point3) -> Vec3 { vec3(p.x as f32, p.y as f32, p.z as f32) }
+/// `[f32;3]` → macroquad `Vec3` (for drawing Fx endpoints).
+fn a3(a: [f32; 3]) -> Vec3 { vec3(a[0], a[1], a[2]) }
 
 /// Per-(faction,kind) baked clips: movement (or idle for riders) + attack.
 struct UnitAnim { mov: Vec<ModelGpu>, atk: Vec<ModelGpu> }
 
-/// Which frame of the one-shot attack clip to show (plays once over the attack).
-fn attack_frame(atk_anim: f32, nf: usize) -> usize {
-    if nf <= 1 { return 0; }
-    let prog = (1.0 - atk_anim / ATK_ANIM_LEN).clamp(0.0, 0.999);
-    (prog * nf as f32) as usize
-}
-
-// ------------------------------------------------------------------------- rng
-
-struct Rng(u64);
-impl Rng {
-    fn new(s: u64) -> Self { Rng(s | 1) }
-    fn next(&mut self) -> u64 { let mut x = self.0; x ^= x << 13; x ^= x >> 7; x ^= x << 17; self.0 = x; x.wrapping_mul(0x2545F4914F6CDD1D) }
-    fn unit(&mut self) -> f64 { (self.next() >> 11) as f64 / (1u64 << 53) as f64 }
-    fn range(&mut self, lo: f64, hi: f64) -> f64 { lo + self.unit() * (hi - lo) }
-}
-
-// ----------------------------------------------------------- procedural terrain
-
-/// Hash an integer lattice point to [0,1) — the value-noise source.
-fn hash2(x: i32, z: i32) -> f64 {
-    let mut h = (x as u32).wrapping_mul(0x1659_5e3d).wrapping_add((z as u32).wrapping_mul(0x27d4_eb2f));
-    h ^= h >> 15; h = h.wrapping_mul(0x85eb_ca6b); h ^= h >> 13;
-    (h & 0x00ff_ffff) as f64 / 0x00ff_ffff as f64
-}
-
-/// Smoothstep-interpolated value noise in [0,1).
-fn vnoise(x: f64, z: f64) -> f64 {
-    let (xi, zi) = (x.floor() as i32, z.floor() as i32);
-    let (fx, fz) = (x - xi as f64, z - zi as f64);
-    let (sx, sz) = (fx * fx * (3.0 - 2.0 * fx), fz * fz * (3.0 - 2.0 * fz));
-    let a = hash2(xi, zi); let b = hash2(xi + 1, zi);
-    let c = hash2(xi, zi + 1); let d = hash2(xi + 1, zi + 1);
-    let ab = a + (b - a) * sx; let cd = c + (d - c) * sx;
-    ab + (cd - ab) * sz
-}
-
-/// The river's centre-line x at a given z (it meanders along Z, seeded).
-fn river_center_x(z: f64) -> f64 {
-    let o = map_seed();
-    WORLD * 0.32 + (z * 0.011 + o).sin() * 95.0 + (z * 0.004 + o).cos() * 45.0
-}
-
-/// Z positions of the bridges across the river (away from the volcano band).
-const BRIDGE_Z: [f64; 4] = [120.0, 260.0, 540.0, 680.0];
-const BRIDGE_HALF_W: f64 = 48.0; // spans the river channel
-const BRIDGE_HALF_D: f64 = 12.0; // deck depth along Z
-
-/// Is (x,z) on a bridge deck? (so the unit crosses dry instead of wading.)
-fn on_bridge(x: f64, z: f64) -> bool {
-    BRIDGE_Z.iter().any(|&bz| (z - bz).abs() < BRIDGE_HALF_D && (x - river_center_x(bz)).abs() < BRIDGE_HALF_W)
-}
-
-/// How strongly a point sits in the river channel: 1 at the centre line, 0 past
-/// the banks, faded to 0 near the volcano so the river doesn't carve the cone.
-fn river_factor(x: f64, z: f64) -> f64 {
-    let d = (x - river_center_x(z)).abs();
-    let w = 44.0;
-    if d >= w { return 0.0; }
-    let t = 1.0 - d / w; // 0 at bank, 1 at centre
-    let dc = ((x - WORLD * 0.5).powi(2) + (z - WORLD * 0.5).powi(2)).sqrt();
-    let vol_mask = (dc / 220.0).clamp(0.0, 1.0); // 0 at volcano, 1 far away
-    t * t * vol_mask
-}
-
-/// Terrain height at a world (x,z): two octaves of hills, a central volcano cone,
-/// and a carved river channel. Deterministic — called per terrain tile + unit step.
-fn terrain_height(x: f64, z: f64) -> f64 {
-    let s = 1.0 / 150.0;
-    let o = map_seed(); // per-run noise offset → a different map each run
-    let mut h = vnoise(x * s + o, z * s + o * 0.7) * 45.0 + vnoise(x * s * 2.7 + o, z * s * 2.7 + o) * 16.0;
-    // Volcano: a cone rising near the centre, with a crater dip at the very top.
-    let (cx, cz) = (WORLD * 0.5, WORLD * 0.5);
-    let d = ((x - cx) * (x - cx) + (z - cz) * (z - cz)).sqrt();
-    if d < 170.0 {
-        let cone = (170.0 - d) * 0.62;
-        h += cone;
-        if d < 28.0 { h -= (28.0 - d) * 1.2; } // crater
-    }
-    // River: pull the height down toward (and below) the water line in the channel.
-    let r = river_factor(x, z);
-    if r > 0.0 { h = h * (1.0 - r) - r * 5.0; }
-    h
-}
-
-/// Surface colour at a point, plus an `emissive` flag (true = lava, drawn
-/// full-bright, ignoring terrain shading). Elevation ramp water → sand → grass
-/// → rock → snow, with a glowing crater pool and a lava flow down one flank.
-fn terrain_surface(x: f64, z: f64, h: f64) -> (Color, bool) {
-    let (cx, cz) = (WORLD * 0.5, WORLD * 0.5);
-    let (px, pz) = (x - cx, z - cz);
-    let d = (px * px + pz * pz).sqrt();
-    if d < 30.0 { return (Color::new(1.0, 0.46, 0.10, 1.0), true); } // crater pool
-    // Lava river: a narrow azimuth wedge flowing down one slope of the cone
-    // (a different flank each run).
-    let flow_dir = -2.1 + (map_seed() * 0.9).sin() * 1.8;
-    let mut dang = (pz.atan2(px) - flow_dir).abs();
-    if dang > std::f64::consts::PI { dang = std::f64::consts::TAU - dang; }
-    if d < 165.0 && dang < 0.15 { return (Color::new(0.96, 0.34, 0.07, 1.0), true); }
-    if d < 150.0 && h > 70.0 { return (Color::new(0.30, 0.11, 0.08, 1.0), false); } // scorched rock
-    let c = if h < 6.0 { Color::new(0.12, 0.28, 0.45, 1.0) } // water
-        else if h < 10.0 { Color::new(0.62, 0.56, 0.34, 1.0) } // sand
-        else if h < 60.0 { Color::new(0.20, 0.42, 0.18, 1.0) } // grass
-        else if h < 95.0 { Color::new(0.38, 0.34, 0.30, 1.0) } // rock
-        else { Color::new(0.82, 0.84, 0.88, 1.0) }; // snow
-    (c, false)
-}
-
-// ----------------------------------------------------------------- unit model
-
-#[derive(Clone, Copy, PartialEq)]
-enum Faction { Red, Blue }
-impl Faction {
-    fn other(self) -> Faction { match self { Faction::Red => Faction::Blue, Faction::Blue => Faction::Red } }
-    fn castle(self) -> (f64, f64) { match self { Faction::Red => (90.0, 90.0), Faction::Blue => (WORLD - 90.0, WORLD - 90.0) } }
-    fn index(self) -> usize { match self { Faction::Red => 0, Faction::Blue => 1 } }
-}
-
-/// The `.glb` model for a (faction, kind): **Red = pirates**, **Blue = undead**.
-/// Quaternius CC0 (Witch is CC-BY) — see assets/siege/CREDITS.md. Some models
-/// are shared across factions (dragon, cannon) and told apart by the tint.
-fn model_for(f: Faction, k: Kind) -> &'static [u8] {
-    use Faction::{Blue, Red};
-    match (f, k) {
-        // Pirates (Red)
-        (Red, Kind::Soldier) => include_bytes!("../../assets/siege/models/anne.glb"),
-        (Red, Kind::Archer) => include_bytes!("../../assets/siege/models/sharky.glb"),
-        (Red, Kind::Knight) => include_bytes!("../../assets/siege/models/pirate_captain.glb"),
-        (Red, Kind::Mage) => include_bytes!("../../assets/siege/models/witch.glb"),
-        (Red, Kind::Healer) => include_bytes!("../../assets/siege/models/henry.glb"),
-        // Undead (Blue)
-        (Blue, Kind::Soldier) => include_bytes!("../../assets/siege/models/zombie.glb"),
-        (Blue, Kind::Archer) => include_bytes!("../../assets/siege/models/skeleton_a.glb"),
-        (Blue, Kind::Knight) => include_bytes!("../../assets/siege/models/skeleton_sword.glb"),
-        (Blue, Kind::Mage) => include_bytes!("../../assets/siege/models/slime.glb"),
-        (Blue, Kind::Healer) => include_bytes!("../../assets/siege/models/bat.glb"),
-        // Shared
-        (_, Kind::Dragon) => include_bytes!("../../assets/siege/models/dragon.glb"),
-        (_, Kind::Catapult) | (_, Kind::Ballista) => include_bytes!("../../assets/siege/models/cannon.glb"),
-    }
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum Kind { Soldier, Archer, Knight, Dragon, Catapult, Mage, Ballista, Healer }
-impl Kind {
-    fn speed(self) -> f64 { match self { Kind::Soldier => 26.0, Kind::Archer => 22.0, Kind::Knight => 52.0, Kind::Dragon => 60.0, Kind::Catapult => 10.0, Kind::Mage => 20.0, Kind::Ballista => 13.0, Kind::Healer => 24.0 } }
-    fn max_hp(self) -> f64 { match self { Kind::Soldier => 100.0, Kind::Archer => 60.0, Kind::Knight => 180.0, Kind::Dragon => 1400.0, Kind::Catapult => 160.0, Kind::Mage => 70.0, Kind::Ballista => 140.0, Kind::Healer => 90.0 } }
-    /// Engagement range — for the siege engines the firing range, for the healer
-    /// the heal range.
-    fn reach(self) -> f64 { match self { Kind::Soldier => 9.0, Kind::Archer => 150.0, Kind::Knight => 12.0, Kind::Dragon => 60.0, Kind::Catapult => 260.0, Kind::Mage => 120.0, Kind::Ballista => 240.0, Kind::Healer => 70.0 } }
-    /// Damage per strike — for the healer, the (positive) amount healed.
-    fn dmg(self) -> f64 { match self { Kind::Soldier => 14.0, Kind::Archer => 18.0, Kind::Knight => 30.0, Kind::Dragon => 22.0, Kind::Catapult => 30.0, Kind::Mage => 16.0, Kind::Ballista => 26.0, Kind::Healer => 24.0 } }
-    fn cooldown(self) -> f64 { match self { Kind::Soldier => 0.8, Kind::Archer => 1.1, Kind::Knight => 1.0, Kind::Dragon => 0.5, Kind::Catapult => 2.4, Kind::Mage => 1.3, Kind::Ballista => 1.7, Kind::Healer => 0.9 } }
-    fn radius(self) -> f32 { match self { Kind::Soldier => 3.0, Kind::Archer => 3.0, Kind::Knight => 4.2, Kind::Dragon => 11.0, Kind::Catapult => 5.5, Kind::Mage => 3.4, Kind::Ballista => 5.0, Kind::Healer => 3.2 } }
-    /// Ground units sit on the terrain; the dragon flies at a fixed altitude
-    /// (low enough to menace the ground — it engages by horizontal distance).
-    fn altitude(self) -> f64 { match self { Kind::Dragon => 46.0, _ => 0.0 } }
-
-    /// All eight kinds, in `index()` order — the render groups units by this.
-    const ALL: [Kind; 8] = [Kind::Soldier, Kind::Archer, Kind::Knight, Kind::Dragon, Kind::Catapult, Kind::Mage, Kind::Ballista, Kind::Healer];
-    fn index(self) -> usize { match self { Kind::Soldier => 0, Kind::Archer => 1, Kind::Knight => 2, Kind::Dragon => 3, Kind::Catapult => 4, Kind::Mage => 5, Kind::Ballista => 6, Kind::Healer => 7 } }
-    /// Per-model orientation + size corrections — some Quaternius models face a
-/// different axis or read over/undersized. Returns (yaw offset in radians, scale
-/// multiplier).
-    fn model_tweak(self, f: Faction) -> (f32, f32) {
-        match (f, self) {
-            (Faction::Blue, Kind::Mage) => (-std::f32::consts::FRAC_PI_2, 0.55), // slime: faces +X, reads big
-            _ => (0.0, 1.0),
-        }
-    }
-
-    /// Visual model height in world units (the model is normalised to height 1).
-    /// Per-kind because some models read bigger than their collision sphere.
-    fn model_height(self) -> f32 {
-        match self {
-            Kind::Catapult | Kind::Ballista => self.radius() * 1.7, // chunky cannon model
-            Kind::Knight => self.radius() * 2.3, // horse + rider; keep it trim
-            Kind::Dragon => self.radius() * 2.2,
-            _ => self.radius() * 2.6,
-        }
-    }
-}
-
-struct Unit {
-    faction: Faction,
-    kind: Kind,
-    p: Point3,
-    hp: f64,
-    cooldown: f64,
-    respawn_at: f64, // sim-time at which a dead unit returns (f64::INFINITY = alive)
-    // Intent written by the *decide* pass (reads only this unit); consumed by the
-    // serial *apply* pass. Keeping writes unit-local is what makes decide parallel.
-    vel: (f64, f64, f64),
-    attacks: Vec<(u32, f64)>, // (target unit id, damage) — many for AoE (dragon)
-    emit: Option<Point3>, // strike point that should spawn a smoke puff this frame
-    fire: Option<Point3>, // catapult: target point to lob a projectile at this frame
-    fx: Vec<Fx>, // visible effects this unit produced this frame
-    face: f32, // heading (radians about Y) for orienting the model
-    phase: f32, // per-unit animation phase offset (so they don't bob in sync)
-    atk_anim: f32, // attack-lunge countdown (seconds), set when the unit strikes
-}
-impl Unit {
-    fn alive(&self) -> bool { self.hp > 0.0 }
-}
-
-/// The lightweight item actually stored in the index: id + faction + position.
-/// Decoupled from `Unit` so the decide pass can hold `&Tree3<IUnit>` immutably
-/// while it mutates the `units` slice through `par_iter_mut`.
-#[derive(Clone, Copy)]
-struct IUnit { id: u32, faction: Faction, p: Point3, health: f32 }
-impl Positioned3 for IUnit { fn position(&self) -> Point3 { self.p } }
-
-// ----------------------------------------------------------------- smoke (LoS)
-
-const SMOKE_R: f64 = 24.0; // puff radius — also the raycast corridor half-width
-const SMOKE_LIFE: f64 = 3.5; // seconds before a puff dissipates
-const SMOKE_CAP: usize = 240; // hard cap on live puffs
-
-/// A smoke cloud — a dynamic line-of-sight blocker. Catapult and dragon strikes
-/// spawn one; it lives in its own `Tree3` so an archer/ballista shot can
-/// `raycast` it: a puff between the shooter and the target blocks the shot.
-#[derive(Clone, Copy)]
-struct Puff { p: Point3, born: f64 }
-impl Positioned3 for Puff { fn position(&self) -> Point3 { self.p } }
-
-// ------------------------------------------------------------- visual effects
-
-/// A transient combat effect — the *visible* part of an attack (the queries
-/// resolve instantly, so without these the fight is invisible). Spawned with the
-/// same parallel-safe pattern as smoke: `decide` pushes into the unit's own `fx`
-/// list, the serial `apply` stamps a birth time and moves them to the global
-/// pool, the render fades them by age.
-#[derive(Clone, Copy)]
-enum FxKind { Arrow, Bolt, Lightning, Ring, Spark }
-#[derive(Clone, Copy)]
-struct Fx { kind: FxKind, a: Vec3, b: Vec3, born: f64 }
-impl Fx {
-    fn new(kind: FxKind, a: Vec3, b: Vec3) -> Fx { Fx { kind, a, b, born: 0.0 } }
-    fn life(kind: FxKind) -> f64 { match kind { FxKind::Arrow | FxKind::Bolt => 0.14, FxKind::Lightning => 0.10, FxKind::Ring => 0.45, FxKind::Spark => 0.30 } }
-}
-const FX_CAP: usize = 4000; // hard cap on live effects
-
-/// `Point3` → macroquad `Vec3`.
-fn v3(p: Point3) -> Vec3 { vec3(p.x as f32, p.y as f32, p.z as f32) }
-
-// ------------------------------------------------------------- projectiles
-
-const PROJ_GRAVITY: f64 = 220.0; // ballistic arc gravity (world units / s²)
-const ARTY_STANDOFF: f64 = 95.0; // artillery keeps at least this far from the enemy
-
-#[derive(Clone, Copy, PartialEq)]
-enum ProjKind { Cannon, LavaRock }
-
-/// A ballistic projectile (cannonball / lava bomb) — arcs under gravity and on
-/// landing does a `Sphere3` AoE. Travel time makes the shot visible.
-struct Projectile { p: Point3, v: (f64, f64, f64), kind: ProjKind, faction: Faction, dmg: f64, r: f64 }
-
-/// Launch velocity for a ballistic arc from `a` to `t` over flight time `tf`.
-fn arc_velocity(a: Point3, t: Point3, tf: f64) -> (f64, f64, f64) {
-    ((t.x - a.x) / tf, (t.y - a.y) / tf + 0.5 * PROJ_GRAVITY * tf, (t.z - a.z) / tf)
-}
-
-// ----------------------------------------------------------------- spawning
-
-fn spawn_unit(rng: &mut Rng, faction: Faction) -> Unit {
-    // Roster mix: mostly foot soldiers, then archers/knights, a few siege engines
-    // and mages, a rare dragon.
-    let roll = rng.unit();
-    let kind = if roll < 0.44 { Kind::Soldier }
-        else if roll < 0.64 { Kind::Archer }
-        else if roll < 0.76 { Kind::Knight }
-        else if roll < 0.86 { Kind::Mage }
-        else if roll < 0.94 { Kind::Healer }
-        else if roll < 0.965 { Kind::Ballista } // siege engines are now rare
-        else if roll < 0.985 { Kind::Catapult }
-        else { Kind::Dragon };
-    let mut u = Unit {
-        faction, kind,
-        p: Point3::new(0.0, 0.0, 0.0),
-        hp: kind.max_hp(),
-        cooldown: 0.0,
-        respawn_at: f64::INFINITY,
-        vel: (0.0, 0.0, 0.0),
-        attacks: Vec::new(),
-        emit: None,
-        fire: None,
-        fx: Vec::new(),
-        face: 0.0,
-        phase: rng.range(0.0, std::f64::consts::TAU) as f32,
-        atk_anim: 0.0,
-    };
-    place_at_castle(rng, &mut u);
-    u
-}
-
-/// Drop a unit at a random point just outside its castle, on the terrain.
-fn place_at_castle(rng: &mut Rng, u: &mut Unit) {
-    let (cx, cz) = u.faction.castle();
-    let x = (cx + rng.range(-60.0, 60.0)).clamp(2.0, WORLD - 2.0);
-    let z = (cz + rng.range(-60.0, 60.0)).clamp(2.0, WORLD - 2.0);
-    let y = terrain_height(x, z) + u.kind.altitude() + u.kind.radius() as f64;
-    u.p = Point3::new(x, y, z);
-    u.hp = u.kind.max_hp();
-    u.respawn_at = f64::INFINITY;
-}
-
-fn spawn_army(rng: &mut Rng, per_faction: usize) -> Vec<Unit> {
-    let mut units = Vec::with_capacity(per_faction * 2);
-    for _ in 0..per_faction { units.push(spawn_unit(rng, Faction::Red)); }
-    for _ in 0..per_faction { units.push(spawn_unit(rng, Faction::Blue)); }
-    units
-}
-
-// ----------------------------------------------------------------- AI: decide
-
-/// One unit's per-frame brain — *read-only* on the shared index, writes only
-/// into `u`'s own `vel`/`attacks`. This is the body that fans out over rayon
-/// (`par_iter_mut`): each unit reads the shared index and mutates only itself.
-///
-/// Three library queries, one per concern: **k-NN** finds the nearest enemy
-/// (targeting) *and* the nearby friends (boids); the dragon's AoE is a sphere
-/// **`cull`**; the archer's line-of-fire is a thick **`raycast`**.
-fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>, body_radius: &[[f64; 8]; 2]) {
-    u.vel = (0.0, 0.0, 0.0);
-    u.attacks.clear();
-    u.emit = None;
-    u.fire = None;
-    u.fx.clear();
-    if !u.alive() { return; }
-
-    // One k-NN pass yields both the nearest enemy (targeting) and the nearby
-    // friends used for flocking (separation + cohesion). k=16 reliably spans
-    // both once the lines meet.
-    let mut target: Option<(Point3, u32, f64)> = None; // nearest enemy (pos, id, dist)
-    let mut heal: Option<(Point3, u32, f32, f64)> = None; // most-wounded friend (pos, id, health, dist)
-    let (mut sep_x, mut sep_z) = (0.0, 0.0); // separation push (from ANY neighbour)
-    let (mut coh_x, mut coh_z, mut friends) = (0.0, 0.0, 0u32); // cohesion centroid
-    let sep_dist = body_radius[u.faction.index()][u.kind.index()] * 2.0; // two bodies of this size shan't overlap
-    for (d, it) in index.knn(u.p, 16) {
-        if it.id == id { continue; }
-        // Separation from ANY neighbour (friend or foe) inside personal space,
-        // weighted by closeness (0 at the edge, strong on contact) so no two
-        // bodies overlap. The same one k-NN drives targeting, cohesion AND this.
-        if d < sep_dist {
-            let (dd, w) = (d.max(1e-3), 1.0 - d / sep_dist);
-            sep_x += (u.p.x - it.p.x) / dd * w;
-            sep_z += (u.p.z - it.p.z) / dd * w;
-        }
-        if it.faction != u.faction {
-            if target.is_none() { target = Some((it.p, it.id, d)); }
-        } else {
-            coh_x += it.p.x; coh_z += it.p.z; friends += 1;
-            if it.health < 0.97 && heal.is_none_or(|(_, _, h, _)| it.health < h) { heal = Some((it.p, it.id, it.health, d)); }
-        }
-    }
-
-    // The healer peels off to its most-wounded comrade; with nobody hurt it
-    // advances WITH the army (toward the nearest enemy / the enemy keep) rather
-    // than drifting to the friend centroid — which made healers clump and jitter
-    // instead of moving. Everyone else just seeks the nearest enemy.
-    let advance = match target {
-        Some((tp, _, d)) => (tp.x, tp.y, tp.z, d),
-        None => { let (cx, cz) = u.faction.other().castle(); (cx, u.p.y, cz, f64::INFINITY) }
-    };
-    let (tx, ty, tz, tdist) = match (u.kind, heal) {
-        (Kind::Healer, Some((p, _, _, d))) => (p.x, p.y, p.z, d),
-        _ => advance,
-    };
-
-    // Velocity = seek (scaled by approach — zero once in reach) + separation
-    // (ALWAYS applied, even while stopped and fighting, so bodies never overlap)
-    // + gentle cohesion for ground-melee formations, capped so separation can't
-    // fling a unit away.
-    let seek = (tx - u.p.x, tz - u.p.z);
-    let slen = (seek.0 * seek.0 + seek.1 * seek.1).sqrt().max(1e-6);
-    let speed = u.kind.speed();
-    // The dragon engages by HORIZONTAL distance (`slen`) — it flies far above the
-    // ground, so a 3D check would never let it reach ground troops.
-    let engage = if u.kind == Kind::Dragon { slen } else { tdist };
-    // Artillery kites to keep a standoff (bombard from range, not melee); everyone
-    // else closes until in reach.
-    let approach = if matches!(u.kind, Kind::Catapult | Kind::Ballista) {
-        if engage < ARTY_STANDOFF { -speed } else if engage > u.kind.reach() * 0.9 { speed } else { 0.0 }
-    } else if engage < u.kind.reach() * 0.8 { 0.0 } else { speed };
-    let (mut vx, mut vz) = (seek.0 / slen * approach, seek.1 / slen * approach);
-    // Separation always on, for every kind (dragons included — they were piling
-    // up): the personal space now comes from each model's real footprint.
-    vx += sep_x * speed * 0.7;
-    vz += sep_z * speed * 0.7;
-    if matches!(u.kind, Kind::Soldier | Kind::Knight) && friends > 0 {
-        let (cx, cz) = (coh_x / friends as f64 - u.p.x, coh_z / friends as f64 - u.p.z);
-        let cl = (cx * cx + cz * cz).sqrt().max(1e-6);
-        vx += cx / cl * speed * 0.12; vz += cz / cl * speed * 0.12; // cohesion
-    }
-    let vl = (vx * vx + vz * vz).sqrt();
-    let cap = speed * 1.5;
-    if vl > cap { let s = cap / vl; vx *= s; vz *= s; }
-    u.vel = (vx, 0.0, vz); // the dragon's altitude is pinned in the apply pass
-
-    // Attacking: only when in reach and off cooldown.
-    if u.cooldown > 0.0 || engage > u.kind.reach() { return; }
-    match u.kind {
-        // Dragon fire-breath: an area cull — every enemy in the blast takes a hit,
-        // and the scorched ground belches a smoke cloud (a new LoS blocker).
-        Kind::Dragon => {
-            let blast = Sphere3::new(tx, ty, tz, u.kind.reach() * 0.5);
-            for it in index.cull(&blast) {
-                if it.faction != u.faction { u.attacks.push((it.id, u.kind.dmg())); }
-            }
-            u.emit = Some(Point3::new(tx, ty, tz));
-            let c = Point3::new(tx, ty, tz);
-            u.fx.push(Fx::new(FxKind::Ring, v3(c), v3(c)));
-            u.fx.push(Fx::new(FxKind::Bolt, v3(u.p), v3(c))); // breath stream from the dragon
-        }
-        // Catapult: lob a real boulder — record the target so the apply pass
-        // launches an arcing projectile that does the AoE on impact (visible
-        // travel time, instead of an instant hidden blast).
-        Kind::Catapult => { u.fire = Some(Point3::new(tx, terrain_height(tx, tz), tz)); }
-        // Ballista: a piercing bolt — an all-hits `raycast` that does NOT stop at
-        // the first unit; every enemy on the line is skewered. (Contrast the
-        // archer, who stops at the first hit.) Smoke blocks the line.
-        Kind::Ballista => {
-            let dir = Point3::new(tx - u.p.x, ty - u.p.y, tz - u.p.z);
-            let len = (dir.x * dir.x + dir.y * dir.y + dir.z * dir.z).sqrt().max(1e-6);
-            let ndir = Point3::new(dir.x / len, dir.y / len, dir.z / len);
-            if smoke.raycast_dda_first(u.p, ndir, len, SMOKE_R).is_some() { return; } // blocked
-            for (_, it) in index.raycast(u.p, ndir, len + 30.0, 3.5) {
-                if it.id != id && it.faction != u.faction { u.attacks.push((it.id, u.kind.dmg())); }
-            }
-            u.fx.push(Fx::new(FxKind::Bolt, v3(u.p), v3(Point3::new(tx, ty, tz))));
-        }
-        // Mage chain-lightning: a `knn` from the strike point arcs to the nearest
-        // enemies — up to 4 links, each taking the bolt.
-        Kind::Mage => {
-            let mut links = 0;
-            let mut from = u.p; // the arc hops shooter → enemy → enemy …
-            for (_, it) in index.knn(Point3::new(tx, ty, tz), 10) {
-                if it.faction == u.faction || it.id == id { continue; }
-                u.attacks.push((it.id, u.kind.dmg()));
-                u.fx.push(Fx::new(FxKind::Lightning, v3(from), v3(it.p)));
-                from = it.p;
-                links += 1;
-                if links >= 4 { break; }
-            }
-        }
-        // Archer line-of-fire: a thick raycast at the target. The *first* unit
-        // struck takes the arrow — a friend in the way blocks the shot (real
-        // line-of-sight, and a `raycast` showcase). The ray starts at the
-        // archer, so skip the self-hit at t≈0.
-        Kind::Archer => {
-            let dir = Point3::new(tx - u.p.x, ty - u.p.y, tz - u.p.z);
-            let len = (dir.x * dir.x + dir.y * dir.y + dir.z * dir.z).sqrt().max(1e-6);
-            let ndir = Point3::new(dir.x / len, dir.y / len, dir.z / len);
-            if smoke.raycast_dda_first(u.p, ndir, len, SMOKE_R).is_some() { return; } // smoke blocks LoS
-            for (_, it) in index.raycast(u.p, ndir, len + 4.0, 3.0) {
-                if it.id == id { continue; }
-                if it.faction != u.faction { u.attacks.push((it.id, u.kind.dmg())); }
-                u.fx.push(Fx::new(FxKind::Arrow, v3(u.p), v3(it.p))); // arrow to whatever it hit
-                break; // the first thing hit stops the arrow
-            }
-        }
-        // Healer: mend the most-wounded nearby comrade — a friendly `knn`, the
-        // heal applied as *negative* damage (capped at full HP in the apply pass).
-        Kind::Healer => {
-            if let Some((p, hid, _, _)) = heal {
-                u.attacks.push((hid, -u.kind.dmg()));
-                u.fx.push(Fx::new(FxKind::Spark, v3(p), v3(p)));
-            }
-        }
-        // Soldier / knight: single melee strike on the k-NN target.
-        _ => { if let Some((_, tid, _)) = target { u.attacks.push((tid, u.kind.dmg())); } }
-    }
-}
-
-// ----------------------------------------------------------------- AI: apply
-
-/// Serial resolution of one frame's intents: move units, apply accumulated
-/// damage, kill the fallen, respawn the dead, turn smoke emissions into puffs and
-/// collect this frame's visual effects (aging out the old ones). Reads every
-/// unit's `vel`/`attacks`/`emit`/`fx` (written by `decide`) and is the only place
-/// cross-unit writes happen.
-fn apply(units: &mut [Unit], smoke: &mut Vec<Puff>, effects: &mut Vec<Fx>, projectiles: &mut Vec<Projectile>, rng: &mut Rng, dt: f64, now: f64) {
-    // 1) movement + cooldown tick (each unit, independent).
-    for u in units.iter_mut() {
-        if !u.alive() { continue; }
-        u.cooldown = (u.cooldown - dt).max(0.0);
-        // Wading: ground units slow right down in the river/water (a soft obstacle).
-        let wade = if u.kind.altitude() == 0.0 && terrain_height(u.p.x, u.p.z) < WATER_LEVEL && !on_bridge(u.p.x, u.p.z) { 0.4 } else { 1.0 };
-        let nx = (u.p.x + u.vel.0 * dt * wade).clamp(2.0, WORLD - 2.0);
-        let nz = (u.p.z + u.vel.2 * dt * wade).clamp(2.0, WORLD - 2.0);
-        let ground = terrain_height(nx, nz) + u.kind.radius() as f64;
-        let ny = if u.kind == Kind::Dragon { (terrain_height(nx, nz) + u.kind.altitude()).max(ground) } else { ground };
-        u.p = Point3::new(nx, ny, nz);
-        // Face the direction of travel (for orienting the model); keep the last
-        // heading while stopped.
-        if u.vel.0 * u.vel.0 + u.vel.2 * u.vel.2 > 1.0 { u.face = (u.vel.0 as f32).atan2(u.vel.2 as f32); }
-        // Reload after a shot (an AoE that caught nobody still fired) and kick off
-        // the attack-lunge animation; otherwise let the lunge decay.
-        let fired = !u.attacks.is_empty() || u.emit.is_some() || u.fire.is_some();
-        if fired { u.cooldown = u.kind.cooldown(); }
-        u.atk_anim = if fired { ATK_ANIM_LEN } else { (u.atk_anim - dt as f32).max(0.0) };
-        // Lava burns: a ground unit standing on emissive terrain takes damage.
-        if u.kind.altitude() == 0.0 && terrain_surface(nx, nz, terrain_height(nx, nz)).1 {
-            u.hp -= LAVA_DPS * dt;
-            if u.hp <= 0.0 { u.respawn_at = now + 4.0; }
-        }
-    }
-
-    // 2) damage resolution — gather first (immutable borrow), then apply.
-    let mut dmg = vec![0.0f64; units.len()];
-    for u in units.iter() {
-        for &(tid, d) in &u.attacks {
-            if let Some(slot) = dmg.get_mut(tid as usize) { *slot += d; }
-        }
-    }
-    for (u, d) in units.iter_mut().zip(dmg) {
-        // d may be negative (a healer's mend); cap healing at full HP. Dead units
-        // are out of the index, so they can't be targeted or healed back.
-        if d != 0.0 && u.alive() {
-            u.hp = (u.hp - d).min(u.kind.max_hp());
-            if u.hp <= 0.0 { u.respawn_at = now + 4.0; } // schedule a respawn
-        }
-    }
-
-    // 3) respawns — dead units return from their keep after the delay.
-    for u in units.iter_mut() {
-        if !u.alive() && u.respawn_at.is_finite() && now >= u.respawn_at {
-            place_at_castle(rng, u);
-        }
-    }
-
-    // 4) smoke — spawn a puff per emission (under the cap), age out the rest.
-    for u in units.iter() {
-        if let Some(p) = u.emit {
-            if smoke.len() < SMOKE_CAP { smoke.push(Puff { p, born: now }); }
-        }
-    }
-    smoke.retain(|s| now - s.born < SMOKE_LIFE);
-
-    // 5) visual effects — stamp birth time, collect, age out (cap to bound work).
-    for u in units.iter() {
-        for f in &u.fx {
-            if effects.len() < FX_CAP { effects.push(Fx { born: now, ..*f }); }
-        }
-    }
-    effects.retain(|f| now - f.born < Fx::life(f.kind));
-
-    // 6) projectiles — launch lobbed shots, fly them, resolve impacts.
-    for u in units.iter() {
-        if let Some(t) = u.fire {
-            let d = ((t.x - u.p.x).powi(2) + (t.z - u.p.z).powi(2)).sqrt();
-            let tf = (d / 120.0).clamp(0.8, 2.5); // flight time → arc height
-            projectiles.push(Projectile { p: u.p, v: arc_velocity(u.p, t, tf), kind: ProjKind::Cannon, faction: u.faction, dmg: Kind::Catapult.dmg() * 1.4, r: 30.0 });
-        }
-    }
-    let mut impacts: Vec<(Point3, Faction, f64, f64, ProjKind)> = Vec::new();
-    projectiles.retain_mut(|pr| {
-        pr.v.1 -= PROJ_GRAVITY * dt;
-        pr.p = Point3::new(pr.p.x + pr.v.0 * dt, pr.p.y + pr.v.1 * dt, pr.p.z + pr.v.2 * dt);
-        let ground = terrain_height(pr.p.x, pr.p.z);
-        let out = pr.p.x < 0.0 || pr.p.x > WORLD || pr.p.z < 0.0 || pr.p.z > WORLD;
-        if pr.p.y <= ground || out {
-            if !out { impacts.push((Point3::new(pr.p.x, ground, pr.p.z), pr.faction, pr.dmg, pr.r, pr.kind)); }
-            false
-        } else { true }
-    });
-    for (ip, fac, dmg, r, kind) in impacts {
-        for u in units.iter_mut() {
-            // Cannonballs hit the firer's enemies; lava bombs scorch everyone.
-            let hits = u.alive() && u.kind.altitude() == 0.0 && (kind == ProjKind::LavaRock || u.faction != fac);
-            if hits {
-                let d2 = (u.p.x - ip.x).powi(2) + (u.p.z - ip.z).powi(2);
-                if d2 < r * r { u.hp -= dmg; if u.hp <= 0.0 { u.respawn_at = now + 4.0; } }
-            }
-        }
-        if smoke.len() < SMOKE_CAP { smoke.push(Puff { p: Point3::new(ip.x, ip.y + 8.0, ip.z), born: now }); }
-        effects.push(Fx { kind: FxKind::Ring, a: v3(ip), b: v3(ip), born: now });
-    }
-}
+// ── Everything simulation-side (Rng, terrain, Faction/model_for/Kind, Unit/IUnit,
+//    smoke, Fx + projectiles, spawning, decide/apply, the volcano) moved to the
+//    shared `siege_sim` module, imported above. What remains is render-only. ──
 
 // ----------------------------------------------------------------- rendering
-
-/// Per-faction team colour + blend amount (alpha). The shader `mix()`es the
-/// model's own colours toward this, so even dark models (knights, dragons) read
-/// clearly as Red or Blue.
-fn faction_tint(f: Faction) -> [f32; 4] {
-    match f { Faction::Red => [0.90, 0.20, 0.14, 0.22], Faction::Blue => [0.30, 0.45, 1.0, 0.22] }
-}
-
-/// Which baked animation frame this unit shows now — the clip loops at a fixed
-/// rate, the units split into `ANIM_GROUPS` phase groups. Quantising the phase to
-/// groups means at most `ANIM_GROUPS` distinct frames are on screen per model at
-/// once, so the draw-call count is bounded regardless of the army size (while the
-/// clip stays smooth over time via the frame count). Static models (`nf`≤1) → 0.
-fn anim_frame(u: &Unit, now: f64, nf: usize) -> usize {
-    if nf <= 1 { return 0; }
-    let group = ((u.phase * std::f32::consts::FRAC_1_PI * 0.5) * ANIM_GROUPS as f32) as usize % ANIM_GROUPS;
-    let off = group as f32 / ANIM_GROUPS as f32; // this group's phase in the loop
-    (((now as f32 * 1.6 + off) * nf as f32) as usize) % nf
-}
 
 /// Procedural "animation" offset for a unit's model this frame (cheap, scales to
 /// the whole army — no skeletal skinning): a walk-bounce while moving (idle
@@ -701,10 +97,10 @@ fn build_terrain_chunks() -> Vec<Mesh> {
                     let n = vec3((-hx / (2.0 * step)) as f32, 1.0, (-hz / (2.0 * step)) as f32).normalize();
                     let (base, emissive) = terrain_surface(x, z, h);
                     let col = if emissive {
-                        base
+                        Color::new(base[0], base[1], base[2], 1.0)
                     } else {
                         let b = 0.32 + 0.68 * n.dot(light).max(0.0); // ambient + diffuse
-                        Color::new(base.r * b, base.g * b, base.b * b, 1.0)
+                        Color::new(base[0] * b, base[1] * b, base[2] * b, 1.0)
                     };
                     vertices.push(Vertex::new(x as f32, h as f32, z as f32, 0.0, 0.0, col));
                 }
@@ -758,7 +154,7 @@ fn build_voxel_chunks() -> Vec<Mesh> {
                     let (x0, z0) = (i as f64 * step, j as f64 * step);
                     let (x1, z1) = (x0 + step, z0 + step);
                     let (base, emissive) = terrain_surface(x0 + step * 0.5, z0 + step * 0.5, h);
-                    let col = |b: f32| Color::new((base.r * b).min(1.0), (base.g * b).min(1.0), (base.b * b).min(1.0), 1.0);
+                    let col = |b: f32| Color::new((base[0] * b).min(1.0), (base[1] * b).min(1.0), (base[2] * b).min(1.0), 1.0);
                     // Per-corner AO: a corner darkens for each taller neighbour cell
                     // touching it (edge neighbours + the diagonal if an edge is up).
                     let ao = |dx: i32, dz: i32| -> f32 {
@@ -823,19 +219,20 @@ fn draw_bridges() {
 fn draw_effects(effects: &[Fx], now: f64) {
     for f in effects {
         let age = ((now - f.born) / Fx::life(f.kind)).clamp(0.0, 1.0) as f32;
+        let (a, b) = (a3(f.a), a3(f.b)); // Fx endpoints are graphics-free [f32;3]
         match f.kind {
-            FxKind::Arrow => draw_line_3d(f.a, f.b, Color::new(0.96, 0.90, 0.45, 1.0)),
-            FxKind::Bolt => draw_line_3d(f.a, f.b, Color::new(1.0, 0.58, 0.16, 1.0)),
-            FxKind::Lightning => draw_line_3d(f.a, f.b, Color::new(0.62, 0.86, 1.0, 1.0)),
-            FxKind::Spark => draw_line_3d(f.a, f.a + vec3(0.0, 7.0, 0.0), Color::new(0.40, 1.0, 0.55, 1.0)),
+            FxKind::Arrow => draw_line_3d(a, b, Color::new(0.96, 0.90, 0.45, 1.0)),
+            FxKind::Bolt => draw_line_3d(a, b, Color::new(1.0, 0.58, 0.16, 1.0)),
+            FxKind::Lightning => draw_line_3d(a, b, Color::new(0.62, 0.86, 1.0, 1.0)),
+            FxKind::Spark => draw_line_3d(a, a + vec3(0.0, 7.0, 0.0), Color::new(0.40, 1.0, 0.55, 1.0)),
             FxKind::Ring => {
                 let r = 8.0 + 26.0 * age; // expanding shockwave
                 let col = Color::new(1.0, 0.45, 0.12, 1.0 - age);
                 let n = 22;
-                let mut prev = f.a + vec3(r, 1.5, 0.0);
+                let mut prev = a + vec3(r, 1.5, 0.0);
                 for i in 1..=n {
                     let t = i as f32 / n as f32 * std::f32::consts::TAU;
-                    let p = f.a + vec3(r * t.cos(), 1.5, r * t.sin());
+                    let p = a + vec3(r * t.cos(), 1.5, r * t.sin());
                     draw_line_3d(prev, p, col);
                     prev = p;
                 }
@@ -880,7 +277,7 @@ async fn main() {
     // both the map (terrain noise offset) and the army composition.
     let seed = std::env::var("SIEGE_SEED").ok().and_then(|s| s.parse::<u64>().ok())
         .unwrap_or_else(|| (macroquad::miniquad::date::now() * 1000.0) as u64);
-    let _ = MAP_SEED.set((seed % 100_000) as f64 * 0.01);
+    set_map_seed((seed % 100_000) as f64 * 0.01);
     let mut rng = Rng::new(seed | 1);
     let mut per_faction = PER_FACTION; // live army size per side (population slider)
     let mut cur_pop = per_faction;
@@ -956,8 +353,7 @@ async fn main() {
     let terrain_chunks = if std::env::var("SIEGE_SMOOTH").is_ok() { build_terrain_chunks() } else { build_voxel_chunks() };
     let mut now = 0.0f64; // simulation clock
     let mut paused = false;
-    let mut volcano_smoke_t = 0.0f64; // next crater-puff time
-    let mut volcano_erupt_t = 7.0f64; // next eruption time
+    let mut volcano = Volcano::new(); // crater plume + eruption timers (shared sim)
 
     // Live thread-count control (native). The decide pass runs inside a rayon
     // pool sized by the slider; dragging the slider blocks camera-orbit.
@@ -1026,45 +422,9 @@ async fn main() {
             for i in 0..units.len() { decide(&mut units[i], i as u32, &index, &smoke_index, &body_radius); }
             apply(&mut units, &mut smoke, &mut effects, &mut projectiles, &mut rng, dt, now);
 
-            // Volcano: a constant smoke plume from the crater, plus an occasional
-            // eruption — a lava spray (orange streaks) + a smoke burst + a ring.
-            let (vcx, vcz) = (WORLD * 0.5, WORLD * 0.5);
-            let vcy = terrain_height(vcx, vcz) + 6.0;
-            volcano_smoke_t -= dt;
-            if volcano_smoke_t <= 0.0 {
-                volcano_smoke_t = 0.35;
-                if smoke.len() < SMOKE_CAP {
-                    smoke.push(Puff { p: Point3::new(vcx + rng.range(-12.0, 12.0), vcy, vcz + rng.range(-12.0, 12.0)), born: now });
-                }
-            }
-            volcano_erupt_t -= dt;
-            if volcano_erupt_t <= 0.0 {
-                volcano_erupt_t = rng.range(9.0, 16.0);
-                let c = vec3(vcx as f32, vcy as f32, vcz as f32);
-                effects.push(Fx { kind: FxKind::Ring, a: c, b: c, born: now });
-                for _ in 0..16 {
-                    let ang = rng.range(0.0, std::f64::consts::TAU) as f32;
-                    let (up, out) = (rng.range(30.0, 65.0) as f32, rng.range(6.0, 48.0) as f32);
-                    let tip = c + vec3(ang.cos() * out, up, ang.sin() * out);
-                    effects.push(Fx { kind: FxKind::Bolt, a: c, b: tip, born: now }); // lava streak
-                }
-                for _ in 0..7 {
-                    if smoke.len() < SMOKE_CAP {
-                        smoke.push(Puff { p: Point3::new(vcx + rng.range(-22.0, 22.0), vcy + rng.range(0.0, 16.0), vcz + rng.range(-22.0, 22.0)), born: now });
-                    }
-                }
-                // Spit real arcing lava bombs that land out on the slopes + scorch
-                // whoever's there (uses the projectile system).
-                let crater = Point3::new(vcx, vcy, vcz);
-                for _ in 0..6 {
-                    let ang = rng.range(0.0, std::f64::consts::TAU);
-                    let dist = rng.range(80.0, 230.0);
-                    let land = Point3::new((vcx + ang.cos() * dist).clamp(4.0, WORLD - 4.0), 0.0, (vcz + ang.sin() * dist).clamp(4.0, WORLD - 4.0));
-                    let land = Point3::new(land.x, terrain_height(land.x, land.z), land.z);
-                    let tf = rng.range(1.6, 2.6);
-                    projectiles.push(Projectile { p: crater, v: arc_velocity(crater, land, tf), kind: ProjKind::LavaRock, faction: Faction::Red, dmg: 60.0, r: 26.0 });
-                }
-            }
+            // Volcano: constant crater plume + the occasional eruption (lava
+            // streaks, smoke burst, arcing lava bombs) — all in the shared sim.
+            volcano_step(&mut volcano, &mut smoke, &mut effects, &mut projectiles, &mut rng, dt, now);
         }
 
         // ----- render 3D -----
