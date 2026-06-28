@@ -538,7 +538,9 @@ pub fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>, 
 /// damage, kill the fallen, respawn the dead, turn smoke emissions into puffs and
 /// collect this frame's visual effects (aging out the old ones). The only place
 /// cross-unit writes happen.
-pub fn apply(units: &mut [Unit], smoke: &mut Vec<Puff>, effects: &mut Vec<Fx>, projectiles: &mut Vec<Projectile>, rng: &mut Rng, dt: f64, now: f64) {
+/// Returns this frame's ground impacts (point + AoE radius) — cannon / lava bombs
+/// — so a renderer can carve craters there (the wgpu/macroquad alterable terrain).
+pub fn apply(units: &mut [Unit], smoke: &mut Vec<Puff>, effects: &mut Vec<Fx>, projectiles: &mut Vec<Projectile>, rng: &mut Rng, dt: f64, now: f64) -> Vec<(Point3, f64)> {
     // 1) movement + cooldown tick (each unit, independent).
     for u in units.iter_mut() {
         if !u.alive() { continue; }
@@ -621,6 +623,7 @@ pub fn apply(units: &mut [Unit], smoke: &mut Vec<Puff>, effects: &mut Vec<Fx>, p
             false
         } else { true }
     });
+    let mut craters: Vec<(Point3, f64)> = Vec::new();
     for (ip, fac, dmg, r, kind) in impacts {
         for u in units.iter_mut() {
             // Cannonballs hit the firer's enemies; lava bombs scorch everyone.
@@ -632,7 +635,9 @@ pub fn apply(units: &mut [Unit], smoke: &mut Vec<Puff>, effects: &mut Vec<Fx>, p
         }
         if smoke.len() < SMOKE_CAP { smoke.push(Puff { p: Point3::new(ip.x, ip.y + 8.0, ip.z), born: now }); }
         effects.push(Fx { kind: FxKind::Ring, a: fa3(ip), b: fa3(ip), born: now });
+        craters.push((ip, r));
     }
+    craters
 }
 
 // ----------------------------------------------------------------- volcano

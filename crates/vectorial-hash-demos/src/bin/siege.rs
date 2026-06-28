@@ -126,15 +126,25 @@ fn build_terrain_chunks() -> Vec<Mesh> {
 /// quad-flip fix from MAP_DESIGN.md, plus the elevation colour ramp. Chunked so
 /// each mesh stays under macroquad's per-draw-call index cap. The cell heights
 /// are a grid → alterable (crater carving) is a future step (BACKLOG).
-fn build_voxel_chunks() -> Vec<Mesh> {
+fn build_voxel_chunks(craters: &[(f32, f32, f32)]) -> Vec<Mesh> {
     const VRES: usize = 80;  // cells/side: cell ≈ 10 world units → visibly blocky
     const CHUNK: usize = 10; // cells/side per mesh: ≤100 cells · ≤30 idx = <5000
     let step = WORLD / VRES as f64;
     let light = vec3(-0.45, 0.84, -0.30).normalize();
+    // Carve craters (x, z, radius) as a smooth bowl out of a cell's height.
+    let carve = |x: f64, z: f64, h: f64| -> f64 {
+        let mut h = h;
+        for &(cx, cz, cr) in craters {
+            let d = (((x - cx as f64).powi(2) + (z - cz as f64).powi(2)).sqrt()) as f32;
+            if d < cr { h -= (cr * 0.45 * (1.0 - d / cr)) as f64; } // cone bowl, ~0.45·r deep
+        }
+        h
+    };
     // Precompute the cell-centre heights once for O(1) neighbour AO lookups.
     let heights: Vec<f64> = (0..VRES * VRES).map(|k| {
         let (i, j) = (k % VRES, k / VRES);
-        terrain_height((i as f64 + 0.5) * step, (j as f64 + 0.5) * step)
+        let (x, z) = ((i as f64 + 0.5) * step, (j as f64 + 0.5) * step);
+        carve(x, z, terrain_height(x, z))
     }).collect();
     let hc = |i: i32, j: i32| -> f64 {
         if i < 0 || j < 0 || i >= VRES as i32 || j >= VRES as i32 { -1000.0 } else { heights[j as usize * VRES + i as usize] }
@@ -348,9 +358,15 @@ async fn main() {
         renderer.upload_model(gl.quad_context, &m.vertices, &m.indices)
     };
 
-    // Static terrain, built once. Voxel (blocky) by default; flip to the smooth
-    // heightfield with $SIEGE_SMOOTH=1.
-    let terrain_chunks = if std::env::var("SIEGE_SMOOTH").is_ok() { build_terrain_chunks() } else { build_voxel_chunks() };
+    // Terrain. Voxel (blocky) by default; `V` toggles the smooth heightfield live
+    // ($SIEGE_SMOOTH=1 starts smooth). The voxel mesh is *alterable*: cannon and
+    // lava-bomb impacts carve craters into it (rebuilt, throttled, when dirty).
+    let mut smooth = std::env::var("SIEGE_SMOOTH").is_ok();
+    let mut craters: Vec<(f32, f32, f32)> = Vec::new(); // (x, z, radius), capped
+    let mut terrain_dirty = false; // a crater landed → rebuild the voxel mesh soon
+    let mut rebuild_t = 0.0f64; // throttle: at most one rebuild per REBUILD_EVERY
+    const REBUILD_EVERY: f64 = 0.4;
+    let mut terrain_chunks = if smooth { build_terrain_chunks() } else { build_voxel_chunks(&craters) };
     let mut now = 0.0f64; // simulation clock
     let mut paused = false;
     let mut volcano = Volcano::new(); // crater plume + eruption timers (shared sim)
@@ -382,6 +398,10 @@ async fn main() {
         let wheel = mouse_wheel().1;
         if wheel != 0.0 { dist = (dist - wheel * 0.5).clamp(200.0, 1600.0); }
         if is_key_pressed(KeyCode::P) { paused = !paused; }
+        if is_key_pressed(KeyCode::V) { // toggle smooth ↔ voxel terrain, rebuild now
+            smooth = !smooth;
+            terrain_chunks = if smooth { build_terrain_chunks() } else { build_voxel_chunks(&craters) };
+        }
         // Rebuild the army when the population slider changed (or on `[`/`]`).
         if is_key_pressed(KeyCode::RightBracket) { per_faction = (per_faction + 100).min(2000); }
         if is_key_pressed(KeyCode::LeftBracket) { per_faction = per_faction.saturating_sub(100).max(20); }
@@ -420,11 +440,25 @@ async fn main() {
             }
             #[cfg(target_arch = "wasm32")]
             for i in 0..units.len() { decide(&mut units[i], i as u32, &index, &smoke_index, &body_radius); }
-            apply(&mut units, &mut smoke, &mut effects, &mut projectiles, &mut rng, dt, now);
+            let impacts = apply(&mut units, &mut smoke, &mut effects, &mut projectiles, &mut rng, dt, now);
 
             // Volcano: constant crater plume + the occasional eruption (lava
             // streaks, smoke burst, arcing lava bombs) — all in the shared sim.
             volcano_step(&mut volcano, &mut smoke, &mut effects, &mut projectiles, &mut rng, dt, now);
+
+            // Alterable terrain: each ground impact carves a crater into the voxel
+            // mesh. Cap the list and rebuild throttled (the voxel rebuild isn't free).
+            for (ip, r) in impacts {
+                craters.push((ip.x as f32, ip.z as f32, (r * 0.85) as f32));
+                terrain_dirty = true;
+            }
+            if craters.len() > 64 { let drop = craters.len() - 64; craters.drain(0..drop); }
+            rebuild_t -= dt;
+            if terrain_dirty && !smooth && rebuild_t <= 0.0 {
+                terrain_chunks = build_voxel_chunks(&craters);
+                terrain_dirty = false;
+                rebuild_t = REBUILD_EVERY;
+            }
         }
 
         // ----- render 3D -----
@@ -547,7 +581,7 @@ async fn main() {
         #[cfg(not(target_arch = "wasm32"))]
         int_slider(20.0, 192.0, 220.0, "threads", &mut n_threads, 1, max_threads, &mut slider_drag);
         draw_text(
-            "drag: orbit  scroll: zoom  P: pause  [ ]: \u{00b1}pop",
+            "drag: orbit  scroll: zoom  P: pause  [ ]: \u{00b1}pop  V: voxel/smooth",
             16.0, screen_height() - 18.0, 20.0, LIGHTGRAY,
         );
         if paused { draw_text("PAUSED", screen_width() * 0.5 - 50.0, 40.0, 36.0, YELLOW); }
