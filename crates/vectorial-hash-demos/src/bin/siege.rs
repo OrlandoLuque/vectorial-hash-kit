@@ -723,6 +723,86 @@ fn build_terrain_chunks() -> Vec<Mesh> {
     meshes
 }
 
+/// Voxel (blocky) terrain. Each grid cell is a flat-topped prism at its true
+/// height, with vertical cliff walls dropping to any lower neighbour — the
+/// stepped "voxel" look, watertight, units sit on the tops. Baked per-corner
+/// ambient occlusion (darker where taller neighbours crowd a corner) with the
+/// quad-flip fix from MAP_DESIGN.md, plus the elevation colour ramp. Chunked so
+/// each mesh stays under macroquad's per-draw-call index cap. The cell heights
+/// are a grid → alterable (crater carving) is a future step (BACKLOG).
+fn build_voxel_chunks() -> Vec<Mesh> {
+    const VRES: usize = 80;  // cells/side: cell ≈ 10 world units → visibly blocky
+    const CHUNK: usize = 10; // cells/side per mesh: ≤100 cells · ≤30 idx = <5000
+    let step = WORLD / VRES as f64;
+    let light = vec3(-0.45, 0.84, -0.30).normalize();
+    // Precompute the cell-centre heights once for O(1) neighbour AO lookups.
+    let heights: Vec<f64> = (0..VRES * VRES).map(|k| {
+        let (i, j) = (k % VRES, k / VRES);
+        terrain_height((i as f64 + 0.5) * step, (j as f64 + 0.5) * step)
+    }).collect();
+    let hc = |i: i32, j: i32| -> f64 {
+        if i < 0 || j < 0 || i >= VRES as i32 || j >= VRES as i32 { -1000.0 } else { heights[j as usize * VRES + i as usize] }
+    };
+    let nchunks = VRES.div_ceil(CHUNK);
+    let mut meshes = Vec::with_capacity(nchunks * nchunks);
+    for cz in 0..nchunks {
+        for cx in 0..nchunks {
+            let (i0, i1) = (cx * CHUNK, ((cx + 1) * CHUNK).min(VRES));
+            let (j0, j1) = (cz * CHUNK, ((cz + 1) * CHUNK).min(VRES));
+            let mut vertices: Vec<Vertex> = Vec::new();
+            let mut indices: Vec<u16> = Vec::new();
+            for j in j0..j1 {
+                for i in i0..i1 {
+                    let (ii, jj) = (i as i32, j as i32);
+                    let h = hc(ii, jj);
+                    let (x0, z0) = (i as f64 * step, j as f64 * step);
+                    let (x1, z1) = (x0 + step, z0 + step);
+                    let (base, emissive) = terrain_surface(x0 + step * 0.5, z0 + step * 0.5, h);
+                    let col = |b: f32| Color::new((base.r * b).min(1.0), (base.g * b).min(1.0), (base.b * b).min(1.0), 1.0);
+                    // Per-corner AO: a corner darkens for each taller neighbour cell
+                    // touching it (edge neighbours + the diagonal if an edge is up).
+                    let ao = |dx: i32, dz: i32| -> f32 {
+                        if emissive { return 1.0; }
+                        let up = h + step * 0.5;
+                        let (s1, s2) = (hc(ii + dx, jj) > up, hc(ii, jj + dz) > up);
+                        let sc = hc(ii + dx, jj + dz) > up;
+                        let n = s1 as i32 + s2 as i32 + (sc && (s1 || s2)) as i32;
+                        1.0 - 0.16 * n as f32
+                    };
+                    let topb = if emissive { 1.0 } else { 0.32 + 0.68 * light.y.max(0.0) as f32 };
+                    let corners = [(x0, z0, ao(-1, -1)), (x1, z0, ao(1, -1)), (x1, z1, ao(1, 1)), (x0, z1, ao(-1, 1))];
+                    let bi = vertices.len() as u16;
+                    for (vx, vz, a) in corners { vertices.push(Vertex::new(vx as f32, h as f32, vz as f32, 0.0, 0.0, col(topb * a))); }
+                    // Quad-flip: split along the diagonal joining the brighter pair
+                    // so AO interpolates symmetrically (no dark-corner triangle leak).
+                    if corners[0].2 + corners[2].2 >= corners[1].2 + corners[3].2 {
+                        indices.extend_from_slice(&[bi, bi + 1, bi + 2, bi, bi + 2, bi + 3]);
+                    } else {
+                        indices.extend_from_slice(&[bi + 1, bi + 2, bi + 3, bi + 1, bi + 3, bi]);
+                    }
+                    // Cliff walls: one quad per lower neighbour, top at h down to it.
+                    let sideb = if emissive { 1.0 } else { 0.32 + 0.68 * 0.42 };
+                    for (dx, dz, e0, e1) in [(-1i32, 0i32, (x0, z1), (x0, z0)), (1, 0, (x1, z0), (x1, z1)), (0, -1, (x0, z0), (x1, z0)), (0, 1, (x1, z1), (x0, z1))] {
+                        let hn = hc(ii + dx, jj + dz);
+                        if hn < h - 0.01 {
+                            let bottom = hn.max(-25.0) as f32;
+                            let (top, bot) = (col(sideb), col(sideb * 0.65));
+                            let si = vertices.len() as u16;
+                            vertices.push(Vertex::new(e0.0 as f32, h as f32, e0.1 as f32, 0.0, 0.0, top));
+                            vertices.push(Vertex::new(e1.0 as f32, h as f32, e1.1 as f32, 0.0, 0.0, top));
+                            vertices.push(Vertex::new(e1.0 as f32, bottom, e1.1 as f32, 0.0, 0.0, bot));
+                            vertices.push(Vertex::new(e0.0 as f32, bottom, e0.1 as f32, 0.0, 0.0, bot));
+                            indices.extend_from_slice(&[si, si + 1, si + 2, si, si + 2, si + 3]);
+                        }
+                    }
+                }
+            }
+            if !vertices.is_empty() { meshes.push(Mesh { vertices, indices, texture: None }); }
+        }
+    }
+    meshes
+}
+
 /// Wooden bridge decks across the river (a plank + two rails per crossing).
 fn draw_bridges() {
     let deck = Color::new(0.36, 0.24, 0.13, 1.0);
@@ -871,7 +951,9 @@ async fn main() {
         renderer.upload_model(gl.quad_context, &m.vertices, &m.indices)
     };
 
-    let terrain_chunks = build_terrain_chunks(); // static — built once, drawn each frame
+    // Static terrain, built once. Voxel (blocky) by default; flip to the smooth
+    // heightfield with $SIEGE_SMOOTH=1.
+    let terrain_chunks = if std::env::var("SIEGE_SMOOTH").is_ok() { build_terrain_chunks() } else { build_voxel_chunks() };
     let mut now = 0.0f64; // simulation clock
     let mut paused = false;
     let mut volcano_smoke_t = 0.0f64; // next crater-puff time
