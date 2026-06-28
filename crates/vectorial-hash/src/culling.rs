@@ -203,6 +203,59 @@ impl Shape for Capsule {
     }
 }
 
+/// A **2D circle** (disc): centre + radius — the simplest analytic [`Shape`],
+/// answering "every item within `r` of the centre". `classify_box` prunes the
+/// cull tightly with the box's nearest/farthest point to the centre (no template
+/// needed — the tree recursion handles the disc's curvature), and the SoA batch
+/// kernel auto-vectorises the leaf test. Promote this instead of redefining a
+/// per-example `Disc`/`Circle`.
+pub struct Circle {
+    cx: f64,
+    cy: f64,
+    r: f64,
+    r2: f64,
+    bbox: Rect,
+}
+
+impl Circle {
+    pub fn new(center: Point, r: f64) -> Self {
+        Self { cx: center.x, cy: center.y, r, r2: r * r, bbox: Rect::new(center.x - r, center.y - r, 2.0 * r, 2.0 * r) }
+    }
+    pub fn center(&self) -> Point { Point::new(self.cx, self.cy) }
+    pub fn radius(&self) -> f64 { self.r }
+}
+
+impl Shape for Circle {
+    fn bounding_box(&self) -> Rect { self.bbox }
+    fn contains_point(&self, p: Point) -> bool {
+        let (dx, dy) = (p.x - self.cx, p.y - self.cy);
+        dx * dx + dy * dy <= self.r2
+    }
+    fn classify_box(&self, b: &Rect) -> Option<CellState> {
+        // Nearest point of the box to the centre (clamp the centre into the box);
+        // if it's beyond r, the whole box is outside the disc → prune.
+        let (nx, ny) = (self.cx.clamp(b.x, b.x_max()), self.cy.clamp(b.y, b.y_max()));
+        let (ndx, ndy) = (nx - self.cx, ny - self.cy);
+        if ndx * ndx + ndy * ndy > self.r2 { return Some(CellState::Out); }
+        // Farthest corner from the centre; if it's within r, the whole box is in.
+        let fx = if (self.cx - b.x).abs() > (self.cx - b.x_max()).abs() { b.x } else { b.x_max() };
+        let fy = if (self.cy - b.y).abs() > (self.cy - b.y_max()).abs() { b.y } else { b.y_max() };
+        let (fdx, fdy) = (fx - self.cx, fy - self.cy);
+        if fdx * fdx + fdy * fdy <= self.r2 { return Some(CellState::In); }
+        Some(CellState::Maybe)
+    }
+    fn wants_batch(&self) -> bool { true }
+    fn contains_batch(&self, xs: &[f64], ys: &[f64], out: &mut Vec<bool>) {
+        out.clear();
+        out.resize(xs.len(), false);
+        let (cx, cy, r2) = (self.cx, self.cy, self.r2);
+        for ((&x, &y), o) in xs.iter().zip(ys).zip(out.iter_mut()) {
+            let (dx, dy) = (x - cx, y - cy);
+            *o = dx * dx + dy * dy <= r2; // branchless → auto-vectorises
+        }
+    }
+}
+
 /// Per-execution cache: one resolved template per distinct cell size.
 /// Shared with the reference quadtree so both structures classify cells
 /// through the exact same machinery.
@@ -440,23 +493,6 @@ mod tests {
         fn position(&self) -> Point { self.0 }
     }
 
-    struct Circle { center: Point, radius: f64 }
-    impl Shape for Circle {
-        fn bounding_box(&self) -> Rect {
-            Rect::new(
-                self.center.x - self.radius,
-                self.center.y - self.radius,
-                self.radius * 2.0,
-                self.radius * 2.0,
-            )
-        }
-        fn contains_point(&self, p: Point) -> bool {
-            let dx = p.x - self.center.x;
-            let dy = p.y - self.center.y;
-            dx * dx + dy * dy <= self.radius * self.radius
-        }
-    }
-
     #[test]
     fn cull_collects_only_points_inside_the_circle() {
         let mut tree = Tree::<Pt>::new(Rect::new(0.0, 0.0, 100.0, 100.0), 2);
@@ -465,7 +501,7 @@ mod tests {
                 tree.insert(Pt(Point::new(x, y)));
             }
         }
-        let circle = Circle { center: Point::new(50.0, 50.0), radius: 20.0 };
+        let circle = Circle::new(Point::new(50.0, 50.0), 20.0);
         let hit = tree.cull(&circle);
         assert_eq!(hit.len(), 1);
         assert_eq!(hit[0].0, Point::new(50.0, 50.0));
@@ -475,8 +511,29 @@ mod tests {
     fn cull_returns_empty_when_shape_outside_root() {
         let mut tree = Tree::<Pt>::new(Rect::new(0.0, 0.0, 100.0, 100.0), 4);
         tree.insert(Pt(Point::new(50.0, 50.0)));
-        let circle = Circle { center: Point::new(500.0, 500.0), radius: 10.0 };
+        let circle = Circle::new(Point::new(500.0, 500.0), 10.0);
         assert!(tree.cull(&circle).is_empty());
+    }
+
+    #[test]
+    fn circle_cull_matches_brute_force() {
+        // The analytic Circle (classify_box In/Out/Maybe + SoA batch) must return
+        // exactly the brute-force set, across churned trees × random circles.
+        let mut seed = 0x1234_5678u64;
+        let mut rng = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; (seed >> 11) as f64 / (1u64 << 53) as f64 };
+        for _ in 0..40 {
+            let mut tree = Tree::<Pt>::new(Rect::new(0.0, 0.0, 1000.0, 1000.0), 8);
+            let pts: Vec<Point> = (0..400).map(|_| Point::new(rng() * 1000.0, rng() * 1000.0)).collect();
+            for &p in &pts { tree.insert(Pt(p)); }
+            for _ in 0..10 {
+                let c = Circle::new(Point::new(rng() * 1000.0, rng() * 1000.0), rng() * 300.0 + 1.0);
+                let mut got: Vec<Point> = tree.cull(&c).iter().map(|p| p.0).collect();
+                let mut want: Vec<Point> = pts.iter().copied().filter(|&p| c.contains_point(p)).collect();
+                got.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+                want.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+                assert_eq!(got, want, "circle cull != brute force");
+            }
+        }
     }
 
     /// A "shape" backed only by a TemplateGrid; `contains_point` would be
@@ -657,7 +714,7 @@ mod tests {
             tree.remove(*p, |it| it.0 == *p);
         }
 
-        let circle = Circle { center: Point::new(120.0, 140.0), radius: 70.0 };
+        let circle = Circle::new(Point::new(120.0, 140.0), 70.0);
         let mut expected: Vec<Point> = tree.cull(&circle).iter().map(|p| p.0).collect();
         expected.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap().then(a.y.partial_cmp(&b.y).unwrap()));
 
@@ -669,7 +726,7 @@ mod tests {
         ];
         for strategy in strategies {
             let mut got: Vec<Point> = tree
-                .cull_walk(&circle, circle.center, strategy)
+                .cull_walk(&circle, circle.center(), strategy)
                 .iter()
                 .map(|p| p.0)
                 .collect();
