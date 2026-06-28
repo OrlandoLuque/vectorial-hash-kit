@@ -20,138 +20,31 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 use winit::{
-    event::{ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent},
+    event::{ElementState, Event, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::EventLoop,
+    keyboard::{KeyCode, PhysicalKey},
     window::WindowBuilder,
 };
 
-use vectorial_hash::{Aabb, Point3, Positioned3, Tree3};
-
-// ============================================================ simulation
-
-const WORLD: f64 = 640.0;
-const PER_FACTION: usize = 1500;
-
-struct Rng(u64);
-impl Rng {
-    fn new(s: u64) -> Self { Rng(s | 1) }
-    fn next(&mut self) -> u64 { let mut x = self.0; x ^= x << 13; x ^= x >> 7; x ^= x << 17; self.0 = x; x.wrapping_mul(0x2545F4914F6CDD1D) }
-    fn range(&mut self, lo: f64, hi: f64) -> f64 { lo + ((self.next() >> 11) as f64 / (1u64 << 53) as f64) * (hi - lo) }
-}
-
-#[derive(Clone, Copy)]
-struct IUnit { id: u32, fac: u8, p: Point3 }
-impl Positioned3 for IUnit { fn position(&self) -> Point3 { self.p } }
-
-struct Unit { p: Point3, vel: (f64, f64), fac: u8, hp: f64, cd: f64, respawn: f64, face: f32 }
-
-fn castle(fac: u8) -> (f64, f64) { if fac == 0 { (80.0, 80.0) } else { (WORLD - 80.0, WORLD - 80.0) } }
-
-fn spawn_unit(rng: &mut Rng, fac: u8) -> Unit {
-    let (cx, cz) = castle(fac);
-    Unit {
-        p: Point3::new((cx + rng.range(-60.0, 60.0)).clamp(2.0, WORLD - 2.0), 0.0, (cz + rng.range(-60.0, 60.0)).clamp(2.0, WORLD - 2.0)),
-        vel: (0.0, 0.0), fac, hp: 100.0, cd: 0.0, respawn: f64::INFINITY, face: 0.0,
-    }
-}
-
-fn spawn_army(rng: &mut Rng) -> Vec<Unit> {
-    let mut u = Vec::with_capacity(PER_FACTION * 2);
-    for _ in 0..PER_FACTION { u.push(spawn_unit(rng, 0)); }
-    for _ in 0..PER_FACTION { u.push(spawn_unit(rng, 1)); }
-    u
-}
-
-const REACH: f64 = 9.0;
-const SPEED: f64 = 26.0;
-const SEP: f64 = 7.0;
-
-/// One sim step: rebuild the index, each unit targets its nearest enemy (k-NN)
-/// and steers toward it with separation; melee damage resolved serially.
-fn step(units: &mut [Unit], index: &mut Tree3<IUnit>, rng: &mut Rng, dt: f64, now: f64) {
-    index.clear();
-    for (i, u) in units.iter().enumerate() {
-        if u.hp > 0.0 { index.insert(IUnit { id: i as u32, fac: u.fac, p: u.p }); }
-    }
-    let mut dmg = vec![0.0f64; units.len()];
-    // decide (read-only on the index): velocity + attack into per-unit scratch
-    let mut hits: Vec<(usize, f64)> = Vec::new();
-    for i in 0..units.len() {
-        if units[i].hp <= 0.0 { units[i].vel = (0.0, 0.0); continue; }
-        let (p, fac) = (units[i].p, units[i].fac);
-        let mut target: Option<(Point3, u32, f64)> = None;
-        let (mut sx, mut sz) = (0.0, 0.0);
-        for (d, it) in index.knn(p, 14) {
-            if it.id == i as u32 { continue; }
-            if d < SEP { let dd = d.max(1e-3); sx += (p.x - it.p.x) / dd; sz += (p.z - it.p.z) / dd; }
-            if it.fac != fac && target.is_none() { target = Some((it.p, it.id, d)); }
-        }
-        let (tx, tz, td) = match target { Some((tp, _, d)) => (tp.x, tp.z, d), None => { let (cx, cz) = castle(1 - fac); (cx, cz, f64::INFINITY) } };
-        let (dx, dz) = (tx - p.x, tz - p.z);
-        let l = (dx * dx + dz * dz).sqrt().max(1e-6);
-        let appr = if td < REACH * 0.8 { 0.0 } else { SPEED };
-        let mut vx = dx / l * appr + sx * SPEED * 0.7;
-        let mut vz = dz / l * appr + sz * SPEED * 0.7;
-        let vl = (vx * vx + vz * vz).sqrt();
-        if vl > SPEED * 1.5 { let s = SPEED * 1.5 / vl; vx *= s; vz *= s; }
-        units[i].vel = (vx, vz);
-        if units[i].cd <= 0.0 && td <= REACH {
-            if let Some((_, tid, _)) = target { hits.push((tid as usize, 14.0)); units[i].cd = 0.8; }
-        }
-    }
-    for (tid, d) in hits { if let Some(s) = dmg.get_mut(tid) { *s += d; } }
-    // apply
-    for (u, d) in units.iter_mut().zip(dmg) {
-        if u.hp <= 0.0 {
-            if u.respawn.is_finite() && now >= u.respawn { let (cx, cz) = castle(u.fac); u.p = Point3::new((cx + rng.range(-60.0, 60.0)).clamp(2.0, WORLD - 2.0), 0.0, (cz + rng.range(-60.0, 60.0)).clamp(2.0, WORLD - 2.0)); u.hp = 100.0; u.respawn = f64::INFINITY; }
-            continue;
-        }
-        u.cd = (u.cd - dt).max(0.0);
-        let nx = (u.p.x + u.vel.0 * dt).clamp(2.0, WORLD - 2.0);
-        let nz = (u.p.z + u.vel.1 * dt).clamp(2.0, WORLD - 2.0);
-        if u.vel.0 * u.vel.0 + u.vel.1 * u.vel.1 > 1.0 { u.face = (u.vel.0 as f32).atan2(u.vel.1 as f32); }
-        u.p = Point3::new(nx, 0.0, nz);
-        if d > 0.0 { u.hp -= d; if u.hp <= 0.0 { u.respawn = now + 4.0; } }
-    }
-}
+use vectorial_hash::{Aabb, Tree3};
+// The whole battle simulation is shared with the macroquad `siege` binary so the
+// two renderers stay in lockstep — see `siege_sim`. This file is wgpu render-only.
+use rayon::prelude::*;
+use vectorial_hash_demos::siege_sim::{
+    apply, decide, default_body_radius, faction_tint, set_map_seed, spawn_army, terrain_height,
+    terrain_surface, volcano_step, Faction, Fx, IUnit, Projectile, Puff, Rng, Unit, Volcano,
+    PER_FACTION, SKY, WORLD,
+};
 
 // ============================================================ terrain
-
-fn hash2(x: i32, z: i32) -> f64 {
-    let mut h = (x as u32).wrapping_mul(0x1659_5e3d).wrapping_add((z as u32).wrapping_mul(0x27d4_eb2f));
-    h ^= h >> 15; h = h.wrapping_mul(0x85eb_ca6b); h ^= h >> 13;
-    (h & 0x00ff_ffff) as f64 / 0x00ff_ffff as f64
-}
-fn vnoise(x: f64, z: f64) -> f64 {
-    let (xi, zi) = (x.floor() as i32, z.floor() as i32);
-    let (fx, fz) = (x - xi as f64, z - zi as f64);
-    let (sx, sz) = (fx * fx * (3.0 - 2.0 * fx), fz * fz * (3.0 - 2.0 * fz));
-    let a = hash2(xi, zi); let b = hash2(xi + 1, zi);
-    let c = hash2(xi, zi + 1); let d = hash2(xi + 1, zi + 1);
-    let ab = a + (b - a) * sx; let cd = c + (d - c) * sx;
-    ab + (cd - ab) * sz
-}
-/// Hills + a central volcano cone (matches the macroquad siege's terrain).
-fn terrain_height(x: f64, z: f64) -> f64 {
-    let s = 1.0 / 150.0;
-    let mut h = vnoise(x * s, z * s) * 42.0 + vnoise(x * s * 2.7, z * s * 2.7) * 15.0;
-    let (cx, cz) = (WORLD * 0.5, WORLD * 0.5);
-    let d = ((x - cx) * (x - cx) + (z - cz) * (z - cz)).sqrt();
-    if d < 160.0 { h += (160.0 - d) * 0.6; if d < 26.0 { h -= (26.0 - d) * 1.2; } }
-    h
-}
-fn terrain_color(h: f64) -> [f32; 3] {
-    if h < 6.0 { [0.12, 0.28, 0.45] } else if h < 10.0 { [0.62, 0.56, 0.34] }
-    else if h < 55.0 { [0.20, 0.42, 0.18] } else if h < 90.0 { [0.38, 0.34, 0.30] }
-    else { [0.82, 0.84, 0.88] }
-}
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct TVertex { pos: [f32; 3], normal: [f32; 3], color: [f32; 4] }
 
-/// Build the terrain as a single triangle mesh (u32 indices — wgpu has no small
-/// drawcall cap, so one mesh is fine). Normals from finite differences.
+/// Build the terrain as a single triangle mesh from the shared heightfield (u32
+/// indices — wgpu has no small drawcall cap, so one mesh is fine). Normals from
+/// finite differences; lava cells are flagged emissive (full-bright) via alpha=0.
 fn build_terrain() -> (Vec<TVertex>, Vec<u32>) {
     const RES: usize = 180;
     let step = WORLD / RES as f64;
@@ -163,7 +56,8 @@ fn build_terrain() -> (Vec<TVertex>, Vec<u32>) {
             let hx = terrain_height(x + step, z) - terrain_height(x - step, z);
             let hz = terrain_height(x, z + step) - terrain_height(x, z - step);
             let n = Vec3::new((-hx / (2.0 * step)) as f32, 1.0, (-hz / (2.0 * step)) as f32).normalize();
-            v.push(TVertex { pos: [x as f32, h as f32, z as f32], normal: n.to_array(), color: { let c = terrain_color(h); [c[0], c[1], c[2], 1.0] } });
+            let (c, emissive) = terrain_surface(x, z, h); // shared ramp + lava flag
+            v.push(TVertex { pos: [x as f32, h as f32, z as f32], normal: n.to_array(), color: [c[0], c[1], c[2], if emissive { 0.0 } else { 1.0 }] });
         }
     }
     let w = (RES + 1) as u32;
@@ -189,9 +83,11 @@ struct CameraUniform { vp: [[f32; 4]; 4], light: [f32; 4] }
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct SkinInstance { model: [[f32; 4]; 4], color: [f32; 4], frame_base: u32, _pad: [u32; 3] }
 
-fn faction_color(fac: u8, alive_hp: f64) -> [f32; 4] {
-    let shade = (0.4 + 0.6 * (alive_hp / 100.0).clamp(0.0, 1.0)) as f32;
-    if fac == 0 { [0.85 * shade, 0.22 * shade, 0.18 * shade, 1.0] } else { [0.20 * shade, 0.38 * shade, 0.9 * shade, 1.0] }
+/// Per-unit instance tint: the shared faction colour, dimmed as the unit loses HP.
+fn faction_color(f: Faction, hp_frac: f64) -> [f32; 4] {
+    let shade = (0.45 + 0.55 * hp_frac.clamp(0.0, 1.0)) as f32;
+    let t = faction_tint(f);
+    [t[0] * shade, t[1] * shade, t[2] * shade, 1.0]
 }
 
 // ============================================================ renderer
@@ -217,9 +113,15 @@ struct State {
     cam_buf: wgpu::Buffer,
     cam_bg: wgpu::BindGroup,
     depth: wgpu::TextureView,
-    // scene
+    // scene — the shared simulation (same battle as the macroquad binary)
     units: Vec<Unit>,
     index: Tree3<IUnit>,
+    smoke: Vec<Puff>,
+    effects: Vec<Fx>,
+    projectiles: Vec<Projectile>,
+    volcano: Volcano,
+    body_radius: [[f64; 8]; 2],
+    paused: bool,
     rng: Rng,
     now: f64,
     last: Instant,
@@ -303,15 +205,21 @@ impl State {
         });
 
         let depth = make_depth(&device, &config);
-        let mut rng = Rng::new(0x51E6E);
-        let units = spawn_army(&mut rng);
-        let index = Tree3::<IUnit>::new(Aabb::new(0.0, 0.0, 0.0, WORLD, 100.0, WORLD), 8);
+        // Per-run seed (reproducible via $SIEGE_SEED) drives the shared map + army.
+        let seed = std::env::var("SIEGE_SEED").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0x51E6E);
+        set_map_seed((seed % 100_000) as f64 * 0.01);
+        let mut rng = Rng::new(seed | 1);
+        let units = spawn_army(&mut rng, PER_FACTION);
+        let index = Tree3::<IUnit>::new(Aabb::new(0.0, 0.0, 0.0, WORLD, SKY, WORLD), 8);
 
         State {
             surface, device, queue, config,
             skin_pipeline, skin_vbuf, skin_ibuf, skin_nidx, skin_inst_buf, skin_bg, num_joints, n_frames,
             terrain_pipeline, terrain_vbuf, terrain_ibuf, terrain_nidx: ti.len() as u32,
-            cam_buf, cam_bg, depth, units, index, rng, now: 0.0, last: Instant::now(),
+            cam_buf, cam_bg, depth, units, index,
+            smoke: Vec::new(), effects: Vec::new(), projectiles: Vec::new(),
+            volcano: Volcano::new(), body_radius: default_body_radius(), paused: false,
+            rng, now: 0.0, last: Instant::now(),
             yaw: 0.9, pitch: 0.7, dist: 760.0, dragging: false, last_mouse: (0.0, 0.0),
             skin_instances: Vec::with_capacity(PER_FACTION * 2),
         }
@@ -337,22 +245,37 @@ impl State {
     fn update_and_render(&mut self) {
         let dt = self.last.elapsed().as_secs_f64().min(0.05);
         self.last = Instant::now();
-        self.now += dt;
-        step(&mut self.units, &mut self.index, &mut self.rng, dt, self.now);
+        if !self.paused {
+            self.now += dt;
+            // Rebuild the unit index from live positions each frame.
+            self.index.clear();
+            for (i, u) in self.units.iter().enumerate() {
+                if u.alive() { self.index.insert(IUnit { id: i as u32, faction: u.faction, p: u.p, health: (u.hp / u.kind.max_hp()) as f32 }); }
+            }
+            // Smoke index (LoS blockers) for the archer / ballista raycasts.
+            let mut smoke_index = Tree3::<Puff>::new(Aabb::new(0.0, 0.0, 0.0, WORLD, SKY, WORLD), 8);
+            for s in &self.smoke { smoke_index.insert(*s); }
+            // Decide (parallel, read-only on the indices) → apply (serial) → volcano.
+            let (idx, smk, br) = (&self.index, &smoke_index, &self.body_radius);
+            self.units.par_iter_mut().enumerate().for_each(|(i, u)| decide(u, i as u32, idx, smk, br));
+            apply(&mut self.units, &mut self.smoke, &mut self.effects, &mut self.projectiles, &mut self.rng, dt, self.now);
+            volcano_step(&mut self.volcano, &mut self.smoke, &mut self.effects, &mut self.projectiles, &mut self.rng, dt, self.now);
+        }
 
         // Units → GPU-skinned instances: a model matrix (place · face · scale on
         // the terrain) + tint + the bone-frame base for the unit's current frame.
+        // (Single shared model for now — per-kind/faction models are the next step.)
         self.skin_instances.clear();
         let nf = self.n_frames.max(1);
         let scale = glam::Vec3::splat(9.0); // model height
         for (i, u) in self.units.iter().enumerate() {
-            if u.hp <= 0.0 { continue; }
-            let y = terrain_height(u.p.x, u.p.z) as f32;
+            if !u.alive() { continue; }
+            let y = (terrain_height(u.p.x, u.p.z) + u.kind.altitude()) as f32; // feet on terrain (dragon flies)
             let model = glam::Mat4::from_translation(glam::Vec3::new(u.p.x as f32, y, u.p.z as f32)) * glam::Mat4::from_rotation_y(u.face) * glam::Mat4::from_scale(scale);
             // phase-grouped frame (same trick as the macroquad version)
             let group = (i as u32 % 5) as f32 / 5.0;
             let frame = (((self.now as f32 * 1.6 + group) * nf as f32) as u32) % nf;
-            self.skin_instances.push(SkinInstance { model: model.to_cols_array_2d(), color: faction_color(u.fac, u.hp), frame_base: frame * self.num_joints, _pad: [0; 3] });
+            self.skin_instances.push(SkinInstance { model: model.to_cols_array_2d(), color: faction_color(u.faction, u.hp / u.kind.max_hp()), frame_base: frame * self.num_joints, _pad: [0; 3] });
         }
         self.queue.write_buffer(&self.skin_inst_buf, 0, bytemuck::cast_slice(&self.skin_instances));
         let cam = self.camera();
@@ -439,7 +362,8 @@ fn vs(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>, @location(2) col: ve
     var o: VOut;
     o.clip = cam.vp * vec4<f32>(p, 1.0);
     let diff = max(dot(normalize(n), normalize(cam.light.xyz)), 0.0);
-    let sh = 0.40 + 0.60 * diff;
+    // alpha < 0.5 flags an emissive (lava) cell → draw it full-bright.
+    let sh = select(0.40 + 0.60 * diff, 1.0, col.a < 0.5);
     o.color = vec4<f32>(col.rgb * sh, 1.0);
     return o;
 }
@@ -466,6 +390,7 @@ async fn run() {
                     WindowEvent::CloseRequested => elwt.exit(),
                     WindowEvent::Resized(s) => st.resize(s.width, s.height),
                     WindowEvent::MouseInput { button: MouseButton::Left, state, .. } => st.dragging = state == ElementState::Pressed,
+                    WindowEvent::KeyboardInput { event: KeyEvent { physical_key: PhysicalKey::Code(KeyCode::KeyP), state: ElementState::Pressed, .. }, .. } => st.paused = !st.paused,
                     WindowEvent::CursorMoved { position, .. } => {
                         if st.dragging {
                             st.yaw += (position.x - st.last_mouse.0) as f32 * 0.01;
