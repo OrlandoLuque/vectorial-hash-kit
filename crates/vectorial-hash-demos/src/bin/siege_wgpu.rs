@@ -151,6 +151,9 @@ struct State {
     volcano: Volcano,
     body_radius: [[f64; 8]; 2],
     paused: bool,
+    red: usize,  // live Red units (for the window-title HUD)
+    blue: usize, // live Blue units
+    fps: f32,    // smoothed frames/second
     rng: Rng,
     now: f64,
     last: Instant,
@@ -289,6 +292,7 @@ impl State {
             cam_buf, cam_bg, depth, units, index,
             smoke: Vec::new(), effects: Vec::new(), projectiles: Vec::new(),
             volcano: Volcano::new(), body_radius: default_body_radius(), paused: false,
+            red: 0, blue: 0, fps: 0.0,
             rng, now: 0.0, last: Instant::now(),
             yaw: 0.9, pitch: 0.7, dist: 760.0, dragging: false, last_mouse: (0.0, 0.0),
             skin_instances: Vec::with_capacity(PER_FACTION * 2),
@@ -331,6 +335,12 @@ impl State {
             apply(&mut self.units, &mut self.smoke, &mut self.effects, &mut self.projectiles, &mut self.rng, dt, self.now);
             volcano_step(&mut self.volcano, &mut self.smoke, &mut self.effects, &mut self.projectiles, &mut self.rng, dt, self.now);
         }
+
+        // HUD stats (shown in the window title — wgpu has no built-in text).
+        let inst = (1.0 / dt.max(1e-3)) as f32;
+        self.fps = if self.fps == 0.0 { inst } else { self.fps * 0.92 + inst * 0.08 };
+        self.red = self.units.iter().filter(|u| u.alive() && u.faction == Faction::Red).count();
+        self.blue = self.units.iter().filter(|u| u.alive() && u.faction == Faction::Blue).count();
 
         // Units → GPU-skinned instances, bucketed by model so each distinct glb
         // draws in one call. Per-model frame_base uses that model's own joint +
@@ -567,6 +577,9 @@ async fn run() {
                     WindowEvent::RedrawRequested => {
                         st.update_and_render();
                         frame += 1;
+                        if frame % 15 == 0 {
+                            window.set_title(&format!("vectorial-hash — siege (wgpu) · Red {} | Blue {} · {:.0} fps{}", st.red, st.blue, st.fps, if st.paused { " · PAUSED" } else { "" }));
+                        }
                         if let Some(m) = max_frames { if frame >= m { elwt.exit(); } }
                     }
                     _ => {}

@@ -535,6 +535,12 @@ async fn main() {
         draw_text(format!("fps {}", get_fps()), 16.0, 54.0, 22.0, LIGHTGRAY);
         draw_text(format!("Red {red}"), 16.0, 80.0, 24.0, Color::new(0.95, 0.4, 0.35, 1.0));
         draw_text(format!("Blue {blue}"), 16.0, 104.0, 24.0, Color::new(0.45, 0.6, 1.0, 1.0));
+        let (lead, lcol) = match red.cmp(&blue) {
+            std::cmp::Ordering::Greater => ("Red leads", Color::new(0.95, 0.4, 0.35, 1.0)),
+            std::cmp::Ordering::Less => ("Blue leads", Color::new(0.45, 0.6, 1.0, 1.0)),
+            std::cmp::Ordering::Equal => ("even", LIGHTGRAY),
+        };
+        draw_text(lead, 16.0, 128.0, 22.0, lcol);
         // Live population slider (per faction) — the spatial-index stress lever.
         int_slider(20.0, 150.0, 220.0, "army/side", &mut per_faction, 20, 2000, &mut pop_drag);
         // Live thread-count slider drives the parallel AI pass (native only).
