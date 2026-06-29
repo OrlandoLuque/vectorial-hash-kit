@@ -31,9 +31,10 @@ use vectorial_hash::{Aabb, Tree3};
 // two renderers stay in lockstep — see `siege_sim`. This file is wgpu render-only.
 use rayon::prelude::*;
 use vectorial_hash_demos::siege_sim::{
-    apply, decide, default_body_radius, faction_tint, model_for, set_map_seed, spawn_army,
-    terrain_height, terrain_surface, volcano_step, Faction, Fx, FxKind, IUnit, Kind, ProjKind,
-    Projectile, Puff, Rng, Unit, Volcano, ANIM_FRAMES, MOVE_PREFS, PER_FACTION, SKY, WORLD,
+    apply, decide, default_body_radius, faction_tint, ground_height, model_for, set_map_seed,
+    spawn_army, terrain_height, terrain_surface, volcano_step, Craters, Faction, Fx, FxKind, IUnit,
+    Kind, ProjKind, Projectile, Puff, Rng, Unit, Volcano, ANIM_FRAMES, MOVE_PREFS, PER_FACTION, SKY,
+    WORLD,
 };
 
 const MAX_POP: usize = 2000; // max army/side the [ ] keys allow (instance-buffer cap)
@@ -47,16 +48,16 @@ struct TVertex { pos: [f32; 3], normal: [f32; 3], color: [f32; 4] }
 /// Build the terrain as a single triangle mesh from the shared heightfield (u32
 /// indices — wgpu has no small drawcall cap, so one mesh is fine). Normals from
 /// finite differences; lava cells are flagged emissive (full-bright) via alpha=0.
-fn build_terrain() -> (Vec<TVertex>, Vec<u32>) {
-    const RES: usize = 180;
+fn build_terrain(craters: &Craters) -> (Vec<TVertex>, Vec<u32>) {
+    const RES: usize = 260; // fine grid so crater bowls read smooth
     let step = WORLD / RES as f64;
     let (mut v, mut idx) = (Vec::with_capacity((RES + 1) * (RES + 1)), Vec::new());
     for iz in 0..=RES {
         for ix in 0..=RES {
             let (x, z) = (ix as f64 * step, iz as f64 * step);
-            let h = terrain_height(x, z);
-            let hx = terrain_height(x + step, z) - terrain_height(x - step, z);
-            let hz = terrain_height(x, z + step) - terrain_height(x, z - step);
+            let h = ground_height(x, z, craters);
+            let hx = ground_height(x + step, z, craters) - ground_height(x - step, z, craters);
+            let hz = ground_height(x, z + step, craters) - ground_height(x, z - step, craters);
             let n = Vec3::new((-hx / (2.0 * step)) as f32, 1.0, (-hz / (2.0 * step)) as f32).normalize();
             let (c, emissive) = terrain_surface(x, z, h); // shared ramp + lava flag
             v.push(TVertex { pos: [x as f32, h as f32, z as f32], normal: n.to_array(), color: [c[0], c[1], c[2], if emissive { 0.0 } else { 1.0 }] });
@@ -78,10 +79,10 @@ fn build_terrain() -> (Vec<TVertex>, Vec<u32>) {
 /// neighbours crowd a corner) folded into the vertex colour. wgpu has no drawcall
 /// cap, so it's one mesh with u32 indices. Normals (up for tops, sideways for
 /// walls) feed the shader's lambert; emissive lava cells get alpha=0.
-fn build_voxel_terrain() -> (Vec<TVertex>, Vec<u32>) {
+fn build_voxel_terrain(craters: &Craters) -> (Vec<TVertex>, Vec<u32>) {
     const VRES: usize = 80;
     let step = WORLD / VRES as f64;
-    let heights: Vec<f64> = (0..VRES * VRES).map(|k| terrain_height(((k % VRES) as f64 + 0.5) * step, ((k / VRES) as f64 + 0.5) * step)).collect();
+    let heights: Vec<f64> = (0..VRES * VRES).map(|k| ground_height(((k % VRES) as f64 + 0.5) * step, ((k / VRES) as f64 + 0.5) * step, craters)).collect();
     let hc = |i: i32, j: i32| -> f64 { if i < 0 || j < 0 || i >= VRES as i32 || j >= VRES as i32 { -1000.0 } else { heights[j as usize * VRES + i as usize] } };
     let (mut v, mut idx): (Vec<TVertex>, Vec<u32>) = (Vec::new(), Vec::new());
     for j in 0..VRES {
@@ -221,6 +222,8 @@ struct State {
     fps: f32,    // smoothed frames/second
     smooth: bool, // terrain mode: false = voxel (default), true = smooth heightfield
     pop: usize,  // army size per side (live, via the [ ] keys)
+    craters: Craters, // shared alterable-terrain state (units sink, mesh deforms)
+    rebuild_t: f64,   // throttle for the crater remesh
     rng: Rng,
     now: f64,
     last: Instant,
@@ -303,7 +306,8 @@ impl State {
         // Terrain: voxel (blocky) by default; $SIEGE_SMOOTH=1 or the `V` key
         // switches to the smooth heightfield. A single mesh + its own pipeline.
         let smooth = std::env::var("SIEGE_SMOOTH").is_ok();
-        let (tv, ti) = if smooth { build_terrain() } else { build_voxel_terrain() };
+        let craters = Craters::new();
+        let (tv, ti) = if smooth { build_terrain(&craters) } else { build_voxel_terrain(&craters) };
         let terrain_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("ter-v"), contents: bytemuck::cast_slice(&tv), usage: wgpu::BufferUsages::VERTEX });
         let terrain_ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("ter-i"), contents: bytemuck::cast_slice(&ti), usage: wgpu::BufferUsages::INDEX });
         let terrain_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("ter-shader"), source: wgpu::ShaderSource::Wgsl(TERRAIN_SHADER.into()) });
@@ -364,7 +368,7 @@ impl State {
             cam_buf, cam_bg, depth, units, index,
             smoke: Vec::new(), effects: Vec::new(), projectiles: Vec::new(),
             volcano: Volcano::new(), body_radius: default_body_radius(), paused: false,
-            red: 0, blue: 0, fps: 0.0, smooth, pop,
+            red: 0, blue: 0, fps: 0.0, smooth, pop, craters, rebuild_t: 0.0,
             rng, now: 0.0, last: Instant::now(),
             yaw: 0.9, pitch: 0.7, dist: 760.0, dragging: false, last_mouse: (0.0, 0.0),
             skin_instances: Vec::with_capacity(PER_FACTION * 2),
@@ -379,9 +383,10 @@ impl State {
         }
     }
 
-    /// Rebuild the terrain mesh for the current `smooth` mode (V key).
+    /// Rebuild the terrain mesh for the current `smooth` mode + craters (V key,
+    /// or after a crater lands).
     fn rebuild_terrain(&mut self) {
-        let (tv, ti) = if self.smooth { build_terrain() } else { build_voxel_terrain() };
+        let (tv, ti) = if self.smooth { build_terrain(&self.craters) } else { build_voxel_terrain(&self.craters) };
         self.terrain_vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("ter-v"), contents: bytemuck::cast_slice(&tv), usage: wgpu::BufferUsages::VERTEX });
         self.terrain_ibuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("ter-i"), contents: bytemuck::cast_slice(&ti), usage: wgpu::BufferUsages::INDEX });
         self.terrain_nidx = ti.len() as u32;
@@ -418,8 +423,17 @@ impl State {
             // Decide (parallel, read-only on the indices) → apply (serial) → volcano.
             let (idx, smk, br) = (&self.index, &smoke_index, &self.body_radius);
             self.units.par_iter_mut().enumerate().for_each(|(i, u)| decide(u, i as u32, idx, smk, br));
-            apply(&mut self.units, &mut self.smoke, &mut self.effects, &mut self.projectiles, &mut self.rng, dt, self.now);
+            let impacts = apply(&mut self.units, &mut self.smoke, &mut self.effects, &mut self.projectiles, &self.craters, &mut self.rng, dt, self.now);
             volcano_step(&mut self.volcano, &mut self.smoke, &mut self.effects, &mut self.projectiles, &mut self.rng, dt, self.now);
+            // Alterable terrain: carve craters at the impacts (shared with the sim,
+            // so units sink in too), remesh throttled — voxel *and* smooth deform.
+            for (ip, r) in impacts { self.craters.carve(ip.x, ip.z, r * 0.85); }
+            self.rebuild_t -= dt;
+            if self.craters.dirty && self.rebuild_t <= 0.0 {
+                self.craters.dirty = false;
+                self.rebuild_t = 0.4;
+                self.rebuild_terrain();
+            }
         }
 
         // HUD stats (shown in the window title — wgpu has no built-in text).
@@ -437,7 +451,7 @@ impl State {
             if !u.alive() { continue; }
             let mi = self.model_idx[u.faction.index()][u.kind.index()];
             let m = &self.models[mi];
-            let y = (terrain_height(u.p.x, u.p.z) + u.kind.altitude()) as f32; // feet on terrain (dragon flies)
+            let y = (ground_height(u.p.x, u.p.z, &self.craters) + u.kind.altitude()) as f32; // feet on the (crater-aware) terrain; dragon flies
             let model = glam::Mat4::from_translation(glam::Vec3::new(u.p.x as f32, y, u.p.z as f32)) * glam::Mat4::from_rotation_y(u.face) * glam::Mat4::from_scale(glam::Vec3::splat(u.kind.model_height()));
             let nf = m.n_frames.max(1);
             let group = (i as u32 % 5) as f32 / 5.0; // phase-grouped frame (as macroquad)

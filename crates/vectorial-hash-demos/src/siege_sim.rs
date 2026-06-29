@@ -320,6 +320,54 @@ pub fn arc_velocity(a: Point3, t: Point3, tf: f64) -> (f64, f64, f64) {
     ((t.x - a.x) / tf, (t.y - a.y) / tf + 0.5 * PROJ_GRAVITY * tf, (t.z - a.z) / tf)
 }
 
+// ----------------------------------------------------------------- craters
+
+/// Alterable-terrain state: the impact craters carved into the battlefield.
+/// **Shared** between the simulation (so units sink into them) and the renderers
+/// (so both the voxel and smooth meshes deform identically) — one source of truth.
+/// Each crater is a smooth bowl `(x, z, radius)`; `depth_at` sums the overlap.
+#[derive(Default)]
+pub struct Craters {
+    list: Vec<(f32, f32, f32)>,
+    pub dirty: bool, // a crater landed since the last remesh
+}
+/// Max craters kept (oldest dropped) — bounds both the depth sum and the remesh.
+pub const CRATER_CAP: usize = 64;
+
+impl Craters {
+    pub fn new() -> Self { Self::default() }
+    /// Carve a crater at `(x, z)` of the given AoE radius; caps the list.
+    pub fn carve(&mut self, x: f64, z: f64, r: f64) {
+        self.list.push((x as f32, z as f32, r as f32));
+        if self.list.len() > CRATER_CAP { let drop = self.list.len() - CRATER_CAP; self.list.drain(0..drop); }
+        self.dirty = true;
+    }
+    /// How far the ground has been lowered at `(x, z)` — a cone bowl per crater,
+    /// ~0.45·r deep at the centre, summed. The single source the mesh + the unit
+    /// ground both read, so they always agree.
+    pub fn depth_at(&self, x: f64, z: f64) -> f64 {
+        let mut d = 0.0;
+        for &(cx, cz, cr) in &self.list {
+            let dist = (((x - cx as f64).powi(2) + (z - cz as f64).powi(2)).sqrt()) as f32;
+            if dist < cr {
+                // Smoothstep bowl: zero slope at the rim *and* the centre, so the
+                // crater is round (no cone tip / hard rim corner) even on the
+                // smooth mesh. ~0.45·r deep at the middle.
+                let t = 1.0 - dist / cr;
+                d += (cr * 0.45 * t * t * (3.0 - 2.0 * t)) as f64;
+            }
+        }
+        d
+    }
+    pub fn is_empty(&self) -> bool { self.list.is_empty() }
+}
+
+/// Ground surface height at `(x, z)` accounting for craters — the value both the
+/// unit feet and the terrain mesh should use.
+pub fn ground_height(x: f64, z: f64, craters: &Craters) -> f64 {
+    terrain_height(x, z) - craters.depth_at(x, z)
+}
+
 // ----------------------------------------------------------------- spawning
 
 pub fn spawn_unit(rng: &mut Rng, faction: Faction) -> Unit {
@@ -540,7 +588,7 @@ pub fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>, 
 /// cross-unit writes happen.
 /// Returns this frame's ground impacts (point + AoE radius) — cannon / lava bombs
 /// — so a renderer can carve craters there (the wgpu/macroquad alterable terrain).
-pub fn apply(units: &mut [Unit], smoke: &mut Vec<Puff>, effects: &mut Vec<Fx>, projectiles: &mut Vec<Projectile>, rng: &mut Rng, dt: f64, now: f64) -> Vec<(Point3, f64)> {
+pub fn apply(units: &mut [Unit], smoke: &mut Vec<Puff>, effects: &mut Vec<Fx>, projectiles: &mut Vec<Projectile>, craters: &Craters, rng: &mut Rng, dt: f64, now: f64) -> Vec<(Point3, f64)> {
     // 1) movement + cooldown tick (each unit, independent).
     for u in units.iter_mut() {
         if !u.alive() { continue; }
@@ -549,8 +597,9 @@ pub fn apply(units: &mut [Unit], smoke: &mut Vec<Puff>, effects: &mut Vec<Fx>, p
         let wade = if u.kind.altitude() == 0.0 && terrain_height(u.p.x, u.p.z) < WATER_LEVEL && !on_bridge(u.p.x, u.p.z) { 0.4 } else { 1.0 };
         let nx = (u.p.x + u.vel.0 * dt * wade).clamp(2.0, WORLD - 2.0);
         let nz = (u.p.z + u.vel.2 * dt * wade).clamp(2.0, WORLD - 2.0);
-        let ground = terrain_height(nx, nz) + u.kind.radius() as f64;
-        let ny = if u.kind == Kind::Dragon { (terrain_height(nx, nz) + u.kind.altitude()).max(ground) } else { ground };
+        let surf = ground_height(nx, nz, craters); // base terrain minus any crater
+        let ground = surf + u.kind.radius() as f64;
+        let ny = if u.kind == Kind::Dragon { (surf + u.kind.altitude()).max(ground) } else { ground };
         u.p = Point3::new(nx, ny, nz);
         // Face the enemy while engaged (the `aim` heading); else face the direction
         // of travel; keep the last heading while idle.
@@ -735,6 +784,7 @@ mod tests {
         let mut effects: Vec<Fx> = Vec::new();
         let mut projectiles: Vec<Projectile> = Vec::new();
         let mut volcano = Volcano::new();
+        let mut craters = Craters::new();
         let br = default_body_radius();
         let mut now = 0.0;
         for _ in 0..30 {
@@ -746,9 +796,12 @@ mod tests {
             let mut smoke_index = Tree3::<Puff>::new(smoke_bounds, 8);
             for s in &smoke { smoke_index.insert(*s); }
             for i in 0..units.len() { decide(&mut units[i], i as u32, &index, &smoke_index, &br); }
-            apply(&mut units, &mut smoke, &mut effects, &mut projectiles, &mut rng, 0.05, now);
+            let impacts = apply(&mut units, &mut smoke, &mut effects, &mut projectiles, &craters, &mut rng, 0.05, now);
+            for (ip, r) in impacts { craters.carve(ip.x, ip.z, r); }
             volcano_step(&mut volcano, &mut smoke, &mut effects, &mut projectiles, &mut rng, 0.05, now);
         }
+        // Craters carved by any impacts must lower the ground where they landed.
+        if !craters.is_empty() { assert!(ground_height(WORLD * 0.5, WORLD * 0.5, &craters) <= terrain_height(WORLD * 0.5, WORLD * 0.5)); }
         // The battle ran without panic and units are still all accounted for.
         assert_eq!(units.len(), 120);
     }

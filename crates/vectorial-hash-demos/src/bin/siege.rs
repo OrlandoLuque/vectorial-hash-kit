@@ -76,8 +76,8 @@ fn anim_offset(u: &Unit, now: f64, h: f32) -> Vec3 {
 /// Chunked because macroquad clamps any single drawcall at 10 000 verts / 5 000
 /// indices; a 6×6 grid of 25-cell chunks (676 verts / 3 750 indices each) stays
 /// under both caps.
-fn build_terrain_chunks() -> Vec<Mesh> {
-    const RES: usize = 150;
+fn build_terrain_chunks(craters: &Craters) -> Vec<Mesh> {
+    const RES: usize = 250; // finer grid (cell ≈ 3.2 u) so crater bowls read smooth
     const CHUNK: usize = 25; // cells/side: (CHUNK+1)²=676 verts, CHUNK²·6=3 750 indices
     let step = WORLD / RES as f64;
     let light = vec3(-0.45, 0.84, -0.30).normalize();
@@ -90,10 +90,11 @@ fn build_terrain_chunks() -> Vec<Mesh> {
             for jz in 0..=CHUNK {
                 for jx in 0..=CHUNK {
                     let (x, z) = ((ix0 + jx) as f64 * step, (iz0 + jz) as f64 * step);
-                    let h = terrain_height(x, z);
-                    // Heightfield normal via central differences.
-                    let hx = terrain_height(x + step, z) - terrain_height(x - step, z);
-                    let hz = terrain_height(x, z + step) - terrain_height(x, z - step);
+                    let h = ground_height(x, z, craters); // base terrain minus craters
+                    // Heightfield normal via central differences (crater-aware, so
+                    // the bowl walls shade).
+                    let hx = ground_height(x + step, z, craters) - ground_height(x - step, z, craters);
+                    let hz = ground_height(x, z + step, craters) - ground_height(x, z - step, craters);
                     let n = vec3((-hx / (2.0 * step)) as f32, 1.0, (-hz / (2.0 * step)) as f32).normalize();
                     let (base, emissive) = terrain_surface(x, z, h);
                     let col = if emissive {
@@ -126,25 +127,15 @@ fn build_terrain_chunks() -> Vec<Mesh> {
 /// quad-flip fix from MAP_DESIGN.md, plus the elevation colour ramp. Chunked so
 /// each mesh stays under macroquad's per-draw-call index cap. The cell heights
 /// are a grid → alterable (crater carving) is a future step (BACKLOG).
-fn build_voxel_chunks(craters: &[(f32, f32, f32)]) -> Vec<Mesh> {
+fn build_voxel_chunks(craters: &Craters) -> Vec<Mesh> {
     const VRES: usize = 80;  // cells/side: cell ≈ 10 world units → visibly blocky
     const CHUNK: usize = 10; // cells/side per mesh: ≤100 cells · ≤30 idx = <5000
     let step = WORLD / VRES as f64;
     let light = vec3(-0.45, 0.84, -0.30).normalize();
-    // Carve craters (x, z, radius) as a smooth bowl out of a cell's height.
-    let carve = |x: f64, z: f64, h: f64| -> f64 {
-        let mut h = h;
-        for &(cx, cz, cr) in craters {
-            let d = (((x - cx as f64).powi(2) + (z - cz as f64).powi(2)).sqrt()) as f32;
-            if d < cr { h -= (cr * 0.45 * (1.0 - d / cr)) as f64; } // cone bowl, ~0.45·r deep
-        }
-        h
-    };
-    // Precompute the cell-centre heights once for O(1) neighbour AO lookups.
+    // Precompute the cell-centre heights once (crater-lowered) for O(1) AO lookups.
     let heights: Vec<f64> = (0..VRES * VRES).map(|k| {
         let (i, j) = (k % VRES, k / VRES);
-        let (x, z) = ((i as f64 + 0.5) * step, (j as f64 + 0.5) * step);
-        carve(x, z, terrain_height(x, z))
+        ground_height((i as f64 + 0.5) * step, (j as f64 + 0.5) * step, craters)
     }).collect();
     let hc = |i: i32, j: i32| -> f64 {
         if i < 0 || j < 0 || i >= VRES as i32 || j >= VRES as i32 { -1000.0 } else { heights[j as usize * VRES + i as usize] }
@@ -362,11 +353,11 @@ async fn main() {
     // ($SIEGE_SMOOTH=1 starts smooth). The voxel mesh is *alterable*: cannon and
     // lava-bomb impacts carve craters into it (rebuilt, throttled, when dirty).
     let mut smooth = std::env::var("SIEGE_SMOOTH").is_ok();
-    let mut craters: Vec<(f32, f32, f32)> = Vec::new(); // (x, z, radius), capped
-    let mut terrain_dirty = false; // a crater landed → rebuild the voxel mesh soon
+    let mut craters = Craters::new(); // shared with the sim: units sink into these
     let mut rebuild_t = 0.0f64; // throttle: at most one rebuild per REBUILD_EVERY
     const REBUILD_EVERY: f64 = 0.4;
-    let mut terrain_chunks = if smooth { build_terrain_chunks() } else { build_voxel_chunks(&craters) };
+    let build_terrain = |smooth: bool, craters: &Craters| if smooth { build_terrain_chunks(craters) } else { build_voxel_chunks(craters) };
+    let mut terrain_chunks = build_terrain(smooth, &craters);
     let mut now = 0.0f64; // simulation clock
     let mut paused = false;
     let mut volcano = Volcano::new(); // crater plume + eruption timers (shared sim)
@@ -400,7 +391,7 @@ async fn main() {
         if is_key_pressed(KeyCode::P) { paused = !paused; }
         if is_key_pressed(KeyCode::V) { // toggle smooth ↔ voxel terrain, rebuild now
             smooth = !smooth;
-            terrain_chunks = if smooth { build_terrain_chunks() } else { build_voxel_chunks(&craters) };
+            terrain_chunks = build_terrain(smooth, &craters);
         }
         // Rebuild the army when the population slider changed (or on `[`/`]`).
         if is_key_pressed(KeyCode::RightBracket) { per_faction = (per_faction + 100).min(2000); }
@@ -440,23 +431,20 @@ async fn main() {
             }
             #[cfg(target_arch = "wasm32")]
             for i in 0..units.len() { decide(&mut units[i], i as u32, &index, &smoke_index, &body_radius); }
-            let impacts = apply(&mut units, &mut smoke, &mut effects, &mut projectiles, &mut rng, dt, now);
+            let impacts = apply(&mut units, &mut smoke, &mut effects, &mut projectiles, &craters, &mut rng, dt, now);
 
             // Volcano: constant crater plume + the occasional eruption (lava
             // streaks, smoke burst, arcing lava bombs) — all in the shared sim.
             volcano_step(&mut volcano, &mut smoke, &mut effects, &mut projectiles, &mut rng, dt, now);
 
-            // Alterable terrain: each ground impact carves a crater into the voxel
-            // mesh. Cap the list and rebuild throttled (the voxel rebuild isn't free).
-            for (ip, r) in impacts {
-                craters.push((ip.x as f32, ip.z as f32, (r * 0.85) as f32));
-                terrain_dirty = true;
-            }
-            if craters.len() > 64 { let drop = craters.len() - 64; craters.drain(0..drop); }
+            // Alterable terrain: each ground impact carves a crater (shared with the
+            // sim, so units sink into it too). Rebuild the mesh throttled — both the
+            // voxel and the smooth heightfield deform.
+            for (ip, r) in impacts { craters.carve(ip.x, ip.z, r * 0.85); }
             rebuild_t -= dt;
-            if terrain_dirty && !smooth && rebuild_t <= 0.0 {
-                terrain_chunks = build_voxel_chunks(&craters);
-                terrain_dirty = false;
+            if craters.dirty && rebuild_t <= 0.0 {
+                terrain_chunks = build_terrain(smooth, &craters);
+                craters.dirty = false;
                 rebuild_t = REBUILD_EVERY;
             }
         }
