@@ -164,7 +164,8 @@ struct UiVertex { pos: [f32; 2], color: [f32; 4] }
 // Overlay layout in **pixels** (top-left origin): the strength bar + the
 // population slider track. Shared by the renderer and the mouse hit-test.
 const UI_BAR: (f32, f32, f32, f32) = (18.0, 18.0, 280.0, 16.0);
-const UI_SLIDER: (f32, f32, f32, f32) = (18.0, 46.0, 280.0, 12.0);
+const UI_SLIDER: (f32, f32, f32, f32) = (18.0, 46.0, 280.0, 12.0); // population
+const UI_THREADS: (f32, f32, f32, f32) = (18.0, 70.0, 280.0, 12.0); // rayon pool size
 
 /// Push a pixel-space rectangle (top-left origin) as two triangles in NDC.
 #[allow(clippy::too_many_arguments)] // a rect + colour + screen dims
@@ -257,10 +258,14 @@ struct State {
     line_buf: wgpu::Buffer,
     line_cap: usize,
     line_verts: Vec<LVertex>,
-    // 2D overlay (strength bar + population slider) — wgpu has no text.
+    // 2D overlay (strength bar + sliders) — wgpu has no text.
     ui_pipeline: wgpu::RenderPipeline,
     ui_buf: wgpu::Buffer,
-    ui_drag: bool, // the population slider is being dragged
+    ui_drag: u8, // which slider is being dragged: 0 none, 1 population, 2 threads
+    // Live rayon pool for the parallel `decide` pass (the thread slider).
+    pool: rayon::ThreadPool,
+    n_threads: usize,
+    max_threads: usize,
     terrain_pipeline: wgpu::RenderPipeline,
     terrain_vbuf: wgpu::Buffer,
     terrain_ibuf: wgpu::Buffer,
@@ -437,6 +442,9 @@ impl State {
         let pop = PER_FACTION;
         let units = spawn_army(&mut rng, pop);
         let index = Tree3::<IUnit>::new(Aabb::new(0.0, 0.0, 0.0, WORLD, SKY, WORLD), 8);
+        // Live rayon pool for the parallel decide pass (the thread slider).
+        let max_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(max_threads).build().unwrap();
 
         State {
             surface, device, queue, config,
@@ -444,7 +452,8 @@ impl State {
             castle_model, castle_inst_buf,
             proj_model, proj_inst_buf,
             line_pipeline, line_buf, line_cap, line_verts: Vec::new(),
-            ui_pipeline, ui_buf, ui_drag: false,
+            ui_pipeline, ui_buf, ui_drag: 0,
+            pool, n_threads: max_threads, max_threads,
             terrain_pipeline, terrain_vbuf, terrain_ibuf, terrain_nidx: ti.len() as u32,
             cam_buf, cam_bg, depth, units, index,
             smoke: Vec::new(), effects: Vec::new(), projectiles: Vec::new(),
@@ -481,6 +490,23 @@ impl State {
         self.units = spawn_army(&mut self.rng, self.pop);
     }
 
+    /// Resize the rayon pool that runs the parallel decide pass (thread slider).
+    fn set_threads(&mut self, n: usize) {
+        let n = n.clamp(1, self.max_threads);
+        if n == self.n_threads { return; }
+        self.n_threads = n;
+        self.pool = rayon::ThreadPoolBuilder::new().num_threads(n).build().unwrap();
+    }
+
+    /// Map a mouse-x to slider `which` (1 = population, 2 = threads) and apply it.
+    fn apply_slider(&mut self, which: u8, mx: f32) {
+        match which {
+            1 => { let (tx, _, tw, _) = UI_SLIDER; let frac = ((mx - tx) / tw).clamp(0.0, 1.0); self.set_population(20 + (frac * (MAX_POP as f32 - 20.0)) as usize); }
+            2 => { let (tx, _, tw, _) = UI_THREADS; let frac = ((mx - tx) / tw).clamp(0.0, 1.0); self.set_threads(1 + (frac * (self.max_threads as f32 - 1.0)).round() as usize); }
+            _ => {}
+        }
+    }
+
     fn camera(&self) -> CameraUniform {
         let target = Vec3::new((WORLD * 0.5) as f32, 20.0, (WORLD * 0.5) as f32);
         let eye = target + Vec3::new(self.dist * self.pitch.cos() * self.yaw.cos(), self.dist * self.pitch.sin(), self.dist * self.pitch.cos() * self.yaw.sin());
@@ -504,8 +530,10 @@ impl State {
             let mut smoke_index = Tree3::<Puff>::new(Aabb::new(0.0, 0.0, 0.0, WORLD, SKY, WORLD), 8);
             for s in &self.smoke { smoke_index.insert(*s); }
             // Decide (parallel, read-only on the indices) → apply (serial) → volcano.
+            // Fans out over the sized pool (the thread slider), like the macroquad demo.
+            let (pool, units) = (&self.pool, &mut self.units);
             let (idx, smk, br) = (&self.index, &smoke_index, &self.body_radius);
-            self.units.par_iter_mut().enumerate().for_each(|(i, u)| decide(u, i as u32, idx, smk, br));
+            pool.install(|| units.par_iter_mut().enumerate().for_each(|(i, u)| decide(u, i as u32, idx, smk, br)));
             let impacts = apply(&mut self.units, &mut self.smoke, &mut self.effects, &mut self.projectiles, &self.craters, &mut self.rng, dt, self.now);
             volcano_step(&mut self.volcano, &mut self.smoke, &mut self.effects, &mut self.projectiles, &mut self.rng, dt, self.now);
             // Alterable terrain: carve craters at the impacts (shared with the sim,
@@ -610,10 +638,14 @@ impl State {
         push_quad(&mut ui, bx - 2.0, by - 2.0, bw + 4.0, bh + 4.0, [0.0, 0.0, 0.0, 0.45], sw, sh); // backing
         push_quad(&mut ui, bx, by, rw, bh, [0.90, 0.25, 0.20, 0.95], sw, sh); // Red strength
         push_quad(&mut ui, bx + rw, by, bw - rw, bh, [0.30, 0.45, 1.0, 0.95], sw, sh); // Blue strength
-        let (tx, ty, tw, th) = UI_SLIDER;
-        push_quad(&mut ui, tx, ty, tw, th, [0.22, 0.22, 0.28, 0.85], sw, sh); // slider track
+        let (tx, ty, tw, th) = UI_SLIDER; // population (white handle)
+        push_quad(&mut ui, tx, ty, tw, th, [0.22, 0.22, 0.28, 0.85], sw, sh);
         let frac = ((self.pop as f32 - 20.0) / (MAX_POP as f32 - 20.0)).clamp(0.0, 1.0);
-        push_quad(&mut ui, tx + frac * tw - 5.0, ty - 3.0, 10.0, th + 6.0, [0.95, 0.95, 0.98, 1.0], sw, sh); // handle
+        push_quad(&mut ui, tx + frac * tw - 5.0, ty - 3.0, 10.0, th + 6.0, [0.95, 0.95, 0.98, 1.0], sw, sh);
+        let (hx, hy, hw, hh) = UI_THREADS; // rayon threads (green handle)
+        push_quad(&mut ui, hx, hy, hw, hh, [0.22, 0.22, 0.28, 0.85], sw, sh);
+        let tfrac = if self.max_threads > 1 { (self.n_threads as f32 - 1.0) / (self.max_threads as f32 - 1.0) } else { 1.0 };
+        push_quad(&mut ui, hx + tfrac * hw - 5.0, hy - 3.0, 10.0, hh + 6.0, [0.40, 0.95, 0.55, 1.0], sw, sh);
         self.queue.write_buffer(&self.ui_buf, 0, bytemuck::cast_slice(&ui));
         let ui_n = ui.len() as u32;
 
@@ -794,15 +826,13 @@ async fn run() {
                     WindowEvent::Resized(s) => st.resize(s.width, s.height),
                     WindowEvent::MouseInput { button: MouseButton::Left, state, .. } => {
                         if state == ElementState::Pressed {
-                            // Over the population slider → drag it, not the camera.
-                            let (tx, ty, tw, th) = UI_SLIDER;
+                            // Over a slider → drag it (population / threads), not the camera.
                             let (mx, my) = (st.last_mouse.0 as f32, st.last_mouse.1 as f32);
-                            if mx >= tx - 8.0 && mx <= tx + tw + 8.0 && my >= ty - 6.0 && my <= ty + th + 6.0 {
-                                st.ui_drag = true;
-                                let frac = ((mx - tx) / tw).clamp(0.0, 1.0);
-                                st.set_population(20 + (frac * (MAX_POP as f32 - 20.0)) as usize);
-                            } else { st.dragging = true; }
-                        } else { st.dragging = false; st.ui_drag = false; }
+                            let hit = |r: (f32, f32, f32, f32)| mx >= r.0 - 8.0 && mx <= r.0 + r.2 + 8.0 && my >= r.1 - 6.0 && my <= r.1 + r.3 + 6.0;
+                            if hit(UI_SLIDER) { st.ui_drag = 1; st.apply_slider(1, mx); }
+                            else if hit(UI_THREADS) { st.ui_drag = 2; st.apply_slider(2, mx); }
+                            else { st.dragging = true; }
+                        } else { st.dragging = false; st.ui_drag = 0; }
                     }
                     WindowEvent::KeyboardInput { event: KeyEvent { physical_key: PhysicalKey::Code(code), state: ElementState::Pressed, .. }, .. } => match code {
                         KeyCode::KeyP => st.paused = !st.paused,
@@ -812,10 +842,9 @@ async fn run() {
                         _ => {}
                     },
                     WindowEvent::CursorMoved { position, .. } => {
-                        if st.ui_drag {
-                            let (tx, _, tw, _) = UI_SLIDER;
-                            let frac = ((position.x as f32 - tx) / tw).clamp(0.0, 1.0);
-                            st.set_population(20 + (frac * (MAX_POP as f32 - 20.0)) as usize);
+                        if st.ui_drag != 0 {
+                            let w = st.ui_drag;
+                            st.apply_slider(w, position.x as f32);
                         } else if st.dragging {
                             st.yaw += (position.x - st.last_mouse.0) as f32 * 0.01;
                             st.pitch = (st.pitch + (position.y - st.last_mouse.1) as f32 * 0.01).clamp(0.05, 1.5);
