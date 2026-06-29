@@ -167,6 +167,7 @@ const UI_BAR: (f32, f32, f32, f32) = (18.0, 18.0, 280.0, 16.0);
 const UI_SLIDER: (f32, f32, f32, f32) = (18.0, 46.0, 280.0, 12.0);
 
 /// Push a pixel-space rectangle (top-left origin) as two triangles in NDC.
+#[allow(clippy::too_many_arguments)] // a rect + colour + screen dims
 fn push_quad(v: &mut Vec<UiVertex>, px: f32, py: f32, w: f32, h: f32, color: [f32; 4], sw: f32, sh: f32) {
     let (x0, x1) = (px / sw * 2.0 - 1.0, (px + w) / sw * 2.0 - 1.0);
     let (y0, y1) = (1.0 - py / sh * 2.0, 1.0 - (py + h) / sh * 2.0);
