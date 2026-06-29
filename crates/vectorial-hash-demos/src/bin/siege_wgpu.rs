@@ -155,6 +155,25 @@ struct SkinInstance { model: [[f32; 4]; 4], color: [f32; 4], frame_base: u32, _p
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct LVertex { pos: [f32; 3], color: [f32; 4] }
 
+/// One screen-space (NDC) UI vertex — the 2D overlay (strength bar + sliders),
+/// since wgpu has no built-in text. Filled triangles, no depth, alpha-blended.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct UiVertex { pos: [f32; 2], color: [f32; 4] }
+
+// Overlay layout in **pixels** (top-left origin): the strength bar + the
+// population slider track. Shared by the renderer and the mouse hit-test.
+const UI_BAR: (f32, f32, f32, f32) = (18.0, 18.0, 280.0, 16.0);
+const UI_SLIDER: (f32, f32, f32, f32) = (18.0, 46.0, 280.0, 12.0);
+
+/// Push a pixel-space rectangle (top-left origin) as two triangles in NDC.
+fn push_quad(v: &mut Vec<UiVertex>, px: f32, py: f32, w: f32, h: f32, color: [f32; 4], sw: f32, sh: f32) {
+    let (x0, x1) = (px / sw * 2.0 - 1.0, (px + w) / sw * 2.0 - 1.0);
+    let (y0, y1) = (1.0 - py / sh * 2.0, 1.0 - (py + h) / sh * 2.0);
+    let q = |x, y| UiVertex { pos: [x, y], color };
+    v.extend_from_slice(&[q(x0, y0), q(x1, y0), q(x1, y1), q(x0, y0), q(x1, y1), q(x0, y1)]);
+}
+
 /// A GPU-resident unit model: rest mesh + per-frame bone matrices + its own bind
 /// group (camera + this model's bone storage buffer). One per distinct `.glb`.
 struct GpuModel {
@@ -237,6 +256,10 @@ struct State {
     line_buf: wgpu::Buffer,
     line_cap: usize,
     line_verts: Vec<LVertex>,
+    // 2D overlay (strength bar + population slider) — wgpu has no text.
+    ui_pipeline: wgpu::RenderPipeline,
+    ui_buf: wgpu::Buffer,
+    ui_drag: bool, // the population slider is being dragged
     terrain_pipeline: wgpu::RenderPipeline,
     terrain_vbuf: wgpu::Buffer,
     terrain_ibuf: wgpu::Buffer,
@@ -390,6 +413,21 @@ impl State {
         let line_cap = 8192usize;
         let line_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("line-v"), size: (line_cap * std::mem::size_of::<LVertex>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
 
+        // 2D overlay pipeline (NDC, no camera bind group, drawn over everything).
+        let ui_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("ui-shader"), source: wgpu::ShaderSource::Wgsl(UI_SHADER.into()) });
+        let ui_pipe_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("ui-pl"), bind_group_layouts: &[], push_constant_ranges: &[] });
+        let ui_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("ui-pipe"),
+            layout: Some(&ui_pipe_layout),
+            vertex: wgpu::VertexState { module: &ui_shader, entry_point: "vs", compilation_options: Default::default(), buffers: &[wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<UiVertex>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x4] }] },
+            fragment: Some(wgpu::FragmentState { module: &ui_shader, entry_point: "fs", compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
+            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState { format: wgpu::TextureFormat::Depth32Float, depth_write_enabled: false, depth_compare: wgpu::CompareFunction::Always, stencil: Default::default(), bias: Default::default() }),
+            multisample: Default::default(),
+            multiview: None,
+        });
+        let ui_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("ui-v"), size: (256 * std::mem::size_of::<UiVertex>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+
         let depth = make_depth(&device, &config);
         // Per-run seed (reproducible via $SIEGE_SEED) drives the shared map + army.
         let seed = std::env::var("SIEGE_SEED").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0x51E6E);
@@ -405,6 +443,7 @@ impl State {
             castle_model, castle_inst_buf,
             proj_model, proj_inst_buf,
             line_pipeline, line_buf, line_cap, line_verts: Vec::new(),
+            ui_pipeline, ui_buf, ui_drag: false,
             terrain_pipeline, terrain_vbuf, terrain_ibuf, terrain_nidx: ti.len() as u32,
             cam_buf, cam_bg, depth, units, index,
             smoke: Vec::new(), effects: Vec::new(), projectiles: Vec::new(),
@@ -433,9 +472,11 @@ impl State {
         self.terrain_nidx = ti.len() as u32;
     }
 
-    /// Respawn both armies at a new per-side size (the [ ] keys).
+    /// Respawn both armies at a new per-side size (the [ ] keys / slider).
     fn set_population(&mut self, pop: usize) {
-        self.pop = pop.clamp(20, MAX_POP);
+        let pop = pop.clamp(20, MAX_POP);
+        if pop == self.pop { return; } // no churn while the slider sits still
+        self.pop = pop;
         self.units = spawn_army(&mut self.rng, self.pop);
     }
 
@@ -559,6 +600,22 @@ impl State {
         if !self.line_verts.is_empty() { self.queue.write_buffer(&self.line_buf, 0, bytemuck::cast_slice(&self.line_verts)); }
         let line_n = self.line_verts.len() as u32;
 
+        // 2D overlay: a Red|Blue strength bar (live counts) + the population slider.
+        let (sw, sh) = (self.config.width as f32, self.config.height as f32);
+        let mut ui: Vec<UiVertex> = Vec::new();
+        let (bx, by, bw, bh) = UI_BAR;
+        let total = (self.red + self.blue).max(1) as f32;
+        let rw = bw * self.red as f32 / total;
+        push_quad(&mut ui, bx - 2.0, by - 2.0, bw + 4.0, bh + 4.0, [0.0, 0.0, 0.0, 0.45], sw, sh); // backing
+        push_quad(&mut ui, bx, by, rw, bh, [0.90, 0.25, 0.20, 0.95], sw, sh); // Red strength
+        push_quad(&mut ui, bx + rw, by, bw - rw, bh, [0.30, 0.45, 1.0, 0.95], sw, sh); // Blue strength
+        let (tx, ty, tw, th) = UI_SLIDER;
+        push_quad(&mut ui, tx, ty, tw, th, [0.22, 0.22, 0.28, 0.85], sw, sh); // slider track
+        let frac = ((self.pop as f32 - 20.0) / (MAX_POP as f32 - 20.0)).clamp(0.0, 1.0);
+        push_quad(&mut ui, tx + frac * tw - 5.0, ty - 3.0, 10.0, th + 6.0, [0.95, 0.95, 0.98, 1.0], sw, sh); // handle
+        self.queue.write_buffer(&self.ui_buf, 0, bytemuck::cast_slice(&ui));
+        let ui_n = ui.len() as u32;
+
         let frame = match self.surface.get_current_texture() { Ok(f) => f, Err(_) => return };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
@@ -602,12 +659,18 @@ impl State {
                 pass.set_index_buffer(pm.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..pm.nidx, 0, 0..proj_n);
             }
-            // combat effects (alpha-blended lines, drawn last).
+            // combat effects (alpha-blended lines).
             if line_n > 0 {
                 pass.set_pipeline(&self.line_pipeline);
                 pass.set_bind_group(0, &self.cam_bg, &[]);
                 pass.set_vertex_buffer(0, self.line_buf.slice(..));
                 pass.draw(0..line_n, 0..1);
+            }
+            // 2D overlay (strength bar + slider), drawn over everything.
+            if ui_n > 0 {
+                pass.set_pipeline(&self.ui_pipeline);
+                pass.set_vertex_buffer(0, self.ui_buf.slice(..));
+                pass.draw(0..ui_n, 0..1);
             }
         }
         self.queue.submit(Some(enc.finish()));
@@ -696,6 +759,20 @@ fn vs(@location(0) p: vec3<f32>, @location(1) color: vec4<f32>) -> VOut {
 fn fs(in: VOut) -> @location(0) vec4<f32> { return in.color; }
 "#;
 
+// 2D screen-space (NDC) overlay — the strength bar + sliders. No camera.
+const UI_SHADER: &str = r#"
+struct VOut { @builtin(position) clip: vec4<f32>, @location(0) color: vec4<f32> };
+@vertex
+fn vs(@location(0) p: vec2<f32>, @location(1) color: vec4<f32>) -> VOut {
+    var o: VOut;
+    o.clip = vec4<f32>(p, 0.0, 1.0);
+    o.color = color;
+    return o;
+}
+@fragment
+fn fs(in: VOut) -> @location(0) vec4<f32> { return in.color; }
+"#;
+
 fn main() {
     pollster::block_on(run());
 }
@@ -714,7 +791,18 @@ async fn run() {
                 Event::WindowEvent { event, .. } => match event {
                     WindowEvent::CloseRequested => elwt.exit(),
                     WindowEvent::Resized(s) => st.resize(s.width, s.height),
-                    WindowEvent::MouseInput { button: MouseButton::Left, state, .. } => st.dragging = state == ElementState::Pressed,
+                    WindowEvent::MouseInput { button: MouseButton::Left, state, .. } => {
+                        if state == ElementState::Pressed {
+                            // Over the population slider → drag it, not the camera.
+                            let (tx, ty, tw, th) = UI_SLIDER;
+                            let (mx, my) = (st.last_mouse.0 as f32, st.last_mouse.1 as f32);
+                            if mx >= tx - 8.0 && mx <= tx + tw + 8.0 && my >= ty - 6.0 && my <= ty + th + 6.0 {
+                                st.ui_drag = true;
+                                let frac = ((mx - tx) / tw).clamp(0.0, 1.0);
+                                st.set_population(20 + (frac * (MAX_POP as f32 - 20.0)) as usize);
+                            } else { st.dragging = true; }
+                        } else { st.dragging = false; st.ui_drag = false; }
+                    }
                     WindowEvent::KeyboardInput { event: KeyEvent { physical_key: PhysicalKey::Code(code), state: ElementState::Pressed, .. }, .. } => match code {
                         KeyCode::KeyP => st.paused = !st.paused,
                         KeyCode::KeyV => { st.smooth = !st.smooth; st.rebuild_terrain(); } // voxel ↔ smooth
@@ -723,7 +811,11 @@ async fn run() {
                         _ => {}
                     },
                     WindowEvent::CursorMoved { position, .. } => {
-                        if st.dragging {
+                        if st.ui_drag {
+                            let (tx, _, tw, _) = UI_SLIDER;
+                            let frac = ((position.x as f32 - tx) / tw).clamp(0.0, 1.0);
+                            st.set_population(20 + (frac * (MAX_POP as f32 - 20.0)) as usize);
+                        } else if st.dragging {
                             st.yaw += (position.x - st.last_mouse.0) as f32 * 0.01;
                             st.pitch = (st.pitch + (position.y - st.last_mouse.1) as f32 * 0.01).clamp(0.05, 1.5);
                         }
