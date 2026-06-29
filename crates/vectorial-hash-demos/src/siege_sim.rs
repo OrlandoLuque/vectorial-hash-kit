@@ -588,6 +588,7 @@ pub fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>, 
 /// cross-unit writes happen.
 /// Returns this frame's ground impacts (point + AoE radius) — cannon / lava bombs
 /// — so a renderer can carve craters there (the wgpu/macroquad alterable terrain).
+#[allow(clippy::too_many_arguments)] // a frame's worth of mutable sim state
 pub fn apply(units: &mut [Unit], smoke: &mut Vec<Puff>, effects: &mut Vec<Fx>, projectiles: &mut Vec<Projectile>, craters: &Craters, rng: &mut Rng, dt: f64, now: f64) -> Vec<(Point3, f64)> {
     // 1) movement + cooldown tick (each unit, independent).
     for u in units.iter_mut() {
