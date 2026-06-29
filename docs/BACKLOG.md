@@ -120,9 +120,27 @@ leading" HUD line, and **alterable voxel terrain** (impact craters + the live `V
 switch). A 2D **`Circle` shape** was promoted to the lib (analytic `classify_box`
 + SoA batch, brute-force gated). Web republished.
 
+**Siege — 2026-06-30 fixes night (landed, after the user ran the wgpu build).**
+All five reported bugs fixed: wgpu terrain now alters on impact, the projectile
+got a real sphere model (was line crosses), on-screen counters + a draggable
+population slider in wgpu, macroquad **smooth** mode deforms too, and units no
+longer float over craters — root cause was that craters were render-only, so they
+were **lifted into the shared sim** (`Craters`, one source of truth for unit feet
++ both meshes). Plus: a **live thread-count slider** in wgpu, the **slime tweak**
+applied in wgpu, **per-pixel lighting** (terrain + units — no more Gouraud facets
+on the volcano / big models), a **smooth elevation colour ramp** (no contour steps
+/ patchy sand along the river), and the slider/HUD overlay. Perf: a precomputed
+boids **separation-force table** behind `$SIEGE_BOID_TABLE=1` — *measured slower*
+than the live maths (the memory wall; default stays maths) — and two free
+heightfield-eval dedups. See **docs/PERF_NOTES.md** (the force-table finding + the
+FPS review: free wins applied, quality-trade-off levers reported).
+
 **Siege — still remaining:**
 - **`siege_wgpu` on the web** (wasm-bindgen + WebGPU/WebGL2 — toolchain work, user
   asked twice) and **slim `siege.wasm`** (fetch-load the glTF models).
+- **Optional "classic Reynolds" boids** behind a flag (inverse-square separation,
+  arrival, inertia) — offered; needs the user's eyes to judge "more organic".
+- **Frustum-cull units** in the render (free quality-wise, situational; PERF_NOTES).
 - **wgpu world polish**: bridge decks + path-to-bridge AI, optional unit-feet snap
   to voxel tops (user chose smooth-float for now; keep it a switch).
 - **Forests as LoS cover** (trees block arrows/bolts via a raycast index, like
