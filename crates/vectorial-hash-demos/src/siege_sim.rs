@@ -148,12 +148,30 @@ pub fn terrain_surface(x: f64, z: f64, h: f64) -> ([f32; 3], bool) {
     if dang > std::f64::consts::PI { dang = TAU - dang; }
     if d < 165.0 && dang < 0.15 { return ([0.96, 0.34, 0.07], true); }
     if d < 150.0 && h > 70.0 { return ([0.30, 0.11, 0.08], false); } // scorched rock
-    let c = if h < 6.0 { [0.12, 0.28, 0.45] } // water
-        else if h < 10.0 { [0.62, 0.56, 0.34] } // sand
-        else if h < 60.0 { [0.20, 0.42, 0.18] } // grass
-        else if h < 95.0 { [0.38, 0.34, 0.30] } // rock
-        else { [0.82, 0.84, 0.88] }; // snow
-    (c, false)
+    (elevation_color(h), false)
+}
+
+/// Smooth elevation colour ramp: flat-ish biome bands (water / sand / grass /
+/// rock / snow) with a **soft smoothstep transition** at each boundary, so a
+/// slope shows a continuous gradient instead of hard "contour" steps — and the
+/// sand line doesn't break into patches where the height wobbles along the river.
+fn elevation_color(h: f64) -> [f32; 3] {
+    const WATER: [f32; 3] = [0.12, 0.28, 0.45];
+    const SAND: [f32; 3] = [0.62, 0.56, 0.34];
+    const GRASS: [f32; 3] = [0.20, 0.42, 0.18];
+    const ROCK: [f32; 3] = [0.38, 0.34, 0.30];
+    const SNOW: [f32; 3] = [0.82, 0.84, 0.88];
+    let mix = |a: [f32; 3], b: [f32; 3], t: f32| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+    // smoothstep(e0,e1,h) — 0 below e0, 1 above e1, smooth in between.
+    let s = |e0: f64, e1: f64| { let t = ((h - e0) / (e1 - e0)).clamp(0.0, 1.0) as f32; t * t * (3.0 - 2.0 * t) };
+    // Chained: each band blends fully in (t→1) before the next transition starts,
+    // so flat bands stay flat and only the boundaries (non-overlapping windows) blur.
+    let mut c = WATER;
+    c = mix(c, SAND, s(5.0, 8.0));
+    c = mix(c, GRASS, s(9.0, 14.0));
+    c = mix(c, ROCK, s(54.0, 66.0));
+    c = mix(c, SNOW, s(88.0, 100.0));
+    c
 }
 
 // ----------------------------------------------------------------- unit model
