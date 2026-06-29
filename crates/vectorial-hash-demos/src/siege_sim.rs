@@ -617,7 +617,8 @@ pub fn apply(units: &mut [Unit], smoke: &mut Vec<Puff>, effects: &mut Vec<Fx>, p
         let wade = if u.kind.altitude() == 0.0 && terrain_height(u.p.x, u.p.z) < WATER_LEVEL && !on_bridge(u.p.x, u.p.z) { 0.4 } else { 1.0 };
         let nx = (u.p.x + u.vel.0 * dt * wade).clamp(2.0, WORLD - 2.0);
         let nz = (u.p.z + u.vel.2 * dt * wade).clamp(2.0, WORLD - 2.0);
-        let surf = ground_height(nx, nz, craters); // base terrain minus any crater
+        let th = terrain_height(nx, nz); // computed once, reused for ground + lava
+        let surf = th - craters.depth_at(nx, nz); // base terrain minus any crater
         let ground = surf + u.kind.radius() as f64;
         let ny = if u.kind == Kind::Dragon { (surf + u.kind.altitude()).max(ground) } else { ground };
         u.p = Point3::new(nx, ny, nz);
@@ -630,7 +631,7 @@ pub fn apply(units: &mut [Unit], smoke: &mut Vec<Puff>, effects: &mut Vec<Fx>, p
         if fired { u.cooldown = u.kind.cooldown(); }
         u.atk_anim = if fired { ATK_ANIM_LEN } else { (u.atk_anim - dt as f32).max(0.0) };
         // Lava burns: a ground unit standing on emissive terrain takes damage.
-        if u.kind.altitude() == 0.0 && terrain_surface(nx, nz, terrain_height(nx, nz)).1 {
+        if u.kind.altitude() == 0.0 && terrain_surface(nx, nz, th).1 {
             u.hp -= LAVA_DPS * dt;
             if u.hp <= 0.0 { u.respawn_at = now + 4.0; }
         }

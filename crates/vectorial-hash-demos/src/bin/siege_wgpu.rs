@@ -562,7 +562,7 @@ impl State {
             if !u.alive() { continue; }
             let mi = self.model_idx[u.faction.index()][u.kind.index()];
             let m = &self.models[mi];
-            let y = (ground_height(u.p.x, u.p.z, &self.craters) + u.kind.altitude()) as f32; // feet on the (crater-aware) terrain; dragon flies
+            let y = (u.p.y - u.kind.radius() as f64) as f32; // feet: drop the sim's (crater-aware) centre to the ground — no terrain recompute
             // Per-model orientation/size correction (e.g. the undead mage slime
             // faces +X and reads big) — same tweak the macroquad demo applies.
             let (yaw_off, scale_mul) = u.kind.model_tweak(u.faction);
