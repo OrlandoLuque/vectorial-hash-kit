@@ -326,7 +326,7 @@ impl State {
         let skin_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("skin-l"),
             entries: &[
-                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
                 wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
             ],
         });
@@ -728,7 +728,7 @@ const SKIN_SHADER: &str = r#"
 struct Camera { vp: mat4x4<f32>, light: vec4<f32> };
 @group(0) @binding(0) var<uniform> cam: Camera;
 @group(0) @binding(1) var<storage, read> bones: array<mat4x4<f32>>;
-struct VOut { @builtin(position) clip: vec4<f32>, @location(0) color: vec4<f32> };
+struct VOut { @builtin(position) clip: vec4<f32>, @location(0) color: vec4<f32>, @location(1) normal: vec3<f32> };
 @vertex
 fn vs(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>, @location(2) joints: vec4<u32>, @location(3) weights: vec4<f32>,
       @location(10) vcolor: vec4<f32>,
@@ -748,17 +748,18 @@ fn vs(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>, @location(2) joints:
     let world = model * vec4<f32>(sp, 1.0);
     var o: VOut;
     o.clip = cam.vp * world;
-    let nn = normalize((model * vec4<f32>(sn, 0.0)).xyz);
-    let diff = max(dot(nn, normalize(cam.light.xyz)), 0.0);
-    let sh = 0.40 + 0.60 * diff;
+    o.normal = (model * vec4<f32>(sn, 0.0)).xyz;
     // The model's own colour, nudged toward the faction tint by the tint's alpha
     // (so even dark models read clearly as Red / Blue) — matches the macroquad mix.
-    let base = mix(vcolor.rgb, tint.rgb, tint.a);
-    o.color = vec4<f32>(base * sh, 1.0);
+    o.color = vec4<f32>(mix(vcolor.rgb, tint.rgb, tint.a), 1.0);
     return o;
 }
 @fragment
-fn fs(in: VOut) -> @location(0) vec4<f32> { return in.color; }
+fn fs(in: VOut) -> @location(0) vec4<f32> {
+    // Per-pixel lambert (interpolated normal) — smooth on big models (slime, dragon).
+    let diff = max(dot(normalize(in.normal), normalize(cam.light.xyz)), 0.0);
+    return vec4<f32>(in.color.rgb * (0.40 + 0.60 * diff), 1.0);
+}
 "#;
 
 const TERRAIN_SHADER: &str = r#"
