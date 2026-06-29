@@ -447,7 +447,7 @@ pub fn spawn_army(rng: &mut Rng, per_faction: usize) -> Vec<Unit> {
 /// Three library queries, one per concern: **k-NN** finds the nearest enemy
 /// (targeting) *and* the nearby friends (boids); the dragon's AoE is a sphere
 /// **`cull`**; the archer/ballista line-of-fire is a thick **`raycast`**.
-pub fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>, body_radius: &[[f64; 8]; 2]) {
+pub fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>, sep: &SepTables) {
     u.vel = (0.0, 0.0, 0.0);
     u.attacks.clear();
     u.emit = None;
@@ -463,13 +463,14 @@ pub fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>, 
     let (mut sep_x, mut sep_z) = (0.0, 0.0); // separation push (from ANY neighbour)
     let (mut coh_x, mut coh_z, mut friends) = (0.0, 0.0, 0u32); // cohesion centroid
     let (mut ali_x, mut ali_z) = (0.0f64, 0.0f64); // alignment: sum of friends' heading vectors
-    let sep_dist = body_radius[u.faction.index()][u.kind.index()] * 2.0; // two bodies of this size shan't overlap
+    let (fi, ki) = (u.faction.index(), u.kind.index());
+    let sep_dist = sep.sep_dist(fi, ki); // two bodies of this size shan't overlap
     for (d, it) in index.knn(u.p, 16) {
         if it.id == id { continue; }
         if d < sep_dist {
-            let (dd, w) = (d.max(1e-3), 1.0 - d / sep_dist);
-            sep_x += (u.p.x - it.p.x) / dd * w;
-            sep_z += (u.p.z - it.p.z) / dd * w;
+            // Precomputed force table (offset → away·weight) — load + add, no sqrt/div.
+            let (fx, fz) = sep.force(fi, ki, it.p.x - u.p.x, it.p.z - u.p.z);
+            sep_x += fx; sep_z += fz;
         }
         if it.faction != u.faction {
             if target.is_none() { target = Some((it.p, it.id, d)); }
@@ -765,6 +766,73 @@ pub fn default_body_radius() -> [[f64; 8]; 2] {
     br
 }
 
+/// **Precomputed separation-force table** — one grid per (faction, kind), indexed
+/// by the integer relative offset `(Δx, Δz) → (Fx, Fz)`, so each neighbour's
+/// separation push is a `load + add` instead of a `sqrt` + three divides. It's the
+/// project's template idea (trade precompute for runtime maths) applied to the
+/// boids steering: the force is a pure function of the offset, so it's tabulable.
+///
+/// **Measured outcome (kept honest):** on a modern CPU the table is actually a
+/// touch *slower* than just doing the maths — a few divisions are cheap and
+/// pipeline well, whereas the lookup costs a memory load and the big-unit grids
+/// (a dragon's sep_dist ≈ 48 → a ~75 KB grid) miss the cache. The "memory wall":
+/// compute got cheap, latency didn't. So the **default is the live maths**; set
+/// `$SIEGE_BOID_TABLE=1` to use the table (for the demonstration / the benchmark).
+/// The quantisation error is negligible either way (a soft steering nudge, capped
+/// at the unit vector × weight). See `bench_boid_force_table`.
+pub struct SepTables { grids: [[SepGrid; 8]; 2], live: bool }
+
+struct SepGrid {
+    r: f64,               // separation distance (= body_radius · 2)
+    half: i32,            // grid covers [-half, half] in each axis
+    size: usize,          // 2·half + 1
+    force: Vec<[f32; 2]>, // size·size of (Fx, Fz)
+}
+impl SepGrid {
+    fn build(r: f64) -> Self {
+        let half = r.ceil().max(1.0) as i32;
+        let size = (2 * half + 1) as usize;
+        let mut force = vec![[0.0f32; 2]; size * size];
+        for j in 0..size {
+            for i in 0..size {
+                let (dx, dz) = ((i as i32 - half) as f64, (j as i32 - half) as f64); // neighbour offset
+                let d = (dx * dx + dz * dz).sqrt();
+                if d > 1e-3 && d < r {
+                    let w = 1.0 - d / r; // away from the neighbour, linear taper
+                    force[j * size + i] = [(-dx / d * w) as f32, (-dz / d * w) as f32];
+                }
+            }
+        }
+        SepGrid { r, half, size, force }
+    }
+}
+impl SepTables {
+    pub fn new(body_radius: &[[f64; 8]; 2]) -> Self {
+        // Default = live maths (measured faster); $SIEGE_BOID_TABLE=1 = the table.
+        Self::new_with(body_radius, std::env::var("SIEGE_BOID_TABLE").is_err())
+    }
+    /// Force the table (`live=false`) or the exact-maths (`live=true`) path —
+    /// for the A/B micro-benchmark, regardless of the env flag.
+    pub fn new_with(body_radius: &[[f64; 8]; 2], live: bool) -> Self {
+        let grids = std::array::from_fn(|fi| std::array::from_fn(|ki| SepGrid::build(body_radius[fi][ki] * 2.0)));
+        SepTables { grids, live }
+    }
+    #[inline] pub fn sep_dist(&self, fi: usize, ki: usize) -> f64 { self.grids[fi][ki].r }
+    /// Separation force from a neighbour at relative offset `(dx, dz)`.
+    #[inline] pub fn force(&self, fi: usize, ki: usize, dx: f64, dz: f64) -> (f64, f64) {
+        let g = &self.grids[fi][ki];
+        if self.live { // exact maths (A/B comparison path)
+            let d = (dx * dx + dz * dz).sqrt().max(1e-3);
+            let w = 1.0 - d / g.r;
+            return (-dx / d * w, -dz / d * w);
+        }
+        let i = (dx.round() as i32 + g.half).clamp(0, g.size as i32 - 1) as usize;
+        let j = (dz.round() as i32 + g.half).clamp(0, g.size as i32 - 1) as usize;
+        let f = g.force[j * g.size + i];
+        (f[0] as f64, f[1] as f64)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -804,7 +872,7 @@ mod tests {
         let mut projectiles: Vec<Projectile> = Vec::new();
         let mut volcano = Volcano::new();
         let mut craters = Craters::new();
-        let br = default_body_radius();
+        let sep = SepTables::new(&default_body_radius());
         let mut now = 0.0;
         for _ in 0..30 {
             now += 0.05;
@@ -814,7 +882,7 @@ mod tests {
             }
             let mut smoke_index = Tree3::<Puff>::new(smoke_bounds, 8);
             for s in &smoke { smoke_index.insert(*s); }
-            for i in 0..units.len() { decide(&mut units[i], i as u32, &index, &smoke_index, &br); }
+            for i in 0..units.len() { decide(&mut units[i], i as u32, &index, &smoke_index, &sep); }
             let impacts = apply(&mut units, &mut smoke, &mut effects, &mut projectiles, &craters, &mut rng, 0.05, now);
             for (ip, r) in impacts { craters.carve(ip.x, ip.z, r); }
             volcano_step(&mut volcano, &mut smoke, &mut effects, &mut projectiles, &mut rng, 0.05, now);
@@ -823,5 +891,64 @@ mod tests {
         if !craters.is_empty() { assert!(ground_height(WORLD * 0.5, WORLD * 0.5, &craters) <= terrain_height(WORLD * 0.5, WORLD * 0.5)); }
         // The battle ran without panic and units are still all accounted for.
         assert_eq!(units.len(), 120);
+    }
+
+    /// Micro-benchmark of the separation-force **table vs exact maths**, across the
+    /// 4 combos (index yes/no × table yes/no). Illustrates the project's two axes:
+    /// the **index** cuts the *number* of force evals (N² → k·N), the **table**
+    /// cuts the *cost* of each. Run with:
+    ///   cargo test -p vectorial-hash-demos --release -- --ignored --nocapture bench_boid
+    #[test]
+    #[ignore]
+    fn bench_boid_force_table() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let mut rng = Rng::new(99);
+        let units = spawn_army(&mut rng, 1000); // 2000 units
+        let br = default_body_radius();
+        let tbl = SepTables::new_with(&br, false); // precomputed table
+        let live = SepTables::new_with(&br, true); // exact sqrt/div
+        let mut index = Tree3::<IUnit>::new(Aabb::new(0.0, 0.0, 0.0, WORLD, SKY, WORLD), 8);
+        for (i, u) in units.iter().enumerate() { index.insert(IUnit { id: i as u32, faction: u.faction, p: u.p, health: 1.0, face: u.face }); }
+
+        // (A) With the k-NN index — the realistic decide separation path.
+        let sep_indexed = |s: &SepTables| {
+            let mut acc = (0.0, 0.0);
+            for u in &units {
+                let (fi, ki) = (u.faction.index(), u.kind.index());
+                let sd = s.sep_dist(fi, ki);
+                for (d, it) in index.knn(u.p, 16) {
+                    if d < sd { let (fx, fz) = s.force(fi, ki, it.p.x - u.p.x, it.p.z - u.p.z); acc.0 += fx; acc.1 += fz; }
+                }
+            }
+            acc
+        };
+        // (B) Brute force, no index — O(N²), where the table really pays. Smaller N.
+        let n2 = 400.min(units.len());
+        let sep_brute = |s: &SepTables| {
+            let mut acc = (0.0, 0.0);
+            for i in 0..n2 {
+                let (u, fi, ki) = (&units[i], units[i].faction.index(), units[i].kind.index());
+                let sd = s.sep_dist(fi, ki);
+                for (j, v) in units.iter().enumerate().take(n2) {
+                    if i == j { continue; }
+                    let (dx, dz) = (v.p.x - u.p.x, v.p.z - u.p.z);
+                    if dx * dx + dz * dz < sd * sd { let (fx, fz) = s.force(fi, ki, dx, dz); acc.0 += fx; acc.1 += fz; }
+                }
+            }
+            acc
+        };
+        let time = |reps: u32, f: &dyn Fn(&SepTables) -> (f64, f64), s: &SepTables| {
+            for _ in 0..2 { black_box(f(s)); } // warm up
+            let t = Instant::now();
+            for _ in 0..reps { black_box(f(s)); }
+            t.elapsed() / reps
+        };
+        println!("\n== boids separation: table vs exact maths ==");
+        println!("index + table  : {:?}", time(20, &sep_indexed, &tbl));
+        println!("index + maths  : {:?}", time(20, &sep_indexed, &live));
+        println!("no-index+table : {:?} (N={n2})", time(20, &sep_brute, &tbl));
+        println!("no-index+maths : {:?} (N={n2})", time(20, &sep_brute, &live));
+        println!("(index cuts the COUNT of evals; table cuts the COST of each)\n");
     }
 }

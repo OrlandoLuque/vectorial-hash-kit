@@ -342,6 +342,10 @@ async fn main() {
         body_radius[1][Kind::Knight.index()] = hr;
         cpu.iter().map(|m| renderer.upload_model(gl.quad_context, &m.vertices, &m.indices)).collect()
     };
+    // Precomputed separation-force table from the model footprints (the boids
+    // push is a table lookup, no per-neighbour sqrt/div). $SIEGE_NO_BOID_TABLE=1
+    // uses the exact live maths instead. Built once — body_radius is now final.
+    let sep = vectorial_hash_demos::siege_sim::SepTables::new(&body_radius);
     // Castle model (static) for the two faction keeps, replacing the cube blocks.
     let castle = {
         let gl = unsafe { get_internal_gl() };
@@ -426,11 +430,11 @@ async fn main() {
                     pool = rayon::ThreadPoolBuilder::new().num_threads(n_threads).build().unwrap();
                     cur_threads = n_threads;
                 }
-                let (idx, smk, br) = (&index, &smoke_index, &body_radius);
+                let (idx, smk, br) = (&index, &smoke_index, &sep);
                 pool.install(|| units.par_iter_mut().enumerate().for_each(|(i, u)| decide(u, i as u32, idx, smk, br)));
             }
             #[cfg(target_arch = "wasm32")]
-            for i in 0..units.len() { decide(&mut units[i], i as u32, &index, &smoke_index, &body_radius); }
+            for i in 0..units.len() { decide(&mut units[i], i as u32, &index, &smoke_index, &sep); }
             let impacts = apply(&mut units, &mut smoke, &mut effects, &mut projectiles, &craters, &mut rng, dt, now);
 
             // Volcano: constant crater plume + the occasional eruption (lava

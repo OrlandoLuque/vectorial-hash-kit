@@ -33,8 +33,8 @@ use rayon::prelude::*;
 use vectorial_hash_demos::siege_sim::{
     apply, decide, default_body_radius, faction_tint, ground_height, model_for, set_map_seed,
     spawn_army, terrain_height, terrain_surface, volcano_step, Craters, Faction, Fx, FxKind, IUnit,
-    Kind, ProjKind, Projectile, Puff, Rng, Unit, Volcano, ANIM_FRAMES, MOVE_PREFS, PER_FACTION, SKY,
-    WORLD,
+    Kind, ProjKind, Projectile, Puff, Rng, SepTables, Unit, Volcano, ANIM_FRAMES, MOVE_PREFS,
+    PER_FACTION, SKY, WORLD,
 };
 
 const MAX_POP: usize = 2000; // max army/side the [ ] keys allow (instance-buffer cap)
@@ -280,7 +280,7 @@ struct State {
     effects: Vec<Fx>,
     projectiles: Vec<Projectile>,
     volcano: Volcano,
-    body_radius: [[f64; 8]; 2],
+    sep: SepTables, // precomputed boids separation-force table
     paused: bool,
     red: usize,  // live Red units (for the window-title HUD)
     blue: usize, // live Blue units
@@ -457,7 +457,7 @@ impl State {
             terrain_pipeline, terrain_vbuf, terrain_ibuf, terrain_nidx: ti.len() as u32,
             cam_buf, cam_bg, depth, units, index,
             smoke: Vec::new(), effects: Vec::new(), projectiles: Vec::new(),
-            volcano: Volcano::new(), body_radius: default_body_radius(), paused: false,
+            volcano: Volcano::new(), sep: SepTables::new(&default_body_radius()), paused: false,
             red: 0, blue: 0, fps: 0.0, smooth, pop, craters, rebuild_t: 0.0,
             rng, now: 0.0, last: Instant::now(),
             yaw: 0.9, pitch: 0.7, dist: 760.0, dragging: false, last_mouse: (0.0, 0.0),
@@ -532,7 +532,7 @@ impl State {
             // Decide (parallel, read-only on the indices) → apply (serial) → volcano.
             // Fans out over the sized pool (the thread slider), like the macroquad demo.
             let (pool, units) = (&self.pool, &mut self.units);
-            let (idx, smk, br) = (&self.index, &smoke_index, &self.body_radius);
+            let (idx, smk, br) = (&self.index, &smoke_index, &self.sep);
             pool.install(|| units.par_iter_mut().enumerate().for_each(|(i, u)| decide(u, i as u32, idx, smk, br)));
             let impacts = apply(&mut self.units, &mut self.smoke, &mut self.effects, &mut self.projectiles, &self.craters, &mut self.rng, dt, self.now);
             volcano_step(&mut self.volcano, &mut self.smoke, &mut self.effects, &mut self.projectiles, &mut self.rng, dt, self.now);
