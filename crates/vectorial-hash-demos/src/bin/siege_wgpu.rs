@@ -563,7 +563,10 @@ impl State {
             let mi = self.model_idx[u.faction.index()][u.kind.index()];
             let m = &self.models[mi];
             let y = (ground_height(u.p.x, u.p.z, &self.craters) + u.kind.altitude()) as f32; // feet on the (crater-aware) terrain; dragon flies
-            let model = glam::Mat4::from_translation(glam::Vec3::new(u.p.x as f32, y, u.p.z as f32)) * glam::Mat4::from_rotation_y(u.face) * glam::Mat4::from_scale(glam::Vec3::splat(u.kind.model_height()));
+            // Per-model orientation/size correction (e.g. the undead mage slime
+            // faces +X and reads big) — same tweak the macroquad demo applies.
+            let (yaw_off, scale_mul) = u.kind.model_tweak(u.faction);
+            let model = glam::Mat4::from_translation(glam::Vec3::new(u.p.x as f32, y, u.p.z as f32)) * glam::Mat4::from_rotation_y(u.face + yaw_off) * glam::Mat4::from_scale(glam::Vec3::splat(u.kind.model_height() * scale_mul));
             let nf = m.n_frames.max(1);
             let group = (i as u32 % 5) as f32 / 5.0; // phase-grouped frame (as macroquad)
             let frame = (((self.now as f32 * 1.6 + group) * nf as f32) as u32) % nf;
