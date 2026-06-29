@@ -170,6 +170,11 @@ struct GpuModel {
 /// cannon). The bind group keeps the bone buffer alive, so it can drop here.
 fn build_gpu_model(device: &wgpu::Device, cam_buf: &wgpu::Buffer, layout: &wgpu::BindGroupLayout, bytes: &[u8]) -> GpuModel {
     let m = vectorial_hash_demos::model::load_unit_model(bytes, ANIM_FRAMES, MOVE_PREFS);
+    upload_skinned(device, cam_buf, layout, &m)
+}
+
+/// Upload an already-built `SkinnedModel` (file or procedural) to the GPU.
+fn upload_skinned(device: &wgpu::Device, cam_buf: &wgpu::Buffer, layout: &wgpu::BindGroupLayout, m: &vectorial_hash_demos::model::SkinnedModel) -> GpuModel {
     let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("skin-v"), contents: bytemuck::cast_slice(&m.vertices), usage: wgpu::BufferUsages::VERTEX });
     let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("skin-i"), contents: bytemuck::cast_slice(&m.indices), usage: wgpu::BufferUsages::INDEX });
     let bone_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("bones"), contents: bytemuck::cast_slice(&m.joint_frames), usage: wgpu::BufferUsages::STORAGE });
@@ -178,6 +183,34 @@ fn build_gpu_model(device: &wgpu::Device, cam_buf: &wgpu::Buffer, layout: &wgpu:
         wgpu::BindGroupEntry { binding: 1, resource: bone_buf.as_entire_binding() },
     ] });
     GpuModel { vbuf, ibuf, nidx: m.indices.len() as u32, bind, num_joints: m.num_joints as u32, n_frames: m.n_frames as u32 }
+}
+
+/// A small unit UV sphere as a static `SkinnedModel` (1 identity joint) for the
+/// projectile markers — rendered through the same skin pipeline as the units, so
+/// cannonballs / lava bombs read as real little balls (not line crosses).
+fn proj_sphere() -> vectorial_hash_demos::model::SkinnedModel {
+    use vectorial_hash_demos::model::{SkinVertex, SkinnedModel};
+    let (rings, sectors) = (8usize, 12usize);
+    let mut verts = Vec::new();
+    for r in 0..=rings {
+        let phi = std::f32::consts::PI * r as f32 / rings as f32;
+        let (sp, cp) = phi.sin_cos();
+        for s in 0..=sectors {
+            let theta = 2.0 * std::f32::consts::PI * s as f32 / sectors as f32;
+            let (st, ct) = theta.sin_cos();
+            let n = [sp * ct, cp, sp * st]; // unit sphere: pos == normal
+            verts.push(SkinVertex { pos: n, normal: n, joints: [0; 4], weights: [1.0, 0.0, 0.0, 0.0], color: [1.0, 1.0, 1.0, 1.0] });
+        }
+    }
+    let mut idx = Vec::new();
+    let w = (sectors + 1) as u32;
+    for r in 0..rings as u32 {
+        for s in 0..sectors as u32 {
+            let a = r * w + s;
+            idx.extend_from_slice(&[a, a + w, a + 1, a + 1, a + w, a + w + 1]);
+        }
+    }
+    SkinnedModel { vertices: verts, indices: idx, joint_frames: vec![glam::Mat4::IDENTITY.to_cols_array_2d()], num_joints: 1, n_frames: 1 }
 }
 
 // ============================================================ renderer
@@ -196,6 +229,9 @@ struct State {
     // The two faction keeps: a static castle model, two instances.
     castle_model: GpuModel,
     castle_inst_buf: wgpu::Buffer,
+    // Projectile markers: a small sphere drawn instanced per live projectile.
+    proj_model: GpuModel,
+    proj_inst_buf: wgpu::Buffer,
     // Combat effects + projectile markers, drawn as coloured line segments.
     line_pipeline: wgpu::RenderPipeline,
     line_buf: wgpu::Buffer,
@@ -334,6 +370,10 @@ impl State {
         }).collect();
         let castle_inst_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("castle-inst"), contents: bytemuck::cast_slice(&castle_inst), usage: wgpu::BufferUsages::VERTEX });
 
+        // Projectile sphere + its instance buffer (one instance per live shot).
+        let proj_model = upload_skinned(&device, &cam_buf, &skin_layout, &proj_sphere());
+        let proj_inst_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("proj-inst"), size: (512 * std::mem::size_of::<SkinInstance>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+
         // Line pipeline for combat effects + projectile markers (LineList, unlit,
         // alpha-blended, depth-tested but not depth-writing).
         let line_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("line-shader"), source: wgpu::ShaderSource::Wgsl(LINE_SHADER.into()) });
@@ -363,6 +403,7 @@ impl State {
             surface, device, queue, config,
             skin_pipeline, models, model_idx, inst_buf,
             castle_model, castle_inst_buf,
+            proj_model, proj_inst_buf,
             line_pipeline, line_buf, line_cap, line_verts: Vec::new(),
             terrain_pipeline, terrain_vbuf, terrain_ibuf, terrain_nidx: ti.len() as u32,
             cam_buf, cam_bg, depth, units, index,
@@ -498,15 +539,18 @@ impl State {
                 }
             }
         }
-        for pr in &self.projectiles {
-            let c = glam::Vec3::new(pr.p.x as f32, pr.p.y as f32, pr.p.z as f32);
-            let col = match pr.kind { ProjKind::Cannon => [0.08, 0.08, 0.08, 1.0], ProjKind::LavaRock => [1.0, 0.45, 0.10, 1.0] };
-            let r = 2.2;
-            push(&mut lv, c - glam::Vec3::X * r, c + glam::Vec3::X * r, col);
-            push(&mut lv, c - glam::Vec3::Y * r, c + glam::Vec3::Y * r, col);
-            push(&mut lv, c - glam::Vec3::Z * r, c + glam::Vec3::Z * r, col);
-        }
         self.line_verts = lv;
+        // Projectiles → small sphere instances (cannonball / lava bomb), drawn
+        // through the skin pipeline like the units — no more line crosses.
+        let mut proj_inst: Vec<SkinInstance> = Vec::with_capacity(self.projectiles.len().min(512));
+        for pr in self.projectiles.iter().take(512) {
+            let r = match pr.kind { ProjKind::Cannon => 3.4, ProjKind::LavaRock => 4.6 };
+            let col = match pr.kind { ProjKind::Cannon => [0.10, 0.10, 0.12, 1.0], ProjKind::LavaRock => [1.0, 0.45, 0.10, 1.0] };
+            let m = glam::Mat4::from_translation(glam::Vec3::new(pr.p.x as f32, pr.p.y as f32, pr.p.z as f32)) * glam::Mat4::from_scale(glam::Vec3::splat(r));
+            proj_inst.push(SkinInstance { model: m.to_cols_array_2d(), color: col, frame_base: 0, _pad: [0; 3] });
+        }
+        if !proj_inst.is_empty() { self.queue.write_buffer(&self.proj_inst_buf, 0, bytemuck::cast_slice(&proj_inst)); }
+        let proj_n = proj_inst.len() as u32;
         // Grow the line buffer if this frame overflows it.
         if self.line_verts.len() > self.line_cap {
             self.line_cap = (self.line_verts.len() * 2).next_power_of_two();
@@ -549,7 +593,16 @@ impl State {
             pass.set_vertex_buffer(1, self.castle_inst_buf.slice(..));
             pass.set_index_buffer(cm.ibuf.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..cm.nidx, 0, 0..2);
-            // combat effects + projectile markers (alpha-blended lines, drawn last).
+            // projectiles — the sphere model, one instance per live shot.
+            if proj_n > 0 {
+                let pm = &self.proj_model;
+                pass.set_bind_group(0, &pm.bind, &[]);
+                pass.set_vertex_buffer(0, pm.vbuf.slice(..));
+                pass.set_vertex_buffer(1, self.proj_inst_buf.slice(..));
+                pass.set_index_buffer(pm.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..pm.nidx, 0, 0..proj_n);
+            }
+            // combat effects (alpha-blended lines, drawn last).
             if line_n > 0 {
                 pass.set_pipeline(&self.line_pipeline);
                 pass.set_bind_group(0, &self.cam_bg, &[]);
