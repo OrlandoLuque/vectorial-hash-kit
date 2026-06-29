@@ -313,7 +313,7 @@ impl State {
         surface.configure(&device, &config);
 
         let cam_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("cam"), size: std::mem::size_of::<CameraUniform>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        let cam_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("cam-l"), entries: &[wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None }] });
+        let cam_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("cam-l"), entries: &[wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None }] });
         let cam_bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("cam-bg"), layout: &cam_layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: cam_buf.as_entire_binding() }] });
         let pipe_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("pl"), bind_group_layouts: &[&cam_layout], push_constant_ranges: &[] });
 
@@ -764,19 +764,23 @@ fn fs(in: VOut) -> @location(0) vec4<f32> { return in.color; }
 const TERRAIN_SHADER: &str = r#"
 struct Camera { vp: mat4x4<f32>, light: vec4<f32> };
 @group(0) @binding(0) var<uniform> cam: Camera;
-struct VOut { @builtin(position) clip: vec4<f32>, @location(0) color: vec4<f32> };
+struct VOut { @builtin(position) clip: vec4<f32>, @location(0) color: vec4<f32>, @location(1) normal: vec3<f32> };
 @vertex
 fn vs(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>, @location(2) col: vec4<f32>) -> VOut {
     var o: VOut;
     o.clip = cam.vp * vec4<f32>(p, 1.0);
-    let diff = max(dot(normalize(n), normalize(cam.light.xyz)), 0.0);
-    // alpha < 0.5 flags an emissive (lava) cell → draw it full-bright.
-    let sh = select(0.40 + 0.60 * diff, 1.0, col.a < 0.5);
-    o.color = vec4<f32>(col.rgb * sh, 1.0);
+    o.color = col;  // alpha < 0.5 flags an emissive (lava) cell
+    o.normal = n;
     return o;
 }
 @fragment
-fn fs(in: VOut) -> @location(0) vec4<f32> { return in.color; }
+fn fs(in: VOut) -> @location(0) vec4<f32> {
+    // Per-pixel lighting (the interpolated normal) — smooth on steep slopes,
+    // no Gouraud facets on the volcano cone.
+    let diff = max(dot(normalize(in.normal), normalize(cam.light.xyz)), 0.0);
+    let sh = select(0.40 + 0.60 * diff, 1.0, in.color.a < 0.5);
+    return vec4<f32>(in.color.rgb * sh, 1.0);
+}
 "#;
 
 // Unlit coloured lines for the combat effects + projectile markers.
