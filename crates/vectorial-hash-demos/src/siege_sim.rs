@@ -22,6 +22,15 @@ pub fn map_seed() -> f64 { *MAP_SEED.get_or_init(|| 0.0) }
 /// Set the per-run map seed (idempotent — only the first call takes effect).
 pub fn set_map_seed(s: f64) { let _ = MAP_SEED.set(s); }
 
+/// "Classic Reynolds" steering: integrate the steering as **acceleration** so
+/// turns have inertia (smoother, more organic) instead of snapping the velocity
+/// each frame. Off by default — `$SIEGE_REYNOLDS=1` turns it on. Returns the blend
+/// factor for `vel → steer` per frame (1.0 = the default kinematic snap).
+static REYNOLDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+fn reynolds_blend() -> f64 {
+    if *REYNOLDS.get_or_init(|| std::env::var("SIEGE_REYNOLDS").is_ok()) { 0.18 } else { 1.0 }
+}
+
 pub const WORLD: f64 = 800.0; // battlefield is WORLD × WORLD in the ground plane
 pub const SKY: f64 = 260.0; // index height — heights reach ~150, the dragon flies
 pub const PER_FACTION: usize = 500; // units each side spawns with (tunable live)
@@ -269,7 +278,8 @@ pub struct Unit {
     pub respawn_at: f64, // sim-time at which a dead unit returns (f64::INFINITY = alive)
     // Intent written by the *decide* pass (reads only this unit); consumed by the
     // serial *apply* pass. Keeping writes unit-local is what makes decide parallel.
-    pub vel: (f64, f64, f64),
+    pub vel: (f64, f64, f64), // actual velocity (apply integrates it; persists for inertia)
+    pub steer: (f64, f64, f64), // desired velocity from decide (the steering target)
     pub attacks: Vec<(u32, f64)>, // (target unit id, damage) — many for AoE (dragon)
     pub emit: Option<Point3>, // strike point that should spawn a smoke puff this frame
     pub fire: Option<Point3>, // catapult: target point to lob a projectile at this frame
@@ -407,6 +417,7 @@ pub fn spawn_unit(rng: &mut Rng, faction: Faction) -> Unit {
         cooldown: 0.0,
         respawn_at: f64::INFINITY,
         vel: (0.0, 0.0, 0.0),
+        steer: (0.0, 0.0, 0.0),
         attacks: Vec::new(),
         emit: None,
         fire: None,
@@ -429,6 +440,8 @@ pub fn place_at_castle(rng: &mut Rng, u: &mut Unit) {
     u.p = Point3::new(x, y, z);
     u.hp = u.kind.max_hp();
     u.respawn_at = f64::INFINITY;
+    u.vel = (0.0, 0.0, 0.0); // start still (matters under inertia)
+    u.steer = (0.0, 0.0, 0.0);
 }
 
 pub fn spawn_army(rng: &mut Rng, per_faction: usize) -> Vec<Unit> {
@@ -448,7 +461,7 @@ pub fn spawn_army(rng: &mut Rng, per_faction: usize) -> Vec<Unit> {
 /// (targeting) *and* the nearby friends (boids); the dragon's AoE is a sphere
 /// **`cull`**; the archer/ballista line-of-fire is a thick **`raycast`**.
 pub fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>, sep: &SepTables) {
-    u.vel = (0.0, 0.0, 0.0);
+    u.steer = (0.0, 0.0, 0.0); // desired velocity (apply blends `vel` toward it)
     u.attacks.clear();
     u.emit = None;
     u.fire = None;
@@ -518,7 +531,7 @@ pub fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>, 
     let vl = (vx * vx + vz * vz).sqrt();
     let cap = speed * 1.5;
     if vl > cap { let s = cap / vl; vx *= s; vz *= s; }
-    u.vel = (vx, 0.0, vz); // the dragon's altitude is pinned in the apply pass
+    u.steer = (vx, 0.0, vz); // desired velocity; apply integrates it (with inertia if Reynolds)
 
     // Aim: face the nearest enemy while one is in k-NN range — so artillery that
     // kites *backward* still fires forward, and melee orient toward the fight
@@ -613,6 +626,13 @@ pub fn apply(units: &mut [Unit], smoke: &mut Vec<Puff>, effects: &mut Vec<Fx>, p
     for u in units.iter_mut() {
         if !u.alive() { continue; }
         u.cooldown = (u.cooldown - dt).max(0.0);
+        // Integrate the steering into the actual velocity: a snap by default
+        // (blend = 1 → vel == steer, the kinematic model), or with **inertia** when
+        // `$SIEGE_REYNOLDS=1` (blend < 1 → turns ease in, more organic).
+        let k = reynolds_blend();
+        u.vel.0 += (u.steer.0 - u.vel.0) * k;
+        u.vel.1 = u.steer.1;
+        u.vel.2 += (u.steer.2 - u.vel.2) * k;
         // Wading: ground units slow right down in the river/water (a soft obstacle).
         let wade = if u.kind.altitude() == 0.0 && terrain_height(u.p.x, u.p.z) < WATER_LEVEL && !on_bridge(u.p.x, u.p.z) { 0.4 } else { 1.0 };
         let nx = (u.p.x + u.vel.0 * dt * wade).clamp(2.0, WORLD - 2.0);
