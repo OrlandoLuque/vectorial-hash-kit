@@ -11,10 +11,16 @@
 //!
 //! Run: `cargo run -p vectorial-hash-demos --bin siege_wgpu --release`
 
-#![cfg(not(target_arch = "wasm32"))]
+// Native always; on wasm only with the `web-wgpu` feature (WebGPU via wasm-bindgen).
+#![cfg(any(not(target_arch = "wasm32"), feature = "web-wgpu"))]
+// On wasm the entry point is `start` (#[wasm_bindgen(start)]), not `main`.
+#![cfg_attr(target_arch = "wasm32", no_main)]
 
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant; // performance.now()-backed Instant for the wasm-bindgen build
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
@@ -29,6 +35,7 @@ use winit::{
 use vectorial_hash::{Aabb, Tree3};
 // The whole battle simulation is shared with the macroquad `siege` binary so the
 // two renderers stay in lockstep — see `siege_sim`. This file is wgpu render-only.
+#[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use vectorial_hash_demos::siege_sim::{
     apply, decide, default_body_radius, faction_tint, ground_height, model_for, set_map_seed,
@@ -262,9 +269,13 @@ struct State {
     ui_pipeline: wgpu::RenderPipeline,
     ui_buf: wgpu::Buffer,
     ui_drag: u8, // which slider is being dragged: 0 none, 1 population, 2 threads
-    // Live rayon pool for the parallel `decide` pass (the thread slider).
+    // Live rayon pool for the parallel `decide` pass (the thread slider). Native
+    // only — wasm has no threads, so the web build runs `decide` serially.
+    #[cfg(not(target_arch = "wasm32"))]
     pool: rayon::ThreadPool,
+    #[cfg(not(target_arch = "wasm32"))]
     n_threads: usize,
+    #[cfg(not(target_arch = "wasm32"))]
     max_threads: usize,
     terrain_pipeline: wgpu::RenderPipeline,
     terrain_vbuf: wgpu::Buffer,
@@ -442,8 +453,11 @@ impl State {
         let pop = PER_FACTION;
         let units = spawn_army(&mut rng, pop);
         let index = Tree3::<IUnit>::new(Aabb::new(0.0, 0.0, 0.0, WORLD, SKY, WORLD), 8);
-        // Live rayon pool for the parallel decide pass (the thread slider).
+        // Live rayon pool for the parallel decide pass (the thread slider). Native
+        // only — wasm decides serially.
+        #[cfg(not(target_arch = "wasm32"))]
         let max_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        #[cfg(not(target_arch = "wasm32"))]
         let pool = rayon::ThreadPoolBuilder::new().num_threads(max_threads).build().unwrap();
 
         State {
@@ -453,7 +467,12 @@ impl State {
             proj_model, proj_inst_buf,
             line_pipeline, line_buf, line_cap, line_verts: Vec::new(),
             ui_pipeline, ui_buf, ui_drag: 0,
-            pool, n_threads: max_threads, max_threads,
+            #[cfg(not(target_arch = "wasm32"))]
+            pool,
+            #[cfg(not(target_arch = "wasm32"))]
+            n_threads: max_threads,
+            #[cfg(not(target_arch = "wasm32"))]
+            max_threads,
             terrain_pipeline, terrain_vbuf, terrain_ibuf, terrain_nidx: ti.len() as u32,
             cam_buf, cam_bg, depth, units, index,
             smoke: Vec::new(), effects: Vec::new(), projectiles: Vec::new(),
@@ -491,6 +510,7 @@ impl State {
     }
 
     /// Resize the rayon pool that runs the parallel decide pass (thread slider).
+    #[cfg(not(target_arch = "wasm32"))]
     fn set_threads(&mut self, n: usize) {
         let n = n.clamp(1, self.max_threads);
         if n == self.n_threads { return; }
@@ -502,6 +522,7 @@ impl State {
     fn apply_slider(&mut self, which: u8, mx: f32) {
         match which {
             1 => { let (tx, _, tw, _) = UI_SLIDER; let frac = ((mx - tx) / tw).clamp(0.0, 1.0); self.set_population(20 + (frac * (MAX_POP as f32 - 20.0)) as usize); }
+            #[cfg(not(target_arch = "wasm32"))]
             2 => { let (tx, _, tw, _) = UI_THREADS; let frac = ((mx - tx) / tw).clamp(0.0, 1.0); self.set_threads(1 + (frac * (self.max_threads as f32 - 1.0)).round() as usize); }
             _ => {}
         }
@@ -529,11 +550,16 @@ impl State {
             // Smoke index (LoS blockers) for the archer / ballista raycasts.
             let mut smoke_index = Tree3::<Puff>::new(Aabb::new(0.0, 0.0, 0.0, WORLD, SKY, WORLD), 8);
             for s in &self.smoke { smoke_index.insert(*s); }
-            // Decide (parallel, read-only on the indices) → apply (serial) → volcano.
-            // Fans out over the sized pool (the thread slider), like the macroquad demo.
-            let (pool, units) = (&self.pool, &mut self.units);
-            let (idx, smk, br) = (&self.index, &smoke_index, &self.sep);
-            pool.install(|| units.par_iter_mut().enumerate().for_each(|(i, u)| decide(u, i as u32, idx, smk, br)));
+            // Decide (read-only on the indices) → apply (serial) → volcano. Native:
+            // fan out over the sized rayon pool (the thread slider). wasm: serial.
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let (pool, units) = (&self.pool, &mut self.units);
+                let (idx, smk, br) = (&self.index, &smoke_index, &self.sep);
+                pool.install(|| units.par_iter_mut().enumerate().for_each(|(i, u)| decide(u, i as u32, idx, smk, br)));
+            }
+            #[cfg(target_arch = "wasm32")]
+            for i in 0..self.units.len() { decide(&mut self.units[i], i as u32, &self.index, &smoke_index, &self.sep); }
             let impacts = apply(&mut self.units, &mut self.smoke, &mut self.effects, &mut self.projectiles, &self.craters, &mut self.rng, dt, self.now);
             volcano_step(&mut self.volcano, &mut self.smoke, &mut self.effects, &mut self.projectiles, &mut self.rng, dt, self.now);
             // Alterable terrain: carve craters at the impacts (shared with the sim,
@@ -645,10 +671,13 @@ impl State {
         push_quad(&mut ui, tx, ty, tw, th, [0.22, 0.22, 0.28, 0.85], sw, sh);
         let frac = ((self.pop as f32 - 20.0) / (MAX_POP as f32 - 20.0)).clamp(0.0, 1.0);
         push_quad(&mut ui, tx + frac * tw - 5.0, ty - 3.0, 10.0, th + 6.0, [0.95, 0.95, 0.98, 1.0], sw, sh);
-        let (hx, hy, hw, hh) = UI_THREADS; // rayon threads (green handle)
-        push_quad(&mut ui, hx, hy, hw, hh, [0.22, 0.22, 0.28, 0.85], sw, sh);
-        let tfrac = if self.max_threads > 1 { (self.n_threads as f32 - 1.0) / (self.max_threads as f32 - 1.0) } else { 1.0 };
-        push_quad(&mut ui, hx + tfrac * hw - 5.0, hy - 3.0, 10.0, hh + 6.0, [0.40, 0.95, 0.55, 1.0], sw, sh);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let (hx, hy, hw, hh) = UI_THREADS; // rayon threads (green handle) — native only
+            push_quad(&mut ui, hx, hy, hw, hh, [0.22, 0.22, 0.28, 0.85], sw, sh);
+            let tfrac = if self.max_threads > 1 { (self.n_threads as f32 - 1.0) / (self.max_threads as f32 - 1.0) } else { 1.0 };
+            push_quad(&mut ui, hx + tfrac * hw - 5.0, hy - 3.0, 10.0, hh + 6.0, [0.40, 0.95, 0.55, 1.0], sw, sh);
+        }
         self.queue.write_buffer(&self.ui_buf, 0, bytemuck::cast_slice(&ui));
         let ui_n = ui.len() as u32;
 
@@ -814,19 +843,36 @@ fn vs(@location(0) p: vec2<f32>, @location(1) color: vec4<f32>) -> VOut {
 fn fs(in: VOut) -> @location(0) vec4<f32> { return in.color; }
 "#;
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() {
     pollster::block_on(run());
+}
+
+// Web entry (wasm-bindgen): set the panic hook + drive the async `run` on the
+// browser's event loop. `main` is native-only; on wasm the runtime calls `start`.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen(start)]
+pub fn start() {
+    console_error_panic_hook::set_once();
+    wasm_bindgen_futures::spawn_local(run());
 }
 
 async fn run() {
     let event_loop = EventLoop::new().expect("event loop");
     let window = Arc::new(WindowBuilder::new().with_title("vectorial-hash — siege (wgpu)").with_inner_size(winit::dpi::LogicalSize::new(1600, 1000)).build(&event_loop).expect("window"));
+    // On the web, mount the winit canvas into the page (full-window).
+    #[cfg(target_arch = "wasm32")]
+    {
+        use winit::platform::web::WindowExtWebSys;
+        let canvas = window.canvas().expect("canvas");
+        let _ = canvas.set_attribute("style", "width:100vw;height:100vh;display:block");
+        web_sys::window().and_then(|w| w.document()).and_then(|d| d.body()).expect("body").append_child(&canvas).expect("append canvas");
+    }
     let mut st = State::new(window.clone()).await;
     let max_frames: Option<u64> = std::env::var("SIEGE_MAX_FRAMES").ok().and_then(|s| s.parse().ok());
     let mut frame: u64 = 0;
 
-    event_loop
-        .run(move |event, elwt| {
+    let handler = move |event, elwt: &winit::event_loop::EventLoopWindowTarget<()>| {
             elwt.set_control_flow(winit::event_loop::ControlFlow::Poll);
             match event {
                 Event::WindowEvent { event, .. } => match event {
@@ -838,7 +884,7 @@ async fn run() {
                             let (mx, my) = (st.last_mouse.0 as f32, st.last_mouse.1 as f32);
                             let hit = |r: (f32, f32, f32, f32)| mx >= r.0 - 8.0 && mx <= r.0 + r.2 + 8.0 && my >= r.1 - 6.0 && my <= r.1 + r.3 + 6.0;
                             if hit(UI_SLIDER) { st.ui_drag = 1; st.apply_slider(1, mx); }
-                            else if hit(UI_THREADS) { st.ui_drag = 2; st.apply_slider(2, mx); }
+                            else if cfg!(not(target_arch = "wasm32")) && hit(UI_THREADS) { st.ui_drag = 2; st.apply_slider(2, mx); }
                             else { st.dragging = true; }
                         } else { st.dragging = false; st.ui_drag = 0; }
                     }
@@ -876,6 +922,13 @@ async fn run() {
                 Event::AboutToWait => window.request_redraw(),
                 _ => {}
             }
-        })
-        .expect("run");
+        };
+
+    #[cfg(not(target_arch = "wasm32"))]
+    event_loop.run(handler).expect("run");
+    #[cfg(target_arch = "wasm32")]
+    {
+        use winit::platform::web::EventLoopExtWebSys;
+        event_loop.spawn(handler); // returns immediately; the browser drives the loop
+    }
 }

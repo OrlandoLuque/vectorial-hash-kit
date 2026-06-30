@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>siege (wgpu) — vectorial-hash</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #0e0e12; color: #cdd2dc;
+      font-family: system-ui, -apple-system, sans-serif; overflow: hidden; }
+    #msg { position: fixed; inset: 0; z-index: 10; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; text-align: center; padding: 2rem; gap: .5rem; }
+    #msg a { color: #7ab8ff; }
+    #msg .small { color: #8b93a3; font-size: .85rem; max-width: 32rem; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <div id="msg">
+    <div>Loading the <b>wgpu</b> siege…</div>
+    <div class="small">Real GPU skeletal skinning of the whole army — the thing macroquad's WebGL1 stack can't do.
+      Drag to orbit · scroll to zoom · <b>P</b> pause · <b>[ ]</b> population · <b>V</b> voxel/smooth terrain.</div>
+  </div>
+  <script type="module">
+    const msg = document.getElementById('msg');
+    if (!navigator.gpu) {
+      msg.innerHTML = '<div>This demo needs <b>WebGPU</b>.</div>' +
+        '<div class="small">Open it in a recent <b>Chrome</b> or <b>Edge</b> (or Firefox Nightly with WebGPU enabled). ' +
+        'The GPU skeletal skinning streams all the animation’s bone matrices through a storage buffer, ' +
+        'which WebGL2 can’t do — so there’s no fallback. The macroquad ' +
+        '<a href="./siege.html">siege.html</a> runs anywhere.</div>';
+    } else {
+      import('./wgpu/siege_wgpu.js')
+        .then(m => m.default())
+        .then(() => { setTimeout(() => msg.remove(), 1500); }) // canvas is mounted by then
+        .catch(e => { msg.innerHTML = '<div>Failed to start.</div><div class="small">' + e + '</div>'; console.error(e); });
+    }
+  </script>
+</body>
+</html>
