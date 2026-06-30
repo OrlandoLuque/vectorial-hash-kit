@@ -212,5 +212,30 @@ fn bench_knn(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench_build, bench_cull, bench_update, bench_knn);
+// ------------------------------------------------------------------- raycast
+fn bench_raycast(c: &mut Criterion) {
+    let items3 = gen3(N, WORLD, 1);
+    let aabb = Aabb::new(0.0, 0.0, 0.0, WORLD, WORLD, WORLD);
+    let mut tree3 = Tree3::<C3>::new(aabb, IL);
+    for it in &items3 { tree3.insert(*it); }
+    // 256 random unit-direction rays across the world.
+    let rays: Vec<(Point3, Point3)> = {
+        let mut r = Rng::new(13);
+        (0..256).map(|_| {
+            let o = Point3::new(r.range(0.0, WORLD), r.range(0.0, WORLD), r.range(0.0, WORLD));
+            let (dx, dy, dz) = (r.range(-1.0, 1.0), r.range(-1.0, 1.0), r.range(-1.0, 1.0));
+            let l = (dx * dx + dy * dy + dz * dz).sqrt().max(1e-6);
+            (o, Point3::new(dx / l, dy / l, dz / l))
+        }).collect()
+    };
+    let (max_t, radius) = (WORLD, 4.0);
+    let mut g = c.benchmark_group("raycast_20k_x256");
+    // All-hits thick raycast (the siege ballista — every unit on the line).
+    g.bench_function("tree3_all", |b| b.iter(|| { let mut n = 0; for (o, d) in &rays { n += tree3.raycast(*o, *d, max_t, radius).len(); } black_box(n) }));
+    // First-hit DDA (the archer / line-of-sight short-circuit).
+    g.bench_function("tree3_dda_first", |b| b.iter(|| { let mut n = 0; for (o, d) in &rays { n += tree3.raycast_dda_first(*o, *d, max_t, radius).is_some() as usize; } black_box(n) }));
+    g.finish();
+}
+
+criterion_group!(benches, bench_build, bench_cull, bench_update, bench_knn, bench_raycast);
 criterion_main!(benches);
