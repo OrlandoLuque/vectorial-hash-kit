@@ -303,6 +303,14 @@ of the exact capsule). A nudge-free **3D Samet/ropes** walk is the remaining
 refinement (the 2D ledger already showed ropes rarely pay their upkeep, so Probe
 is a fine default).
 
+The **8-way `Octree3`** now carries the same surface — `Octree3::raycast` (thick
+capsule), `raycast_dda`, `raycast_dda_first` — ported verbatim from `Tree3` (the
+walk only touches `locate`/`bbox`/`items`, which the octree shares). Same
+Probe-style nudge, same subset guarantee; brute-force gated identically (DDA ⊆
+exact capsule, sorted, first == nearest). So both adaptive 3D trees and the flat
+Morton grid answer thin-ray / first-hit; the hierarchical capsule still wins the
+thick band.
+
 ## Concepts (glossary)
 
 **Descent vs. `cull_walk` — two ways to traverse the same tree.** Both return the

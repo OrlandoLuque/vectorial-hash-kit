@@ -11,7 +11,8 @@
 
 use crate::serde_io::{corrupt, r_aabb, r_f64, r_u32, r_u64, r_u8, w_aabb, w_f64, w_u32, w_u64, w_u8};
 use crate::template::CellState;
-use crate::tree3::{aabb_min_dist2, knn_offer, knn_worst, Aabb, ItemRef, KnnEntry, Point3, Positioned3, Shape3};
+use crate::tree::RaycastOut;
+use crate::tree3::{aabb_min_dist2, knn_offer, knn_worst, Aabb, ItemRef, KnnEntry, Point3, Positioned3, Segment3, Shape3};
 use std::io::{self, Read, Write};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -392,6 +393,157 @@ impl<T: Positioned3> Octree3<T> {
             }
         }
     }
+
+    /// "Thick ray-cast" — see [`crate::Tree3::raycast`]. Every item within
+    /// `radius` of the ray `origin + t·normalize(dir)`, `t ∈ [0, max_dist]`,
+    /// as `(t, &item)` sorted by `t`. Built on the [`Segment3`] capsule + `cull`.
+    pub fn raycast(&self, origin: Point3, dir: Point3, max_dist: f64, radius: f64) -> Vec<(f64, &T)> {
+        let m = (dir.x * dir.x + dir.y * dir.y + dir.z * dir.z).sqrt();
+        if m == 0.0 { return Vec::new(); }
+        let (ux, uy, uz) = (dir.x / m, dir.y / m, dir.z / m);
+        let end = Point3::new(origin.x + ux * max_dist, origin.y + uy * max_dist, origin.z + uz * max_dist);
+        let seg = Segment3::new(origin, end, radius);
+        let mut hits: Vec<(f64, &T)> = self.cull(&seg).into_iter().map(|it| {
+            let p = it.position();
+            let t = ((p.x - origin.x) * ux + (p.y - origin.y) * uy + (p.z - origin.z) * uz).clamp(0.0, max_dist);
+            (t, it)
+        }).collect();
+        hits.sort_by(|a, b| a.0.total_cmp(&b.0));
+        hits
+    }
+
+    /// **DDA leaf-walk ray-cast** over the 8-way octree — the octree analogue of
+    /// [`crate::Tree3::raycast_dda`]. Walks the leaves the centre ray crosses
+    /// front-to-back (Probe-style: the slab test gives the exit `t`, `locate`
+    /// finds the next leaf across that face), collecting items within `radius`
+    /// of the ray, sorted by `t`, + traversal stats. Thin corridor — use
+    /// `raycast` / `cull(&Segment3)` for the exact thick band. The result is a
+    /// subset of the exact capsule (the nudge may skip a sliver, never invent a
+    /// hit).
+    pub fn raycast_dda(&self, origin: Point3, dir: Point3, max_t: f64, radius: f64) -> RaycastOut<'_, T> {
+        let mut out = RaycastOut { hits: Vec::new(), leaves_visited: 0, items_tested: 0 };
+        let m = (dir.x * dir.x + dir.y * dir.y + dir.z * dir.z).sqrt();
+        if m == 0.0 { return out; }
+        let (ux, uy, uz) = (dir.x / m, dir.y / m, dir.z / m);
+        let end = Point3::new(origin.x + ux * max_t, origin.y + uy * max_t, origin.z + uz * max_t);
+        let r2 = radius * radius;
+        let mut leaf = match self.raycast_start_leaf(origin, ux, uy, uz, max_t) {
+            Some(l) => l,
+            None => return out,
+        };
+        let mut guard = 0usize;
+        loop {
+            guard += 1;
+            if guard > self.nodes.len() * 3 + 32 { break; }
+            out.leaves_visited += 1;
+            for it in &self.get(leaf).items {
+                out.items_tested += 1;
+                let p = it.position();
+                let (apx, apy, apz) = (p.x - origin.x, p.y - origin.y, p.z - origin.z);
+                let proj = apx * ux + apy * uy + apz * uz;
+                let d2 = if proj <= 0.0 {
+                    apx * apx + apy * apy + apz * apz
+                } else if proj >= max_t {
+                    let (bx, by, bz) = (p.x - end.x, p.y - end.y, p.z - end.z);
+                    bx * bx + by * by + bz * bz
+                } else {
+                    (apx * apx + apy * apy + apz * apz) - proj * proj
+                };
+                if d2 <= r2 { out.hits.push((proj.clamp(0.0, max_t), it)); }
+            }
+            match self.ray_step(leaf, origin, ux, uy, uz, max_t) {
+                Some((_, next)) => leaf = next,
+                None => break,
+            }
+        }
+        out.hits.sort_by(|a, b| a.0.total_cmp(&b.0));
+        out
+    }
+
+    /// First hit (nearest along the ray) with front-to-back **early-exit** —
+    /// see [`crate::Tree3::raycast_dda_first`]. Same Probe-style walk as
+    /// [`Octree3::raycast_dda`], stopping at the first leaf beyond the best hit.
+    pub fn raycast_dda_first(&self, origin: Point3, dir: Point3, max_t: f64, radius: f64) -> Option<(f64, &T)> {
+        let m = (dir.x * dir.x + dir.y * dir.y + dir.z * dir.z).sqrt();
+        if m == 0.0 { return None; }
+        let (ux, uy, uz) = (dir.x / m, dir.y / m, dir.z / m);
+        let end = Point3::new(origin.x + ux * max_t, origin.y + uy * max_t, origin.z + uz * max_t);
+        let r2 = radius * radius;
+        let mut leaf = self.raycast_start_leaf(origin, ux, uy, uz, max_t)?;
+        let mut best: Option<(f64, &T)> = None;
+        let mut t_enter = 0.0;
+        let mut guard = 0usize;
+        loop {
+            guard += 1;
+            if guard > self.nodes.len() * 3 + 32 { break; }
+            if let Some((bt, _)) = best {
+                if t_enter - radius > bt { break; }
+            }
+            for it in &self.get(leaf).items {
+                let p = it.position();
+                let (apx, apy, apz) = (p.x - origin.x, p.y - origin.y, p.z - origin.z);
+                let proj = apx * ux + apy * uy + apz * uz;
+                let d2 = if proj <= 0.0 {
+                    apx * apx + apy * apy + apz * apz
+                } else if proj >= max_t {
+                    let (bx, by, bz) = (p.x - end.x, p.y - end.y, p.z - end.z);
+                    bx * bx + by * by + bz * bz
+                } else {
+                    (apx * apx + apy * apy + apz * apz) - proj * proj
+                };
+                if d2 <= r2 {
+                    let t = proj.clamp(0.0, max_t);
+                    if best.is_none_or(|(bt, _)| t < bt) { best = Some((t, it)); }
+                }
+            }
+            match self.ray_step(leaf, origin, ux, uy, uz, max_t) {
+                Some((t_exit, next)) => { t_enter = t_exit; leaf = next; }
+                None => break,
+            }
+        }
+        best
+    }
+
+    /// The leaf the ray enters the world at (clipped + nudged inside), or `None`
+    /// if it misses or starts past `max_t`. Shared by the Probe-style DDAs.
+    fn raycast_start_leaf(&self, origin: Point3, ux: f64, uy: f64, uz: f64, max_t: f64) -> Option<ONodeId> {
+        let world = self.get(self.root).bbox;
+        let span = world.w.max(world.h).max(world.d);
+        let mut t = 0.0_f64;
+        for (oa, ua, lo, hi) in [(origin.x, ux, world.x, world.x_max()), (origin.y, uy, world.y, world.y_max()), (origin.z, uz, world.z, world.z_max())] {
+            if ua == 0.0 {
+                if oa < lo || oa > hi { return None; }
+            } else {
+                let (mut ta, tb) = ((lo - oa) / ua, (hi - oa) / ua);
+                if ta > tb { ta = tb; }
+                t = t.max(ta);
+            }
+        }
+        let t0 = t.max(0.0) + span * 1e-9;
+        if t0 >= max_t { return None; }
+        let entry = Point3::new(origin.x + ux * t0, origin.y + uy * t0, origin.z + uz * t0);
+        if !world.contains(entry) { return None; }
+        Some(self.locate(entry))
+    }
+
+    /// One Probe-style DDA step from `leaf`: the slab test gives the exit `t`,
+    /// then `locate` the leaf just across the exit face (nudged a hair past it).
+    /// `(t_exit, next_leaf)`, or `None` if the ray ends, leaves the world, or the
+    /// nudge fails to cross (numerical).
+    fn ray_step(&self, leaf: ONodeId, origin: Point3, ux: f64, uy: f64, uz: f64, max_t: f64) -> Option<(f64, ONodeId)> {
+        let b = self.get(leaf).bbox;
+        let tx = if ux > 0.0 { (b.x_max() - origin.x) / ux } else if ux < 0.0 { (b.x - origin.x) / ux } else { f64::INFINITY };
+        let ty = if uy > 0.0 { (b.y_max() - origin.y) / uy } else if uy < 0.0 { (b.y - origin.y) / uy } else { f64::INFINITY };
+        let tz = if uz > 0.0 { (b.z_max() - origin.z) / uz } else if uz < 0.0 { (b.z - origin.z) / uz } else { f64::INFINITY };
+        let t_exit = tx.min(ty).min(tz);
+        if t_exit >= max_t { return None; }
+        let eps = b.w.min(b.h).min(b.d) * 1e-4 + (t_exit.abs() + 1.0) * 1e-12;
+        let np = Point3::new(origin.x + ux * (t_exit + eps), origin.y + uy * (t_exit + eps), origin.z + uz * (t_exit + eps));
+        if !self.get(self.root).bbox.contains(np) { return None; }
+        let next = self.locate(np);
+        if next == leaf { return None; }
+        Some((t_exit, next))
+    }
 }
 
 // ------------------------------------------------------------- serialization
@@ -486,6 +638,62 @@ mod tests {
     #[derive(Clone, Copy)]
     struct P(Point3);
     impl Positioned3 for P { fn position(&self) -> Point3 { self.0 } }
+
+    #[test]
+    fn octree_raycast_dda_subset_of_capsule_and_first() {
+        // The 8-way DDA hits must be a subset of the exact capsule raycast (no
+        // invented items / wrong cells), sorted; first == nearest. Mirrors the
+        // Tree3 raycast test.
+        let mut x = 0x0C7A_3D11u64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        let pts: Vec<P> = (0..6000).map(|_| P(Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0))).collect();
+        let mut tree = Octree3::<P>::new(Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0), 6);
+        for p in &pts { tree.insert(*p); }
+        let mut any = false;
+        for (o, d, mt, r) in [
+            (Point3::new(10.0, 10.0, 10.0), Point3::new(1.0, 0.8, 0.6), 400.0, 8.0),
+            (Point3::new(250.0, 10.0, 128.0), Point3::new(-1.0, 1.0, 0.2), 400.0, 12.0),
+            (Point3::new(0.0, 128.0, 128.0), Point3::new(1.0, 0.0, 0.0), 256.0, 20.0),
+        ] {
+            let dda = tree.raycast_dda(o, d, mt, r);
+            for w in dda.hits.windows(2) { assert!(w[0].0 <= w[1].0, "not sorted"); }
+            let cap: std::collections::HashSet<(u64, u64, u64)> = tree.raycast(o, d, mt, r).iter().map(|(_, p)| (p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits())).collect();
+            for (_, p) in &dda.hits {
+                assert!(cap.contains(&(p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits())), "DDA hit not in the exact capsule set");
+                any = true;
+            }
+            match (tree.raycast_dda_first(o, d, mt, r), dda.hits.first()) {
+                (None, None) => {}
+                (Some((t1, _)), Some(&(t0, _))) => assert!((t1 - t0).abs() < 1e-9, "first {t1} != nearest {t0}"),
+                _ => panic!("raycast_dda_first / raycast_dda nearest disagree"),
+            }
+        }
+        assert!(any, "DDA found nothing — likely a traversal bug");
+    }
+
+    #[test]
+    fn octree_raycast_thick_matches_brute() {
+        // The thick capsule raycast must equal brute force, sorted by t.
+        let mut x = 0x0C7B_CA57u64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        let pts: Vec<P> = (0..4000).map(|_| P(Point3::new(rng() * 100.0, rng() * 100.0, rng() * 100.0))).collect();
+        let mut tree = Octree3::<P>::new(Aabb::new(0.0, 0.0, 0.0, 100.0, 100.0, 100.0), 8);
+        for p in &pts { tree.insert(*p); }
+        let (origin, dir, max_dist, radius) = (Point3::new(0.0, 50.0, 50.0), Point3::new(1.0, 0.0, 0.0), 100.0, 6.0);
+        let (ux, uy, uz) = (1.0, 0.0, 0.0);
+        let mut want: Vec<(u64, u64, u64)> = pts.iter().filter(|p| {
+            let q = p.0;
+            let t = ((q.x - origin.x) * ux + (q.y - origin.y) * uy + (q.z - origin.z) * uz).clamp(0.0, max_dist);
+            let (cx, cy, cz) = (origin.x + ux * t, origin.y + uy * t, origin.z + uz * t);
+            let (dx, dy, dz) = (q.x - cx, q.y - cy, q.z - cz);
+            dx * dx + dy * dy + dz * dz <= radius * radius
+        }).map(|p| (p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits())).collect();
+        let hits = tree.raycast(origin, dir, max_dist, radius);
+        for w in hits.windows(2) { assert!(w[0].0 <= w[1].0, "raycast hits not sorted by t"); }
+        let mut got: Vec<(u64, u64, u64)> = hits.iter().map(|(_, p)| (p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits())).collect();
+        want.sort(); got.sort();
+        assert_eq!(want, got, "octree raycast set != brute capsule");
+    }
 
     #[test]
     fn octree_serialize_roundtrip() {

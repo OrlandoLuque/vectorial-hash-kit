@@ -154,8 +154,10 @@ threads can't help — and that contrast is the point: the slider makes the
 measured crossover (`PARALLEL.md`) visible. Native only; hidden on wasm.
 
 **A. Ray-cast / structure follow-ups (continue the thread)**
-1. **`Octree3` DDA** — `raycast_dda` + `raycast_dda_first` on the 8-way octree
-   (Probe-style, like `Tree3`). Brute-force gated (⊆ capsule + first==nearest).
+1. ~~**`Octree3` DDA**~~ — **done.** `raycast` (thick capsule), `raycast_dda`,
+   `raycast_dda_first` on the 8-way octree (Probe-style, ported from `Tree3`).
+   Brute-force gated (DDA ⊆ exact capsule + sorted + first==nearest; thick ==
+   brute). Still uses the `locate`+epsilon nudge → item 2 (nudge-free walk).
 2. **Nudge-free 3D walk** — real 3D neighbour-finding (Samet ascend-to-LCA, or
    ropes) so the `Tree3`/`Octree3` DDA steps without the `locate`+epsilon nudge.
    (The 2D ledger says ropes rarely pay upkeep → Samet first.)
