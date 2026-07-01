@@ -44,7 +44,7 @@ use vectorial_hash_demos::siege_sim::{
     PER_FACTION, SKY, WORLD,
 };
 
-const MAX_POP: usize = 2000; // max army/side the [ ] keys allow (instance-buffer cap)
+const MAX_POP: usize = 10000; // max army/side the slider + [ ] keys allow (instance-buffer cap)
 
 // ============================================================ terrain
 
@@ -331,8 +331,8 @@ impl State {
         // GPU skinning: one shared bind-group layout + pipeline, then one model per
         // distinct (faction,kind) glb. The instance buffer is shared — units are
         // bucketed by model each frame.
-        // Sized for the max army the [ ] keys allow (2000/side), so growing the
-        // population never needs a buffer resize.
+        // Sized for the max army the slider / [ ] keys allow (10000/side, i.e.
+        // 20000 instances ~= 1.9 MB), so growing the population never resizes.
         let inst_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("skin-inst"), size: (MAX_POP * 2 * std::mem::size_of::<SkinInstance>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let skin_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("skin-l"),

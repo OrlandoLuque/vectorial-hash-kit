@@ -19,7 +19,7 @@ Live (single-threaded wasm build): <https://orlandoluque.github.io/vectorial-has
 - drag left mouse: orbit · scroll: zoom · `P`: pause · `[` / `]`: ± population ·
   `V`: voxel ↔ smooth terrain (both binaries)
 - **population slider** (top-left): army size per side — the spatial-index stress
-  lever (20…2000 each).
+  lever (20…10000 each, i.e. up to 20k units).
 - **thread slider** (native only): set the rayon pool size *live* and watch the
   fps response — the parallel scaling, on screen. wasm has no threads, so the web
   build hides it and runs the AI serially.

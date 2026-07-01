@@ -398,7 +398,7 @@ async fn main() {
             terrain_chunks = build_terrain(smooth, &craters);
         }
         // Rebuild the army when the population slider changed (or on `[`/`]`).
-        if is_key_pressed(KeyCode::RightBracket) { per_faction = (per_faction + 100).min(2000); }
+        if is_key_pressed(KeyCode::RightBracket) { per_faction = (per_faction + 100).min(10000); }
         if is_key_pressed(KeyCode::LeftBracket) { per_faction = per_faction.saturating_sub(100).max(20); }
         if per_faction != cur_pop {
             units = spawn_army(&mut rng, per_faction);
@@ -568,7 +568,7 @@ async fn main() {
         };
         draw_text(lead, 16.0, 128.0, 22.0, lcol);
         // Live population slider (per faction) — the spatial-index stress lever.
-        int_slider(20.0, 150.0, 220.0, "army/side", &mut per_faction, 20, 2000, &mut pop_drag);
+        int_slider(20.0, 150.0, 220.0, "army/side", &mut per_faction, 20, 10000, &mut pop_drag);
         // Live thread-count slider drives the parallel AI pass (native only).
         #[cfg(not(target_arch = "wasm32"))]
         int_slider(20.0, 192.0, 220.0, "threads", &mut n_threads, 1, max_threads, &mut slider_drag);
