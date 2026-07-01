@@ -152,8 +152,15 @@ FPS review: free wins applied, quality-trade-off levers reported).
 - **Frustum-cull units** in the render (free quality-wise, situational; PERF_NOTES).
 - **wgpu world polish**: bridge decks + path-to-bridge AI, optional unit-feet snap
   to voxel tops (user chose smooth-float for now; keep it a switch).
-- **Forests as LoS cover** (trees block arrows/bolts via a raycast index, like
-  smoke) + a **balance** pass (use the HUD).
+- ~~**Forests**~~ — **done** (first pass). Seeded copses (`siege_sim::forest_*`)
+  that **slow ground movement** (up to ½ speed; flyers pass over) and give
+  **ranged cover** (arrows/bolts do ½ damage to a target in the trees). Canopies
+  drawn in both binaries (green sphere blobs). Copse count/size + factors are
+  easy knobs; **balance pass** still wants the user's eyes on the HUD.
+- **2D critters thread slider (#56 opt A)** — refactor `Sim::cull_attack` to a
+  read-only cull (+ post-hoc stat/mismatch fold) and restructure `Sim::step`'s
+  firing loop into decide → parallel cull → apply, gated by the brute-force
+  tests. Queued as a focused pass (touches the bench-shared sim).
 
 **Thread-slider retrofit for the critters demos** (user, 2026-06-27) —
 **`critters3d` done**; **2D `critters` deferred.** The 3D combat wave now runs
