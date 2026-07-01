@@ -323,7 +323,8 @@ fn proj_sphere() -> vectorial_hash_demos::model::SkinnedModel {
 // ============================================================ renderer
 
 struct State {
-    surface: wgpu::Surface<'static>,
+    surface: Option<wgpu::Surface<'static>>, // None in the headless bench (renders offscreen)
+    off_tex: Option<wgpu::Texture>,          // the offscreen render target (headless)
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
@@ -378,6 +379,7 @@ struct State {
     volcano: Volcano,
     sep: SepTables, // precomputed boids separation-force table
     paused: bool,
+    bench_dt: Option<f64>, // fixed sim dt for the headless bench (None = real-time)
     red: usize,  // live Red units (for the window-title HUD)
     blue: usize, // live Blue units
     fps: f32,    // smoothed frames/second
@@ -397,16 +399,22 @@ struct State {
 }
 
 impl State {
-    async fn new(window: Arc<winit::window::Window>) -> State {
-        let size = window.inner_size();
+    // `window` = None → **headless** (render into an offscreen texture, no
+    // present) for the FPS benchmark; `headless_size` is the render resolution.
+    async fn new(window: Option<Arc<winit::window::Window>>, headless_size: (u32, u32)) -> State {
+        let size = match &window { Some(w) => w.inner_size(), None => winit::dpi::PhysicalSize::new(headless_size.0, headless_size.1) };
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
-        let surface = instance.create_surface(window).expect("surface");
-        let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, compatible_surface: Some(&surface), force_fallback_adapter: false }).await.expect("adapter");
+        let surface = window.map(|w| instance.create_surface(w).expect("surface"));
+        let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, compatible_surface: surface.as_ref(), force_fallback_adapter: false }).await.expect("adapter");
         let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor::default(), None).await.expect("device");
-        let caps = surface.get_capabilities(&adapter);
-        let format = caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
-        let config = wgpu::SurfaceConfiguration { usage: wgpu::TextureUsages::RENDER_ATTACHMENT, format, width: size.width.max(1), height: size.height.max(1), present_mode: wgpu::PresentMode::AutoVsync, desired_maximum_frame_latency: 2, alpha_mode: caps.alpha_modes[0], view_formats: vec![] };
-        surface.configure(&device, &config);
+        let (format, alpha) = match &surface {
+            Some(s) => { let caps = s.get_capabilities(&adapter); (caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]), caps.alpha_modes[0]) }
+            None => (wgpu::TextureFormat::Rgba8UnormSrgb, wgpu::CompositeAlphaMode::Opaque),
+        };
+        let config = wgpu::SurfaceConfiguration { usage: wgpu::TextureUsages::RENDER_ATTACHMENT, format, width: size.width.max(1), height: size.height.max(1), present_mode: wgpu::PresentMode::AutoVsync, desired_maximum_frame_latency: 2, alpha_mode: alpha, view_formats: vec![] };
+        if let Some(s) = &surface { s.configure(&device, &config); }
+        // Offscreen render target for the headless bench (no swapchain to present to).
+        let off_tex = surface.is_none().then(|| device.create_texture(&wgpu::TextureDescriptor { label: Some("offscreen"), size: wgpu::Extent3d { width: config.width, height: config.height, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage: wgpu::TextureUsages::RENDER_ATTACHMENT, view_formats: &[] }));
 
         let cam_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("cam"), size: std::mem::size_of::<CameraUniform>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let cam_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("cam-l"), entries: &[wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None }] });
@@ -594,7 +602,7 @@ impl State {
         let pool = rayon::ThreadPoolBuilder::new().num_threads(max_threads).build().unwrap();
 
         State {
-            surface, device, queue, config,
+            surface, off_tex, device, queue, config, bench_dt: None,
             skin_pipeline, models, model_idx, inst_buf,
             castle_model, castle_inst_buf,
             horse_model, horse_inst_buf,
@@ -622,7 +630,7 @@ impl State {
     fn resize(&mut self, w: u32, h: u32) {
         if w > 0 && h > 0 {
             self.config.width = w; self.config.height = h;
-            self.surface.configure(&self.device, &self.config);
+            if let Some(s) = &self.surface { s.configure(&self.device, &self.config); }
             self.depth = make_depth(&self.device, &self.config);
         }
     }
@@ -673,8 +681,10 @@ impl State {
     }
 
     fn update_and_render(&mut self) {
-        let dt = self.last.elapsed().as_secs_f64().min(0.05);
-        self.last = Instant::now();
+        let dt = match self.bench_dt {
+            Some(d) => d, // fixed step for the headless bench (deterministic)
+            None => { let d = self.last.elapsed().as_secs_f64().min(0.05); self.last = Instant::now(); d }
+        };
         if !self.paused {
             self.now += dt;
             // Rebuild the unit index from live positions each frame.
@@ -864,8 +874,16 @@ impl State {
         self.queue.write_buffer(&self.ui_buf, 0, bytemuck::cast_slice(&ui));
         let ui_n = ui.len() as u32;
 
-        let frame = match self.surface.get_current_texture() { Ok(f) => f, Err(_) => return };
-        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // Acquire the render target: the swapchain frame (windowed) or the
+        // offscreen texture (headless bench — no swapchain to present to).
+        let frame = match &self.surface {
+            Some(s) => match s.get_current_texture() { Ok(f) => Some(f), Err(_) => return },
+            None => None,
+        };
+        let view = match &frame {
+            Some(f) => f.texture.create_view(&wgpu::TextureViewDescriptor::default()),
+            None => self.off_tex.as_ref().unwrap().create_view(&wgpu::TextureViewDescriptor::default()),
+        };
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -940,7 +958,12 @@ impl State {
             }
         }
         self.queue.submit(Some(enc.finish()));
-        frame.present();
+        match frame {
+            Some(f) => f.present(),
+            // Headless: no swapchain — block until the GPU finishes this frame so
+            // the bench times the real render cost (no vsync, no presentation).
+            None => { self.device.poll(wgpu::Maintain::Wait); }
+        }
     }
 }
 
@@ -1046,7 +1069,41 @@ fn fs(in: VOut) -> @location(0) vec4<f32> { return in.color; }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() {
-    pollster::block_on(run());
+    if std::env::var("SIEGE_BENCH").is_ok() {
+        pollster::block_on(bench_headless());
+    } else {
+        pollster::block_on(run());
+    }
+}
+
+/// Headless **offscreen** FPS benchmark: the full per-frame pipeline (sim + build
+/// instances + render to a texture) with **no window and no present/vsync**,
+/// blocking on the GPU each frame so the timing is the real render cost. Warms to
+/// a mid-battle clash, then times each thread count. `SIEGE_POP` units/side,
+/// `SIEGE_SECS` per thread count, `SIEGE_WARMUP_SIM` sim-seconds to clash.
+#[cfg(not(target_arch = "wasm32"))]
+async fn bench_headless() {
+    let ev = |k: &str, d: f64| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+    let (secs, warmup_sim) = (ev("SIEGE_SECS", 3.0), ev("SIEGE_WARMUP_SIM", 30.0));
+    let (w, h) = (1600u32, 1000u32);
+    let mut st = State::new(None, (w, h)).await;
+    st.bench_dt = Some(1.0 / 60.0);
+    if let Some(p) = std::env::var("SIEGE_POP").ok().and_then(|s| s.parse().ok()) { st.set_population(p); }
+    println!("siege_wgpu OFFSCREEN bench | {w}x{h} | {} units/side ({} total) | warm to sim t={warmup_sim:.0}s (clash), then {secs:.0}s per thread count | full render to a texture, NO present/vsync (GPU-blocked per frame)", st.pop, st.pop * 2);
+    let wt = Instant::now();
+    while st.now < warmup_sim { st.update_and_render(); }
+    println!("warmed to clash in {:.1}s wall ({} Red / {} Blue alive)\n", wt.elapsed().as_secs_f64(), st.red, st.blue);
+    println!("{:>8} | {:>9} {:>10} {:>7}", "threads", "frames", "fps", "vs 1");
+    let mut base = 0.0f64;
+    for n in 1..=st.max_threads {
+        st.set_threads(n);
+        let t = Instant::now();
+        let mut frames = 0u64;
+        while t.elapsed().as_secs_f64() < secs { st.update_and_render(); frames += 1; }
+        let fps = frames as f64 / t.elapsed().as_secs_f64();
+        if n == 1 { base = fps; }
+        println!("{:>8} | {:>9} {:>10.1} {:>6.2}x", n, frames, fps, fps / base);
+    }
 }
 
 // Web entry (wasm-bindgen): set the panic hook + drive the async `run` on the
@@ -1069,7 +1126,7 @@ async fn run() {
         let _ = canvas.set_attribute("style", "width:100vw;height:100vh;display:block");
         web_sys::window().and_then(|w| w.document()).and_then(|d| d.body()).expect("body").append_child(&canvas).expect("append canvas");
     }
-    let mut st = State::new(window.clone()).await;
+    let mut st = State::new(Some(window.clone()), (1600, 1000)).await;
     let max_frames: Option<u64> = std::env::var("SIEGE_MAX_FRAMES").ok().and_then(|s| s.parse().ok());
     let mut frame: u64 = 0;
 
