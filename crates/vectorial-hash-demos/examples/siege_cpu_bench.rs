@@ -46,11 +46,19 @@ struct SimState {
     now: f64,
 }
 
-fn step_frame(s: &mut SimState, index: &mut Tree3<IUnit>, pool: &rayon::ThreadPool, sep: &SepTables, world: Aabb, dt: f64) {
+fn step_frame(s: &mut SimState, index: &mut Tree3<IUnit>, pool: &rayon::ThreadPool, sep: &SepTables, world: Aabb, dt: f64, bulk: bool) {
     s.now += dt;
-    index.clear();
-    for (i, u) in s.units.iter().enumerate() {
-        if u.alive() { index.insert(IUnit { id: i as u32, faction: u.faction, p: u.p, health: (u.hp / u.kind.max_hp()) as f32, face: u.face }); }
+    if bulk {
+        // Parallel top-down partition (fans the rebuild out over the same pool)
+        // instead of the serial clear() + per-unit insert loop.
+        let items: Vec<IUnit> = s.units.iter().enumerate().filter(|(_, u)| u.alive())
+            .map(|(i, u)| IUnit { id: i as u32, faction: u.faction, p: u.p, health: (u.hp / u.kind.max_hp()) as f32, face: u.face }).collect();
+        *index = pool.install(|| Tree3::<IUnit>::bulk_load_par(world, 8, items));
+    } else {
+        index.clear();
+        for (i, u) in s.units.iter().enumerate() {
+            if u.alive() { index.insert(IUnit { id: i as u32, faction: u.faction, p: u.p, health: (u.hp / u.kind.max_hp()) as f32, face: u.face }); }
+        }
     }
     let mut smoke_index = Tree3::<Puff>::new(world, 8);
     for p in &s.smoke { smoke_index.insert(*p); }
@@ -81,27 +89,29 @@ fn main() {
     let warm_pool = rayon::ThreadPoolBuilder::new().num_threads(max).build().unwrap();
     let wt = Instant::now();
     while s.now < warmup_sim {
-        step_frame(&mut s, &mut index, &warm_pool, &sep, world, dt);
+        step_frame(&mut s, &mut index, &warm_pool, &sep, world, dt, false);
     }
     let alive = s.units.iter().filter(|u| u.alive()).count();
     println!("warmed to clash in {:.1}s wall ({} alive, {} smoke puffs, {} projectiles)\n", wt.elapsed().as_secs_f64(), alive, s.smoke.len(), s.projectiles.len());
-    println!("{:>8} | {:>9} {:>10} {:>8} {:>7}", "threads", "frames", "CPU fps", "vs 1", "eff");
 
+    // Measure the full CPU frame at each thread count, twice: with the current
+    // serial clear()+insert index rebuild, and with the parallel bulk_load_par
+    // rebuild — the "antes / después" of the bulk-load lever.
     let warmed = s; // the shared clash state
-    let mut base = 0.0f64;
-    for threads in 1..=max {
+    let measure = |threads: usize, bulk: bool| -> f64 {
         let mut sc = warmed.clone();
         let mut idx = Tree3::<IUnit>::new(world, 8);
         let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
         let t = Instant::now();
         let mut frames = 0u64;
-        while t.elapsed().as_secs_f64() < secs {
-            step_frame(&mut sc, &mut idx, &pool, &sep, world, dt);
-            frames += 1;
-        }
-        let fps = frames as f64 / t.elapsed().as_secs_f64();
-        if threads == 1 { base = fps; }
-        println!("{:>8} | {:>9} {:>10.1} {:>7.2}x {:>6.0}%", threads, frames, fps, fps / base, fps / base / threads as f64 * 100.0);
+        while t.elapsed().as_secs_f64() < secs { step_frame(&mut sc, &mut idx, &pool, &sep, world, dt, bulk); frames += 1; }
+        frames as f64 / t.elapsed().as_secs_f64()
+    };
+    println!("{:>8} | {:>12} {:>14} {:>8}", "threads", "insert fps", "bulk_load fps", "gain");
+    for threads in 1..=max {
+        let ins = measure(threads, false);
+        let blk = measure(threads, true);
+        println!("{:>8} | {:>12.1} {:>14.1} {:>7.2}x", threads, ins, blk, blk / ins);
     }
 
     // Is a headless GPU adapter available? (Decides whether an offscreen render

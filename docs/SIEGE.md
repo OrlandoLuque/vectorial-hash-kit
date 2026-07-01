@@ -66,9 +66,13 @@ A frame is two passes:
 
 This decide→apply split is the general pattern for a parallel agent simulation:
 the reads parallelise trivially, the cross-unit writes are quarantined into one
-cheap serial pass. The index is **rebuilt** each frame from live positions (a
-cheap serial insert loop); relocation-by-handle is the alternative lever when the
-rebuild dominates ([THREE_D.md](THREE_D.md) § `ItemRef`).
+cheap serial pass. The index is **rebuilt** each frame from live positions — a
+serial insert loop by default, or (native `--features parallel`) a parallel
+`Tree3::bulk_load_par`, which fans the rebuild out over the same pool and lifts
+the CPU-fps ceiling ~1.14× at high thread counts by attacking the serial-rebuild
+Amdahl tail ([PARALLEL.md](PARALLEL.md) § "Parallel bulk-load"). Relocation-by-
+handle is the other lever when the rebuild dominates ([THREE_D.md](THREE_D.md)
+§ `ItemRef`).
 
 ## Two extra index showcases
 

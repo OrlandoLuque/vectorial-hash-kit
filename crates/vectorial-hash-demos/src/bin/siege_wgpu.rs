@@ -731,10 +731,24 @@ impl State {
         }
         if !self.paused {
             self.now += dt;
-            // Rebuild the unit index from live positions each frame.
-            self.index.clear();
-            for (i, u) in self.units.iter().enumerate() {
-                if u.alive() { self.index.insert(IUnit { id: i as u32, faction: u.faction, p: u.p, health: (u.hp / u.kind.max_hp()) as f32, face: u.face }); }
+            // Rebuild the unit index from live positions each frame. Native + the
+            // `parallel` feature: a parallel top-down partition (`bulk_load_par`)
+            // over the sized pool — it attacks the serial-rebuild Amdahl tail
+            // (~1.14× CPU-fps at high thread counts, PARALLEL.md). Otherwise
+            // (default native / wasm): the serial clear()+insert loop.
+            #[cfg(all(not(target_arch = "wasm32"), feature = "parallel"))]
+            {
+                let world = Aabb::new(0.0, 0.0, 0.0, WORLD, SKY, WORLD);
+                let items: Vec<IUnit> = self.units.iter().enumerate().filter(|(_, u)| u.alive())
+                    .map(|(i, u)| IUnit { id: i as u32, faction: u.faction, p: u.p, health: (u.hp / u.kind.max_hp()) as f32, face: u.face }).collect();
+                self.index = self.pool.install(|| Tree3::<IUnit>::bulk_load_par(world, 8, items));
+            }
+            #[cfg(not(all(not(target_arch = "wasm32"), feature = "parallel")))]
+            {
+                self.index.clear();
+                for (i, u) in self.units.iter().enumerate() {
+                    if u.alive() { self.index.insert(IUnit { id: i as u32, faction: u.faction, p: u.p, health: (u.hp / u.kind.max_hp()) as f32, face: u.face }); }
+                }
             }
             // Smoke index (LoS blockers) for the archer / ballista raycasts.
             let mut smoke_index = Tree3::<Puff>::new(Aabb::new(0.0, 0.0, 0.0, WORLD, SKY, WORLD), 8);

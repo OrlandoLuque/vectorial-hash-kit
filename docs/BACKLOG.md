@@ -22,7 +22,11 @@ frame). Lay the parallel infra first so the demo is multithreaded from the start
   index … })`: reads are `&self` + `Sync`, units mutated disjointly → safe, no new
   API needed. Confirm + document it (this is the demo's lever).
 - **Parallel batch `knn` / `raycast`** (the read-fan-out, like `cull_many_par`).
-- **Parallel tree bulk-load** (sort-then-link) for fast per-frame rebuilds (C9).
+- **Parallel tree bulk-load** — **DONE** (2026-07-01): `Tree3::bulk_load` /
+  `bulk_load_par` (top-down partition; par fans out over rayon). Wired into both
+  siege binaries' per-frame rebuild (native `--features parallel`). Measured
+  ~1.14× CPU-fps at 12–16 threads; serial `bulk_load` loses to arena-reuse insert
+  (PARALLEL.md § "Parallel bulk-load").
 - **Properly benchmarked + tested** (user, 2026-06-27): interleaved min-of-N vs
   the serial path (the `raycast_compare` anti-contamination methodology — rotate
   order, min, `noise` column, two runs), and correctness tests (parallel result
@@ -230,8 +234,11 @@ crossover visible (`PARALLEL.md`), like siege. wasm runs the wave serially.
 **C. Performance**
 8. **Morton multi-level linear octree** — coarse occupancy levels so a big-radius
    cull skips empty blocks instead of scanning every fine cell (2D + 3D).
-9. **Parallel tree bulk-load** — sort-then-link build for static datasets
-   (`Tree`/`Tree3`), the parallel build the trees lack (Morton has `extend_par`).
+9. **Parallel tree bulk-load** — **DONE** (2026-07-01, `Tree3`): `bulk_load` +
+   `bulk_load_par` (top-down partition, par via rayon `join`), brute-force gated,
+   wired into the siege per-frame rebuild. ~1.14× CPU-fps at 12–16 threads.
+   *Remaining (optional):* the same for the 2D `Tree` (the siege rebuild is 3D,
+   so 2D wasn't needed yet).
 10. **SoA *permanent* leaf storage** — *low priority*: the batch kernel is done
     and measured marginal (~1.0–1.26× end-to-end, descent-dominated); permanent
     storage would only save the materialisation copy. Park unless a workload needs it.
@@ -327,8 +334,8 @@ visual glance the next morning; everything else is autonomously verifiable.
    bucket group. The grouping is the serial tail (Amdahl), so the win is the
    encode for large `N`; pair with `clear()` for a cheap parallel
    rebuild-per-frame. Tested identical to serial insert (count/cells/cull).
-   *Remaining:* a parallel **tree** bulk-load (sort-then-link) is a different
-   algorithm and is left as future work.
+   *Remaining:* ~~a parallel **tree** bulk-load~~ — **also done** (2026-07-01):
+   `Tree3::bulk_load_par` (top-down partition, rayon `join`), in the siege rebuild.
 6. **k-NN parity** — `knn` exists on `Tree3`/`Octree3`; add it to `Tree`,
    `QuadTree`, `IntegerTree`, and `MortonGrid3` (the latter ring-by-ring, shared
    with item 3). Brute-force gated.

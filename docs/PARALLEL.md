@@ -33,6 +33,10 @@ let hits: Vec<Vec<&T>> = tree.cull_many(&shapes);
 
 // Feature `parallel`, rayon-backed — same result, fanned over threads:
 let hits: Vec<Vec<&T>> = tree.cull_many_par(&shapes);
+
+// Feature `parallel` — build a whole tree from all items at once, top-down
+// partition fanned over threads (the per-frame-rebuild lever; see below):
+let tree = Tree3::bulk_load_par(bounds, item_limit, items); // serial: bulk_load
 ```
 
 `cull_many_par` exists on all five structures (`Tree`, `QuadTree`,
@@ -192,12 +196,68 @@ The takeaway for the thread slider: **more threads is not always better** — pa
 the point where the GPU (or the serial sim tail) dominates, extra cores are idle
 overhead. The slider lets you find the knee for your machine + unit count.
 
-## Why not parallelise the build / relocation too?
+## Parallel bulk-load — the rebuild lever (measured)
 
-- **Build (`insert` loop):** a tree build is a sequence of dependent structural
-  mutations; parallel insertion needs lock-free nodes or a parallel
-  sort-then-link (bulk-load) pass. Worth exploring for static datasets, but it's
-  a different algorithm, not a free `par_iter`. Out of scope for this feature.
+`decide` parallelises; the per-frame **index rebuild** doesn't — it's the serial
+Amdahl tail above. `Tree3::bulk_load` / `bulk_load_par` attack exactly that: one
+**top-down partition** (longest-axis-midpoint, the same rule `divide` uses
+incrementally) instead of N root-descending `insert`s. `bulk_load_par` fans the
+partition out over rayon (`join` per split), leaving a cheap serial arena flatten.
+
+First, the rebuild step *in isolation* (`bulk_load_bench`, 15 542 units mid-clash,
+16-core / RTX 4080 SUPER box):
+
+```
+                  strategy   us/rebuild   vs insert
+  clear + insert (current)      3639         1.00x
+        bulk_load (serial)      4433         0.82x   ← SLOWER
+     bulk_load_par (2 thr)      3125         1.16x
+     bulk_load_par (4 thr)      2339         1.56x
+     bulk_load_par (8 thr)      2313         1.57x
+    bulk_load_par (16 thr)      2300         1.58x
+```
+
+Two honest findings:
+
+- **Serial `bulk_load` *loses* (0.82×)** to `clear()` + `insert`. The insert loop
+  reuses the arena (`clear` keeps capacity) and touches memory linearly; the
+  recursive partition allocates two fresh child `Vec`s at every internal node —
+  that allocation churn costs more than the root-descents it saves. So the serial
+  path is **not** worth it; the win is purely from parallelism.
+- **`bulk_load_par` wins, then plateaus** at ~1.58× (4+ threads). The serial
+  flatten tail + allocator contention cap it — more than 4 threads on *this* step
+  buys nothing.
+
+End-to-end, though, the frame is rebuild + `decide` + `apply`, and the rebuild's
+share *grows* with thread count (decide gets cheaper, the serial tail doesn't). So
+swapping the rebuild for `bulk_load_par` lifts the whole CPU-fps ceiling more the
+more cores you have (`siege_cpu_bench`, full CPU frame, 20 k units):
+
+```
+ threads   insert fps   bulk_load fps   gain
+       1       24.3          24.3        1.00x
+       4       59.4          63.6        1.07x
+       8       79.0          87.9        1.11x
+      13       87.3         100.4        1.15x
+      16       86.4          98.7        1.14x
+```
+
+**No benefit single-threaded** (nothing to parallelise; the serial `bulk_load` it
+falls back on is a wash-to-slight-loss), rising to **~1.14–1.15× at 12–16
+threads** — 87 → 100 fps. It's a lever for exactly the regime where the serial
+rebuild had become the bottleneck.
+
+Wiring: the siege binaries use `bulk_load_par` on **native builds with
+`--features parallel`** (the perf build); the default native run and the wasm
+build keep the serial `clear()` + `insert` loop (wasm has no threads, and the
+serial `bulk_load` would only lose). Handle `i` still addresses `items[i]`, so
+`ItemRef` stays valid across a bulk rebuild.
+
+## Why not parallelise relocation / the Morton build too?
+
+- **Relocation (`update_ref`):** a single item's move is an ascend-to-LCA +
+  re-descend — a dependent structural mutation, not a `par_iter`. The lever there
+  is doing *fewer* of them (`ItemRef`), not threading each one.
 - **Morton rebuild:** the per-point cell code *is* independent (computing
   `morton3(cell_of(p))` for every point parallelises), but the bucket inserts
   into the shared `HashMap` serialise. A parallel build would compute codes in

@@ -446,11 +446,32 @@ async fn main() {
         if !paused {
             now += dt;
 
-            // Rebuild the index from this frame's live positions. The build is
-            // serial and cheap; the queries (decide) are the parallel part.
-            index.clear();
-            for (i, u) in units.iter().enumerate() {
-                if u.alive() { index.insert(IUnit { id: i as u32, faction: u.faction, p: u.p, health: (u.hp / u.kind.max_hp()) as f32, face: u.face }); }
+            // Keep the rayon pool sized to the slider (native) — before the
+            // rebuild, so the parallel bulk-load below uses the current pool.
+            #[cfg(not(target_arch = "wasm32"))]
+            if cur_threads != n_threads {
+                pool = rayon::ThreadPoolBuilder::new().num_threads(n_threads).build().unwrap();
+                cur_threads = n_threads;
+            }
+
+            // Rebuild the index from this frame's live positions. Native + the
+            // `parallel` feature: a parallel top-down partition (`bulk_load_par`)
+            // that fans the rebuild out over the pool — it attacks the
+            // serial-rebuild Amdahl tail (~1.14× CPU-fps at high thread counts,
+            // PARALLEL.md). Otherwise (default native / wasm): the serial
+            // clear()+insert loop (serial bulk_load loses to the arena reuse).
+            #[cfg(all(not(target_arch = "wasm32"), feature = "parallel"))]
+            {
+                let items: Vec<IUnit> = units.iter().enumerate().filter(|(_, u)| u.alive())
+                    .map(|(i, u)| IUnit { id: i as u32, faction: u.faction, p: u.p, health: (u.hp / u.kind.max_hp()) as f32, face: u.face }).collect();
+                index = pool.install(|| Tree3::<IUnit>::bulk_load_par(world, 8, items));
+            }
+            #[cfg(not(all(not(target_arch = "wasm32"), feature = "parallel")))]
+            {
+                index.clear();
+                for (i, u) in units.iter().enumerate() {
+                    if u.alive() { index.insert(IUnit { id: i as u32, faction: u.faction, p: u.p, health: (u.hp / u.kind.max_hp()) as f32, face: u.face }); }
+                }
             }
             // Rebuild the smoke index from last frame's live puffs.
             smoke_index.clear();
@@ -461,10 +482,6 @@ async fn main() {
             // mutates only itself while reading the shared indices. wasm: serial.
             #[cfg(not(target_arch = "wasm32"))]
             {
-                if cur_threads != n_threads {
-                    pool = rayon::ThreadPoolBuilder::new().num_threads(n_threads).build().unwrap();
-                    cur_threads = n_threads;
-                }
                 let (idx, smk, br) = (&index, &smoke_index, &sep);
                 pool.install(|| units.par_iter_mut().enumerate().for_each(|(i, u)| decide(u, i as u32, idx, smk, br)));
             }

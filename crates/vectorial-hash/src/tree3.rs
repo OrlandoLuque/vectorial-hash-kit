@@ -1387,6 +1387,64 @@ mod tests {
         let _ = brute(&pts, &Sphere3::new(0.0,0.0,0.0,10.0));
     }
 
+    #[test]
+    fn bulk_load_matches_insert_and_brute_force() {
+        // A tree built with `bulk_load` (one top-down partition) must answer
+        // `cull` exactly like an insert-by-insert tree and brute force, and its
+        // handles must be stable: `ItemRef(i)` addresses `items[i]`.
+        let mut x = 0xC0FF_EE42u64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x >> 11) as f64 / (1u64 << 53) as f64 };
+        let world = Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0);
+        let pts: Vec<P> = (0..3000).map(|_| P(Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0))).collect();
+        let bulk = Tree3::<P>::bulk_load(world, 8, pts.clone());
+        for (cx, cy, cz, r) in [(128.0,128.0,128.0,40.0),(40.0,40.0,40.0,60.0),(250.0,250.0,250.0,30.0),(0.0,0.0,0.0,100.0)] {
+            let sphere = Sphere3::new(cx, cy, cz, r).with_raster();
+            let mut want: Vec<(u64,u64,u64)> = pts.iter().filter(|p| sphere.contains_point(p.0))
+                .map(|p| (p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits())).collect();
+            let mut got: Vec<(u64,u64,u64)> = bulk.cull(&sphere).iter()
+                .map(|p| (p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits())).collect();
+            want.sort(); got.sort();
+            assert_eq!(want, got, "bulk_load cull != brute for sphere ({cx},{cy},{cz}) r={r}");
+        }
+        assert_eq!(bulk.item_count(), pts.len(), "bulk_load dropped items");
+        // Handle stability: remove_ref(i) yields exactly items[i].
+        let mut t = Tree3::<P>::bulk_load(world, 8, pts.clone());
+        for i in (0..pts.len()).step_by(97) {
+            let got = t.remove_ref(ItemRef(i as u32)).expect("handle i must resolve");
+            assert_eq!(got.0.x.to_bits(), pts[i].0.x.to_bits(), "ItemRef({i}) addressed the wrong item");
+            assert_eq!(got.0.z.to_bits(), pts[i].0.z.to_bits(), "ItemRef({i}) addressed the wrong item");
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn bulk_load_par_matches_serial() {
+        // The parallel partition must produce a structurally identical tree to
+        // the serial one — same cull answers, same stable handles.
+        let mut x = 0x51E6_E00Du64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x >> 11) as f64 / (1u64 << 53) as f64 };
+        let world = Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0);
+        let pts: Vec<P> = (0..8000).map(|_| P(Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0))).collect();
+        let ser = Tree3::<P>::bulk_load(world, 8, pts.clone());
+        let par = Tree3::<P>::bulk_load_par(world, 8, pts.clone());
+        for (cx, cy, cz, r) in [(128.0,128.0,128.0,50.0),(200.0,60.0,90.0,45.0),(0.0,0.0,0.0,300.0)] {
+            let s = Sphere3::new(cx, cy, cz, r);
+            let sphere = if r <= 100.0 { s.with_raster() } else { s }; // don't raster a world-covering sphere
+            let mut a: Vec<(u64,u64,u64)> = ser.cull(&sphere).iter().map(|p| (p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits())).collect();
+            let mut b: Vec<(u64,u64,u64)> = par.cull(&sphere).iter().map(|p| (p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits())).collect();
+            a.sort(); b.sort();
+            assert_eq!(a, b, "bulk_load_par cull != serial for sphere ({cx},{cy},{cz}) r={r}");
+        }
+        // Handles must map the same way in both.
+        let mut sr = Tree3::<P>::bulk_load(world, 8, pts.clone());
+        let mut pr = Tree3::<P>::bulk_load_par(world, 8, pts.clone());
+        for i in (0..pts.len()).step_by(131) {
+            let a = sr.remove_ref(ItemRef(i as u32)).unwrap();
+            let b = pr.remove_ref(ItemRef(i as u32)).unwrap();
+            assert_eq!(a.0.x.to_bits(), b.0.x.to_bits(), "par handle {i} differs from serial");
+        }
+    }
+
     #[cfg(feature = "parallel")]
     #[test]
     fn knn_many_par_matches_serial() {
