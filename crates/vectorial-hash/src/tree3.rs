@@ -599,6 +599,41 @@ impl<T: Positioned3> Tree3<T> {
         }
     }
 
+    /// Build a tree from **all `items` at once** — a top-down partition (the same
+    /// longest-axis-midpoint split `divide` uses) rather than N `insert`s. Handle
+    /// `i` addresses `items[i]` (so `ItemRef(i)` is stable, as after inserting in
+    /// order). A per-frame *rebuild* via `bulk_load` avoids the repeated
+    /// root-descents of `clear()` + `insert` — one partition pass instead. Items
+    /// are assumed within `bbox` (as the demos' clamped positions are).
+    pub fn bulk_load(bbox: Aabb, item_limit: usize, items: Vec<T>) -> Self {
+        assert!(item_limit >= 1, "item_limit must be >= 1");
+        let min_cell = bbox.w.max(bbox.h).max(bbox.d) * 1e-12;
+        let n = items.len();
+        let mut nodes: Vec<Node3<T>> = Vec::new();
+        let mut locs = vec![ItemLoc { node: Node3Id(0), slot: 0 }; n];
+        let indexed: Vec<(u32, T)> = items.into_iter().enumerate().map(|(i, it)| (i as u32, it)).collect();
+        build3_serial(&mut nodes, &mut locs, item_limit, min_cell, bbox, None, indexed);
+        Tree3 { nodes, free: Vec::new(), locs, free_handles: Vec::new(), item_limit, merge_limit: item_limit, min_cell, root: Node3Id(0) }
+    }
+
+    /// Parallel [`Tree3::bulk_load`] (feature `parallel`): the top-down partition
+    /// — the O(n log n) work — fans out over rayon (`join` per split); the arena
+    /// flatten is a cheap serial tail. The lever for the per-frame index rebuild
+    /// that the serial `insert` loop can't parallelise (see `docs/PARALLEL.md`).
+    #[cfg(feature = "parallel")]
+    pub fn bulk_load_par(bbox: Aabb, item_limit: usize, items: Vec<T>) -> Self
+    where T: Send {
+        assert!(item_limit >= 1, "item_limit must be >= 1");
+        let min_cell = bbox.w.max(bbox.h).max(bbox.d) * 1e-12;
+        let n = items.len();
+        let indexed: Vec<(u32, T)> = items.into_iter().enumerate().map(|(i, it)| (i as u32, it)).collect();
+        let build = build3_par(item_limit, min_cell, bbox, indexed);
+        let mut nodes: Vec<Node3<T>> = Vec::new();
+        let mut locs = vec![ItemLoc { node: Node3Id(0), slot: 0 }; n];
+        flatten3(&mut nodes, &mut locs, bbox, None, build);
+        Tree3 { nodes, free: Vec::new(), locs, free_handles: Vec::new(), item_limit, merge_limit: item_limit, min_cell, root: Node3Id(0) }
+    }
+
     fn divide(&mut self, id: Node3Id) {
         let (bbox, items, hs) = {
             let n = self.get_mut(id);
@@ -1125,6 +1160,98 @@ pub(crate) fn knn_offer<'a, T: Positioned3>(heap: &mut std::collections::BinaryH
         heap.pop();
         heap.push(KnnEntry { d2, item: it });
     }
+}
+
+// ------------------------------------------------------------- bulk build
+// Shared top-down build for `Tree3::bulk_load` / `bulk_load_par`. Splits the
+// longest axis at its midpoint — the same rule `divide` uses incrementally.
+
+/// Longest-axis-midpoint split of `b` into (lower, upper) halves.
+fn split_halves3(b: Aabb) -> (Aabb, Aabb) {
+    if b.w >= b.h && b.w >= b.d {
+        let h = b.w / 2.0;
+        (Aabb::new(b.x, b.y, b.z, h, b.h, b.d), Aabb::new(b.x + h, b.y, b.z, h, b.h, b.d))
+    } else if b.h >= b.d {
+        let h = b.h / 2.0;
+        (Aabb::new(b.x, b.y, b.z, b.w, h, b.d), Aabb::new(b.x, b.y + h, b.z, b.w, h, b.d))
+    } else {
+        let h = b.d / 2.0;
+        (Aabb::new(b.x, b.y, b.z, b.w, b.h, h), Aabb::new(b.x, b.y, b.z + h, b.w, b.h, h))
+    }
+}
+
+/// A node should split iff it overflows `item_limit`, hasn't hit the `min_cell`
+/// floor, and its items aren't all at one point (inseparable) — mirrors `divide`.
+fn splittable3<T: Positioned3>(items: &[(u32, T)], item_limit: usize, min_cell: f64, bbox: Aabb) -> bool {
+    items.len() > item_limit
+        && bbox.w.max(bbox.h).max(bbox.d) > min_cell
+        && { let first = items[0].1.position(); !items.iter().all(|(_, it)| it.position() == first) }
+}
+
+/// Recursively build the arena in DFS order. Returns the new node's id.
+fn build3_serial<T: Positioned3>(nodes: &mut Vec<Node3<T>>, locs: &mut [ItemLoc], item_limit: usize, min_cell: f64, bbox: Aabb, parent: Option<Node3Id>, items: Vec<(u32, T)>) -> Node3Id {
+    let id = Node3Id(nodes.len() as u32);
+    nodes.push(Node3 { bbox, parent, children: None, items: Vec::new(), hs: Vec::new() });
+    if !splittable3(&items, item_limit, min_cell, bbox) {
+        let node = &mut nodes[id.0 as usize];
+        for (h, it) in items {
+            let slot = node.items.len() as u32;
+            locs[h as usize] = ItemLoc { node: id, slot };
+            node.items.push(it); node.hs.push(h);
+        }
+        return id;
+    }
+    let (ab, bb) = split_halves3(bbox);
+    let (mut ai, mut bi) = (Vec::new(), Vec::new());
+    for (h, it) in items { if ab.contains(it.position()) { ai.push((h, it)); } else { bi.push((h, it)); } }
+    let a = build3_serial(nodes, locs, item_limit, min_cell, ab, Some(id), ai);
+    let b = build3_serial(nodes, locs, item_limit, min_cell, bb, Some(id), bi);
+    nodes[id.0 as usize].children = Some([a, b]);
+    id
+}
+
+/// A subtree built off-arena (so the recursion can fan out over threads); the
+/// child boxes are recomputed on flatten (deterministic), so they aren't stored.
+#[cfg(feature = "parallel")]
+enum Build3<T> { Leaf(Vec<(u32, T)>), Split(Box<Build3<T>>, Box<Build3<T>>) }
+
+/// Parallel partition (rayon `join` per split) producing a [`Build3`] tree.
+#[cfg(feature = "parallel")]
+fn build3_par<T: Positioned3 + Send>(item_limit: usize, min_cell: f64, bbox: Aabb, items: Vec<(u32, T)>) -> Build3<T> {
+    if !splittable3(&items, item_limit, min_cell, bbox) { return Build3::Leaf(items); }
+    let (ab, bb) = split_halves3(bbox);
+    let (mut ai, mut bi) = (Vec::new(), Vec::new());
+    for (h, it) in items { if ab.contains(it.position()) { ai.push((h, it)); } else { bi.push((h, it)); } }
+    let (a, b) = rayon::join(
+        || build3_par(item_limit, min_cell, ab, ai),
+        || build3_par(item_limit, min_cell, bb, bi),
+    );
+    Build3::Split(Box::new(a), Box::new(b))
+}
+
+/// Serial flatten of a [`Build3`] tree into the arena (cheap tail after the
+/// parallel partition). Recomputes the child boxes with `split_halves3`.
+#[cfg(feature = "parallel")]
+fn flatten3<T: Positioned3>(nodes: &mut Vec<Node3<T>>, locs: &mut [ItemLoc], bbox: Aabb, parent: Option<Node3Id>, build: Build3<T>) -> Node3Id {
+    let id = Node3Id(nodes.len() as u32);
+    nodes.push(Node3 { bbox, parent, children: None, items: Vec::new(), hs: Vec::new() });
+    match build {
+        Build3::Leaf(items) => {
+            let node = &mut nodes[id.0 as usize];
+            for (h, it) in items {
+                let slot = node.items.len() as u32;
+                locs[h as usize] = ItemLoc { node: id, slot };
+                node.items.push(it); node.hs.push(h);
+            }
+        }
+        Build3::Split(a, b) => {
+            let (ab, bb) = split_halves3(bbox);
+            let ca = flatten3(nodes, locs, ab, Some(id), *a);
+            let cb = flatten3(nodes, locs, bb, Some(id), *b);
+            nodes[id.0 as usize].children = Some([ca, cb]);
+        }
+    }
+    id
 }
 
 /// Squared distance from `q` to the nearest point of box `b` (0 if inside).

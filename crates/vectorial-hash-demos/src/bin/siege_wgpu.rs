@@ -692,9 +692,11 @@ impl State {
         }
     }
 
-    /// Look direction from yaw/pitch (used by the free-fly camera).
+    /// Look direction from yaw/pitch — the SAME direction the orbit camera looks
+    /// (eye → map centre), so toggling to free-fly doesn't swing the view around.
+    /// Positive pitch looks down, negative looks up.
     fn forward(&self) -> Vec3 {
-        Vec3::new(self.pitch.cos() * self.yaw.cos(), -self.pitch.sin(), self.pitch.cos() * self.yaw.sin())
+        -Vec3::new(self.pitch.cos() * self.yaw.cos(), self.pitch.sin(), self.pitch.cos() * self.yaw.sin())
     }
 
     fn camera(&self) -> CameraUniform {
@@ -1241,7 +1243,8 @@ async fn run() {
                             st.apply_slider(w, position.x as f32);
                         } else if st.dragging {
                             st.yaw += (position.x - st.last_mouse.0) as f32 * 0.01;
-                            st.pitch = (st.pitch + (position.y - st.last_mouse.1) as f32 * 0.01).clamp(0.05, 1.5);
+                            let (lo, hi) = if st.free_cam { (-1.45, 1.45) } else { (0.05, 1.5) }; // free-fly can look up
+                            st.pitch = (st.pitch + (position.y - st.last_mouse.1) as f32 * 0.01).clamp(lo, hi);
                         }
                         st.last_mouse = (position.x, position.y);
                     }
@@ -1264,7 +1267,8 @@ async fn run() {
                                 if st.ui_drag != 0 { let w = st.ui_drag; st.apply_slider(w, mx); }
                                 else if st.dragging {
                                     st.yaw += (t.location.x - st.last_mouse.0) as f32 * 0.01;
-                                    st.pitch = (st.pitch + (t.location.y - st.last_mouse.1) as f32 * 0.01).clamp(0.05, 1.5);
+                                    let (lo, hi) = if st.free_cam { (-1.45, 1.45) } else { (0.05, 1.5) };
+                                    st.pitch = (st.pitch + (t.location.y - st.last_mouse.1) as f32 * 0.01).clamp(lo, hi);
                                 }
                                 st.last_mouse = (t.location.x, t.location.y);
                             }
