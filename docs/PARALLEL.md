@@ -147,6 +147,51 @@ cost**, because keeping bodies spread keeps the spatial index shallow and its
 queries fast. It's a neat demonstration that *good spatial distribution is a
 performance feature*, not just a visual one.
 
+## Siege: CPU-only vs full-pipeline FPS (headless, by thread count)
+
+Two headless benchmarks measure the real per-frame budget of the `siege_wgpu`
+demo at **20 000 units, mid-clash** — both warm the sim to the clash first (the
+armies start apart; the early spread frames are cheap and unrepresentative), then
+sweep the thread count. Measured on an RTX 4080 SUPER at 1600×1000:
+
+- `cargo run -p vectorial-hash-demos --example siege_cpu_bench --release` — the
+  **CPU sim only** (index rebuild + parallel `decide` + serial `apply`), no GPU.
+- `SIEGE_BENCH=1 cargo run -p vectorial-hash-demos --bin siege_wgpu --release` —
+  the **full pipeline offscreen**: sim + build instances + render to a texture,
+  **no window, no present/vsync**, blocking on the GPU each frame.
+
+```
+ threads   CPU-only fps   offscreen (sim+render) fps
+       1        24.2                14.8
+       2        39.8                21.0
+       4        60.2                26.8
+       6        71.5                29.5
+       8        76.2            ~31  (peak)
+      12        81.7                29.1
+      16        91.8                29.5
+```
+
+Reading it:
+
+- **CPU sim alone**: 24 fps (1 thread) → **92 fps (16 threads)**, scaling 3.8×.
+  Only `decide` parallelises; the serial index-rebuild + `apply` cap it (Amdahl),
+  so efficiency falls from 82 % (2 threads) to 24 % (16) — the sweet spot is
+  ~half the cores.
+- **Add the GPU render** and the ceiling drops to **~15–31 fps**, peaking at
+  **~7–8 threads** then *plateauing*: the render is now a big **fixed** per-frame
+  cost, so past ~8 threads the CPU `decide` is no longer the bottleneck and more
+  cores do nothing. At 20 k, the geometry (skinned units + horses + forest) makes
+  the GPU a real limiter.
+- **This offscreen number is a conservative *lower bound*.** It blocks CPU↔GPU
+  each frame (`device.poll(Wait)`), so it measures `CPU + GPU` *summed*. The real
+  windowed demo **pipelines** them (the CPU builds frame N+1 while the GPU renders
+  N), so on-screen FPS is closer to `1/max(CPU, GPU)` — higher. (That's why the
+  demo shows ~48 fps at 4 threads where this blocked bench reads ~27.)
+
+The takeaway for the thread slider: **more threads is not always better** — past
+the point where the GPU (or the serial sim tail) dominates, extra cores are idle
+overhead. The slider lets you find the knee for your machine + unit count.
+
 ## Why not parallelise the build / relocation too?
 
 - **Build (`insert` loop):** a tree build is a sequence of dependent structural
