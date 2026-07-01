@@ -2575,6 +2575,7 @@ dependencies = [
  "getrandom 0.2.17",
  "glam",
  "gltf",
+ "js-sys",
  "macroquad",
  "pollster",
  "rayon",

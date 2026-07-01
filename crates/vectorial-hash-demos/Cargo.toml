@@ -20,7 +20,7 @@ parallel = ["vectorial-hash/parallel"]
 # Builds the `siege_wgpu` binary for the **web** (WebGPU via wasm-bindgen). Pulls
 # the wgpu stack + the wasm glue only when set, so the macroquad critters wasm
 # builds stay lean. Pass `--features web-wgpu` to the wasm32 build of `siege_wgpu`.
-web-wgpu = ["dep:wgpu", "dep:winit", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:console_error_panic_hook", "dep:web-sys", "dep:web-time", "dep:getrandom"]
+web-wgpu = ["dep:wgpu", "dep:winit", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:console_error_panic_hook", "dep:web-sys", "dep:web-time", "dep:getrandom", "dep:js-sys"]
 
 [dependencies]
 vectorial-hash = { workspace = true }
@@ -59,4 +59,5 @@ wasm-bindgen-futures = { version = "0.4", optional = true }
 console_error_panic_hook = { version = "0.1", optional = true }
 web-time = { version = "1", optional = true }
 getrandom = { version = "0.2", features = ["js"], optional = true }
-web-sys = { version = "0.3", optional = true, features = ["Document", "Window", "Element", "HtmlCanvasElement"] }
+js-sys = { version = "0.3", optional = true }
+web-sys = { version = "0.3", optional = true, features = ["Document", "Window", "Element", "HtmlCanvasElement", "Request", "RequestInit", "Response"] }

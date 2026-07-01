@@ -37,14 +37,31 @@ use vectorial_hash::{Aabb, Tree3};
 // two renderers stay in lockstep — see `siege_sim`. This file is wgpu render-only.
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
+#[cfg(not(target_arch = "wasm32"))]
+use vectorial_hash_demos::siege_sim::model_for;
+#[cfg(target_arch = "wasm32")]
+use vectorial_hash_demos::siege_sim::SIEGE_MODEL_FILES;
 use vectorial_hash_demos::siege_sim::{
-    apply, decide, default_body_radius, faction_tint, ground_height, model_for, set_map_seed,
+    apply, decide, default_body_radius, faction_tint, ground_height, model_file, set_map_seed,
     spawn_army, terrain_height, terrain_surface, volcano_step, Craters, Faction, Fx, FxKind, IUnit,
     Kind, ProjKind, Projectile, Puff, Rng, SepTables, Unit, Volcano, ANIM_FRAMES, MOVE_PREFS,
     PER_FACTION, SKY, WORLD,
 };
 
 const MAX_POP: usize = 10000; // max army/side the slider + [ ] keys allow (instance-buffer cap)
+
+/// Fetch a file over HTTP (web build) — used to stream the `.glb` models at
+/// startup instead of baking them into the wasm (keeps siege_wgpu.wasm small).
+#[cfg(target_arch = "wasm32")]
+async fn fetch_bytes(url: &str) -> Vec<u8> {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+    let win = web_sys::window().expect("no window");
+    let resp: web_sys::Response = JsFuture::from(win.fetch_with_str(url)).await
+        .unwrap_or_else(|e| panic!("fetch {url}: {e:?}")).dyn_into().expect("not a Response");
+    let buf = JsFuture::from(resp.array_buffer().expect("array_buffer")).await.expect("await array_buffer");
+    js_sys::Uint8Array::new(&buf).to_vec()
+}
 
 // ============================================================ terrain
 
@@ -362,18 +379,42 @@ impl State {
             multiview: None,
         });
 
+        // On the web, stream the models from `models/<name>.glb` at startup so
+        // they aren't baked into the wasm (keeps it ~1.5 MB instead of ~9). Native
+        // embeds them. `unit_bytes` / `prop_bytes` hide the split.
+        #[cfg(target_arch = "wasm32")]
+        let model_table: std::collections::HashMap<&'static str, Vec<u8>> = {
+            let mut m = std::collections::HashMap::new();
+            for &name in SIEGE_MODEL_FILES {
+                m.insert(name, fetch_bytes(&format!("models/{name}")).await);
+            }
+            m
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let unit_bytes = |f: Faction, k: Kind| -> Vec<u8> { model_for(f, k).to_vec() };
+        #[cfg(target_arch = "wasm32")]
+        let unit_bytes = |f: Faction, k: Kind| -> Vec<u8> { model_table[model_file(f, k)].clone() };
+        #[cfg(not(target_arch = "wasm32"))]
+        let prop_bytes = |name: &str| -> Vec<u8> {
+            match name {
+                "castle.glb" => include_bytes!("../../assets/siege/models/castle.glb").to_vec(),
+                _ => unreachable!("unknown siege prop {name}"),
+            }
+        };
+        #[cfg(target_arch = "wasm32")]
+        let prop_bytes = |name: &str| -> Vec<u8> { model_table[name].clone() };
+
         // One GpuModel per distinct (faction,kind) glb — the dragon and the cannon
-        // are shared across factions, deduped by the byte-slice pointer.
+        // are shared across factions, deduped by file name.
         let mut models: Vec<GpuModel> = Vec::new();
         let mut model_idx = [[0usize; 8]; 2];
-        let mut seen: Vec<(*const u8, usize)> = Vec::new();
+        let mut seen: Vec<(&'static str, usize)> = Vec::new();
         for f in Faction::ALL {
             for k in Kind::ALL {
-                let bytes = model_for(f, k);
-                let ptr = bytes.as_ptr();
-                let idx = match seen.iter().find(|(p, _)| *p == ptr) {
+                let name = model_file(f, k);
+                let idx = match seen.iter().find(|(n, _)| *n == name) {
                     Some(&(_, i)) => i,
-                    None => { let i = models.len(); models.push(build_gpu_model(&device, &cam_buf, &skin_layout, bytes)); seen.push((ptr, i)); i }
+                    None => { let i = models.len(); models.push(build_gpu_model(&device, &cam_buf, &skin_layout, &unit_bytes(f, k))); seen.push((name, i)); i }
                 };
                 model_idx[f.index()][k.index()] = idx;
             }
@@ -401,7 +442,7 @@ impl State {
         // Castle model (static) for the two keeps — two fixed instances, facing
         // the map centre, tinted by faction. Reuses the skin pipeline (1 identity
         // joint via the static fallback).
-        let castle_model = build_gpu_model(&device, &cam_buf, &skin_layout, include_bytes!("../../assets/siege/models/castle.glb"));
+        let castle_model = build_gpu_model(&device, &cam_buf, &skin_layout, &prop_bytes("castle.glb"));
         let castle_inst: Vec<SkinInstance> = Faction::ALL.iter().map(|&f| {
             let (cx, cz) = f.castle();
             let yaw = ((WORLD * 0.5 - cx) as f32).atan2((WORLD * 0.5 - cz) as f32);
