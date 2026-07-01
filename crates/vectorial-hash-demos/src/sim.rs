@@ -10,6 +10,10 @@
 
 use std::collections::{HashMap, HashSet};
 use crate::time::Instant; // wasm-compatible drop-in (native + browser)
+// The combat wave's attack culls fan out over a live-sized rayon pool (native
+// only; wasm has no threads and culls the wave serially).
+#[cfg(not(target_arch = "wasm32"))]
+use rayon::prelude::*;
 
 use vectorial_hash::{
     IntegerTree, IPoint, IPositioned, IRect, IUpdateStrategy, PlacedTemplate, Point as VPoint,
@@ -201,6 +205,16 @@ impl Mode {
             _ => None,
         }
     }
+}
+
+/// One combat cull's timing + dual-mode mismatch, produced by the read-only
+/// [`Sims::cull_attack_ro`] so a parallel wave can fold its stats afterward.
+#[derive(Default, Clone, Copy)]
+pub struct AtkStat {
+    pub t_us: f64, pub t_n: u32,
+    pub q_us: f64, pub q_n: u32,
+    pub it_us: f64, pub it_n: u32,
+    pub mismatch: bool,
 }
 
 /// Per-frame accumulated timings for one structure, in microseconds.
@@ -431,38 +445,52 @@ impl Sims {
     }
 
     pub fn cull_attack<Sh: Shape>(&mut self, shape: &Sh) -> Vec<(u32, VPoint)> {
+        let (hits, st) = self.cull_attack_ro(shape);
+        self.fold_atk_stat(st);
+        hits
+    }
+
+    /// **Read-only** combat cull: same result as [`Sims::cull_attack`] but returns
+    /// the per-structure timing + dual-mode mismatch instead of mutating `self`,
+    /// so a whole wave of attacks can be culled in **parallel** (`&self`, hence
+    /// `Sync`) and the stats folded serially afterward with [`Sims::fold_atk_stat`].
+    pub fn cull_attack_ro<Sh: Shape>(&self, shape: &Sh) -> (Vec<(u32, VPoint)>, AtkStat) {
+        let mut st = AtkStat::default();
         let mut tree_ids: Option<Vec<(u32, VPoint)>> = None;
         let mut quad_ids: Option<Vec<(u32, VPoint)>> = None;
         let mut itree_ids: Option<Vec<(u32, VPoint)>> = None;
         if let Some(t) = &self.tree {
             let s = Instant::now();
             let hits = t.cull(shape);
-            self.t.atk += s.elapsed().as_secs_f64() * 1e6;
-            self.t.atk_n += 1;
+            st.t_us = s.elapsed().as_secs_f64() * 1e6; st.t_n = 1;
             tree_ids = Some(hits.iter().map(|c| (c.id, c.pos)).collect());
         }
         if let Some(q) = &self.quad {
             let s = Instant::now();
             let hits = q.cull(shape);
-            self.q.atk += s.elapsed().as_secs_f64() * 1e6;
-            self.q.atk_n += 1;
+            st.q_us = s.elapsed().as_secs_f64() * 1e6; st.q_n = 1;
             quad_ids = Some(hits.iter().map(|c| (c.id, c.pos)).collect());
         }
         if let Some(t) = &self.itree {
             let s = Instant::now();
             let hits = t.cull(shape);
-            self.it.atk += s.elapsed().as_secs_f64() * 1e6;
-            self.it.atk_n += 1;
+            st.it_us = s.elapsed().as_secs_f64() * 1e6; st.it_n = 1;
             itree_ids = Some(hits.iter().map(|c| (c.id, c.pos)).collect());
         }
         if let (Some(a), Some(b)) = (&tree_ids, &quad_ids) {
             let sa: HashSet<u32> = a.iter().map(|(id, _)| *id).collect();
             let sb: HashSet<u32> = b.iter().map(|(id, _)| *id).collect();
-            if sa != sb {
-                self.mismatches += 1;
-            }
+            st.mismatch = sa != sb;
         }
-        tree_ids.or(quad_ids).or(itree_ids).unwrap_or_default()
+        (tree_ids.or(quad_ids).or(itree_ids).unwrap_or_default(), st)
+    }
+
+    /// Fold one (or a batch's) [`AtkStat`] into the frame's accumulated timings.
+    pub fn fold_atk_stat(&mut self, st: AtkStat) {
+        self.t.atk += st.t_us; self.t.atk_n += st.t_n;
+        self.q.atk += st.q_us; self.q.atk_n += st.q_n;
+        self.it.atk += st.it_us; self.it.atk_n += st.it_n;
+        if st.mismatch { self.mismatches += 1; }
     }
 
     pub fn vision_prey(&mut self, pos: VPoint, self_id: u32) -> Option<VPoint> {
@@ -763,6 +791,12 @@ pub struct Sim {
     /// square and (for the `IntegerTree` mode) a power of two — see
     /// [`WORLD_STEPS`].
     world_size: f64,
+    /// Live thread count + pool for the combat wave's parallel culls (native
+    /// only). Sized by the demo's thread slider via [`Sim::set_threads`].
+    #[cfg(not(target_arch = "wasm32"))]
+    n_threads: usize,
+    #[cfg(not(target_arch = "wasm32"))]
+    pool: rayon::ThreadPool,
 }
 
 /// Selectable world sizes for the live stepper. All powers of two (square),
@@ -822,8 +856,29 @@ impl Sim {
             respawns: Vec::new(),
             next_id: 0,
             world_size: MAP_W,
+            #[cfg(not(target_arch = "wasm32"))]
+            n_threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+            #[cfg(not(target_arch = "wasm32"))]
+            pool: rayon::ThreadPoolBuilder::new().build().unwrap(),
         }
     }
+
+    /// Size the rayon pool that the combat wave's culls fan out over (native
+    /// only — wasm has no threads and culls the wave serially). The `critters`
+    /// demo drives this from a live thread slider; the crossover is the same one
+    /// `docs/PARALLEL.md` measures, now visible in the 2D combat demo.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_threads(&mut self, n: usize) {
+        let n = n.max(1);
+        if n != self.n_threads {
+            self.n_threads = n;
+            self.pool = rayon::ThreadPoolBuilder::new().num_threads(n).build().unwrap();
+        }
+    }
+
+    /// Current combat-cull thread count (native).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn threads(&self) -> usize { self.n_threads }
 
     pub fn respawn_queue_len(&self) -> usize {
         self.respawns.len()
@@ -913,10 +968,18 @@ impl Sim {
         let kind_of: HashMap<u32, Kind> = snap2.iter().map(|&(id, k, _, _)| (id, k)).collect();
         let mut killed: Vec<(u32, VPoint, Kind, Kind)> = Vec::new();
         let mut killed_ids: HashSet<u32> = HashSet::new();
+
+        // Combat wave — decide → cull → apply, so the per-critter attack culls
+        // (the many-queries-per-frame workload) fan out over the thread pool.
+        //
+        // 1) DECIDE (serial): tick cooldowns (rng) and build each firing critter's
+        //    attack shape. Hunter's `vision_prey` is a &mut cull (its own timing),
+        //    so this pass stays serial. Unlike the old interleaved loop, a critter
+        //    that will die this frame still decides here — its shot is discarded in
+        //    (3) if it was killed first (so the outcome matches, bar the rng order).
+        let ar = params.agent_radius;
+        let mut plan: Vec<(u32, Kind, VPoint, AttackShape)> = Vec::new();
         for &(id, kind, pos, _) in &snap2 {
-            if killed_ids.contains(&id) {
-                continue;
-            }
             let (cd_min, cd_max) = kind.cooldown();
             let cd = match self.cooldowns.get_mut(&id) {
                 Some(v) => v,
@@ -926,13 +989,9 @@ impl Sim {
                 }
             };
             *cd -= dt;
-            if *cd > 0.0 {
-                continue;
-            }
+            if *cd > 0.0 { continue; }
             let reset = self.rng.range(cd_min, cd_max) / params.fire_rate;
             *self.cooldowns.get_mut(&id).unwrap() = reset;
-
-            let ar = params.agent_radius;
             let attack = match kind {
                 Kind::Hunter => self.sims.vision_prey_dilated(pos, id, ar).and_then(|tpos| {
                     make_attack_dilated(arsenal, DROP_ID, pos, Some((tpos.x - pos.x, tpos.y - pos.y)), ar)
@@ -943,22 +1002,42 @@ impl Sim {
                 }
                 Kind::Pulsar => make_attack_dilated(arsenal, CIRCLE_ID, pos, None, ar),
             };
-            if let Some(atk) = attack {
-                for (vid, vpos) in self.sims.cull_attack(&atk) {
-                    if vid != id && !killed_ids.contains(&vid) {
-                        killed_ids.insert(vid);
-                        let vkind = kind_of.get(&vid).copied().unwrap_or(Kind::Drifter);
-                        killed.push((vid, vpos, vkind, kind));
-                    }
+            if let Some(atk) = attack { plan.push((id, kind, pos, atk)); }
+        }
+
+        // 2) CULL (parallel native / serial wasm): each attack is a read-only cull
+        //    against the shared index, so the hit sets are identical to the serial
+        //    path regardless of thread count — the slider only changes speed.
+        let culled: Vec<(Vec<(u32, VPoint)>, AtkStat)> = {
+            let sims = &self.sims;
+            #[cfg(not(target_arch = "wasm32"))]
+            { self.pool.install(|| plan.par_iter().map(|(_, _, _, atk)| sims.cull_attack_ro(atk)).collect()) }
+            #[cfg(target_arch = "wasm32")]
+            { plan.iter().map(|(_, _, _, atk)| sims.cull_attack_ro(atk)).collect() }
+        };
+
+        // 3) APPLY (serial): fold the per-cull stats, then resolve kills in order —
+        //    a critter killed by an earlier attacker this frame has its own shot
+        //    fizzle (the `killed_ids` skip), matching the old interleaved rule.
+        for (i, (hits, st)) in culled.into_iter().enumerate() {
+            self.sims.fold_atk_stat(st);
+            let (id, kind, pos, atk) = &plan[i];
+            let (id, kind, pos) = (*id, *kind, *pos);
+            if killed_ids.contains(&id) { continue; }
+            for (vid, vpos) in hits {
+                if vid != id && !killed_ids.contains(&vid) {
+                    killed_ids.insert(vid);
+                    let vkind = kind_of.get(&vid).copied().unwrap_or(Kind::Drifter);
+                    killed.push((vid, vpos, vkind, kind));
                 }
-                self.events.push(SimEvent::Attack {
-                    kind,
-                    origin: pos,
-                    shape_id: if kind == Kind::Pulsar { CIRCLE_ID } else { DROP_ID },
-                    angle_deg: atk.angle_deg,
-                    origin_int: atk.origin,
-                });
             }
+            self.events.push(SimEvent::Attack {
+                kind,
+                origin: pos,
+                shape_id: if kind == Kind::Pulsar { CIRCLE_ID } else { DROP_ID },
+                angle_deg: atk.angle_deg,
+                origin_int: atk.origin,
+            });
         }
         for (vid, vpos, vkind, attacker) in killed {
             if self.sims.remove(vpos, vid).is_some() {

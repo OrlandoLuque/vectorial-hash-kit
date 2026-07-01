@@ -157,10 +157,16 @@ FPS review: free wins applied, quality-trade-off levers reported).
   **ranged cover** (arrows/bolts do ½ damage to a target in the trees). Canopies
   drawn in both binaries (green sphere blobs). Copse count/size + factors are
   easy knobs; **balance pass** still wants the user's eyes on the HUD.
-- **2D critters thread slider (#56 opt A)** — refactor `Sim::cull_attack` to a
-  read-only cull (+ post-hoc stat/mismatch fold) and restructure `Sim::step`'s
-  firing loop into decide → parallel cull → apply, gated by the brute-force
-  tests. Queued as a focused pass (touches the bench-shared sim).
+- ~~**2D critters thread slider (#56 opt A)**~~ — **done.** `Sims::cull_attack`
+  split into a read-only `cull_attack_ro` (returns timing/mismatch) + `fold_atk_stat`;
+  `Sim::step`'s firing loop restructured into decide (serial, rng) → cull
+  (parallel over a live-sized pool `Sim::set_threads`, native / serial wasm) →
+  apply (serial, order-preserving kill resolution). `critters` gained a **threads**
+  slider. Verified via the headless bench in `--mode both`: *all culls still
+  agree* (the dual-index mismatch check stays 0) and kills resolve — the parallel
+  path is result-identical to serial. (One accepted change: a critter that dies
+  this frame still decided/culled, discarded on apply, so the rng draw order
+  shifts slightly — no determinism test pins it.)
 
 **Thread-slider retrofit for the critters demos** (user, 2026-06-27) —
 **`critters3d` done**; **2D `critters` deferred.** The 3D combat wave now runs

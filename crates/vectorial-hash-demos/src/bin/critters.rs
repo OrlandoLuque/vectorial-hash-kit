@@ -293,6 +293,12 @@ async fn main() {
     let mut respawn_f: f32 = RESPAWN_DELAY as f32;
     let mut speed_f: f32 = 1.0;
     let mut fire_f: f32 = 1.0;
+    // Live thread count for the combat wave's parallel attack culls (native only;
+    // wasm has no threads and culls the wave serially). Defaults to all cores.
+    #[cfg(not(target_arch = "wasm32"))]
+    let max_threads_f = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f32;
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut threads_f: f32 = max_threads_f;
     // Agent body radius (Minkowski dilation): 0 = point agents. Toggled with
     // `D` and tuned with the panel slider.
     let mut agent_radius_f: f32 = 0.0;
@@ -458,6 +464,11 @@ async fn main() {
             ui.slider(hash!(), "respawn s", 0.5f32..10f32, &mut respawn_f);
             ui.slider(hash!(), "speed x", 0.25f32..4f32, &mut speed_f);
             ui.slider(hash!(), "fire x", 0.25f32..3f32, &mut fire_f);
+            // Combat attack culls fan out over a rayon pool; size it live (native
+            // only). Watch the "attack cull" graph / fps as you drag — the same
+            // crossover PARALLEL.md measures, now in the 2D demo.
+            #[cfg(not(target_arch = "wasm32"))]
+            ui.slider(hash!(), "threads", 1f32..max_threads_f, &mut threads_f);
             ui.separator();
             ui.slider(hash!(), "agent r [D]", 0f32..40f32, &mut agent_radius_f);
         });
@@ -505,6 +516,8 @@ async fn main() {
                 no_attack: false,
                 agent_radius: agent_radius_f as f64,
             };
+            #[cfg(not(target_arch = "wasm32"))]
+            sim.set_threads(threads_f.round() as usize);
             sim.step(dt, &arsenal, &params);
             consume_events(&mut sim, &arsenal, now, &mut effects, &mut rings);
         }
