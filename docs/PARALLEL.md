@@ -135,18 +135,17 @@ space" push) on/off, so you can A/B both the look and the cost. Two effects:
    ground, flocking alone keeps a tidy distribution cheaply; the failure mode was
    the *dragons* (now fixed — separation is altitude-layered).
 
-Compare live via the on-screen counters (wgpu: `FPS` + the green/red `COL` tag;
-macroquad: the `fps`/`collisions` line). Fill in your machine's readings:
+Compare live via the on-screen counters (wgpu: `FPS`/`THR` + the green/red `COL`
+tag; macroquad: the `fps`/`collisions` line).
 
-```
- wgpu · pop 20000 · <your GPU>          FPS
- collisions ON  (separation, default)   ____
- collisions OFF (overlaps allowed)      ____
-```
-
-Expectation on a GPU-bound frame (20k units): the two are close, because the
-limiter is the render, not the AI — but watch whether OFF *drops* as the piled
-units degenerate the index over a few seconds.
+**Observed (user, wgpu, ~20k units): turning collisions OFF *lowers* FPS.** This
+confirms the second-order effect — the direct saving (a few force lookups) is
+dwarfed by the cost of the units piling into shared cells and deepening the
+index, so every `knn`/`cull`/`update` that frame walks a taller tree. The
+counter-intuitive headline: **collision avoidance here is a net perf *win*, not a
+cost**, because keeping bodies spread keeps the spatial index shallow and its
+queries fast. It's a neat demonstration that *good spatial distribution is a
+performance feature*, not just a visual one.
 
 ## Why not parallelise the build / relocation too?
 

@@ -854,6 +854,12 @@ impl State {
         let col_on = vectorial_hash_demos::siege_sim::separation_on();
         let colc = if col_on { [0.55, 1.0, 0.60, 1.0] } else { [1.0, 0.55, 0.40, 1.0] };
         push_text(&mut ui, hx, 102.0, 3.0, colc, "COL", sw, sh);
+        // Thread count driving the parallel `decide` pass (wasm has no threads → 1).
+        #[cfg(not(target_arch = "wasm32"))]
+        let thr = self.n_threads;
+        #[cfg(target_arch = "wasm32")]
+        let thr = 1usize;
+        push_text(&mut ui, hx, 120.0, 3.0, white, &format!("THR {thr}"), sw, sh);
         ui.truncate(16384); // never exceed the ui buffer (guards write_buffer)
         self.queue.write_buffer(&self.ui_buf, 0, bytemuck::cast_slice(&ui));
         let ui_n = ui.len() as u32;
