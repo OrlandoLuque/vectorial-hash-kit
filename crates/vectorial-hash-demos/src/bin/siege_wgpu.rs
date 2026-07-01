@@ -42,7 +42,7 @@ use vectorial_hash_demos::siege_sim::model_for;
 #[cfg(target_arch = "wasm32")]
 use vectorial_hash_demos::siege_sim::SIEGE_MODEL_FILES;
 use vectorial_hash_demos::siege_sim::{
-    apply, decide, default_body_radius, faction_tint, ground_height, model_file, set_map_seed,
+    apply, decide, default_body_radius, faction_tint, forest_trees, ground_height, model_file, set_map_seed,
     spawn_army, terrain_height, terrain_surface, volcano_step, Craters, Faction, Fx, FxKind, IUnit,
     Kind, ProjKind, Projectile, Puff, Rng, SepTables, Unit, Volcano, ANIM_FRAMES, MOVE_PREFS,
     PER_FACTION, SKY, WORLD,
@@ -338,6 +338,9 @@ struct State {
     // Cavalry mounts: a horse under every knight (parity with the macroquad demo).
     horse_model: GpuModel,
     horse_inst_buf: wgpu::Buffer,
+    // Forest canopies: green sphere blobs (static per map) reusing the sphere mesh.
+    tree_inst_buf: wgpu::Buffer,
+    tree_n: u32,
     // Projectile markers: a small sphere drawn instanced per live projectile.
     proj_model: GpuModel,
     proj_inst_buf: wgpu::Buffer,
@@ -521,6 +524,22 @@ impl State {
         let horse_model = build_gpu_model(&device, &cam_buf, &skin_layout, &prop_bytes("horse.glb"));
         let horse_inst_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("horse-inst"), size: (MAX_POP * 2 * std::mem::size_of::<SkinInstance>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
 
+        // Forest canopies: two green sphere blobs per tree (movement slowdown +
+        // ranged cover live in the sim). Static per map — drawn with the sphere mesh.
+        let mut tree_inst: Vec<SkinInstance> = Vec::new();
+        for (fx, fz) in forest_trees() {
+            let ty = terrain_height(fx, fz) as f32;
+            let blob = |y: f32, r: f32, c: [f32; 4]| {
+                let m = glam::Mat4::from_translation(glam::Vec3::new(fx as f32, ty + y, fz as f32)) * glam::Mat4::from_scale(glam::Vec3::splat(r));
+                SkinInstance { model: m.to_cols_array_2d(), color: c, frame_base: 0, _pad: [0; 3] }
+            };
+            tree_inst.push(blob(9.0, 7.5, [0.11, 0.32, 0.13, 1.0]));
+            tree_inst.push(blob(15.0, 5.2, [0.16, 0.42, 0.18, 1.0]));
+        }
+        let tree_n = tree_inst.len() as u32;
+        if tree_inst.is_empty() { tree_inst.push(SkinInstance { model: [[0.0; 4]; 4], color: [0.0; 4], frame_base: 0, _pad: [0; 3] }); }
+        let tree_inst_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("tree-inst"), contents: bytemuck::cast_slice(&tree_inst), usage: wgpu::BufferUsages::VERTEX });
+
         // Projectile sphere + its instance buffer (one instance per live shot).
         let proj_model = upload_skinned(&device, &cam_buf, &skin_layout, &proj_sphere());
         let proj_inst_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("proj-inst"), size: (512 * std::mem::size_of::<SkinInstance>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
@@ -578,6 +597,7 @@ impl State {
             skin_pipeline, models, model_idx, inst_buf,
             castle_model, castle_inst_buf,
             horse_model, horse_inst_buf,
+            tree_inst_buf, tree_n,
             proj_model, proj_inst_buf,
             line_pipeline, line_buf, line_cap, line_verts: Vec::new(),
             ui_pipeline, ui_buf, ui_drag: 0,
@@ -818,7 +838,7 @@ impl State {
         }
         tris += (self.castle_model.nidx as u64 / 3) * 2;
         tris += (self.horse_model.nidx as u64 / 3) * horse_n as u64;
-        tris += (self.proj_model.nidx as u64 / 3) * proj_n as u64;
+        tris += (self.proj_model.nidx as u64 / 3) * (proj_n + self.tree_n) as u64;
         // Numeric HUD — a labelled column top-right (wgpu has no text; 3x5 font).
         let white = [0.92, 0.94, 0.98, 1.0];
         let redc = [1.0, 0.50, 0.44, 1.0];
@@ -876,6 +896,15 @@ impl State {
             pass.set_vertex_buffer(1, self.castle_inst_buf.slice(..));
             pass.set_index_buffer(cm.ibuf.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..cm.nidx, 0, 0..2);
+            // forest canopies — green sphere blobs (reuse the projectile sphere mesh).
+            if self.tree_n > 0 {
+                let pm = &self.proj_model;
+                pass.set_bind_group(0, &pm.bind, &[]);
+                pass.set_vertex_buffer(0, pm.vbuf.slice(..));
+                pass.set_vertex_buffer(1, self.tree_inst_buf.slice(..));
+                pass.set_index_buffer(pm.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..pm.nidx, 0, 0..self.tree_n);
+            }
             // projectiles — the sphere model, one instance per live shot.
             if proj_n > 0 {
                 let pm = &self.proj_model;

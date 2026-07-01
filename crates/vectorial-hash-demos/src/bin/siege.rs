@@ -412,6 +412,10 @@ async fn main() {
     let max_frames: Option<u64> = std::env::var("SIEGE_MAX_FRAMES").ok().and_then(|s| s.parse().ok());
     let mut frame_no: u64 = 0;
 
+    // Forest canopy positions (deterministic per map seed) — the woods that slow
+    // movement + give ranged cover in the sim; drawn as stacked green blobs.
+    let forest_xz = forest_trees();
+
     loop {
         // ----- input: orbit / zoom / controls -----
         let mp = mouse_position();
@@ -559,6 +563,13 @@ async fn main() {
                 castle_inst.push(EffectInstance::new(m, faction_tint(f)));
             }
             tris += renderer.draw_models(gl.quad_context, &castle, &castle_inst, mvp, light);
+        }
+        // Forest canopies: two stacked green blobs per tree (cover + slowdown are
+        // in the sim). Cheap draw_sphere; the set is fixed per map.
+        for &(fx, fz) in &forest_xz {
+            let ty = terrain_height(fx, fz) as f32;
+            draw_sphere(vec3(fx as f32, ty + 9.0, fz as f32), 7.5, None, Color::new(0.11, 0.32, 0.13, 1.0));
+            draw_sphere(vec3(fx as f32, ty + 15.0, fz as f32), 5.2, None, Color::new(0.16, 0.42, 0.18, 1.0));
         }
         // Projectiles: small spheres arcing through the air (cannonballs / lava).
         for pr in &projectiles {

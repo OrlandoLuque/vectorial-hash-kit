@@ -121,6 +121,51 @@ pub fn river_factor(x: f64, z: f64) -> f64 {
     t * t * vol_mask
 }
 
+// ------------------------------------------------------------------- forests
+
+/// Forest cover at (x, z): 0 = open ground, up to 1 = deep wood. A handful of
+/// seeded copses, away from the river (nothing grows in the channel). Woods slow
+/// ground movement and give ranged **cover** (Total War style) — see [`apply`]
+/// (the wade/forest slowdown) and [`decide`] (halved ranged damage vs a target
+/// in the trees). Flyers (the dragon) pass over untouched.
+pub fn forest_factor(x: f64, z: f64) -> f64 {
+    if river_factor(x, z) > 0.15 { return 0.0; }
+    let o = map_seed();
+    let mut f = 0.0_f64;
+    for i in 0..6 {
+        let a = i as f64;
+        let cx = WORLD * (0.15 + 0.70 * ((a * 1.7 + o).sin() * 0.5 + 0.5));
+        let cz = WORLD * (0.12 + 0.76 * ((a * 2.3 + o * 1.4).cos() * 0.5 + 0.5));
+        let r = WORLD * (0.07 + 0.05 * ((a * 0.9 + o).sin() * 0.5 + 0.5));
+        let d = ((x - cx).powi(2) + (z - cz).powi(2)).sqrt();
+        if d < r { let t = 1.0 - d / r; f = f.max(t * t * (3.0 - 2.0 * t)); }
+    }
+    f
+}
+
+/// Deep enough forest to count as cover / slow a unit down.
+pub fn in_forest(x: f64, z: f64) -> bool { forest_factor(x, z) > 0.35 }
+
+/// Deterministic canopy positions `(x, z)` for drawing the woods — a jittered
+/// grid kept where the forest is dense. The renderer looks up the terrain height.
+pub fn forest_trees() -> Vec<(f64, f64)> {
+    let o = map_seed();
+    let step = 17.0;
+    let mut trees = Vec::new();
+    let mut gz = 20.0;
+    while gz < WORLD - 20.0 {
+        let mut gx = 20.0;
+        while gx < WORLD - 20.0 {
+            let jx = gx + (gx * 0.21 + gz * 0.13 + o).sin() * step * 0.5;
+            let jz = gz + (gx * 0.17 - gz * 0.29 + o).cos() * step * 0.5;
+            if forest_factor(jx, jz) > 0.45 { trees.push((jx, jz)); }
+            gx += step;
+        }
+        gz += step;
+    }
+    trees
+}
+
 /// Terrain height at a world (x,z): two octaves of hills, a central volcano cone,
 /// and a carved river channel. Deterministic — called per terrain tile + unit step.
 pub fn terrain_height(x: f64, z: f64) -> f64 {
@@ -599,6 +644,9 @@ pub fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>, 
 
     // Attacking: only when in reach and off cooldown.
     if u.cooldown > 0.0 || engage > u.kind.reach() { return; }
+    // Ranged cover: a target standing in the trees takes half damage from arrows
+    // and bolts (Total War style). Melee ignores it; the dragon strikes from above.
+    let cover = |p: Point3| -> f64 { if in_forest(p.x, p.z) { 0.5 } else { 1.0 } };
     match u.kind {
         // Dragon fire-breath: an area cull — every enemy in the blast takes a hit,
         // and the scorched ground belches a smoke cloud (a new LoS blocker).
@@ -623,7 +671,7 @@ pub fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>, 
             let ndir = Point3::new(dir.x / len, dir.y / len, dir.z / len);
             if smoke.raycast_dda_first(u.p, ndir, len, SMOKE_R).is_some() { return; } // blocked
             for (_, it) in index.raycast(u.p, ndir, len + 30.0, 3.5) {
-                if it.id != id && it.faction != u.faction { u.attacks.push((it.id, u.kind.dmg())); }
+                if it.id != id && it.faction != u.faction { u.attacks.push((it.id, u.kind.dmg() * cover(it.p))); }
             }
             u.fx.push(Fx::new(FxKind::Bolt, fa3(u.p), fa3(Point3::new(tx, ty, tz))));
         }
@@ -650,7 +698,7 @@ pub fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>, 
             if smoke.raycast_dda_first(u.p, ndir, len, SMOKE_R).is_some() { return; } // smoke blocks LoS
             for (_, it) in index.raycast(u.p, ndir, len + 4.0, 3.0) {
                 if it.id == id { continue; }
-                if it.faction != u.faction { u.attacks.push((it.id, u.kind.dmg())); }
+                if it.faction != u.faction { u.attacks.push((it.id, u.kind.dmg() * cover(it.p))); }
                 u.fx.push(Fx::new(FxKind::Arrow, fa3(u.p), fa3(it.p))); // arrow to whatever it hit
                 break; // the first thing hit stops the arrow
             }
@@ -689,10 +737,14 @@ pub fn apply(units: &mut [Unit], smoke: &mut Vec<Puff>, effects: &mut Vec<Fx>, p
         u.vel.0 += (u.steer.0 - u.vel.0) * k;
         u.vel.1 = u.steer.1;
         u.vel.2 += (u.steer.2 - u.vel.2) * k;
-        // Wading: ground units slow right down in the river/water (a soft obstacle).
-        let wade = if u.kind.altitude() == 0.0 && terrain_height(u.p.x, u.p.z) < WATER_LEVEL && !on_bridge(u.p.x, u.p.z) { 0.4 } else { 1.0 };
-        let nx = (u.p.x + u.vel.0 * dt * wade).clamp(2.0, WORLD - 2.0);
-        let nz = (u.p.z + u.vel.2 * dt * wade).clamp(2.0, WORLD - 2.0);
+        // Wading: ground units slow right down in the river/water (a soft obstacle);
+        // forest undergrowth slows them too (flyers pass over both). The strongest
+        // slowdown wins.
+        let wade: f64 = if u.kind.altitude() == 0.0 && terrain_height(u.p.x, u.p.z) < WATER_LEVEL && !on_bridge(u.p.x, u.p.z) { 0.4 } else { 1.0 };
+        let forest: f64 = if u.kind.altitude() == 0.0 { 1.0 - 0.5 * forest_factor(u.p.x, u.p.z) } else { 1.0 };
+        let slow = wade.min(forest);
+        let nx = (u.p.x + u.vel.0 * dt * slow).clamp(2.0, WORLD - 2.0);
+        let nz = (u.p.z + u.vel.2 * dt * slow).clamp(2.0, WORLD - 2.0);
         let th = terrain_height(nx, nz); // computed once, reused for ground + lava
         let surf = th - craters.depth_at(nx, nz); // base terrain minus any crater
         let ground = surf + u.kind.radius() as f64;
