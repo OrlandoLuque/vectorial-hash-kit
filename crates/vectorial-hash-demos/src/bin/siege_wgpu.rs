@@ -200,6 +200,67 @@ fn push_quad(v: &mut Vec<UiVertex>, px: f32, py: f32, w: f32, h: f32, color: [f3
     v.extend_from_slice(&[q(x0, y0), q(x1, y0), q(x1, y1), q(x0, y0), q(x1, y1), q(x0, y1)]);
 }
 
+/// A 3x5 bitmap font (wgpu has no text) — glyphs as ASCII art so they're
+/// verifiable in-source. Covers the digits + the few letters the HUD labels use.
+fn glyph(c: char) -> [&'static str; 5] {
+    match c {
+        '0' => ["111", "101", "101", "101", "111"],
+        '1' => ["010", "110", "010", "010", "111"],
+        '2' => ["111", "001", "111", "100", "111"],
+        '3' => ["111", "001", "111", "001", "111"],
+        '4' => ["101", "101", "111", "001", "001"],
+        '5' => ["111", "100", "111", "001", "111"],
+        '6' => ["111", "100", "111", "101", "111"],
+        '7' => ["111", "001", "010", "010", "010"],
+        '8' => ["111", "101", "111", "101", "111"],
+        '9' => ["111", "101", "111", "001", "111"],
+        'A' => ["111", "101", "111", "101", "101"],
+        'B' => ["110", "101", "110", "101", "110"],
+        'D' => ["110", "101", "101", "101", "110"],
+        'E' => ["111", "100", "110", "100", "111"],
+        'F' => ["111", "100", "110", "100", "100"],
+        'H' => ["101", "101", "111", "101", "101"],
+        'I' => ["111", "010", "010", "010", "111"],
+        'K' => ["101", "101", "110", "101", "101"],
+        'L' => ["100", "100", "100", "100", "111"],
+        'M' => ["101", "111", "111", "101", "101"],
+        'O' => ["111", "101", "101", "101", "111"],
+        'P' => ["111", "101", "111", "100", "100"],
+        'R' => ["111", "101", "110", "101", "101"],
+        'S' => ["111", "100", "111", "001", "111"],
+        'T' => ["111", "010", "010", "010", "010"],
+        'U' => ["101", "101", "101", "101", "111"],
+        'W' => ["101", "101", "101", "111", "101"],
+        ':' => ["000", "010", "000", "010", "000"],
+        '.' => ["000", "000", "000", "000", "010"],
+        _ => ["000", "000", "000", "000", "000"], // space / unknown
+    }
+}
+
+/// "TRI 1.2M" / "TRI 345K" / "TRI 900" — the frame's triangle count, short.
+fn tri_label(t: u64) -> String {
+    if t >= 1_000_000 { format!("TRI {}.{}M", t / 1_000_000, (t % 1_000_000) / 100_000) }
+    else if t >= 1_000 { format!("TRI {}K", t / 1_000) }
+    else { format!("TRI {t}") }
+}
+
+/// Draw a string as `px`-sized pixels of the 3x5 font, left-aligned at (x, y).
+#[allow(clippy::too_many_arguments)]
+fn push_text(v: &mut Vec<UiVertex>, x: f32, y: f32, px: f32, color: [f32; 4], text: &str, sw: f32, sh: f32) {
+    let mut cx = x;
+    for c in text.chars() {
+        let g = glyph(c.to_ascii_uppercase());
+        for (row, bits) in g.iter().enumerate() {
+            for (col, ch) in bits.char_indices() {
+                if ch == '1' {
+                    push_quad(v, cx + col as f32 * px, y + row as f32 * px, px, px, color, sw, sh);
+                }
+            }
+        }
+        cx += 4.0 * px; // 3 wide + 1 gap
+    }
+}
+
 /// A GPU-resident unit model: rest mesh + per-frame bone matrices + its own bind
 /// group (camera + this model's bone storage buffer). One per distinct `.glb`.
 struct GpuModel {
@@ -493,7 +554,9 @@ impl State {
             multisample: Default::default(),
             multiview: None,
         });
-        let ui_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("ui-v"), size: (256 * std::mem::size_of::<UiVertex>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        // Sized for the bars/sliders + the 3x5-font numeric HUD (each glyph pixel
+        // is a quad = 6 verts, so a few labelled lines run to a few thousand).
+        let ui_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("ui-v"), size: (16384 * std::mem::size_of::<UiVertex>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
 
         let depth = make_depth(&device, &config);
         // Per-run seed (reproducible via $SIEGE_SEED) drives the shared map + army.
@@ -744,6 +807,26 @@ impl State {
             let tfrac = if self.max_threads > 1 { (self.n_threads as f32 - 1.0) / (self.max_threads as f32 - 1.0) } else { 1.0 };
             push_quad(&mut ui, hx + tfrac * hw - 5.0, hy - 3.0, 10.0, hh + 6.0, [0.40, 0.95, 0.55, 1.0], sw, sh);
         }
+        // Triangles drawn this frame (terrain + every instanced model).
+        let mut tris: u64 = (self.terrain_nidx / 3) as u64;
+        for (mi, m) in self.models.iter().enumerate() {
+            let (s, e) = ranges[mi];
+            tris += (m.nidx as u64 / 3) * (e - s) as u64;
+        }
+        tris += (self.castle_model.nidx as u64 / 3) * 2;
+        tris += (self.horse_model.nidx as u64 / 3) * horse_n as u64;
+        tris += (self.proj_model.nidx as u64 / 3) * proj_n as u64;
+        // Numeric HUD — a labelled column top-right (wgpu has no text; 3x5 font).
+        let white = [0.92, 0.94, 0.98, 1.0];
+        let redc = [1.0, 0.50, 0.44, 1.0];
+        let bluec = [0.55, 0.68, 1.0, 1.0];
+        let hx = sw - 150.0;
+        push_text(&mut ui, hx, 12.0, 3.0, white, &format!("FPS {:.0}", self.fps), sw, sh);
+        push_text(&mut ui, hx, 30.0, 3.0, redc, &format!("RED {}", self.red), sw, sh);
+        push_text(&mut ui, hx, 48.0, 3.0, bluec, &format!("BLU {}", self.blue), sw, sh);
+        push_text(&mut ui, hx, 66.0, 3.0, white, &format!("POP {}", self.pop), sw, sh);
+        push_text(&mut ui, hx, 84.0, 3.0, white, &tri_label(tris), sw, sh);
+        ui.truncate(16384); // never exceed the ui buffer (guards write_buffer)
         self.queue.write_buffer(&self.ui_buf, 0, bytemuck::cast_slice(&ui));
         let ui_n = ui.len() as u32;
 
