@@ -190,6 +190,7 @@ struct UiVertex { pos: [f32; 2], color: [f32; 4] }
 const UI_BAR: (f32, f32, f32, f32) = (18.0, 18.0, 280.0, 16.0);
 const UI_SLIDER: (f32, f32, f32, f32) = (18.0, 46.0, 280.0, 12.0); // population
 const UI_THREADS: (f32, f32, f32, f32) = (18.0, 70.0, 280.0, 12.0); // rayon pool size
+const UI_PAUSE: (f32, f32, f32, f32) = (18.0, 92.0, 96.0, 30.0);    // pause/play button (tap on mobile)
 
 /// Push a pixel-space rectangle (top-left origin) as two triangles in NDC.
 #[allow(clippy::too_many_arguments)] // a rect + colour + screen dims
@@ -245,6 +246,7 @@ fn glyph(c: char) -> [&'static str; 5] {
         'T' => ["111", "010", "010", "010", "010"],
         'U' => ["101", "101", "101", "101", "111"],
         'W' => ["101", "101", "101", "111", "101"],
+        'Y' => ["101", "101", "010", "010", "010"],
         ':' => ["000", "010", "000", "010", "000"],
         '.' => ["000", "000", "000", "000", "010"],
         _ => ["000", "000", "000", "000", "000"], // space / unknown
@@ -409,6 +411,9 @@ struct State {
     dist: f32,
     dragging: bool,
     last_mouse: (f64, f64),
+    free_cam: bool,        // F: free-fly camera (WASD/QE) instead of the orbit
+    cam_pos: glam::Vec3,   // eye position in free-fly mode
+    mv: [bool; 6],         // held move keys: W,S,A,D,Q(down),E(up)
     skin_instances: Vec<SkinInstance>,
 }
 
@@ -638,6 +643,7 @@ impl State {
             red: 0, blue: 0, fps: 0.0, smooth, pop, craters, rebuild_t: 0.0,
             rng, now: 0.0, last: Instant::now(),
             yaw: 0.9, pitch: 0.7, dist: 760.0, dragging: false, last_mouse: (0.0, 0.0),
+            free_cam: false, cam_pos: glam::Vec3::ZERO, mv: [false; 6],
             skin_instances: Vec::with_capacity(PER_FACTION * 2),
         }
     }
@@ -686,9 +692,18 @@ impl State {
         }
     }
 
+    /// Look direction from yaw/pitch (used by the free-fly camera).
+    fn forward(&self) -> Vec3 {
+        Vec3::new(self.pitch.cos() * self.yaw.cos(), -self.pitch.sin(), self.pitch.cos() * self.yaw.sin())
+    }
+
     fn camera(&self) -> CameraUniform {
-        let target = Vec3::new((WORLD * 0.5) as f32, 20.0, (WORLD * 0.5) as f32);
-        let eye = target + Vec3::new(self.dist * self.pitch.cos() * self.yaw.cos(), self.dist * self.pitch.sin(), self.dist * self.pitch.cos() * self.yaw.sin());
+        let (eye, target) = if self.free_cam {
+            (self.cam_pos, self.cam_pos + self.forward())
+        } else {
+            let target = Vec3::new((WORLD * 0.5) as f32, 20.0, (WORLD * 0.5) as f32);
+            (target + Vec3::new(self.dist * self.pitch.cos() * self.yaw.cos(), self.dist * self.pitch.sin(), self.dist * self.pitch.cos() * self.yaw.sin()), target)
+        };
         let view = Mat4::look_at_rh(eye, target, Vec3::Y);
         let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
         let proj = Mat4::perspective_rh(45f32.to_radians(), aspect, 1.0, 4000.0);
@@ -701,6 +716,17 @@ impl State {
             Some(d) => d, // fixed step for the headless bench (deterministic)
             None => { let d = self.last.elapsed().as_secs_f64().min(0.05); self.last = Instant::now(); d }
         };
+        // Free-fly camera: move the eye by the held WASD / Q-E keys (native).
+        if self.free_cam {
+            let fwd = self.forward();
+            let right = fwd.cross(Vec3::Y).normalize_or_zero();
+            let sp = 500.0 * dt as f32;
+            let mut d = Vec3::ZERO;
+            if self.mv[0] { d += fwd; } if self.mv[1] { d -= fwd; }
+            if self.mv[3] { d += right; } if self.mv[2] { d -= right; }
+            if self.mv[5] { d += Vec3::Y; } if self.mv[4] { d -= Vec3::Y; }
+            if d.length_squared() > 0.0 { self.cam_pos += d.normalize() * sp; }
+        }
         if !self.paused {
             self.now += dt;
             // Rebuild the unit index from live positions each frame.
@@ -873,6 +899,15 @@ impl State {
         tris += (self.castle_model.nidx as u64 / 3) * 2;
         tris += (self.horse_model.nidx as u64 / 3) * horse_n as u64;
         tris += (self.proj_model.nidx as u64 / 3) * (proj_n + self.tree_n) as u64;
+        // Pause/play button (tap on mobile — wgpu has no built-in text so the
+        // keyboard P shortcut doesn't exist on touch).
+        {
+            let (px, py, pw, ph) = UI_PAUSE;
+            let running = !self.paused;
+            push_quad(&mut ui, px, py, pw, ph, if running { [0.18, 0.34, 0.22, 0.9] } else { [0.42, 0.22, 0.16, 0.95] }, sw, sh);
+            let label = if running { "PAUSE" } else { "PLAY" };
+            push_text(&mut ui, px + 8.0, py + 9.0, 3.0, [0.92, 0.94, 0.98, 1.0], label, sw, sh);
+        }
         // Numeric HUD — a labelled column top-right (wgpu has no text; 3x5 font).
         let white = [0.92, 0.94, 0.98, 1.0];
         let redc = [1.0, 0.50, 0.44, 1.0];
@@ -1165,19 +1200,40 @@ async fn run() {
                             // Over a slider → drag it (population / threads), not the camera.
                             let (mx, my) = (st.last_mouse.0 as f32, st.last_mouse.1 as f32);
                             let hit = |r: (f32, f32, f32, f32)| mx >= r.0 - 8.0 && mx <= r.0 + r.2 + 8.0 && my >= r.1 - 6.0 && my <= r.1 + r.3 + 6.0;
-                            if hit(UI_SLIDER) { st.ui_drag = 1; st.apply_slider(1, mx); }
+                            if hit(UI_PAUSE) { st.paused = !st.paused; }
+                            else if hit(UI_SLIDER) { st.ui_drag = 1; st.apply_slider(1, mx); }
                             else if cfg!(not(target_arch = "wasm32")) && hit(UI_THREADS) { st.ui_drag = 2; st.apply_slider(2, mx); }
                             else { st.dragging = true; }
                         } else { st.dragging = false; st.ui_drag = 0; }
                     }
-                    WindowEvent::KeyboardInput { event: KeyEvent { physical_key: PhysicalKey::Code(code), state: ElementState::Pressed, .. }, .. } => match code {
-                        KeyCode::KeyP => st.paused = !st.paused,
-                        KeyCode::KeyV => { st.smooth = !st.smooth; st.rebuild_terrain(); } // voxel ↔ smooth
-                        KeyCode::KeyC => vectorial_hash_demos::siege_sim::set_separation(!vectorial_hash_demos::siege_sim::separation_on()), // collisions on/off
-                        KeyCode::KeyK => st.frustum_cull = !st.frustum_cull, // frustum culling on/off
-                        KeyCode::BracketRight => { let p = st.pop + 100; st.set_population(p); }
-                        KeyCode::BracketLeft => { let p = st.pop.saturating_sub(100); st.set_population(p); }
-                        _ => {}
+                    WindowEvent::KeyboardInput { event: KeyEvent { physical_key: PhysicalKey::Code(code), state, .. }, .. } => {
+                        let pressed = state == ElementState::Pressed;
+                        // Held movement keys for the free-fly camera (F).
+                        match code {
+                            KeyCode::KeyW => st.mv[0] = pressed,
+                            KeyCode::KeyS => st.mv[1] = pressed,
+                            KeyCode::KeyA => st.mv[2] = pressed,
+                            KeyCode::KeyD => st.mv[3] = pressed,
+                            KeyCode::KeyQ => st.mv[4] = pressed,
+                            KeyCode::KeyE => st.mv[5] = pressed,
+                            _ => {}
+                        }
+                        if pressed { match code {
+                            KeyCode::KeyP => st.paused = !st.paused,
+                            KeyCode::KeyV => { st.smooth = !st.smooth; st.rebuild_terrain(); } // voxel ↔ smooth
+                            KeyCode::KeyC => vectorial_hash_demos::siege_sim::set_separation(!vectorial_hash_demos::siege_sim::separation_on()), // collisions on/off
+                            KeyCode::KeyK => st.frustum_cull = !st.frustum_cull, // frustum culling on/off
+                            KeyCode::KeyF => { // orbit ↔ free-fly (WASD move, Q/E down/up, drag to look)
+                                st.free_cam = !st.free_cam;
+                                if st.free_cam {
+                                    let t = Vec3::new((WORLD * 0.5) as f32, 20.0, (WORLD * 0.5) as f32);
+                                    st.cam_pos = t + Vec3::new(st.dist * st.pitch.cos() * st.yaw.cos(), st.dist * st.pitch.sin(), st.dist * st.pitch.cos() * st.yaw.sin());
+                                }
+                            }
+                            KeyCode::BracketRight => { let p = st.pop + 100; st.set_population(p); }
+                            KeyCode::BracketLeft => { let p = st.pop.saturating_sub(100); st.set_population(p); }
+                            _ => {}
+                        }}
                     },
                     WindowEvent::CursorMoved { position, .. } => {
                         if st.ui_drag != 0 {
@@ -1192,6 +1248,28 @@ async fn run() {
                     WindowEvent::MouseWheel { delta, .. } => {
                         let d = match delta { MouseScrollDelta::LineDelta(_, y) => y, MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.02 };
                         st.dist = (st.dist - d * 30.0).clamp(150.0, 1800.0);
+                    }
+                    // Touch (mobile): tap the pause button / population slider; drag to orbit.
+                    WindowEvent::Touch(t) => {
+                        let (mx, my) = (t.location.x as f32, t.location.y as f32);
+                        let hit = |r: (f32, f32, f32, f32)| mx >= r.0 - 8.0 && mx <= r.0 + r.2 + 8.0 && my >= r.1 - 6.0 && my <= r.1 + r.3 + 6.0;
+                        match t.phase {
+                            winit::event::TouchPhase::Started => {
+                                if hit(UI_PAUSE) { st.paused = !st.paused; }
+                                else if hit(UI_SLIDER) { st.ui_drag = 1; st.apply_slider(1, mx); }
+                                else { st.dragging = true; }
+                                st.last_mouse = (t.location.x, t.location.y);
+                            }
+                            winit::event::TouchPhase::Moved => {
+                                if st.ui_drag != 0 { let w = st.ui_drag; st.apply_slider(w, mx); }
+                                else if st.dragging {
+                                    st.yaw += (t.location.x - st.last_mouse.0) as f32 * 0.01;
+                                    st.pitch = (st.pitch + (t.location.y - st.last_mouse.1) as f32 * 0.01).clamp(0.05, 1.5);
+                                }
+                                st.last_mouse = (t.location.x, t.location.y);
+                            }
+                            _ => { st.dragging = false; st.ui_drag = 0; }
+                        }
                     }
                     WindowEvent::RedrawRequested => {
                         st.update_and_render();

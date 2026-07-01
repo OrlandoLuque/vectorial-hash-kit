@@ -20,6 +20,10 @@ Live (single-threaded wasm build): <https://orlandoluque.github.io/vectorial-has
   `V`: voxel ↔ smooth terrain · `C`: collisions (boids separation) on/off — A/B
   the look and the perf of "no two bodies overlap" vs. letting them pile
   (see `PARALLEL.md`) (both binaries)
+- `siege_wgpu` extras: `F` free-fly camera (WASD move, Q/E down/up, drag to
+  look) ↔ orbit · `K` frustum-culling on/off · an on-screen **pause button**
+  (tap — works on mobile touch, where the keyboard shortcut can't) · headless
+  FPS bench via `SIEGE_BENCH=1` (see `PARALLEL.md`)
 - **population slider** (top-left): army size per side — the spatial-index stress
   lever (20…10000 each, i.e. up to 20k units).
 - **thread slider** (native only): set the rayon pool size *live* and watch the
