@@ -539,15 +539,16 @@ async fn main() {
                 mov_b[fi][ki][anim_frame(u, now, frames_mov[fi][ki])].push(inst);
             }
         }
+        let mut tris = 0usize; // model triangles drawn this frame (units + cavalry + keeps)
         {
             let gl = unsafe { get_internal_gl() };
             let light = vec3(-0.45, 0.84, -0.30).normalize();
             for ((f, k), anim) in &models {
-                for (fr, gpu) in anim.mov.iter().enumerate() { renderer.draw_models(gl.quad_context, gpu, &mov_b[f.index()][k.index()][fr], mvp, light); }
-                for (fr, gpu) in anim.atk.iter().enumerate() { renderer.draw_models(gl.quad_context, gpu, &atk_b[f.index()][k.index()][fr], mvp, light); }
+                for (fr, gpu) in anim.mov.iter().enumerate() { tris += renderer.draw_models(gl.quad_context, gpu, &mov_b[f.index()][k.index()][fr], mvp, light); }
+                for (fr, gpu) in anim.atk.iter().enumerate() { tris += renderer.draw_models(gl.quad_context, gpu, &atk_b[f.index()][k.index()][fr], mvp, light); }
             }
             for (fr, gpu) in horse.iter().enumerate() {
-                renderer.draw_models(gl.quad_context, gpu, &horses[fr], mvp, light); // cavalry mounts
+                tris += renderer.draw_models(gl.quad_context, gpu, &horses[fr], mvp, light); // cavalry mounts
             }
             // Castles — one model per faction keep, facing the map centre.
             let mut castle_inst = Vec::with_capacity(2);
@@ -557,7 +558,7 @@ async fn main() {
                 let m = Mat4::from_translation(vec3(cx as f32, terrain_height(cx, cz) as f32, cz as f32)) * Mat4::from_rotation_y(yaw) * Mat4::from_scale(Vec3::splat(62.0));
                 castle_inst.push(EffectInstance::new(m, faction_tint(f)));
             }
-            renderer.draw_models(gl.quad_context, &castle, &castle_inst, mvp, light);
+            tris += renderer.draw_models(gl.quad_context, &castle, &castle_inst, mvp, light);
         }
         // Projectiles: small spheres arcing through the air (cannonballs / lava).
         for pr in &projectiles {
@@ -588,7 +589,8 @@ async fn main() {
         // ----- HUD -----
         set_default_camera();
         draw_text("vectorial-hash — SIEGE", 16.0, 28.0, 30.0, WHITE);
-        draw_text(format!("fps {}", get_fps()), 16.0, 54.0, 22.0, LIGHTGRAY);
+        let poly_str = if tris >= 1_000_000 { format!("{:.1}M", tris as f64 / 1e6) } else if tris >= 1_000 { format!("{}K", tris / 1000) } else { format!("{tris}") };
+        draw_text(format!("fps {}   polys {poly_str}", get_fps()), 16.0, 54.0, 22.0, LIGHTGRAY);
         draw_text(format!("Red {red}"), 16.0, 80.0, 24.0, Color::new(0.95, 0.4, 0.35, 1.0));
         draw_text(format!("Blue {blue}"), 16.0, 104.0, 24.0, Color::new(0.45, 0.6, 1.0, 1.0));
         let (lead, lcol) = match red.cmp(&blue) {

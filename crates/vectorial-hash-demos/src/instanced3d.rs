@@ -398,9 +398,11 @@ impl InstancedRenderer {
     /// Draw every `instances` entry of one model in a single instanced call —
     /// solid triangles, diffuse-lit from `light_dir`, each instance placed by its
     /// model matrix and multiplied by its tint colour.
-    pub fn draw_models(&mut self, ctx: &mut dyn RenderingBackend, model: &ModelGpu, instances: &[EffectInstance], mvp: Mat4, light_dir: Vec3) {
+    /// Returns the number of triangles drawn (`model tris x instances`), so the
+    /// caller can total the frame's polygon count for the HUD.
+    pub fn draw_models(&mut self, ctx: &mut dyn RenderingBackend, model: &ModelGpu, instances: &[EffectInstance], mvp: Mat4, light_dir: Vec3) -> usize {
         if instances.is_empty() {
-            return;
+            return 0;
         }
         if instances.len() > self.model_inst_cap {
             ctx.delete_buffer(self.model_inst_buf);
@@ -417,6 +419,7 @@ impl InstancedRenderer {
         let u = SphereUniforms { mvp: mvp.to_cols_array(), light_dir: light_dir.to_array() };
         ctx.apply_uniforms(UniformsSource::table(&u));
         ctx.draw(0, model.nidx, instances.len() as i32);
+        (model.nidx / 3) as usize * instances.len()
     }
 }
 

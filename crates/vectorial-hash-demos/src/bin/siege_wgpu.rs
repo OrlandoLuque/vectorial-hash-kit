@@ -702,10 +702,13 @@ impl State {
             if !u.alive() { continue; }
             let mi = self.model_idx[u.faction.index()][u.kind.index()];
             let m = &self.models[mi];
-            let y = (u.p.y - u.kind.radius() as f64) as f32; // feet: drop the sim's (crater-aware) centre to the ground — no terrain recompute
+            let mut y = (u.p.y - u.kind.radius() as f64) as f32; // feet: drop the sim's (crater-aware) centre to the ground — no terrain recompute
             // Per-model orientation/size correction (e.g. the undead mage slime
             // faces +X and reads big) — same tweak the macroquad demo applies.
-            let (yaw_off, scale_mul) = u.kind.model_tweak(u.faction);
+            let (yaw_off, mut scale_mul) = u.kind.model_tweak(u.faction);
+            // Cavalry rider: lift onto the horse and shrink to rider size (the
+            // horse is drawn separately) — mirrors the macroquad placement.
+            if u.kind == Kind::Knight { y += (u.kind.model_height() * 0.5) as f32; scale_mul *= 0.72; }
             let model = glam::Mat4::from_translation(glam::Vec3::new(u.p.x as f32, y, u.p.z as f32)) * glam::Mat4::from_rotation_y(u.face + yaw_off) * glam::Mat4::from_scale(glam::Vec3::splat(u.kind.model_height() * scale_mul));
             let nf = m.n_frames.max(1);
             let group = (i as u32 % 5) as f32 / 5.0; // phase-grouped frame (as macroquad)
