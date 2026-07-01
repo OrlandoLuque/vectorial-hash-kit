@@ -16,7 +16,7 @@
 //!   renders the right frame per unit, so the army animates without runtime
 //!   skinning. Static `load_glb` (rest pose) is kept for props.
 
-use macroquad::prelude::{Mat4, Quat, Vec3, Vec4};
+use glam::{Mat4, Quat, Vec3, Vec4};
 
 /// One model vertex for the instanced pipeline (`repr(C)` to match the vertex
 /// attributes `in_pos` Float3, `in_normal` Float3, `in_color` Float4).
@@ -64,7 +64,7 @@ fn visit(
     indices: &mut Vec<u16>,
 ) {
     let world = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
-    let normal_mat = Mat4::from_mat3(macroquad::prelude::Mat3::from_mat4(world)); // rotation+scale, no translation
+    let normal_mat = Mat4::from_mat3(glam::Mat3::from_mat4(world)); // rotation+scale, no translation
 
     if let Some(mesh) = node.mesh() {
         for prim in mesh.primitives() {

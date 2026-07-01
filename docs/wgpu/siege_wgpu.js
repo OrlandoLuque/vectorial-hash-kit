@@ -1,7 +1,3 @@
-import * as import1 from "env"
-import * as import2 from "env"
-
-
 export function start() {
     wasm.start();
 }
@@ -1210,8 +1206,6 @@ function __wbg_get_imports() {
     return {
         __proto__: null,
         "./siege_wgpu_bg.js": import0,
-        "env": import1,
-        "env": import2,
     };
 }
 

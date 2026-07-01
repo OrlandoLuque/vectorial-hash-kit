@@ -8,10 +8,18 @@
 //! [`instanced3d`] is the only graphics-bearing module here: a GPU-instanced
 //! point renderer (raw miniquad) used by the `critters3d` demo.
 
+// The macroquad/miniquad-bearing modules are excluded from the `web-wgpu` build
+// so the wgpu wasm binary links no macroquad — otherwise miniquad's `env`
+// file-loading imports (fs_get_buffer_size / fs_take_buffer) leak in and break
+// the wasm-bindgen module load. `model` + `siege_sim` are macroquad-free (model
+// uses glam directly), so the wgpu binary uses only those.
+#[cfg(not(feature = "web-wgpu"))]
 pub mod instanced3d;
 pub mod model;
+#[cfg(not(feature = "web-wgpu"))]
 pub mod sim;
 /// Shared, graphics-free simulation for the `siege` demo — used by both the
 /// macroquad and wgpu binaries so the two renderers can't drift apart.
 pub mod siege_sim;
+#[cfg(not(feature = "web-wgpu"))]
 pub mod time;

@@ -20,7 +20,7 @@ parallel = ["vectorial-hash/parallel"]
 # Builds the `siege_wgpu` binary for the **web** (WebGPU via wasm-bindgen). Pulls
 # the wgpu stack + the wasm glue only when set, so the macroquad critters wasm
 # builds stay lean. Pass `--features web-wgpu` to the wasm32 build of `siege_wgpu`.
-web-wgpu = ["dep:wgpu", "dep:winit", "dep:glam", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:console_error_panic_hook", "dep:web-sys", "dep:web-time", "dep:getrandom"]
+web-wgpu = ["dep:wgpu", "dep:winit", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:console_error_panic_hook", "dep:web-sys", "dep:web-time", "dep:getrandom"]
 
 [dependencies]
 vectorial-hash = { workspace = true }
@@ -32,6 +32,11 @@ gltf = { version = "1.4", default-features = false, features = ["import", "utils
 # Plain-old-data casts for the GPU vertex/bone buffers (SkinVertex). Builds for
 # wasm; only the wgpu binary uses the GPU buffers, but the type lives in the lib.
 bytemuck = { version = "1", features = ["derive"] }
+# glam for the glTF loader maths in `model` — directly (not via macroquad's
+# re-export), so the wgpu binary doesn't drag in macroquad/miniquad (whose `env`
+# file-loading imports break the wasm-bindgen web build). macroquad uses its own
+# glam internally; `model` only ever returns plain arrays, so versions don't mix.
+glam = "0.27"
 
 # rayon powers the `siege` demo's per-unit AI fan-out (a live thread-count
 # slider). Native only — wasm has no OS threads, so the web build runs the same
@@ -43,14 +48,12 @@ wgpu = "0.20"
 winit = "0.29"
 pollster = "0.3"
 bytemuck = { version = "1", features = ["derive"] }
-glam = "0.27"
 
 # `siege_wgpu` on the **web** (WebGPU via wasm-bindgen) — only pulled by the
 # `web-wgpu` feature, so the macroquad critters wasm builds don't compile wgpu.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wgpu = { version = "0.20", optional = true }
 winit = { version = "0.29", optional = true }
-glam = { version = "0.27", optional = true }
 wasm-bindgen = { version = "=0.2.126", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 console_error_panic_hook = { version = "0.1", optional = true }
