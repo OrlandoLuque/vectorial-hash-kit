@@ -73,6 +73,7 @@ pub fn anim_frame(u: &Unit, now: f64, nf: usize) -> usize {
 
 // ------------------------------------------------------------------------- rng
 
+#[derive(Clone)]
 pub struct Rng(u64);
 impl Rng {
     pub fn new(s: u64) -> Self { Rng(s | 1) }
@@ -367,6 +368,7 @@ pub fn faction_tint(f: Faction) -> [f32; 4] {
     match f { Faction::Red => [0.90, 0.20, 0.14, 0.22], Faction::Blue => [0.30, 0.45, 1.0, 0.22] }
 }
 
+#[derive(Clone)]
 pub struct Unit {
     pub faction: Faction,
     pub kind: Kind,
@@ -439,6 +441,7 @@ pub enum ProjKind { Cannon, LavaRock }
 
 /// A ballistic projectile (cannonball / lava bomb) — arcs under gravity and on
 /// landing does a `Sphere3` AoE. Travel time makes the shot visible.
+#[derive(Clone)]
 pub struct Projectile { pub p: Point3, pub v: (f64, f64, f64), pub kind: ProjKind, pub faction: Faction, pub dmg: f64, pub r: f64 }
 
 /// Launch velocity for a ballistic arc from `a` to `t` over flight time `tf`.
@@ -452,7 +455,7 @@ pub fn arc_velocity(a: Point3, t: Point3, tf: f64) -> (f64, f64, f64) {
 /// **Shared** between the simulation (so units sink into them) and the renderers
 /// (so both the voxel and smooth meshes deform identically) — one source of truth.
 /// Each crater is a smooth bowl `(x, z, radius)`; `depth_at` sums the overlap.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Craters {
     list: Vec<(f32, f32, f32)>,
     pub dirty: bool, // a crater landed since the last remesh
@@ -869,6 +872,7 @@ pub fn apply(units: &mut [Unit], smoke: &mut Vec<Puff>, effects: &mut Vec<Fx>, p
 // ----------------------------------------------------------------- volcano
 
 /// The central volcano's running state (next plume puff / next eruption time).
+#[derive(Clone)]
 pub struct Volcano { pub smoke_t: f64, pub erupt_t: f64 }
 impl Default for Volcano { fn default() -> Self { Volcano { smoke_t: 0.0, erupt_t: 7.0 } } }
 impl Volcano { pub fn new() -> Self { Self::default() } }
