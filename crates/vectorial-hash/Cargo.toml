@@ -29,6 +29,9 @@ rayon = { workspace = true, optional = true }
 [dev-dependencies]
 # Benchmark harness (benches/spatial.rs). Dev-only — never in the shipped crate.
 criterion = { workspace = true }
+# Property-based fuzzing (tests/proptest_structures.rs): randomized op sequences
+# vs a brute-force model, with shrinking. Dev-only.
+proptest = "1"
 
 [[bench]]
 name = "spatial"

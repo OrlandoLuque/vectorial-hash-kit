@@ -168,8 +168,14 @@ measured crossover (`PARALLEL.md`) visible. Native only; hidden on wasm.
    `raycast_first` / capsule ops so perf regressions are tracked.
 
 **B. Correctness / robustness**
-5. **Property / fuzz tests** (proptest) — randomized insert/update/remove/cull/knn
-   vs brute force with shrinking, across all seven structures.
+5. ~~**Property / fuzz tests** (proptest)~~ — **done.**
+   `tests/proptest_structures.rs`: a randomized op sequence (insert / remove /
+   update via the O(1) `ItemRef` path) driven against a brute-force model, then
+   `cull` (3 volumes) + `knn` (2 probes × k∈{1,5,12}) asserted equal, with
+   shrinking. All seven structures (`Tree`, `QuadTree`, `IntegerTree`, `Tree3`,
+   `Octree3`, `MortonGrid` 2D + `MortonGrid3` insert-only). Also checks
+   `item_count()` tracks the model so the handle bookkeeping can't silently
+   drift. proptest is a dev-dependency only (not in the shipped crate / wasm).
 6. ~~**Serialization for all structures**~~ — **done.** `serialize`/`deserialize`
    now on `Tree`, `QuadTree`, `IntegerTree`, `Octree3`, `MortonGrid` (2D),
    `MortonGrid3` (mirroring `Tree3`), sharing the LE byte-IO helpers in
