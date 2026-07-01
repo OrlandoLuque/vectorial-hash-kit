@@ -200,6 +200,19 @@ fn push_quad(v: &mut Vec<UiVertex>, px: f32, py: f32, w: f32, h: f32, color: [f3
     v.extend_from_slice(&[q(x0, y0), q(x1, y0), q(x1, y1), q(x0, y0), q(x1, y1), q(x0, y1)]);
 }
 
+/// The 6 world-space frustum planes from a view-proj matrix (Gribb-Hartmann),
+/// normalised so `plane·(x,y,z,1)` is the signed distance.
+fn frustum_planes(vp: glam::Mat4) -> [glam::Vec4; 6] {
+    let (r0, r1, r2, r3) = (vp.row(0), vp.row(1), vp.row(2), vp.row(3));
+    let mut p = [r3 + r0, r3 - r0, r3 + r1, r3 - r1, r3 + r2, r3 - r2]; // L,R,B,T,N,F
+    for pl in &mut p { let n = pl.truncate().length().max(1e-6); *pl /= n; }
+    p
+}
+/// Is the world-space sphere (centre `c`, radius `r`) at least partly inside?
+fn sphere_in_frustum(planes: &[glam::Vec4; 6], c: glam::Vec3, r: f32) -> bool {
+    planes.iter().all(|pl| pl.x * c.x + pl.y * c.y + pl.z * c.z + pl.w >= -r)
+}
+
 /// A 3x5 bitmap font (wgpu has no text) — glyphs as ASCII art so they're
 /// verifiable in-source. Covers the digits + the few letters the HUD labels use.
 fn glyph(c: char) -> [&'static str; 5] {
@@ -379,6 +392,7 @@ struct State {
     volcano: Volcano,
     sep: SepTables, // precomputed boids separation-force table
     paused: bool,
+    frustum_cull: bool,    // skip units outside the camera (K key / $SIEGE_NO_CULL)
     bench_dt: Option<f64>, // fixed sim dt for the headless bench (None = real-time)
     red: usize,  // live Red units (for the window-title HUD)
     blue: usize, // live Blue units
@@ -603,6 +617,7 @@ impl State {
 
         State {
             surface, off_tex, device, queue, config, bench_dt: None,
+            frustum_cull: std::env::var("SIEGE_NO_CULL").is_err(),
             skin_pipeline, models, model_idx, inst_buf,
             castle_model, castle_inst_buf,
             horse_model, horse_inst_buf,
@@ -680,6 +695,7 @@ impl State {
         CameraUniform { vp: (proj * view).to_cols_array_2d(), light: [-0.45, 0.84, -0.30, 0.0] }
     }
 
+
     fn update_and_render(&mut self) {
         let dt = match self.bench_dt {
             Some(d) => d, // fixed step for the headless bench (deterministic)
@@ -728,9 +744,16 @@ impl State {
         // draws in one call. Per-model frame_base uses that model's own joint +
         // frame count; the instance colour is the faction tint (the shader mixes
         // the model's own colours toward it). Model height varies by kind.
+        // Camera + frustum (fixed for this frame): reused for the camera uniform
+        // below and to skip units the camera can't see (K toggles; big win zoomed
+        // in, free when the whole field is visible).
+        let cam = self.camera();
+        let planes = frustum_planes(glam::Mat4::from_cols_array_2d(&cam.vp));
+        let do_cull = self.frustum_cull;
         let mut buckets: Vec<Vec<SkinInstance>> = (0..self.models.len()).map(|_| Vec::new()).collect();
         for (i, u) in self.units.iter().enumerate() {
             if !u.alive() { continue; }
+            if do_cull && !sphere_in_frustum(&planes, glam::Vec3::new(u.p.x as f32, u.p.y as f32, u.p.z as f32), (u.kind.model_height() * 1.5) as f32) { continue; }
             let mi = self.model_idx[u.faction.index()][u.kind.index()];
             let m = &self.models[mi];
             let mut y = (u.p.y - u.kind.radius() as f64) as f32; // feet: drop the sim's (crater-aware) centre to the ground — no terrain recompute
@@ -762,6 +785,7 @@ impl State {
         let hnj = self.horse_model.num_joints;
         for (i, u) in self.units.iter().enumerate() {
             if !u.alive() || u.kind != Kind::Knight { continue; }
+            if do_cull && !sphere_in_frustum(&planes, glam::Vec3::new(u.p.x as f32, u.p.y as f32, u.p.z as f32), (u.kind.model_height() * 1.5) as f32) { continue; }
             let gy = ground_height(u.p.x, u.p.z, &self.craters) as f32;
             let model = glam::Mat4::from_translation(glam::Vec3::new(u.p.x as f32, gy, u.p.z as f32)) * glam::Mat4::from_rotation_y(u.face) * glam::Mat4::from_scale(glam::Vec3::splat(Kind::Knight.model_height()));
             let group = (i as u32 % 5) as f32 / 5.0;
@@ -770,8 +794,7 @@ impl State {
         }
         let horse_n = (horse_inst.len().min(MAX_POP * 2)) as u32;
         if horse_n > 0 { self.queue.write_buffer(&self.horse_inst_buf, 0, bytemuck::cast_slice(&horse_inst[..horse_n as usize])); }
-        let cam = self.camera();
-        self.queue.write_buffer(&self.cam_buf, 0, bytemuck::cast_slice(&[cam]));
+        self.queue.write_buffer(&self.cam_buf, 0, bytemuck::cast_slice(&[cam])); // cam computed above (reused for the frustum)
 
         // Combat effects + projectile markers → coloured line segments (built into
         // a detached Vec so the loops can read self.effects/self.projectiles).
@@ -1089,6 +1112,7 @@ async fn bench_headless() {
     let mut st = State::new(None, (w, h)).await;
     st.bench_dt = Some(1.0 / 60.0);
     if let Some(p) = std::env::var("SIEGE_POP").ok().and_then(|s| s.parse().ok()) { st.set_population(p); }
+    if let Some(d) = std::env::var("SIEGE_CAM_DIST").ok().and_then(|s| s.parse().ok()) { st.dist = d; } // zoom for the frustum-cull A/B
     println!("siege_wgpu OFFSCREEN bench | {w}x{h} | {} units/side ({} total) | warm to sim t={warmup_sim:.0}s (clash), then {secs:.0}s per thread count | full render to a texture, NO present/vsync (GPU-blocked per frame)", st.pop, st.pop * 2);
     let wt = Instant::now();
     while st.now < warmup_sim { st.update_and_render(); }
@@ -1150,6 +1174,7 @@ async fn run() {
                         KeyCode::KeyP => st.paused = !st.paused,
                         KeyCode::KeyV => { st.smooth = !st.smooth; st.rebuild_terrain(); } // voxel ↔ smooth
                         KeyCode::KeyC => vectorial_hash_demos::siege_sim::set_separation(!vectorial_hash_demos::siege_sim::separation_on()), // collisions on/off
+                        KeyCode::KeyK => st.frustum_cull = !st.frustum_cull, // frustum culling on/off
                         KeyCode::BracketRight => { let p = st.pop + 100; st.set_population(p); }
                         KeyCode::BracketLeft => { let p = st.pop.saturating_sub(100); st.set_population(p); }
                         _ => {}
