@@ -428,18 +428,29 @@ pub fn ground_height(x: f64, z: f64, craters: &Craters) -> f64 {
 
 // ----------------------------------------------------------------- spawning
 
-pub fn spawn_unit(rng: &mut Rng, faction: Faction) -> Unit {
-    // Roster mix: mostly foot soldiers, then archers/knights, a few siege engines
-    // and mages, a rare dragon.
+/// Draw a unit kind from the roster distribution: mostly foot soldiers, then
+/// archers/knights, a few mages/healers, and *rare* siege engines + dragons
+/// (cannons and dragons are a third of what they were; the freed slots went to
+/// foot soldiers, per user request).
+pub fn roll_kind(rng: &mut Rng) -> Kind {
     let roll = rng.unit();
-    let kind = if roll < 0.44 { Kind::Soldier }
-        else if roll < 0.64 { Kind::Archer }
-        else if roll < 0.76 { Kind::Knight }
-        else if roll < 0.86 { Kind::Mage }
-        else if roll < 0.94 { Kind::Healer }
-        else if roll < 0.965 { Kind::Ballista } // siege engines are now rare
-        else if roll < 0.985 { Kind::Catapult }
-        else { Kind::Dragon };
+    if roll < 0.48 { Kind::Soldier }
+    else if roll < 0.68 { Kind::Archer }
+    else if roll < 0.80 { Kind::Knight }
+    else if roll < 0.90 { Kind::Mage }
+    else if roll < 0.98 { Kind::Healer }
+    else if roll < 0.98833 { Kind::Ballista } // 2.5% -> 0.83%
+    else if roll < 0.995 { Kind::Catapult }   // 2.0% -> 0.67%
+    else { Kind::Dragon }                      // 1.5% -> 0.50%
+}
+
+pub fn spawn_unit(rng: &mut Rng, faction: Faction) -> Unit {
+    let kind = roll_kind(rng);
+    spawn_unit_of(rng, faction, kind)
+}
+
+/// Build a unit of a *given* kind (position still randomised by `place_at_castle`).
+pub fn spawn_unit_of(rng: &mut Rng, faction: Faction, kind: Kind) -> Unit {
     let mut u = Unit {
         faction, kind,
         p: Point3::new(0.0, 0.0, 0.0),
@@ -461,11 +472,13 @@ pub fn spawn_unit(rng: &mut Rng, faction: Faction) -> Unit {
     u
 }
 
-/// Drop a unit at a random point just outside its castle, on the terrain.
+/// Drop a unit at a random point just outside its castle, on the terrain. The
+/// spread is wide and fully random (no per-kind spawn points), so kinds mix into
+/// a broad front instead of marching as rigid lanes.
 pub fn place_at_castle(rng: &mut Rng, u: &mut Unit) {
     let (cx, cz) = u.faction.castle();
-    let x = (cx + rng.range(-60.0, 60.0)).clamp(2.0, WORLD - 2.0);
-    let z = (cz + rng.range(-60.0, 60.0)).clamp(2.0, WORLD - 2.0);
+    let x = (cx + rng.range(-95.0, 95.0)).clamp(2.0, WORLD - 2.0);
+    let z = (cz + rng.range(-95.0, 95.0)).clamp(2.0, WORLD - 2.0);
     let y = terrain_height(x, z) + u.kind.altitude() + u.kind.radius() as f64;
     u.p = Point3::new(x, y, z);
     u.hp = u.kind.max_hp();
@@ -475,9 +488,14 @@ pub fn place_at_castle(rng: &mut Rng, u: &mut Unit) {
 }
 
 pub fn spawn_army(rng: &mut Rng, per_faction: usize) -> Vec<Unit> {
+    // Mirror-identical armies: roll ONE roster of kinds and give both factions the
+    // same count of every type, so neither side gets luckier on rare units
+    // (dragons/cannons). Positions + model/tint still differ by faction; respawns
+    // keep a unit's kind, so the balance holds over the battle.
+    let roster: Vec<Kind> = (0..per_faction).map(|_| roll_kind(rng)).collect();
     let mut units = Vec::with_capacity(per_faction * 2);
-    for _ in 0..per_faction { units.push(spawn_unit(rng, Faction::Red)); }
-    for _ in 0..per_faction { units.push(spawn_unit(rng, Faction::Blue)); }
+    for &k in &roster { units.push(spawn_unit_of(rng, Faction::Red, k)); }
+    for &k in &roster { units.push(spawn_unit_of(rng, Faction::Blue, k)); }
     units
 }
 
@@ -547,6 +565,14 @@ pub fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>, 
         if engage < ARTY_STANDOFF { -speed } else if engage > u.kind.reach() * 0.9 { speed } else { 0.0 }
     } else if engage < u.kind.reach() * 0.8 { 0.0 } else { speed };
     let (mut vx, mut vz) = (seek.0 / slen * approach, seek.1 / slen * approach);
+    // Dragons: when they'd otherwise hover over the target (approach == 0), circle
+    // it instead of piling up. The tangential sign is split by id so a group
+    // spreads into a ring (CW/CCW) rather than stalling in a clump.
+    if u.kind == Kind::Dragon && approach == 0.0 {
+        let dir = if id & 1 == 0 { 1.0 } else { -1.0 };
+        vx += -seek.1 / slen * speed * 0.85 * dir;
+        vz += seek.0 / slen * speed * 0.85 * dir;
+    }
     vx += sep_x * speed * 0.7;
     vz += sep_z * speed * 0.7;
     if matches!(u.kind, Kind::Soldier | Kind::Knight) && friends > 0 {
