@@ -392,4 +392,33 @@ fn run_parallel(args: &Args) {
         }
         println!();
     }
+
+    // Thread-count scaling: fix the workload (pop=20000), vary the pool size
+    // 1..=hardware. `par ms` is `cull_many_par` inside an N-thread pool; `vs 1`
+    // is the speedup over a single thread (ideal = N); `eff` = that / N.
+    let pop = 20_000usize;
+    let mut rng = Rng::new(args.seed);
+    let mut tree = Tree3::<C3>::new(world, args.item_limit);
+    for id in 0..pop {
+        let p = Point3::new(rng.range(MARGIN, args.world - MARGIN), rng.range(MARGIN, args.world - MARGIN), rng.range(MARGIN, args.world - MARGIN));
+        tree.insert(C3 { id: id as u32, p });
+    }
+    for &q in &[64usize, 256, 1024] {
+        let shapes: Vec<Sphere3> = (0..q).map(|_| Sphere3::new(rng.range(0.0, args.world), rng.range(0.0, args.world), rng.range(0.0, args.world), args.vision)).collect();
+        println!("thread scaling | pop={pop} | queries={q}");
+        println!("{:>8} | {:>12} {:>8} {:>7}", "threads", "par ms", "vs 1", "eff");
+        let mut base = 0.0f64;
+        for n in 1..=threads {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(n).build().unwrap();
+            let mut bh = pool.install(|| tree.cull_many_par(&shapes).iter().map(|v| v.len()).sum::<usize>()); // warm
+            let t = Instant::now();
+            for _ in 0..reps { bh = bh.wrapping_add(pool.install(|| tree.cull_many_par(&shapes).iter().map(|v| v.len()).sum::<usize>())); }
+            let ms = t.elapsed().as_secs_f64() * 1e3 / reps as f64;
+            if bh == usize::MAX { println!("unreachable"); }
+            if n == 1 { base = ms; }
+            let vs1 = base / ms.max(1e-9);
+            println!("{:>8} | {:>12.4} {:>7.2}x {:>6.0}%", n, ms, vs1, vs1 / n as f64 * 100.0);
+        }
+        println!();
+    }
 }
