@@ -29,6 +29,7 @@
 //! ```
 
 pub mod geom;
+mod serde_io;
 pub mod template;
 pub mod tree;
 pub mod culling;

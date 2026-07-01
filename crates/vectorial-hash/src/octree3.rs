@@ -9,8 +9,10 @@
 //! the plumbing. Splits a leaf into eight equal octants; the free-list
 //! reclaims merged-out slots.
 
+use crate::serde_io::{corrupt, r_aabb, r_f64, r_u32, r_u64, r_u8, w_aabb, w_f64, w_u32, w_u64, w_u8};
 use crate::template::CellState;
 use crate::tree3::{aabb_min_dist2, knn_offer, knn_worst, Aabb, ItemRef, KnnEntry, Point3, Positioned3, Shape3};
+use std::io::{self, Read, Write};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ONodeId(pub u32);
@@ -392,6 +394,90 @@ impl<T: Positioned3> Octree3<T> {
     }
 }
 
+// ------------------------------------------------------------- serialization
+
+const OCTREE3_MAGIC: &[u8; 4] = b"VHO3";
+const OCTREE3_VERSION: u8 = 1;
+
+impl<T: Positioned3> Octree3<T> {
+    /// Serialize the **built** octree (exact arena, free-list, params — no
+    /// rebuild on load) to `w`. Items are written by the caller's `write_item`
+    /// closure. Mirrors [`crate::Tree3::serialize`], 8-way instead of binary.
+    pub fn serialize<W: Write>(&self, w: &mut W, write_item: impl Fn(&mut W, &T) -> io::Result<()>) -> io::Result<()> {
+        w.write_all(OCTREE3_MAGIC)?;
+        w_u8(w, OCTREE3_VERSION)?;
+        w_u64(w, self.item_limit as u64)?;
+        w_u64(w, self.merge_limit as u64)?;
+        w_f64(w, self.min_cell)?;
+        w_u32(w, self.root.0)?;
+        w_u32(w, self.free.len() as u32)?;
+        for f in &self.free { w_u32(w, f.0)?; }
+        w_u32(w, self.nodes.len() as u32)?;
+        for n in &self.nodes {
+            w_aabb(w, &n.bbox)?;
+            match n.parent {
+                Some(p) => { w_u8(w, 1)?; w_u32(w, p.0)?; }
+                None => w_u8(w, 0)?,
+            }
+            match n.children {
+                Some(kids) => { w_u8(w, 1)?; for k in kids { w_u32(w, k.0)?; } }
+                None => w_u8(w, 0)?,
+            }
+            w_u32(w, n.items.len() as u32)?;
+            for it in &n.items { write_item(w, it)?; }
+            for &h in &n.hs { w_u32(w, h)?; }
+        }
+        Ok(())
+    }
+
+    /// Inverse of [`Octree3::serialize`]: rebuild the exact octree from `r`,
+    /// reading each item with `read_item` (must mirror the writer's layout).
+    pub fn deserialize<R: Read>(r: &mut R, read_item: impl Fn(&mut R) -> io::Result<T>) -> io::Result<Self> {
+        let mut magic = [0u8; 4];
+        r.read_exact(&mut magic)?;
+        if &magic != OCTREE3_MAGIC { return Err(corrupt("bad Octree3 magic")); }
+        if r_u8(r)? != OCTREE3_VERSION { return Err(corrupt("unsupported Octree3 version")); }
+        let item_limit = r_u64(r)? as usize;
+        let merge_limit = r_u64(r)? as usize;
+        let min_cell = r_f64(r)?;
+        let root = ONodeId(r_u32(r)?);
+        let nfree = r_u32(r)? as usize;
+        let mut free = Vec::with_capacity(nfree);
+        for _ in 0..nfree { free.push(ONodeId(r_u32(r)?)); }
+        let nnodes = r_u32(r)? as usize;
+        let mut nodes = Vec::with_capacity(nnodes);
+        for _ in 0..nnodes {
+            let bbox = r_aabb(r)?;
+            let parent = if r_u8(r)? == 1 { Some(ONodeId(r_u32(r)?)) } else { None };
+            let children = if r_u8(r)? == 1 {
+                let mut kids = [ONodeId(0); 8];
+                for k in &mut kids { *k = ONodeId(r_u32(r)?); }
+                Some(kids)
+            } else { None };
+            let nitems = r_u32(r)? as usize;
+            let mut items = Vec::with_capacity(nitems);
+            for _ in 0..nitems { items.push(read_item(r)?); }
+            let mut hs = Vec::with_capacity(nitems);
+            for _ in 0..nitems { hs.push(r_u32(r)?); }
+            nodes.push(ONode { bbox, parent, children, items, hs });
+        }
+        if root.0 as usize >= nnodes { return Err(corrupt("root index out of range")); }
+        // Rebuild the handle → location map from the leaves' handle ids so
+        // ItemRefs stay valid across the round-trip.
+        let max_h = nodes.iter().flat_map(|n| n.hs.iter().copied()).max().map_or(0, |m| m + 1) as usize;
+        let mut locs = vec![OItemLoc { node: ONodeId(0), slot: 0 }; max_h];
+        let mut used = vec![false; max_h];
+        for (ni, n) in nodes.iter().enumerate() {
+            for (slot, &h) in n.hs.iter().enumerate() {
+                locs[h as usize] = OItemLoc { node: ONodeId(ni as u32), slot: slot as u32 };
+                used[h as usize] = true;
+            }
+        }
+        let free_handles: Vec<u32> = (0..max_h as u32).filter(|&h| !used[h as usize]).collect();
+        Ok(Octree3 { nodes, free, locs, free_handles, item_limit, merge_limit, min_cell, root })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,6 +486,71 @@ mod tests {
     #[derive(Clone, Copy)]
     struct P(Point3);
     impl Positioned3 for P { fn position(&self) -> Point3 { self.0 } }
+
+    #[test]
+    fn octree_serialize_roundtrip() {
+        use std::io::{Cursor, Read, Write};
+        #[derive(Clone, Copy)]
+        struct M { id: u32, p: Point3 }
+        impl Positioned3 for M { fn position(&self) -> Point3 { self.p } }
+        let mut x = 0x0C73_5E12u64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        let world = Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0);
+        let mut tree = Octree3::<M>::new(world, 6);
+        let mut live: std::collections::BTreeMap<u32, Point3> = std::collections::BTreeMap::new();
+        let mut next = 0u32;
+        for _ in 0..1500 {
+            let p = Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0);
+            tree.insert(M { id: next, p }); live.insert(next, p); next += 1;
+        }
+        for _ in 0..3000 {
+            let roll = rng();
+            let ids: Vec<u32> = live.keys().copied().collect();
+            if roll < 0.5 && !ids.is_empty() {
+                let id = ids[(rng() * ids.len() as f64) as usize % ids.len()];
+                let old = live[&id]; let np = Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0);
+                if tree.update(old, |m| m.id == id, |m| m.p = np) { live.insert(id, np); }
+            } else if roll < 0.7 && !ids.is_empty() {
+                let id = ids[(rng() * ids.len() as f64) as usize % ids.len()];
+                tree.remove(live[&id], |m| m.id == id); live.remove(&id);
+            } else {
+                let p = Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0);
+                tree.insert(M { id: next, p }); live.insert(next, p); next += 1;
+            }
+        }
+        let doomed: Vec<u32> = live.keys().copied().take(live.len() * 2 / 5).collect();
+        for id in doomed { tree.remove(live[&id], |m| m.id == id); live.remove(&id); }
+        assert!(tree.node_count() > tree.live_node_count(), "expected dead slots");
+
+        let mut buf = Vec::new();
+        tree.serialize(&mut buf, |w, it| {
+            w.write_all(&it.id.to_le_bytes())?;
+            w.write_all(&it.p.x.to_le_bytes())?; w.write_all(&it.p.y.to_le_bytes())?; w.write_all(&it.p.z.to_le_bytes())
+        }).unwrap();
+        let loaded = Octree3::<M>::deserialize(&mut Cursor::new(&buf), |r| {
+            let mut a = [0u8; 4]; r.read_exact(&mut a)?; let mut b = [0u8; 8];
+            let id = u32::from_le_bytes(a);
+            r.read_exact(&mut b)?; let px = f64::from_le_bytes(b);
+            r.read_exact(&mut b)?; let py = f64::from_le_bytes(b);
+            r.read_exact(&mut b)?; let pz = f64::from_le_bytes(b);
+            Ok(M { id, p: Point3::new(px, py, pz) })
+        }).unwrap();
+        assert_eq!(loaded.node_count(), tree.node_count(), "arena size");
+        assert_eq!(loaded.live_node_count(), tree.live_node_count(), "live nodes");
+        assert_eq!(loaded.leaf_count(), tree.leaf_count(), "leaves");
+        assert_eq!(loaded.item_count(), tree.item_count(), "items");
+        for (cx, cy, cz, r) in [(128.0, 128.0, 128.0, 30.0), (60.0, 200.0, 90.0, 50.0), (10.0, 10.0, 10.0, 80.0)] {
+            let s = Sphere3::new(cx, cy, cz, r).with_raster();
+            let mut a: Vec<u32> = tree.cull(&s).iter().map(|m| m.id).collect();
+            let mut b: Vec<u32> = loaded.cull(&s).iter().map(|m| m.id).collect();
+            a.sort(); b.sort();
+            assert_eq!(a, b, "cull differs after round-trip ({cx},{cy},{cz}) r={r}");
+        }
+        let ka: Vec<f64> = tree.knn(Point3::new(120.0, 120.0, 120.0), 8).iter().map(|(d, _)| *d).collect();
+        let kb: Vec<f64> = loaded.knn(Point3::new(120.0, 120.0, 120.0), 8).iter().map(|(d, _)| *d).collect();
+        assert_eq!(ka, kb, "knn differs after round-trip");
+        assert!(Octree3::<M>::deserialize(&mut Cursor::new(&b"XXXXX"[..]), |_| unreachable!()).is_err());
+    }
 
     #[test]
     fn octree_knn_matches_brute_force() {

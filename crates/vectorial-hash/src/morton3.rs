@@ -21,7 +21,9 @@
 //! comparison in `tree3d_bench` shows where each wins.
 
 use std::collections::HashMap;
+use std::io::{self, Read, Write};
 
+use crate::serde_io::{corrupt, r_aabb, r_u32, r_u64, r_u8, w_aabb, w_u32, w_u64, w_u8};
 use crate::template::CellState;
 use crate::tree::RaycastOut;
 use crate::tree3::{knn_offer, knn_worst, Aabb, KnnEntry, Point3, Positioned3, Shape3};
@@ -567,6 +569,57 @@ impl<T: Positioned3> MortonGrid3<T> {
     }
 }
 
+// ------------------------------------------------------------- serialization
+
+const MORTON3_MAGIC: &[u8; 4] = b"VHM3";
+const MORTON3_VERSION: u8 = 1;
+
+impl<T: Positioned3> MortonGrid3<T> {
+    /// Serialize the grid (world + resolution + occupied buckets) to `w`. Items
+    /// are written by `write_item`. Unlike the trees there is no arena to
+    /// preserve — the cell layout is implicit in `world`/`levels`, so only the
+    /// occupied `(code → bucket)` pairs are stored. Iteration order is the hash
+    /// map's (unspecified), so the byte stream is not canonical, but a
+    /// round-trip reproduces an equivalent grid.
+    pub fn serialize<W: Write>(&self, w: &mut W, write_item: impl Fn(&mut W, &T) -> io::Result<()>) -> io::Result<()> {
+        w.write_all(MORTON3_MAGIC)?;
+        w_u8(w, MORTON3_VERSION)?;
+        w_aabb(w, &self.world)?;
+        w_u32(w, self.levels)?;
+        w_u32(w, self.cells.len() as u32)?;
+        for (&code, bucket) in &self.cells {
+            w_u64(w, code)?;
+            w_u32(w, bucket.len() as u32)?;
+            for it in bucket { write_item(w, it)?; }
+        }
+        Ok(())
+    }
+
+    /// Inverse of [`MortonGrid3::serialize`]: rebuild an equivalent grid from
+    /// `r`, reading each item with `read_item` (must mirror the writer's layout).
+    pub fn deserialize<R: Read>(r: &mut R, read_item: impl Fn(&mut R) -> io::Result<T>) -> io::Result<Self> {
+        let mut magic = [0u8; 4];
+        r.read_exact(&mut magic)?;
+        if &magic != MORTON3_MAGIC { return Err(corrupt("bad MortonGrid3 magic")); }
+        if r_u8(r)? != MORTON3_VERSION { return Err(corrupt("unsupported MortonGrid3 version")); }
+        let world = r_aabb(r)?;
+        let levels = r_u32(r)?;
+        if !(1..=21).contains(&levels) { return Err(corrupt("MortonGrid3 levels out of 1..=21")); }
+        let mut grid = Self::new(world, levels);
+        let ncells = r_u32(r)? as usize;
+        grid.cells.reserve(ncells);
+        for _ in 0..ncells {
+            let code = r_u64(r)?;
+            let n = r_u32(r)? as usize;
+            let mut bucket = Vec::with_capacity(n);
+            for _ in 0..n { bucket.push(read_item(r)?); }
+            grid.len += bucket.len();
+            grid.cells.insert(code, bucket);
+        }
+        Ok(grid)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,6 +628,45 @@ mod tests {
     #[derive(Clone, Copy)]
     struct P(Point3);
     impl Positioned3 for P { fn position(&self) -> Point3 { self.0 } }
+
+    #[test]
+    fn morton3_serialize_roundtrip() {
+        use std::io::{Cursor, Read, Write};
+        #[derive(Clone, Copy)]
+        struct M { id: u32, p: Point3 }
+        impl Positioned3 for M { fn position(&self) -> Point3 { self.p } }
+        let mut x = 0x0117_5E12u64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        let world = Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0);
+        let mut grid = MortonGrid3::<M>::new(world, 5);
+        for id in 0..4000u32 {
+            grid.insert(M { id, p: Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0) });
+        }
+        let mut buf = Vec::new();
+        grid.serialize(&mut buf, |w, it| {
+            w.write_all(&it.id.to_le_bytes())?;
+            w.write_all(&it.p.x.to_le_bytes())?; w.write_all(&it.p.y.to_le_bytes())?; w.write_all(&it.p.z.to_le_bytes())
+        }).unwrap();
+        let loaded = MortonGrid3::<M>::deserialize(&mut Cursor::new(&buf), |r| {
+            let mut a = [0u8; 4]; r.read_exact(&mut a)?; let mut b = [0u8; 8];
+            let id = u32::from_le_bytes(a);
+            r.read_exact(&mut b)?; let px = f64::from_le_bytes(b);
+            r.read_exact(&mut b)?; let py = f64::from_le_bytes(b);
+            r.read_exact(&mut b)?; let pz = f64::from_le_bytes(b);
+            Ok(M { id, p: Point3::new(px, py, pz) })
+        }).unwrap();
+        assert_eq!(loaded.item_count(), grid.item_count(), "items");
+        assert_eq!(loaded.cell_count(), grid.cell_count(), "cells");
+        assert_eq!(loaded.levels(), grid.levels(), "levels");
+        for (cx, cy, cz, r) in [(128.0, 128.0, 128.0, 30.0), (60.0, 200.0, 90.0, 50.0), (10.0, 10.0, 10.0, 80.0)] {
+            let s = Sphere3::new(cx, cy, cz, r).with_raster();
+            let mut a: Vec<u32> = grid.cull(&s).iter().map(|m| m.id).collect();
+            let mut b: Vec<u32> = loaded.cull(&s).iter().map(|m| m.id).collect();
+            a.sort(); b.sort();
+            assert_eq!(a, b, "cull differs after round-trip ({cx},{cy},{cz}) r={r}");
+        }
+        assert!(MortonGrid3::<M>::deserialize(&mut Cursor::new(&b"XXXXX"[..]), |_| unreachable!()).is_err());
+    }
 
     #[test]
     fn morton_encode_known_values() {

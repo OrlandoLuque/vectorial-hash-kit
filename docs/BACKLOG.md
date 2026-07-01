@@ -168,8 +168,14 @@ measured crossover (`PARALLEL.md`) visible. Native only; hidden on wasm.
 **B. Correctness / robustness**
 5. **Property / fuzz tests** (proptest) — randomized insert/update/remove/cull/knn
    vs brute force with shrinking, across all seven structures.
-6. **Serialization for all structures** — only `Tree3` has versioned serialize;
-   extend to `Tree`/`QuadTree`/`IntegerTree`/`Octree3`/`MortonGrid`/`MortonGrid3`.
+6. ~~**Serialization for all structures**~~ — **done.** `serialize`/`deserialize`
+   now on `Tree`, `QuadTree`, `IntegerTree`, `Octree3`, `MortonGrid` (2D),
+   `MortonGrid3` (mirroring `Tree3`), sharing the LE byte-IO helpers in
+   `serde_io.rs`. Each round-trips the exact arena + free-list + `ItemRef`
+   handles (grids: world+levels+buckets), gated by a per-structure round-trip
+   test (arena counts + cull + knn identical + corruption rejected). `Tree`'s
+   `neighbors` ropes are *rebuilt geometrically on load* (not stored), so the
+   format is feature-independent.
 7. **Templates CI cleanup** — fix the ~21 clippy lints + make the fingerprint
    test cross-platform (deterministic float formatting + sorted iteration), then
    move templates/cli back into the **hard** CI gate (currently advisory).
@@ -419,13 +425,16 @@ Everything else in this file is **future** — left to triage later.
   gated. 2–13 µs/query at 50k for k=1..50; octree ≈ binary. `tree3d_bench --knn
   K`. See `THREE_D.md` § "k-nearest-neighbour". Follow-up: `MortonGrid3::knn`
   (ring-by-ring outward from the query cell).
-- ~~**Index serialization**~~ — **done for `Tree3`.** `Tree3::serialize` /
-  `deserialize` round-trip the built tree (exact arena + free-list, no rebuild)
-  to any `std::io::Write`/`Read`, dependency-free, items via a caller closure
-  (works for any `T`). Round-trip test preserves cull + knn + arena and rejects
-  corruption. Follow-up: the same ~60-line pattern for `Octree3` and the 2D
-  trees (`Tree`/`QuadTree`/`IntegerTree`); a versioned format already in place
-  (magic `VHT3` + version byte).
+- ~~**Index serialization**~~ — **done for all structures.** `serialize` /
+  `deserialize` round-trip the built index (exact arena + free-list + `ItemRef`
+  handles, no rebuild) to any `std::io::Write`/`Read`, dependency-free, items via
+  a caller closure (works for any `T`). Now on `Tree`, `QuadTree`, `IntegerTree`,
+  `Tree3`, `Octree3`, and the Morton grids (`MortonGrid` 2D + `MortonGrid3` store
+  world+levels+occupied buckets, no arena). Shared LE byte-IO in `serde_io.rs`;
+  each a versioned format (magic `VHT2`/`VHQ2`/`VHI2`/`VHT3`/`VHO3`/`VHM2`/`VHM3`
+  + version byte). Per-structure round-trip test: arena counts + cull + knn
+  identical + corruption rejected. `Tree`'s `neighbors` ropes are derived state,
+  rebuilt geometrically on load, so the format doesn't depend on the feature.
 
 ## Dilation
 - **3D dilation (Minkowski)** — agent body radius for the 3D critters, the way

@@ -1137,28 +1137,12 @@ pub(crate) fn aabb_min_dist2(b: &Aabb, q: Point3) -> f64 {
 }
 
 // ------------------------------------------------------------- serialization
-// Little-endian primitive read/write helpers (no external dependency).
-
-fn w_u32<W: Write>(w: &mut W, v: u32) -> io::Result<()> { w.write_all(&v.to_le_bytes()) }
-fn w_u64<W: Write>(w: &mut W, v: u64) -> io::Result<()> { w.write_all(&v.to_le_bytes()) }
-fn w_f64<W: Write>(w: &mut W, v: f64) -> io::Result<()> { w.write_all(&v.to_le_bytes()) }
-fn r_u32<R: Read>(r: &mut R) -> io::Result<u32> { let mut b = [0u8; 4]; r.read_exact(&mut b)?; Ok(u32::from_le_bytes(b)) }
-fn r_u64<R: Read>(r: &mut R) -> io::Result<u64> { let mut b = [0u8; 8]; r.read_exact(&mut b)?; Ok(u64::from_le_bytes(b)) }
-fn r_f64<R: Read>(r: &mut R) -> io::Result<f64> { let mut b = [0u8; 8]; r.read_exact(&mut b)?; Ok(f64::from_le_bytes(b)) }
-fn r_u8<R: Read>(r: &mut R) -> io::Result<u8> { let mut b = [0u8; 1]; r.read_exact(&mut b)?; Ok(b[0]) }
-
-fn w_aabb<W: Write>(w: &mut W, b: &Aabb) -> io::Result<()> {
-    w_f64(w, b.x)?; w_f64(w, b.y)?; w_f64(w, b.z)?;
-    w_f64(w, b.w)?; w_f64(w, b.h)?; w_f64(w, b.d)
-}
-fn r_aabb<R: Read>(r: &mut R) -> io::Result<Aabb> {
-    Ok(Aabb::new(r_f64(r)?, r_f64(r)?, r_f64(r)?, r_f64(r)?, r_f64(r)?, r_f64(r)?))
-}
+// Little-endian primitive read/write helpers live in `crate::serde_io`, shared
+// by every structure's serializer (so the byte layout is defined once).
+use crate::serde_io::{corrupt, r_aabb, r_f64, r_u32, r_u64, r_u8, w_aabb, w_f64, w_u32, w_u64};
 
 const TREE3_MAGIC: &[u8; 4] = b"VHT3";
 const TREE3_VERSION: u8 = 2; // v2 adds per-leaf handle ids (the ItemRef layer)
-
-fn corrupt(msg: &str) -> io::Error { io::Error::new(io::ErrorKind::InvalidData, msg) }
 
 impl<T: Positioned3> Tree3<T> {
     /// Serialize the **built** tree (exact arena, free-list, and params — no

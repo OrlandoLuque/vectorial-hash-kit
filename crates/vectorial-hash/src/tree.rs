@@ -1,7 +1,9 @@
 //! Spatial tree: items live in leaf cells; cells split when they overflow.
 
 use crate::geom::{Point, Rect};
+use crate::serde_io::{corrupt, r_f64, r_rect, r_u32, r_u64, r_u8, w_f64, w_rect, w_u32, w_u64, w_u8};
 use crate::tree3::ItemRef;
+use std::io::{self, Read, Write};
 
 /// Stable handle into the tree's node arena.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -1058,6 +1060,114 @@ fn pick_split<T: Positioned>(bbox: Rect, items: &[T]) -> (Rect, Rect) {
     }
 }
 
+// ------------------------------------------------------------- serialization
+
+const TREE_MAGIC: &[u8; 4] = b"VHT2";
+const TREE_VERSION: u8 = 1;
+
+impl<T: Positioned> Tree<T> {
+    /// Serialize the **built** tree (exact arena, free-list, params — no rebuild
+    /// on load) to `w`. Items are written by `write_item`. The 2D analogue of
+    /// [`crate::Tree3::serialize`].
+    ///
+    /// Leaf neighbour "ropes" (the `neighbors` feature) are *not* written — they
+    /// are derived state, rebuilt geometrically on load — so the byte format is
+    /// identical whether or not the writer had the feature enabled.
+    pub fn serialize<W: Write>(&self, w: &mut W, write_item: impl Fn(&mut W, &T) -> io::Result<()>) -> io::Result<()> {
+        w.write_all(TREE_MAGIC)?;
+        w_u8(w, TREE_VERSION)?;
+        w_u64(w, self.item_limit as u64)?;
+        w_u64(w, self.merge_limit as u64)?;
+        w_f64(w, self.min_cell)?;
+        w_u32(w, self.root.0)?;
+        w_u32(w, self.free.len() as u32)?;
+        for f in &self.free { w_u32(w, f.0)?; }
+        w_u32(w, self.nodes.len() as u32)?;
+        for n in &self.nodes {
+            w_rect(w, &n.bbox)?;
+            match n.parent {
+                Some(p) => { w_u8(w, 1)?; w_u32(w, p.0)?; }
+                None => w_u8(w, 0)?,
+            }
+            match n.children {
+                Some([a, b]) => { w_u8(w, 1)?; w_u32(w, a.0)?; w_u32(w, b.0)?; }
+                None => w_u8(w, 0)?,
+            }
+            w_u32(w, n.items.len() as u32)?;
+            for it in &n.items { write_item(w, it)?; }
+            for &h in &n.hs { w_u32(w, h)?; }
+        }
+        Ok(())
+    }
+
+    /// Inverse of [`Tree::serialize`]: rebuild the exact tree from `r`, reading
+    /// each item with `read_item` (must mirror the writer's layout). Under the
+    /// `neighbors` feature the leaf ropes are rebuilt geometrically after load.
+    pub fn deserialize<R: Read>(r: &mut R, read_item: impl Fn(&mut R) -> io::Result<T>) -> io::Result<Self> {
+        let mut magic = [0u8; 4];
+        r.read_exact(&mut magic)?;
+        if &magic != TREE_MAGIC { return Err(corrupt("bad Tree magic")); }
+        if r_u8(r)? != TREE_VERSION { return Err(corrupt("unsupported Tree version")); }
+        let item_limit = r_u64(r)? as usize;
+        let merge_limit = r_u64(r)? as usize;
+        let min_cell = r_f64(r)?;
+        let root = NodeId(r_u32(r)?);
+        let nfree = r_u32(r)? as usize;
+        let mut free = Vec::with_capacity(nfree);
+        for _ in 0..nfree { free.push(NodeId(r_u32(r)?)); }
+        let nnodes = r_u32(r)? as usize;
+        let mut nodes = Vec::with_capacity(nnodes);
+        for _ in 0..nnodes {
+            let bbox = r_rect(r)?;
+            let parent = if r_u8(r)? == 1 { Some(NodeId(r_u32(r)?)) } else { None };
+            let children = if r_u8(r)? == 1 { Some([NodeId(r_u32(r)?), NodeId(r_u32(r)?)]) } else { None };
+            let nitems = r_u32(r)? as usize;
+            let mut items = Vec::with_capacity(nitems);
+            for _ in 0..nitems { items.push(read_item(r)?); }
+            let mut hs = Vec::with_capacity(nitems);
+            for _ in 0..nitems { hs.push(r_u32(r)?); }
+            nodes.push(Node {
+                bbox, parent, children, items, hs,
+                #[cfg(feature = "neighbors")]
+                ropes: Default::default(),
+            });
+        }
+        if root.0 as usize >= nnodes { return Err(corrupt("root index out of range")); }
+        let max_h = nodes.iter().flat_map(|n| n.hs.iter().copied()).max().map_or(0, |m| m + 1) as usize;
+        let mut locs = vec![ItemLoc { node: NodeId(0), slot: 0 }; max_h];
+        let mut used = vec![false; max_h];
+        for (ni, n) in nodes.iter().enumerate() {
+            for (slot, &h) in n.hs.iter().enumerate() {
+                locs[h as usize] = ItemLoc { node: NodeId(ni as u32), slot: slot as u32 };
+                used[h as usize] = true;
+            }
+        }
+        let free_handles: Vec<u32> = (0..max_h as u32).filter(|&h| !used[h as usize]).collect();
+        #[allow(unused_mut)]
+        let mut tree = Tree { nodes, free, locs, free_handles, item_limit, merge_limit, min_cell, root };
+        #[cfg(feature = "neighbors")]
+        tree.rebuild_ropes();
+        Ok(tree)
+    }
+
+    /// Recompute every leaf's neighbour ropes geometrically (Samet's algorithm)
+    /// — used after [`Tree::deserialize`], since ropes are derived and not
+    /// stored. Equivalent to the incremental state the ropes would hold had the
+    /// tree been built by insertion.
+    #[cfg(feature = "neighbors")]
+    fn rebuild_ropes(&mut self) {
+        let mut leaves: Vec<NodeId> = Vec::new();
+        self.visit_leaves(|id, _| leaves.push(id));
+        for leaf in leaves {
+            for side in Side::ALL {
+                let mut buf = Vec::new();
+                self.neighbors_samet(leaf, side, &mut buf);
+                self.get_mut(leaf).ropes[side.index()] = buf;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1066,6 +1176,78 @@ mod tests {
     struct Pt(Point);
     impl Positioned for Pt {
         fn position(&self) -> Point { self.0 }
+    }
+
+    struct Disc { cx: f64, cy: f64, r: f64 }
+    impl crate::Shape for Disc {
+        fn bounding_box(&self) -> Rect { Rect::new(self.cx - self.r, self.cy - self.r, 2.0 * self.r, 2.0 * self.r) }
+        fn contains_point(&self, p: Point) -> bool { let (dx, dy) = (p.x - self.cx, p.y - self.cy); dx * dx + dy * dy <= self.r * self.r }
+    }
+
+    #[test]
+    fn tree_serialize_roundtrip() {
+        // Round-trips the exact arena (incl. dead slots) + item handles, and —
+        // under the `neighbors` feature — verifies the ropes rebuilt on load
+        // give the same neighbour walk as the live tree.
+        use std::io::{Cursor, Read, Write};
+        #[derive(Clone, Copy)]
+        struct M { id: u32, p: Point }
+        impl Positioned for M { fn position(&self) -> Point { self.p } }
+        let mut x = 0x07EE_5E12u64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        let mut tree = Tree::<M>::new(Rect::new(0.0, 0.0, 256.0, 256.0), 5);
+        let mut live: std::collections::BTreeMap<u32, Point> = std::collections::BTreeMap::new();
+        let mut next = 0u32;
+        for _ in 0..1500 {
+            let p = Point::new(rng() * 256.0, rng() * 256.0);
+            tree.insert(M { id: next, p }); live.insert(next, p); next += 1;
+        }
+        for _ in 0..3000 {
+            let roll = rng();
+            let ids: Vec<u32> = live.keys().copied().collect();
+            if roll < 0.5 && !ids.is_empty() {
+                let id = ids[(rng() * ids.len() as f64) as usize % ids.len()];
+                let old = live[&id]; let np = Point::new(rng() * 256.0, rng() * 256.0);
+                if tree.update(old, |m| m.id == id, |m| m.p = np) { live.insert(id, np); }
+            } else if roll < 0.7 && !ids.is_empty() {
+                let id = ids[(rng() * ids.len() as f64) as usize % ids.len()];
+                tree.remove(live[&id], |m| m.id == id); live.remove(&id);
+            } else {
+                let p = Point::new(rng() * 256.0, rng() * 256.0);
+                tree.insert(M { id: next, p }); live.insert(next, p); next += 1;
+            }
+        }
+        let doomed: Vec<u32> = live.keys().copied().take(live.len() * 2 / 5).collect();
+        for id in doomed { tree.remove(live[&id], |m| m.id == id); live.remove(&id); }
+        assert!(tree.node_count() > tree.live_node_count(), "expected dead slots");
+
+        let mut buf = Vec::new();
+        tree.serialize(&mut buf, |w, it| {
+            w.write_all(&it.id.to_le_bytes())?;
+            w.write_all(&it.p.x.to_le_bytes())?; w.write_all(&it.p.y.to_le_bytes())
+        }).unwrap();
+        let loaded = Tree::<M>::deserialize(&mut Cursor::new(&buf), |r| {
+            let mut a = [0u8; 4]; r.read_exact(&mut a)?; let mut b = [0u8; 8];
+            let id = u32::from_le_bytes(a);
+            r.read_exact(&mut b)?; let px = f64::from_le_bytes(b);
+            r.read_exact(&mut b)?; let py = f64::from_le_bytes(b);
+            Ok(M { id, p: Point::new(px, py) })
+        }).unwrap();
+        assert_eq!(loaded.node_count(), tree.node_count(), "arena size");
+        assert_eq!(loaded.live_node_count(), tree.live_node_count(), "live nodes");
+        assert_eq!(loaded.leaf_count(), tree.leaf_count(), "leaves");
+        assert_eq!(loaded.item_count(), tree.item_count(), "items");
+        for (cx, cy, r) in [(128.0, 128.0, 30.0), (60.0, 200.0, 50.0), (10.0, 10.0, 80.0)] {
+            let s = Disc { cx, cy, r };
+            let mut a: Vec<u32> = tree.cull(&s).iter().map(|m| m.id).collect();
+            let mut b: Vec<u32> = loaded.cull(&s).iter().map(|m| m.id).collect();
+            a.sort(); b.sort();
+            assert_eq!(a, b, "cull differs after round-trip ({cx},{cy}) r={r}");
+        }
+        let ka: Vec<f64> = tree.knn(Point::new(120.0, 120.0), 8).iter().map(|(d, _)| *d).collect();
+        let kb: Vec<f64> = loaded.knn(Point::new(120.0, 120.0), 8).iter().map(|(d, _)| *d).collect();
+        assert_eq!(ka, kb, "knn differs after round-trip");
+        assert!(Tree::<M>::deserialize(&mut Cursor::new(&b"XXXXX"[..]), |_| unreachable!()).is_err());
     }
 
     #[test]

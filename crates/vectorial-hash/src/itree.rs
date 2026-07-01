@@ -23,9 +23,11 @@
 
 use crate::culling::{classify_child, SizeCache};
 use crate::geom::{Point, Rect};
+use crate::serde_io::{corrupt, r_i32, r_u32, r_u64, r_u8, w_i32, w_u32, w_u64, w_u8};
 use crate::template::CellState;
 use crate::tree3::ItemRef;
 use crate::Shape;
+use std::io::{self, Read, Write};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct IPoint {
@@ -585,6 +587,84 @@ fn collect_matching_items_i<'a, T: IPositioned, S: Shape>(
     }
 }
 
+// ------------------------------------------------------------- serialization
+
+const ITREE_MAGIC: &[u8; 4] = b"VHI2";
+const ITREE_VERSION: u8 = 1;
+
+impl<T: IPositioned> IntegerTree<T> {
+    /// Serialize the **built** integer tree (exact arena, free-list, params — no
+    /// rebuild on load) to `w`. Items are written by `write_item`. Mirrors
+    /// [`crate::Tree3::serialize`] over the i32 binary split.
+    pub fn serialize<W: Write>(&self, w: &mut W, write_item: impl Fn(&mut W, &T) -> io::Result<()>) -> io::Result<()> {
+        w.write_all(ITREE_MAGIC)?;
+        w_u8(w, ITREE_VERSION)?;
+        w_u64(w, self.item_limit as u64)?;
+        w_u64(w, self.merge_limit as u64)?;
+        w_i32(w, self.min_cell)?;
+        w_u32(w, self.root.0)?;
+        w_u32(w, self.free.len() as u32)?;
+        for f in &self.free { w_u32(w, f.0)?; }
+        w_u32(w, self.nodes.len() as u32)?;
+        for n in &self.nodes {
+            w_i32(w, n.bbox.x)?; w_i32(w, n.bbox.y)?; w_i32(w, n.bbox.w)?; w_i32(w, n.bbox.h)?;
+            match n.parent {
+                Some(p) => { w_u8(w, 1)?; w_u32(w, p.0)?; }
+                None => w_u8(w, 0)?,
+            }
+            match n.children {
+                Some([a, b]) => { w_u8(w, 1)?; w_u32(w, a.0)?; w_u32(w, b.0)?; }
+                None => w_u8(w, 0)?,
+            }
+            w_u32(w, n.items.len() as u32)?;
+            for it in &n.items { write_item(w, it)?; }
+            for &h in &n.hs { w_u32(w, h)?; }
+        }
+        Ok(())
+    }
+
+    /// Inverse of [`IntegerTree::serialize`]: rebuild the exact tree from `r`,
+    /// reading each item with `read_item` (must mirror the writer's layout).
+    pub fn deserialize<R: Read>(r: &mut R, read_item: impl Fn(&mut R) -> io::Result<T>) -> io::Result<Self> {
+        let mut magic = [0u8; 4];
+        r.read_exact(&mut magic)?;
+        if &magic != ITREE_MAGIC { return Err(corrupt("bad IntegerTree magic")); }
+        if r_u8(r)? != ITREE_VERSION { return Err(corrupt("unsupported IntegerTree version")); }
+        let item_limit = r_u64(r)? as usize;
+        let merge_limit = r_u64(r)? as usize;
+        let min_cell = r_i32(r)?;
+        let root = INodeId(r_u32(r)?);
+        let nfree = r_u32(r)? as usize;
+        let mut free = Vec::with_capacity(nfree);
+        for _ in 0..nfree { free.push(INodeId(r_u32(r)?)); }
+        let nnodes = r_u32(r)? as usize;
+        let mut nodes = Vec::with_capacity(nnodes);
+        for _ in 0..nnodes {
+            let bbox = IRect::new(r_i32(r)?, r_i32(r)?, r_i32(r)?, r_i32(r)?);
+            let parent = if r_u8(r)? == 1 { Some(INodeId(r_u32(r)?)) } else { None };
+            let children = if r_u8(r)? == 1 { Some([INodeId(r_u32(r)?), INodeId(r_u32(r)?)]) } else { None };
+            let nitems = r_u32(r)? as usize;
+            let mut items = Vec::with_capacity(nitems);
+            for _ in 0..nitems { items.push(read_item(r)?); }
+            let mut hs = Vec::with_capacity(nitems);
+            for _ in 0..nitems { hs.push(r_u32(r)?); }
+            nodes.push(INode { bbox, parent, children, items, hs });
+        }
+        if root.0 as usize >= nnodes { return Err(corrupt("root index out of range")); }
+        let max_h = nodes.iter().flat_map(|n| n.hs.iter().copied()).max().map_or(0, |m| m + 1) as usize;
+        let mut locs = vec![IItemLoc { node: INodeId(0), slot: 0 }; max_h];
+        let mut used = vec![false; max_h];
+        for (ni, n) in nodes.iter().enumerate() {
+            for (slot, &h) in n.hs.iter().enumerate() {
+                locs[h as usize] = IItemLoc { node: INodeId(ni as u32), slot: slot as u32 };
+                used[h as usize] = true;
+            }
+        }
+        let free_handles: Vec<u32> = (0..max_h as u32).filter(|&h| !used[h as usize]).collect();
+        Ok(IntegerTree { nodes, free, locs, free_handles, item_limit, merge_limit, min_cell, root })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,6 +672,75 @@ mod tests {
     #[derive(Clone, Copy)]
     struct IP(IPoint);
     impl IPositioned for IP { fn position(&self) -> IPoint { self.0 } }
+
+    struct Disc { cx: f64, cy: f64, r: f64 }
+    impl Shape for Disc {
+        fn bounding_box(&self) -> Rect { Rect::new(self.cx - self.r, self.cy - self.r, 2.0 * self.r, 2.0 * self.r) }
+        fn contains_point(&self, p: Point) -> bool { let (dx, dy) = (p.x - self.cx, p.y - self.cy); dx * dx + dy * dy <= self.r * self.r }
+    }
+
+    #[test]
+    fn itree_serialize_roundtrip() {
+        use std::io::{Cursor, Read, Write};
+        #[derive(Clone, Copy)]
+        struct M { id: u32, p: IPoint }
+        impl IPositioned for M { fn position(&self) -> IPoint { self.p } }
+        let mut x = 0x01EE_5E12u64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        let rint = |r: &mut dyn FnMut() -> f64| (r() * 256.0) as i32;
+        let mut tree = IntegerTree::<M>::new(IRect::new(0, 0, 256, 256), 5);
+        let mut live: std::collections::BTreeMap<u32, IPoint> = std::collections::BTreeMap::new();
+        let mut next = 0u32;
+        for _ in 0..1500 {
+            let p = IPoint::new(rint(&mut rng), rint(&mut rng));
+            tree.insert(M { id: next, p }); live.insert(next, p); next += 1;
+        }
+        for _ in 0..3000 {
+            let roll = rng();
+            let ids: Vec<u32> = live.keys().copied().collect();
+            if roll < 0.5 && !ids.is_empty() {
+                let id = ids[(rng() * ids.len() as f64) as usize % ids.len()];
+                let old = live[&id]; let np = IPoint::new(rint(&mut rng), rint(&mut rng));
+                if tree.update(old, |m| m.id == id, |m| m.p = np) { live.insert(id, np); }
+            } else if roll < 0.7 && !ids.is_empty() {
+                let id = ids[(rng() * ids.len() as f64) as usize % ids.len()];
+                tree.remove(live[&id], |m| m.id == id); live.remove(&id);
+            } else {
+                let p = IPoint::new(rint(&mut rng), rint(&mut rng));
+                tree.insert(M { id: next, p }); live.insert(next, p); next += 1;
+            }
+        }
+        let doomed: Vec<u32> = live.keys().copied().take(live.len() * 2 / 5).collect();
+        for id in doomed { tree.remove(live[&id], |m| m.id == id); live.remove(&id); }
+        assert!(tree.node_count() > tree.live_node_count(), "expected dead slots");
+
+        let mut buf = Vec::new();
+        tree.serialize(&mut buf, |w, it| {
+            w.write_all(&it.id.to_le_bytes())?;
+            w.write_all(&it.p.x.to_le_bytes())?; w.write_all(&it.p.y.to_le_bytes())
+        }).unwrap();
+        let loaded = IntegerTree::<M>::deserialize(&mut Cursor::new(&buf), |r| {
+            let mut a = [0u8; 4]; r.read_exact(&mut a)?; let id = u32::from_le_bytes(a);
+            r.read_exact(&mut a)?; let px = i32::from_le_bytes(a);
+            r.read_exact(&mut a)?; let py = i32::from_le_bytes(a);
+            Ok(M { id, p: IPoint::new(px, py) })
+        }).unwrap();
+        assert_eq!(loaded.node_count(), tree.node_count(), "arena size");
+        assert_eq!(loaded.live_node_count(), tree.live_node_count(), "live nodes");
+        assert_eq!(loaded.leaf_count(), tree.leaf_count(), "leaves");
+        assert_eq!(loaded.item_count(), tree.item_count(), "items");
+        for (cx, cy, r) in [(128.0, 128.0, 30.0), (60.0, 200.0, 50.0), (10.0, 10.0, 80.0)] {
+            let s = Disc { cx, cy, r };
+            let mut a: Vec<u32> = tree.cull(&s).iter().map(|m| m.id).collect();
+            let mut b: Vec<u32> = loaded.cull(&s).iter().map(|m| m.id).collect();
+            a.sort(); b.sort();
+            assert_eq!(a, b, "cull differs after round-trip ({cx},{cy}) r={r}");
+        }
+        let ka: Vec<f64> = tree.knn(IPoint::new(120, 120), 8).iter().map(|(d, _)| *d).collect();
+        let kb: Vec<f64> = loaded.knn(IPoint::new(120, 120), 8).iter().map(|(d, _)| *d).collect();
+        assert_eq!(ka, kb, "knn differs after round-trip");
+        assert!(IntegerTree::<M>::deserialize(&mut Cursor::new(&b"XXXXX"[..]), |_| unreachable!()).is_err());
+    }
 
     #[test]
     fn knn_matches_brute() {

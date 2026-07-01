@@ -13,10 +13,12 @@
 
 use crate::culling::{classify_child, collect_matching_items, SizeCache};
 use crate::geom::{Point, Rect};
+use crate::serde_io::{corrupt, r_f64, r_rect, r_u32, r_u64, r_u8, w_f64, w_rect, w_u32, w_u64, w_u8};
 use crate::tree::{Positioned, UpdateStrategy};
 use crate::tree3::ItemRef;
 use crate::CellState;
 use crate::Shape;
+use std::io::{self, Read, Write};
 
 /// Stable handle into the quadtree's node arena.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -510,6 +512,88 @@ impl<T: Positioned> QuadTree<T> {
     }
 }
 
+// ------------------------------------------------------------- serialization
+
+const QUADTREE_MAGIC: &[u8; 4] = b"VHQ2";
+const QUADTREE_VERSION: u8 = 1;
+
+impl<T: Positioned> QuadTree<T> {
+    /// Serialize the **built** quadtree (exact arena, free-list, params — no
+    /// rebuild on load) to `w`. Items are written by `write_item`. Mirrors
+    /// [`crate::Tree3::serialize`] over the 2D 4-way split.
+    pub fn serialize<W: Write>(&self, w: &mut W, write_item: impl Fn(&mut W, &T) -> io::Result<()>) -> io::Result<()> {
+        w.write_all(QUADTREE_MAGIC)?;
+        w_u8(w, QUADTREE_VERSION)?;
+        w_u64(w, self.item_limit as u64)?;
+        w_u64(w, self.merge_limit as u64)?;
+        w_f64(w, self.min_cell)?;
+        w_u32(w, self.root.0)?;
+        w_u32(w, self.free.len() as u32)?;
+        for f in &self.free { w_u32(w, f.0)?; }
+        w_u32(w, self.nodes.len() as u32)?;
+        for n in &self.nodes {
+            w_rect(w, &n.bbox)?;
+            match n.parent {
+                Some(p) => { w_u8(w, 1)?; w_u32(w, p.0)?; }
+                None => w_u8(w, 0)?,
+            }
+            match n.children {
+                Some(kids) => { w_u8(w, 1)?; for k in kids { w_u32(w, k.0)?; } }
+                None => w_u8(w, 0)?,
+            }
+            w_u32(w, n.items.len() as u32)?;
+            for it in &n.items { write_item(w, it)?; }
+            for &h in &n.hs { w_u32(w, h)?; }
+        }
+        Ok(())
+    }
+
+    /// Inverse of [`QuadTree::serialize`]: rebuild the exact quadtree from `r`,
+    /// reading each item with `read_item` (must mirror the writer's layout).
+    pub fn deserialize<R: Read>(r: &mut R, read_item: impl Fn(&mut R) -> io::Result<T>) -> io::Result<Self> {
+        let mut magic = [0u8; 4];
+        r.read_exact(&mut magic)?;
+        if &magic != QUADTREE_MAGIC { return Err(corrupt("bad QuadTree magic")); }
+        if r_u8(r)? != QUADTREE_VERSION { return Err(corrupt("unsupported QuadTree version")); }
+        let item_limit = r_u64(r)? as usize;
+        let merge_limit = r_u64(r)? as usize;
+        let min_cell = r_f64(r)?;
+        let root = QNodeId(r_u32(r)?);
+        let nfree = r_u32(r)? as usize;
+        let mut free = Vec::with_capacity(nfree);
+        for _ in 0..nfree { free.push(QNodeId(r_u32(r)?)); }
+        let nnodes = r_u32(r)? as usize;
+        let mut nodes = Vec::with_capacity(nnodes);
+        for _ in 0..nnodes {
+            let bbox = r_rect(r)?;
+            let parent = if r_u8(r)? == 1 { Some(QNodeId(r_u32(r)?)) } else { None };
+            let children = if r_u8(r)? == 1 {
+                let mut kids = [QNodeId(0); 4];
+                for k in &mut kids { *k = QNodeId(r_u32(r)?); }
+                Some(kids)
+            } else { None };
+            let nitems = r_u32(r)? as usize;
+            let mut items = Vec::with_capacity(nitems);
+            for _ in 0..nitems { items.push(read_item(r)?); }
+            let mut hs = Vec::with_capacity(nitems);
+            for _ in 0..nitems { hs.push(r_u32(r)?); }
+            nodes.push(QNode { bbox, parent, children, items, hs });
+        }
+        if root.0 as usize >= nnodes { return Err(corrupt("root index out of range")); }
+        let max_h = nodes.iter().flat_map(|n| n.hs.iter().copied()).max().map_or(0, |m| m + 1) as usize;
+        let mut locs = vec![QItemLoc { node: QNodeId(0), slot: 0 }; max_h];
+        let mut used = vec![false; max_h];
+        for (ni, n) in nodes.iter().enumerate() {
+            for (slot, &h) in n.hs.iter().enumerate() {
+                locs[h as usize] = QItemLoc { node: QNodeId(ni as u32), slot: slot as u32 };
+                used[h as usize] = true;
+            }
+        }
+        let free_handles: Vec<u32> = (0..max_h as u32).filter(|&h| !used[h as usize]).collect();
+        Ok(QuadTree { nodes, free, locs, free_handles, item_limit, merge_limit, min_cell, root })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -520,6 +604,75 @@ mod tests {
         fn position(&self) -> Point {
             self.0
         }
+    }
+
+    struct Disc { cx: f64, cy: f64, r: f64 }
+    impl Shape for Disc {
+        fn bounding_box(&self) -> Rect { Rect::new(self.cx - self.r, self.cy - self.r, 2.0 * self.r, 2.0 * self.r) }
+        fn contains_point(&self, p: Point) -> bool { let (dx, dy) = (p.x - self.cx, p.y - self.cy); dx * dx + dy * dy <= self.r * self.r }
+    }
+
+    #[test]
+    fn quadtree_serialize_roundtrip() {
+        use std::io::{Cursor, Read, Write};
+        #[derive(Clone, Copy)]
+        struct M { id: u32, p: Point }
+        impl Positioned for M { fn position(&self) -> Point { self.p } }
+        let mut x = 0x0DAB_5E12u64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        let mut tree = QuadTree::<M>::new(Rect::new(0.0, 0.0, 256.0, 256.0), 5);
+        let mut live: std::collections::BTreeMap<u32, Point> = std::collections::BTreeMap::new();
+        let mut next = 0u32;
+        for _ in 0..1500 {
+            let p = Point::new(rng() * 256.0, rng() * 256.0);
+            tree.insert(M { id: next, p }); live.insert(next, p); next += 1;
+        }
+        for _ in 0..3000 {
+            let roll = rng();
+            let ids: Vec<u32> = live.keys().copied().collect();
+            if roll < 0.5 && !ids.is_empty() {
+                let id = ids[(rng() * ids.len() as f64) as usize % ids.len()];
+                let old = live[&id]; let np = Point::new(rng() * 256.0, rng() * 256.0);
+                if tree.update(old, |m| m.id == id, |m| m.p = np) { live.insert(id, np); }
+            } else if roll < 0.7 && !ids.is_empty() {
+                let id = ids[(rng() * ids.len() as f64) as usize % ids.len()];
+                tree.remove(live[&id], |m| m.id == id); live.remove(&id);
+            } else {
+                let p = Point::new(rng() * 256.0, rng() * 256.0);
+                tree.insert(M { id: next, p }); live.insert(next, p); next += 1;
+            }
+        }
+        let doomed: Vec<u32> = live.keys().copied().take(live.len() * 2 / 5).collect();
+        for id in doomed { tree.remove(live[&id], |m| m.id == id); live.remove(&id); }
+        assert!(tree.node_count() > tree.live_node_count(), "expected dead slots");
+
+        let mut buf = Vec::new();
+        tree.serialize(&mut buf, |w, it| {
+            w.write_all(&it.id.to_le_bytes())?;
+            w.write_all(&it.p.x.to_le_bytes())?; w.write_all(&it.p.y.to_le_bytes())
+        }).unwrap();
+        let loaded = QuadTree::<M>::deserialize(&mut Cursor::new(&buf), |r| {
+            let mut a = [0u8; 4]; r.read_exact(&mut a)?; let mut b = [0u8; 8];
+            let id = u32::from_le_bytes(a);
+            r.read_exact(&mut b)?; let px = f64::from_le_bytes(b);
+            r.read_exact(&mut b)?; let py = f64::from_le_bytes(b);
+            Ok(M { id, p: Point::new(px, py) })
+        }).unwrap();
+        assert_eq!(loaded.node_count(), tree.node_count(), "arena size");
+        assert_eq!(loaded.live_node_count(), tree.live_node_count(), "live nodes");
+        assert_eq!(loaded.leaf_count(), tree.leaf_count(), "leaves");
+        assert_eq!(loaded.item_count(), tree.item_count(), "items");
+        for (cx, cy, r) in [(128.0, 128.0, 30.0), (60.0, 200.0, 50.0), (10.0, 10.0, 80.0)] {
+            let s = Disc { cx, cy, r };
+            let mut a: Vec<u32> = tree.cull(&s).iter().map(|m| m.id).collect();
+            let mut b: Vec<u32> = loaded.cull(&s).iter().map(|m| m.id).collect();
+            a.sort(); b.sort();
+            assert_eq!(a, b, "cull differs after round-trip ({cx},{cy}) r={r}");
+        }
+        let ka: Vec<f64> = tree.knn(Point::new(120.0, 120.0), 8).iter().map(|(d, _)| *d).collect();
+        let kb: Vec<f64> = loaded.knn(Point::new(120.0, 120.0), 8).iter().map(|(d, _)| *d).collect();
+        assert_eq!(ka, kb, "knn differs after round-trip");
+        assert!(QuadTree::<M>::deserialize(&mut Cursor::new(&b"XXXXX"[..]), |_| unreachable!()).is_err());
     }
 
     #[test]
