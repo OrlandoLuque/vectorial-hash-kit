@@ -274,6 +274,9 @@ struct State {
     // The two faction keeps: a static castle model, two instances.
     castle_model: GpuModel,
     castle_inst_buf: wgpu::Buffer,
+    // Cavalry mounts: a horse under every knight (parity with the macroquad demo).
+    horse_model: GpuModel,
+    horse_inst_buf: wgpu::Buffer,
     // Projectile markers: a small sphere drawn instanced per live projectile.
     proj_model: GpuModel,
     proj_inst_buf: wgpu::Buffer,
@@ -398,6 +401,7 @@ impl State {
         let prop_bytes = |name: &str| -> Vec<u8> {
             match name {
                 "castle.glb" => include_bytes!("../../assets/siege/models/castle.glb").to_vec(),
+                "horse.glb" => include_bytes!("../../assets/siege/models/horse.glb").to_vec(),
                 _ => unreachable!("unknown siege prop {name}"),
             }
         };
@@ -450,6 +454,11 @@ impl State {
             SkinInstance { model: m.to_cols_array_2d(), color: faction_tint(f), frame_base: 0, _pad: [0; 3] }
         }).collect();
         let castle_inst_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("castle-inst"), contents: bytemuck::cast_slice(&castle_inst), usage: wgpu::BufferUsages::VERTEX });
+
+        // Cavalry mount: one GPU-skinned horse per live knight. Instances rebuilt
+        // each frame; the buffer is sized for the worst case (every unit a knight).
+        let horse_model = build_gpu_model(&device, &cam_buf, &skin_layout, &prop_bytes("horse.glb"));
+        let horse_inst_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("horse-inst"), size: (MAX_POP * 2 * std::mem::size_of::<SkinInstance>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
 
         // Projectile sphere + its instance buffer (one instance per live shot).
         let proj_model = upload_skinned(&device, &cam_buf, &skin_layout, &proj_sphere());
@@ -505,6 +514,7 @@ impl State {
             surface, device, queue, config,
             skin_pipeline, models, model_idx, inst_buf,
             castle_model, castle_inst_buf,
+            horse_model, horse_inst_buf,
             proj_model, proj_inst_buf,
             line_pipeline, line_buf, line_cap, line_verts: Vec::new(),
             ui_pipeline, ui_buf, ui_drag: 0,
@@ -648,6 +658,21 @@ impl State {
             ranges.push((start, self.skin_instances.len() as u32));
         }
         self.queue.write_buffer(&self.inst_buf, 0, bytemuck::cast_slice(&self.skin_instances));
+        // Cavalry mounts: a horse under each live knight, animated with the horse's
+        // own clip (parity with the macroquad demo, which the wgpu build lacked).
+        let mut horse_inst: Vec<SkinInstance> = Vec::new();
+        let hnf = self.horse_model.n_frames.max(1);
+        let hnj = self.horse_model.num_joints;
+        for (i, u) in self.units.iter().enumerate() {
+            if !u.alive() || u.kind != Kind::Knight { continue; }
+            let gy = ground_height(u.p.x, u.p.z, &self.craters) as f32;
+            let model = glam::Mat4::from_translation(glam::Vec3::new(u.p.x as f32, gy, u.p.z as f32)) * glam::Mat4::from_rotation_y(u.face) * glam::Mat4::from_scale(glam::Vec3::splat(Kind::Knight.model_height()));
+            let group = (i as u32 % 5) as f32 / 5.0;
+            let frame = (((self.now as f32 * 1.6 + group) * hnf as f32) as u32) % hnf;
+            horse_inst.push(SkinInstance { model: model.to_cols_array_2d(), color: faction_tint(u.faction), frame_base: frame * hnj, _pad: [0; 3] });
+        }
+        let horse_n = (horse_inst.len().min(MAX_POP * 2)) as u32;
+        if horse_n > 0 { self.queue.write_buffer(&self.horse_inst_buf, 0, bytemuck::cast_slice(&horse_inst[..horse_n as usize])); }
         let cam = self.camera();
         self.queue.write_buffer(&self.cam_buf, 0, bytemuck::cast_slice(&[cam]));
 
@@ -748,6 +773,15 @@ impl State {
                 pass.set_vertex_buffer(0, m.vbuf.slice(..));
                 pass.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..m.nidx, 0, s..e);
+            }
+            // cavalry horses — one instance per live knight.
+            if horse_n > 0 {
+                let hm = &self.horse_model;
+                pass.set_bind_group(0, &hm.bind, &[]);
+                pass.set_vertex_buffer(0, hm.vbuf.slice(..));
+                pass.set_vertex_buffer(1, self.horse_inst_buf.slice(..));
+                pass.set_index_buffer(hm.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..hm.nidx, 0, 0..horse_n);
             }
             // castles — the static model, two instances (one per keep).
             let cm = &self.castle_model;
