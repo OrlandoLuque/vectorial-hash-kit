@@ -304,6 +304,35 @@ async fn main() {
         InstancedRenderer::new(gl.quad_context)
     };
 
+    // On the **web**, the models stream from `models/<name>` at startup instead
+    // of being baked into the wasm (which kept siege.wasm ~9 MB heavier than it
+    // needs to be). Native still embeds them via `include_bytes!`. `unit_bytes`
+    // / `prop_bytes` hide the split so the loading code below is target-agnostic.
+    #[cfg(target_arch = "wasm32")]
+    let model_table: std::collections::HashMap<&'static str, Vec<u8>> = {
+        let mut m = std::collections::HashMap::new();
+        for &name in SIEGE_MODEL_FILES {
+            let bytes = macroquad::file::load_file(&format!("models/{name}")).await
+                .unwrap_or_else(|e| panic!("fetch models/{name}: {e:?}"));
+            m.insert(name, bytes);
+        }
+        m
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let unit_bytes = |f: Faction, k: Kind| -> Vec<u8> { model_for(f, k).to_vec() };
+    #[cfg(target_arch = "wasm32")]
+    let unit_bytes = |f: Faction, k: Kind| -> Vec<u8> { model_table[model_file(f, k)].clone() };
+    #[cfg(not(target_arch = "wasm32"))]
+    let prop_bytes = |name: &str| -> Vec<u8> {
+        match name {
+            "horse.glb" => include_bytes!("../../assets/siege/models/horse.glb").to_vec(),
+            "castle.glb" => include_bytes!("../../assets/siege/models/castle.glb").to_vec(),
+            _ => unreachable!("unknown siege prop {name}"),
+        }
+    };
+    #[cfg(target_arch = "wasm32")]
+    let prop_bytes = |name: &str| -> Vec<u8> { model_table[name].clone() };
+
     // Load + upload a glTF model per (faction, kind) — pirates vs undead. While
     // loading, derive each one's world-space body radius from its own XZ footprint
     // × render height, so the space a unit occupies (separation) matches what's
@@ -319,8 +348,9 @@ async fn main() {
                 // Riders sit on the horse → their "movement" clip is the idle (no
                 // running legs); everyone else walks/runs/flies.
                 let mov_prefs = if k == Kind::Knight { IDLE_PREFS } else { MOVE_PREFS };
-                let mov_cpu = load_glb_clip(model_for(f, k), ANIM_FRAMES, mov_prefs);
-                let atk_cpu = load_glb_clip(model_for(f, k), ATTACK_FRAMES, ATTACK_PREFS);
+                let ub = unit_bytes(f, k);
+                let mov_cpu = load_glb_clip(&ub, ANIM_FRAMES, mov_prefs);
+                let atk_cpu = load_glb_clip(&ub, ATTACK_FRAMES, ATTACK_PREFS);
                 let (_, sc) = k.model_tweak(f);
                 body_radius[f.index()][k.index()] = (mov_cpu[0].footprint * k.model_height() * sc) as f64;
                 frames_mov[f.index()][k.index()] = mov_cpu.len();
@@ -336,7 +366,7 @@ async fn main() {
     // which is bigger than the rider — so the knight's footprint is the horse's.
     let horse: Vec<ModelGpu> = {
         let gl = unsafe { get_internal_gl() };
-        let cpu = load_glb_clip(include_bytes!("../../assets/siege/models/horse.glb"), ANIM_FRAMES, MOVE_PREFS);
+        let cpu = load_glb_clip(&prop_bytes("horse.glb"), ANIM_FRAMES, MOVE_PREFS);
         let hr = (cpu[0].footprint * Kind::Knight.model_height()) as f64;
         body_radius[0][Kind::Knight.index()] = hr;
         body_radius[1][Kind::Knight.index()] = hr;
@@ -349,7 +379,7 @@ async fn main() {
     // Castle model (static) for the two faction keeps, replacing the cube blocks.
     let castle = {
         let gl = unsafe { get_internal_gl() };
-        let m = load_glb(include_bytes!("../../assets/siege/models/castle.glb"));
+        let m = load_glb(&prop_bytes("castle.glb"));
         renderer.upload_model(gl.quad_context, &m.vertices, &m.indices)
     };
 

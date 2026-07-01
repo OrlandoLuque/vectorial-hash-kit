@@ -16,6 +16,15 @@ cp target/wasm32-unknown-unknown/release/critters.wasm   docs/critters.wasm
 cp target/wasm32-unknown-unknown/release/critters3d.wasm docs/critters3d.wasm
 cp target/wasm32-unknown-unknown/release/siege.wasm      docs/siege.wasm
 
-echo "done -> docs/{critters,critters3d,siege}.wasm  (commit + push to deploy)"
+# The siege demo fetches its models at runtime (they're NOT baked into the wasm —
+# keeps siege.wasm ~1.6 MB instead of ~9.5). They must be served from docs/models/;
+# copy exactly the set `siege_sim::SIEGE_MODEL_FILES` lists.
+mkdir -p docs/models
+for m in anne sharky pirate_captain witch henry zombie skeleton_a skeleton_sword \
+         slime bat dragon cannon horse castle; do
+  cp "crates/vectorial-hash-demos/assets/siege/models/$m.glb" "docs/models/$m.glb"
+done
+
+echo "done -> docs/{critters,critters3d,siege}.wasm + docs/models/*.glb  (commit + push to deploy)"
 # To refresh the JS bundle after a macroquad upgrade:
 #   cp ~/.cargo/registry/src/*/macroquad-*/js/mq_js_bundle.js docs/mq_js_bundle.js

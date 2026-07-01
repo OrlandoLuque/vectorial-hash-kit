@@ -218,6 +218,36 @@ pub fn model_for(f: Faction, k: Kind) -> &'static [u8] {
     }
 }
 
+/// The basename of the `.glb` for a (faction, kind). The **web** build fetches
+/// models by name from `models/<name>` (so they aren't baked into the wasm —
+/// keeps it ~1 MB instead of ~10). Must stay in lockstep with [`model_for`].
+pub fn model_file(f: Faction, k: Kind) -> &'static str {
+    use Faction::{Blue, Red};
+    match (f, k) {
+        (Red, Kind::Soldier) => "anne.glb",
+        (Red, Kind::Archer) => "sharky.glb",
+        (Red, Kind::Knight) => "pirate_captain.glb",
+        (Red, Kind::Mage) => "witch.glb",
+        (Red, Kind::Healer) => "henry.glb",
+        (Blue, Kind::Soldier) => "zombie.glb",
+        (Blue, Kind::Archer) => "skeleton_a.glb",
+        (Blue, Kind::Knight) => "skeleton_sword.glb",
+        (Blue, Kind::Mage) => "slime.glb",
+        (Blue, Kind::Healer) => "bat.glb",
+        (_, Kind::Dragon) => "dragon.glb",
+        (_, Kind::Catapult) | (_, Kind::Ballista) => "cannon.glb",
+    }
+}
+
+/// Every distinct `.glb` the siege demo needs — unit models (via [`model_file`])
+/// plus the two props loaded directly (`horse`, `castle`). The web build fetches
+/// these at startup; the build script copies exactly this set to `docs/models/`.
+pub const SIEGE_MODEL_FILES: &[&str] = &[
+    "anne.glb", "sharky.glb", "pirate_captain.glb", "witch.glb", "henry.glb",
+    "zombie.glb", "skeleton_a.glb", "skeleton_sword.glb", "slime.glb", "bat.glb",
+    "dragon.glb", "cannon.glb", "horse.glb", "castle.glb",
+];
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum Kind { Soldier, Archer, Knight, Dragon, Catapult, Mage, Ballista, Healer }
 impl Kind {

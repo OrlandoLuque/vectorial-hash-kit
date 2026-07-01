@@ -136,8 +136,17 @@ heightfield-eval dedups. See **docs/PERF_NOTES.md** (the force-table finding + t
 FPS review: free wins applied, quality-trade-off levers reported).
 
 **Siege — still remaining:**
-- **`siege_wgpu` on the web** (wasm-bindgen + WebGPU/WebGL2 — toolchain work, user
-  asked twice) and **slim `siege.wasm`** (fetch-load the glTF models).
+- ~~**slim `siege.wasm`**~~ — **done.** The macroquad siege web build fetches its
+  glTF models from `docs/models/<name>.glb` at startup instead of `include_bytes!`,
+  so the ~9 MB of models aren't baked in: **siege.wasm 9.5 MB → 1.6 MB** (the
+  unreferenced `model_for` + prop bytes are dead-stripped by wasm-ld gc). Native
+  still embeds them (zero behaviour change). Split hidden behind `unit_bytes` /
+  `prop_bytes` + `siege_sim::{model_file, SIEGE_MODEL_FILES}`; the build script
+  copies the set to `docs/models/`. *Runtime fetch to be eyeballed in-browser.*
+- **`siege_wgpu` on the web** — publishes, but recent Chrome rejects `requestDevice`
+  because wgpu 0.20 sends the now-removed `maxInterStageShaderComponents` limit.
+  Fix queued: a small `GPUAdapter.prototype.requestDevice` shim in the shell that
+  strips the dropped limit (no wasm rebuild); or upgrade wgpu.
 - **Optional "classic Reynolds" boids** behind a flag (inverse-square separation,
   arrival, inertia) — offered; needs the user's eyes to judge "more organic".
 - **Frustum-cull units** in the render (free quality-wise, situational; PERF_NOTES).
