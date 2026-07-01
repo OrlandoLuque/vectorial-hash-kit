@@ -23,10 +23,12 @@ frame). Lay the parallel infra first so the demo is multithreaded from the start
   API needed. Confirm + document it (this is the demo's lever).
 - **Parallel batch `knn` / `raycast`** (the read-fan-out, like `cull_many_par`).
 - **Parallel tree bulk-load** — **DONE** (2026-07-01): `Tree3::bulk_load` /
-  `bulk_load_par` (top-down partition; par fans out over rayon). Wired into both
-  siege binaries' per-frame rebuild (native `--features parallel`). Measured
-  ~1.14× CPU-fps at 12–16 threads; serial `bulk_load` loses to arena-reuse insert
-  (PARALLEL.md § "Parallel bulk-load").
+  `bulk_load_par` (top-down partition; par fans out over rayon), brute-force
+  gated. A parallel *rebuild* (~1.14× CPU-fps at high threads). **But** the
+  follow-up measurement (2026-07-02) showed **keeping** the tree with `update_ref`
+  in place beats rebuilding it at all (~1.06–1.4×), so both siege binaries now use
+  `siege_sim::sync_index` (keep) instead; `bulk_load_par` stays the library
+  primitive for from-scratch static builds (PARALLEL.md § "rebuild vs keep").
 - **Properly benchmarked + tested** (user, 2026-06-27): interleaved min-of-N vs
   the serial path (the `raycast_compare` anti-contamination methodology — rotate
   order, min, `noise` column, two runs), and correctness tests (parallel result

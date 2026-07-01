@@ -11,7 +11,7 @@
 
 use std::f64::consts::TAU;
 
-use vectorial_hash::{Point3, Positioned3, Sphere3, Tree3};
+use vectorial_hash::{ItemRef, Point3, Positioned3, Sphere3, Tree3};
 
 // ---------------------------------------------------------------- world config
 
@@ -399,6 +399,40 @@ impl Unit {
 #[derive(Clone, Copy)]
 pub struct IUnit { pub id: u32, pub faction: Faction, pub p: Point3, pub health: f32, pub face: f32 }
 impl Positioned3 for IUnit { fn position(&self) -> Point3 { self.p } }
+impl IUnit {
+    /// The index item for unit `i`.
+    pub fn of(i: usize, u: &Unit) -> IUnit { IUnit { id: i as u32, faction: u.faction, p: u.p, health: (u.hp / u.kind.max_hp()) as f32, face: u.face } }
+}
+
+/// Keep the unit index in sync with live positions **without rebuilding it**.
+///
+/// Instead of `clear()` + an `insert` per unit every frame, this *maintains* the
+/// existing tree: a unit that stayed inside its leaf costs O(1) (`update_ref`
+/// short-circuits on `bbox.contains`); only a unit that crossed a leaf boundary
+/// relocates. Deaths `remove_ref`, respawns `insert_ref`. `handles[i]` is unit
+/// `i`'s stable [`ItemRef`] (`None` when it isn't indexed — dead, or sunk out of
+/// bounds). Call once per frame, before [`decide`], in place of the rebuild.
+///
+/// Measured **~1.06× (1 thread) up to ~1.35–1.4× (12–16 threads)** faster on the
+/// full CPU frame than `clear()`+`insert` — the maintenance is far cheaper and,
+/// because `update_ref` still splits/merges, the tree stays balanced enough that
+/// the `decide` queries don't slow down (`examples/siege_cpu_bench`, PARALLEL.md).
+/// Produces a **byte-identical index** to the rebuild every frame (verified).
+///
+/// On an army rebuild (population slider) or map reset, the caller must
+/// `index.clear()` and reset `handles` (all `None`, len == `units.len()`) so the
+/// stale entries/handles are dropped; the next call re-inserts everyone.
+pub fn sync_index(index: &mut Tree3<IUnit>, units: &[Unit], handles: &mut Vec<Option<ItemRef>>) {
+    if handles.len() != units.len() { handles.resize(units.len(), None); }
+    for (i, u) in units.iter().enumerate() {
+        match (u.alive(), handles[i]) {
+            (true, Some(h)) => { let it = IUnit::of(i, u); if !index.update_ref(h, |s| *s = it) { handles[i] = index.insert_ref(it); } }
+            (true, None)    => { handles[i] = index.insert_ref(IUnit::of(i, u)); }
+            (false, Some(h)) => { index.remove_ref(h); handles[i] = None; }
+            (false, None)   => {}
+        }
+    }
+}
 
 // ----------------------------------------------------------------- smoke (LoS)
 

@@ -66,13 +66,16 @@ A frame is two passes:
 
 This decide→apply split is the general pattern for a parallel agent simulation:
 the reads parallelise trivially, the cross-unit writes are quarantined into one
-cheap serial pass. The index is **rebuilt** each frame from live positions — a
-serial insert loop by default, or (native `--features parallel`) a parallel
-`Tree3::bulk_load_par`, which fans the rebuild out over the same pool and lifts
-the CPU-fps ceiling ~1.14× at high thread counts by attacking the serial-rebuild
-Amdahl tail ([PARALLEL.md](PARALLEL.md) § "Parallel bulk-load"). Relocation-by-
-handle is the other lever when the rebuild dominates ([THREE_D.md](THREE_D.md)
-§ `ItemRef`).
+cheap serial pass. The index is **kept, not rebuilt**: `siege_sim::sync_index`
+`update_ref`s each unit to its new spot in place (O(1) when it stayed in its leaf,
+relocate only on a boundary cross), `remove_ref`s deaths and `insert_ref`s
+respawns. That beats a `clear()`+`insert` rebuild by **~1.06× (1 thread) up to
+~1.4× (12–16 threads)** — cheaper maintenance shrinks the serial Amdahl tail, so
+the parallel `decide` scales better — and it needs no threads, so the wasm build
+wins too. It's the same relocation-by-handle lever the `critters` demos use
+([THREE_D.md](THREE_D.md) § `ItemRef`); the "rebuild vs keep" measurement (and
+where a parallel `bulk_load` rebuild still fits) is in
+[PARALLEL.md](PARALLEL.md) § "The per-frame index: rebuild vs keep".
 
 ## Two extra index showcases
 

@@ -43,7 +43,7 @@ use vectorial_hash_demos::siege_sim::model_for;
 use vectorial_hash_demos::siege_sim::SIEGE_MODEL_FILES;
 use vectorial_hash_demos::siege_sim::{
     apply, decide, default_body_radius, faction_tint, forest_trees, ground_height, model_file, set_map_seed,
-    spawn_army, terrain_height, terrain_surface, volcano_step, Craters, Faction, Fx, FxKind, IUnit,
+    spawn_army, sync_index, terrain_height, terrain_surface, volcano_step, Craters, Faction, Fx, FxKind, IUnit,
     Kind, ProjKind, Projectile, Puff, Rng, SepTables, Unit, Volcano, ANIM_FRAMES, MOVE_PREFS,
     PER_FACTION, SKY, WORLD,
 };
@@ -388,6 +388,7 @@ struct State {
     // scene — the shared simulation (same battle as the macroquad binary)
     units: Vec<Unit>,
     index: Tree3<IUnit>,
+    handles: Vec<Option<vectorial_hash::ItemRef>>, // stable per-unit handles for the keep-in-place index sync
     smoke: Vec<Puff>,
     effects: Vec<Fx>,
     projectiles: Vec<Projectile>,
@@ -637,7 +638,7 @@ impl State {
             #[cfg(not(target_arch = "wasm32"))]
             max_threads,
             terrain_pipeline, terrain_vbuf, terrain_ibuf, terrain_nidx: ti.len() as u32,
-            cam_buf, cam_bg, depth, units, index,
+            cam_buf, cam_bg, depth, units, index, handles: Vec::new(),
             smoke: Vec::new(), effects: Vec::new(), projectiles: Vec::new(),
             volcano: Volcano::new(), sep: SepTables::new(&default_body_radius()), paused: false,
             red: 0, blue: 0, fps: 0.0, smooth, pop, craters, rebuild_t: 0.0,
@@ -671,6 +672,7 @@ impl State {
         if pop == self.pop { return; } // no churn while the slider sits still
         self.pop = pop;
         self.units = spawn_army(&mut self.rng, self.pop);
+        self.index.clear(); self.handles.clear(); // drop stale handles; sync_index re-inserts everyone
     }
 
     /// Resize the rayon pool that runs the parallel decide pass (thread slider).
@@ -731,25 +733,13 @@ impl State {
         }
         if !self.paused {
             self.now += dt;
-            // Rebuild the unit index from live positions each frame. Native + the
-            // `parallel` feature: a parallel top-down partition (`bulk_load_par`)
-            // over the sized pool — it attacks the serial-rebuild Amdahl tail
-            // (~1.14× CPU-fps at high thread counts, PARALLEL.md). Otherwise
-            // (default native / wasm): the serial clear()+insert loop.
-            #[cfg(all(not(target_arch = "wasm32"), feature = "parallel"))]
-            {
-                let world = Aabb::new(0.0, 0.0, 0.0, WORLD, SKY, WORLD);
-                let items: Vec<IUnit> = self.units.iter().enumerate().filter(|(_, u)| u.alive())
-                    .map(|(i, u)| IUnit { id: i as u32, faction: u.faction, p: u.p, health: (u.hp / u.kind.max_hp()) as f32, face: u.face }).collect();
-                self.index = self.pool.install(|| Tree3::<IUnit>::bulk_load_par(world, 8, items));
-            }
-            #[cfg(not(all(not(target_arch = "wasm32"), feature = "parallel")))]
-            {
-                self.index.clear();
-                for (i, u) in self.units.iter().enumerate() {
-                    if u.alive() { self.index.insert(IUnit { id: i as u32, faction: u.faction, p: u.p, health: (u.hp / u.kind.max_hp()) as f32, face: u.face }); }
-                }
-            }
+            // Sync the unit index to this frame's positions WITHOUT rebuilding it:
+            // keep the tree and update_ref movers in place (O(1) if they stayed in
+            // their leaf), remove_ref deaths, insert_ref respawns. ~1.06–1.4×
+            // faster on the CPU frame than clear()+insert, more with more threads
+            // (it shrinks the serial tail); no threads needed → wasm wins too.
+            // Verified index-identical to the rebuild (siege_cpu_bench).
+            sync_index(&mut self.index, &self.units, &mut self.handles);
             // Smoke index (LoS blockers) for the archer / ballista raycasts.
             let mut smoke_index = Tree3::<Puff>::new(Aabb::new(0.0, 0.0, 0.0, WORLD, SKY, WORLD), 8);
             for s in &self.smoke { smoke_index.insert(*s); }

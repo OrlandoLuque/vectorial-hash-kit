@@ -196,62 +196,62 @@ The takeaway for the thread slider: **more threads is not always better** — pa
 the point where the GPU (or the serial sim tail) dominates, extra cores are idle
 overhead. The slider lets you find the knee for your machine + unit count.
 
-## Parallel bulk-load — the rebuild lever (measured)
+## The per-frame index: rebuild vs keep (measured)
 
-`decide` parallelises; the per-frame **index rebuild** doesn't — it's the serial
-Amdahl tail above. `Tree3::bulk_load` / `bulk_load_par` attack exactly that: one
-**top-down partition** (longest-axis-midpoint, the same rule `divide` uses
-incrementally) instead of N root-descending `insert`s. `bulk_load_par` fans the
-partition out over rayon (`join` per split), leaving a cheap serial arena flatten.
+`decide` parallelises; the per-frame **index maintenance** doesn't — it's the
+serial Amdahl tail above. So it's the lever worth chasing. Three strategies,
+measured end-to-end on the full CPU frame (`siege_cpu_bench`, 20 k units
+mid-clash, 16-core / RTX 4080 SUPER):
 
-First, the rebuild step *in isolation* (`bulk_load_bench`, 15 542 units mid-clash,
-16-core / RTX 4080 SUPER box):
-
-```
-                  strategy   us/rebuild   vs insert
-  clear + insert (current)      3639         1.00x
-        bulk_load (serial)      4433         0.82x   ← SLOWER
-     bulk_load_par (2 thr)      3125         1.16x
-     bulk_load_par (4 thr)      2339         1.56x
-     bulk_load_par (8 thr)      2313         1.57x
-    bulk_load_par (16 thr)      2300         1.58x
-```
-
-Two honest findings:
-
-- **Serial `bulk_load` *loses* (0.82×)** to `clear()` + `insert`. The insert loop
-  reuses the arena (`clear` keeps capacity) and touches memory linearly; the
-  recursive partition allocates two fresh child `Vec`s at every internal node —
-  that allocation churn costs more than the root-descents it saves. So the serial
-  path is **not** worth it; the win is purely from parallelism.
-- **`bulk_load_par` wins, then plateaus** at ~1.58× (4+ threads). The serial
-  flatten tail + allocator contention cap it — more than 4 threads on *this* step
-  buys nothing.
-
-End-to-end, though, the frame is rebuild + `decide` + `apply`, and the rebuild's
-share *grows* with thread count (decide gets cheaper, the serial tail doesn't). So
-swapping the rebuild for `bulk_load_par` lifts the whole CPU-fps ceiling more the
-more cores you have (`siege_cpu_bench`, full CPU frame, 20 k units):
+- **insert** — `clear()` + an `insert` per unit. What the demo used to do.
+- **bulk** — `Tree3::bulk_load_par`: one **top-down partition** (longest-axis
+  midpoint, the rule `divide` uses) fanned over rayon (`join` per split) instead
+  of N root-descents. A parallel *rebuild*.
+- **keep** — don't rebuild: keep the tree and `update_ref` each unit to its new
+  spot (**O(1) if it stayed in its leaf**; relocate only on a boundary cross),
+  `remove_ref` deaths, `insert_ref` respawns.
 
 ```
- threads   insert fps   bulk_load fps   gain
-       1       24.3          24.3        1.00x
-       4       59.4          63.6        1.07x
-       8       79.0          87.9        1.11x
-      13       87.3         100.4        1.15x
-      16       86.4          98.7        1.14x
+ threads   insert fps    bulk fps    keep fps  | bulk/ins  keep/ins
+       1       24.4         24.3        25.9    |   0.99x     1.06x
+       4       60.2         65.2        73.8    |   1.08x     1.23x
+       8       78.7         90.8       105.0    |   1.15x     1.33x
+      13       89.1        102.3       124.3    |   1.15x     1.39x
+      16       91.7        101.0       127.0    |   1.10x     1.38x
 ```
 
-**No benefit single-threaded** (nothing to parallelise; the serial `bulk_load` it
-falls back on is a wash-to-slight-loss), rising to **~1.14–1.15× at 12–16
-threads** — 87 → 100 fps. It's a lever for exactly the regime where the serial
-rebuild had become the bottleneck.
+**`keep` wins outright — 1.06× single-threaded, up to ~1.4× at 12–16 threads**
+(91 → 127 fps). Two things make it win:
 
-Wiring: the siege binaries use `bulk_load_par` on **native builds with
-`--features parallel`** (the perf build); the default native run and the wasm
-build keep the serial `clear()` + `insert` loop (wasm has no threads, and the
-serial `bulk_load` would only lose). Handle `i` still addresses `items[i]`, so
-`ItemRef` stays valid across a bulk rebuild.
+1. **Less work.** Units drift a *fraction of a cell* per frame, so most stay in
+   their leaf and `update_ref` short-circuits to an O(1) position write — far
+   cheaper than reinserting all N from the root. The tree still `divide`s/merges
+   on the few boundary crossers, so it stays balanced enough that the `decide`
+   queries **don't** slow down (the drift I worried about didn't materialise).
+2. **It shrinks the serial tail.** Cheaper maintenance = smaller Amdahl serial
+   fraction, so the parallel `decide` dominates more and thread-scaling improves
+   — which is why the win *grows* with core count. No threads needed either, so
+   **wasm gets the single-thread win for free**.
+
+Verified a **byte-for-byte-identical index to `clear()`+`insert` every frame**
+(`siege_cpu_bench` runs both in lockstep and asserts equal item counts; a handful
+of units that sink into deep craters below `y=0` fall out of the root AABB and are
+dropped by *both* — pre-existing, identical for each).
+
+Both siege binaries now use `keep` (the shared `siege_sim::sync_index`) on every
+build — native and wasm. The 3D `critters` demo already relocated in place
+(`update_ref`), so this brings siege in line with it.
+
+**Where `bulk_load` still fits.** `bulk` is the *middle* option — a parallel
+rebuild beats a serial one (1.1–1.16×) but loses to not rebuilding at all. Keep it
+for the case `keep` can't serve: a **from-scratch build of a static or
+fully-churned set** (no prior tree to maintain, no stable handles) — e.g. a
+one-shot spatial join, or the first build before a `keep` loop. The serial
+`Tree3::bulk_load` is a wash-to-slight-loss vs `insert` (per-node `Vec`
+allocations lose to the arena-reuse insert loop); the win is purely `bulk_load_par`
+fanning the partition over threads (plateaus ~1.58× at 4+ threads — the serial
+flatten tail + allocator contention cap it). Handle `i` addresses `items[i]`, so
+`ItemRef` survives a bulk build.
 
 ## Why not parallelise relocation / the Morton build too?
 

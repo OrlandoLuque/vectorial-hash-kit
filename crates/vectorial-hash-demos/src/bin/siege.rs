@@ -286,6 +286,9 @@ async fn main() {
     let mut units = spawn_army(&mut rng, per_faction);
     let world = Aabb::new(0.0, 0.0, 0.0, WORLD, SKY, WORLD);
     let mut index = Tree3::<IUnit>::new(world, 8);
+    // Per-unit stable handles for the keep-in-place index sync (see below); reset
+    // whenever the army is rebuilt by the population slider.
+    let mut handles: Vec<Option<vectorial_hash::ItemRef>> = Vec::new();
     // Smoke lives in its own index so archer/ballista shots can raycast it.
     let mut smoke: Vec<Puff> = Vec::new();
     let mut effects: Vec<Fx> = Vec::new(); // transient combat visuals
@@ -438,6 +441,7 @@ async fn main() {
         if per_faction != cur_pop {
             units = spawn_army(&mut rng, per_faction);
             cur_pop = per_faction;
+            index.clear(); handles.clear(); // drop stale handles; sync_index re-inserts everyone
         }
 
         let dt = (get_frame_time() as f64).min(0.05); // clamp huge hitches
@@ -446,33 +450,21 @@ async fn main() {
         if !paused {
             now += dt;
 
-            // Keep the rayon pool sized to the slider (native) — before the
-            // rebuild, so the parallel bulk-load below uses the current pool.
+            // Keep the rayon pool sized to the slider (native), for the decide
+            // fan-out below.
             #[cfg(not(target_arch = "wasm32"))]
             if cur_threads != n_threads {
                 pool = rayon::ThreadPoolBuilder::new().num_threads(n_threads).build().unwrap();
                 cur_threads = n_threads;
             }
 
-            // Rebuild the index from this frame's live positions. Native + the
-            // `parallel` feature: a parallel top-down partition (`bulk_load_par`)
-            // that fans the rebuild out over the pool — it attacks the
-            // serial-rebuild Amdahl tail (~1.14× CPU-fps at high thread counts,
-            // PARALLEL.md). Otherwise (default native / wasm): the serial
-            // clear()+insert loop (serial bulk_load loses to the arena reuse).
-            #[cfg(all(not(target_arch = "wasm32"), feature = "parallel"))]
-            {
-                let items: Vec<IUnit> = units.iter().enumerate().filter(|(_, u)| u.alive())
-                    .map(|(i, u)| IUnit { id: i as u32, faction: u.faction, p: u.p, health: (u.hp / u.kind.max_hp()) as f32, face: u.face }).collect();
-                index = pool.install(|| Tree3::<IUnit>::bulk_load_par(world, 8, items));
-            }
-            #[cfg(not(all(not(target_arch = "wasm32"), feature = "parallel")))]
-            {
-                index.clear();
-                for (i, u) in units.iter().enumerate() {
-                    if u.alive() { index.insert(IUnit { id: i as u32, faction: u.faction, p: u.p, health: (u.hp / u.kind.max_hp()) as f32, face: u.face }); }
-                }
-            }
+            // Sync the index to this frame's positions WITHOUT rebuilding it: keep
+            // the tree and update_ref movers in place (O(1) if they stayed in
+            // their leaf), remove_ref deaths, insert_ref respawns. ~1.06–1.4×
+            // faster on the CPU frame than clear()+insert, more with more threads
+            // (it shrinks the serial tail); no threads needed, so wasm wins too.
+            // Measured + verified identical to the rebuild in siege_cpu_bench.
+            sync_index(&mut index, &units, &mut handles);
             // Rebuild the smoke index from last frame's live puffs.
             smoke_index.clear();
             for s in &smoke { smoke_index.insert(*s); }
