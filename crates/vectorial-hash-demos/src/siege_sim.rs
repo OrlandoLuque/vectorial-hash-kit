@@ -22,6 +22,14 @@ pub fn map_seed() -> f64 { *MAP_SEED.get_or_init(|| 0.0) }
 /// Set the per-run map seed (idempotent — only the first call takes effect).
 pub fn set_map_seed(s: f64) { let _ = MAP_SEED.set(s); }
 
+/// Live toggle for the boids **separation** (collision avoidance). On by default;
+/// the `C` key flips it so you can A/B "no two units share a space" vs. letting
+/// them overlap — the visual *and* the perf (units clump into the same cells,
+/// which deepens the index and slows the k-NN). See [`decide`].
+static SEPARATION_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+pub fn set_separation(on: bool) { SEPARATION_ON.store(on, std::sync::atomic::Ordering::Relaxed); }
+pub fn separation_on() -> bool { SEPARATION_ON.load(std::sync::atomic::Ordering::Relaxed) }
+
 /// "Classic Reynolds" steering: integrate the steering as **acceleration** so
 /// turns have inertia (smoother, more organic) instead of snapping the velocity
 /// each frame. Off by default — `$SIEGE_REYNOLDS=1` turns it on. Returns the blend
@@ -586,13 +594,14 @@ pub fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>, 
     let (mut ali_x, mut ali_z) = (0.0f64, 0.0f64); // alignment: sum of friends' heading vectors
     let (fi, ki) = (u.faction.index(), u.kind.index());
     let sep_dist = sep.sep_dist(fi, ki); // two bodies of this size shan't overlap
+    let sep_on = separation_on(); // live collision-avoidance toggle (C key)
     for (d, it) in index.knn(u.p, 16) {
         if it.id == id { continue; }
         // Separation acts only *within* an altitude layer: a flying dragon must
         // not be shoved sideways by the ground troops directly under it (and vice
         // versa), or it drifts along with — and clumps above — its own army
         // instead of advancing. Same layer (|Δy| small) → normal body separation.
-        if d < sep_dist && (it.p.y - u.p.y).abs() < 24.0 {
+        if sep_on && d < sep_dist && (it.p.y - u.p.y).abs() < 24.0 {
             // Precomputed force table (offset → away·weight) — load + add, no sqrt/div.
             let (fx, fz) = sep.force(fi, ki, it.p.x - u.p.x, it.p.z - u.p.z);
             sep_x += fx; sep_z += fz;

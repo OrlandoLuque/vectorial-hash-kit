@@ -84,6 +84,70 @@ the ~tens-of-µs fork cost** — practically, ≥ 64 independent queries, or ≥
 a large index. Below that, `cull_many` (serial) is the right call, and the demo's
 per-frame single frustum cull would only be slowed down by threads.
 
+## Thread-count scaling (measured)
+
+The same bench also sweeps the **pool size** 1..=16 at a fixed workload
+(`pop=20000`), so the diminishing returns are visible. `vs 1` is speedup over a
+single thread (ideal = N); `eff` is that ÷ N (parallel efficiency). The pool's
+worker threads are built **once** and reused every rep — only the *work* is
+forked/joined each call — so this is steady-state per-frame cost, not thread
+spin-up.
+
+```
+                 64 queries      256 queries      1024 queries
+ threads   par ms  vs1  eff |  par ms  vs1  eff |  par ms  vs1  eff
+       1   0.134  1.0x 100% |  0.678  1.0x 100% |  2.815  1.0x 100%
+       2   0.107  1.3x  62% |  0.395  1.7x  86% |  1.506  1.9x  93%
+       4   0.070  1.9x  48% |  0.186  3.6x  91% |  0.762  3.7x  92%
+       6   0.064  2.1x  35% |  0.152  4.5x  75% |  0.541  5.2x  87%
+       8   0.052  2.6x  33% |  0.183  3.7x  46% |  0.437  6.4x  80%
+      11   0.053  2.5x  23% |  0.133  5.1x  46% |  0.381  7.4x  67%
+      13   0.047  2.8x  22% |  0.154  4.4x  34% |  0.377  7.5x  57%
+      16   0.039  3.5x  22% |  0.136  5.0x  31% |  0.400  7.0x  44%
+```
+
+Reading it:
+
+- **Efficiency falls as threads rise.** On the heavy frame (1024 culls) 8 threads
+  give 6.4× at **80 %** efficiency; pushing to 16 only reaches 7.0× and drops to
+  **44 %** — you pay two more cores of fork/memory-bandwidth cost for ~10 % more
+  speed. The sweet spot for realistic frames is **~half the cores** (here 6–8).
+- **Light frames barely scale.** At 64 culls even 16 threads reach only 3.5×
+  (~20 % efficiency) — the fork/join floor dominates.
+- This is exactly why the demos expose a **thread slider** rather than always
+  using every core: the best count depends on how busy the frame is, and "more"
+  is not "better" past the knee.
+
+## Collisions on/off — separation cost + its second-order effect
+
+The siege demos have a live **collision toggle** (`C` key, `siege_sim::
+set_separation`) that turns the boids **separation** (the "no two bodies share a
+space" push) on/off, so you can A/B both the look and the cost. Two effects:
+
+1. **Direct cost (small).** Separation reuses the *same* `knn(16)` the AI already
+   runs for targeting, so turning it off saves only the per-neighbour force
+   lookups — a few table reads per unit. On its own, negligible.
+2. **Second-order (the interesting one).** With separation *off*, units pile into
+   the same cells; the spatial index's leaves overflow and it **deepens**, so
+   every `knn` / `cull` / `update_ref` that frame walks a taller tree — i.e.
+   allowing collisions can *cost* FPS via index degeneracy, not save it. This is
+   the boids/flocking-vs-hard-collision trade the demo was built to show: on the
+   ground, flocking alone keeps a tidy distribution cheaply; the failure mode was
+   the *dragons* (now fixed — separation is altitude-layered).
+
+Compare live via the on-screen counters (wgpu: `FPS` + the green/red `COL` tag;
+macroquad: the `fps`/`collisions` line). Fill in your machine's readings:
+
+```
+ wgpu · pop 20000 · <your GPU>          FPS
+ collisions ON  (separation, default)   ____
+ collisions OFF (overlaps allowed)      ____
+```
+
+Expectation on a GPU-bound frame (20k units): the two are close, because the
+limiter is the render, not the AI — but watch whether OFF *drops* as the piled
+units degenerate the index over a few seconds.
+
 ## Why not parallelise the build / relocation too?
 
 - **Build (`insert` loop):** a tree build is a sequence of dependent structural

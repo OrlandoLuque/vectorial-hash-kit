@@ -427,6 +427,7 @@ async fn main() {
         let wheel = mouse_wheel().1;
         if wheel != 0.0 { dist = (dist - wheel * 0.5).clamp(200.0, 1600.0); }
         if is_key_pressed(KeyCode::P) { paused = !paused; }
+        if is_key_pressed(KeyCode::C) { set_separation(!separation_on()); } // collisions on/off
         if is_key_pressed(KeyCode::V) { // toggle smooth ↔ voxel terrain, rebuild now
             smooth = !smooth;
             terrain_chunks = build_terrain(smooth, &craters);
@@ -601,7 +602,9 @@ async fn main() {
         set_default_camera();
         draw_text("vectorial-hash — SIEGE", 16.0, 28.0, 30.0, WHITE);
         let poly_str = if tris >= 1_000_000 { format!("{:.1}M", tris as f64 / 1e6) } else if tris >= 1_000 { format!("{}K", tris / 1000) } else { format!("{tris}") };
+        let (col_txt, col_c) = if separation_on() { ("collisions ON [C]", Color::new(0.55, 0.9, 0.6, 1.0)) } else { ("collisions OFF [C]", Color::new(1.0, 0.6, 0.4, 1.0)) };
         draw_text(format!("fps {}   polys {poly_str}", get_fps()), 16.0, 54.0, 22.0, LIGHTGRAY);
+        draw_text(col_txt, 260.0, 54.0, 20.0, col_c);
         draw_text(format!("Red {red}"), 16.0, 80.0, 24.0, Color::new(0.95, 0.4, 0.35, 1.0));
         draw_text(format!("Blue {blue}"), 16.0, 104.0, 24.0, Color::new(0.45, 0.6, 1.0, 1.0));
         let (lead, lcol) = match red.cmp(&blue) {

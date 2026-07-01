@@ -216,6 +216,7 @@ fn glyph(c: char) -> [&'static str; 5] {
         '9' => ["111", "101", "111", "001", "111"],
         'A' => ["111", "101", "111", "101", "101"],
         'B' => ["110", "101", "110", "101", "110"],
+        'C' => ["111", "100", "100", "100", "111"],
         'D' => ["110", "101", "101", "101", "110"],
         'E' => ["111", "100", "110", "100", "111"],
         'F' => ["111", "100", "110", "100", "100"],
@@ -849,6 +850,10 @@ impl State {
         push_text(&mut ui, hx, 48.0, 3.0, bluec, &format!("BLU {}", self.blue), sw, sh);
         push_text(&mut ui, hx, 66.0, 3.0, white, &format!("POP {}", self.pop), sw, sh);
         push_text(&mut ui, hx, 84.0, 3.0, white, &tri_label(tris), sw, sh);
+        // Collision (separation) state — green = on, red = off (toggle with C).
+        let col_on = vectorial_hash_demos::siege_sim::separation_on();
+        let colc = if col_on { [0.55, 1.0, 0.60, 1.0] } else { [1.0, 0.55, 0.40, 1.0] };
+        push_text(&mut ui, hx, 102.0, 3.0, colc, "COL", sw, sh);
         ui.truncate(16384); // never exceed the ui buffer (guards write_buffer)
         self.queue.write_buffer(&self.ui_buf, 0, bytemuck::cast_slice(&ui));
         let ui_n = ui.len() as u32;
@@ -1081,6 +1086,7 @@ async fn run() {
                     WindowEvent::KeyboardInput { event: KeyEvent { physical_key: PhysicalKey::Code(code), state: ElementState::Pressed, .. }, .. } => match code {
                         KeyCode::KeyP => st.paused = !st.paused,
                         KeyCode::KeyV => { st.smooth = !st.smooth; st.rebuild_terrain(); } // voxel ↔ smooth
+                        KeyCode::KeyC => vectorial_hash_demos::siege_sim::set_separation(!vectorial_hash_demos::siege_sim::separation_on()), // collisions on/off
                         KeyCode::BracketRight => { let p = st.pop + 100; st.set_population(p); }
                         KeyCode::BracketLeft => { let p = st.pop.saturating_sub(100); st.set_population(p); }
                         _ => {}

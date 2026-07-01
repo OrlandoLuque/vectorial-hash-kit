@@ -17,7 +17,9 @@ cargo run -p vectorial-hash-demos --bin siege_wgpu --release   # wgpu (compariso
 Live (single-threaded wasm build): <https://orlandoluque.github.io/vectorial-hash-kit/siege.html>
 
 - drag left mouse: orbit · scroll: zoom · `P`: pause · `[` / `]`: ± population ·
-  `V`: voxel ↔ smooth terrain (both binaries)
+  `V`: voxel ↔ smooth terrain · `C`: collisions (boids separation) on/off — A/B
+  the look and the perf of "no two bodies overlap" vs. letting them pile
+  (see `PARALLEL.md`) (both binaries)
 - **population slider** (top-left): army size per side — the spatial-index stress
   lever (20…10000 each, i.e. up to 20k units).
 - **thread slider** (native only): set the rayon pool size *live* and watch the
