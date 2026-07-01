@@ -29,6 +29,20 @@
         'which WebGL2 can’t do — so there’s no fallback. The macroquad ' +
         '<a href="./siege.html">siege.html</a> runs anywhere.</div>';
     } else {
+      // wgpu 0.20 asks requestDevice for the limit `maxInterStageShaderComponents`,
+      // which recent Chrome removed from the WebGPU spec — a non-undefined value
+      // for an unrecognized limit makes requestDevice throw. Strip any requested
+      // limit the adapter doesn't actually advertise (covers this + future churn),
+      // right in the shell so no wasm rebuild is needed.
+      const _requestDevice = GPUAdapter.prototype.requestDevice;
+      GPUAdapter.prototype.requestDevice = function (desc) {
+        if (desc && desc.requiredLimits) {
+          for (const key of Object.keys(desc.requiredLimits)) {
+            if (!(key in this.limits)) delete desc.requiredLimits[key];
+          }
+        }
+        return _requestDevice.call(this, desc);
+      };
       import('./wgpu/siege_wgpu.js')
         .then(m => m.default())
         .then(() => { setTimeout(() => msg.remove(), 1500); }) // canvas is mounted by then
