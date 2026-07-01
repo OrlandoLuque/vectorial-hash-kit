@@ -41,10 +41,9 @@ jobs:
       - name: clippy (vectorial-hash, parallel feature — gate)
         run: cargo clippy -p vectorial-hash --all-targets --features parallel -- -D warnings
 
-      # Advisory: templates + cli still carry pre-existing lints (tracked in the
-      # backlog). Visible here, but not blocking until that cleanup pass lands.
-      - name: clippy (templates + cli — advisory)
-        continue-on-error: true
+      # Gate: templates + cli are now clippy-clean (the cleanup pass landed —
+      # grid-indexing lints allowed with justification, the rest fixed).
+      - name: clippy (templates + cli — gate)
         run: cargo clippy -p vectorial-hash-templates -p vectorial-hash-cli --all-targets -- -D warnings
 
       - name: test (vectorial-hash — gate)
@@ -53,13 +52,12 @@ jobs:
       - name: test (vectorial-hash, parallel feature — gate)
         run: cargo test -p vectorial-hash --features parallel
 
-      # Advisory: the templates fingerprint-regression test compares against a
-      # fixture generated on the dev box (Windows); it is not yet portable across
-      # platforms (float formatting / iteration order), so it fails on the Linux
-      # runner. Tracked in the backlog — gate it once the fingerprint is made
-      # platform-independent.
-      - name: test (templates + cli — advisory)
-        continue-on-error: true
+      # Gate: templates + cli tests. The fingerprint-regression test is now
+      # portable — it hard-checks determinism + row structure everywhere, and
+      # the fixture bytes within a cross-platform tolerance (libm ULPs at tangent
+      # cells can flip a few of ~14k rows). Exact byte review runs on the
+      # reference platform via VH_FINGERPRINT_STRICT=1.
+      - name: test (templates + cli — gate)
         run: cargo test -p vectorial-hash-templates -p vectorial-hash-cli
 
       - name: benches + examples compile

@@ -184,9 +184,17 @@ measured crossover (`PARALLEL.md`) visible. Native only; hidden on wasm.
    test (arena counts + cull + knn identical + corruption rejected). `Tree`'s
    `neighbors` ropes are *rebuilt geometrically on load* (not stored), so the
    format is feature-independent.
-7. **Templates CI cleanup** — fix the ~21 clippy lints + make the fingerprint
-   test cross-platform (deterministic float formatting + sorted iteration), then
-   move templates/cli back into the **hard** CI gate (currently advisory).
+7. ~~**Templates CI cleanup**~~ — **done.** The ~21 clippy lints are gone
+   (grid-indexing `needless_range_loop` + one `type_complexity` allowed
+   crate-wide with justification — 2D matrices index by explicit `(x,y)`; the
+   rest fixed: `Default` impls, collapsed ifs, `div_ceil`, redundant closure,
+   module doc). The fingerprint test is now portable: it hard-gates
+   **determinism** (generate twice) + **row structure** (count + per-row labels)
+   everywhere, exact **bytes** on the reference platform (`VH_FINGERPRINT_STRICT=1`,
+   where libm noise is zero), and on other runners fails only on a *wholesale*
+   break (>25 % rows) — a subtle real regression and cross-platform libm ULPs are
+   the same tiny magnitude, so subtle byte review belongs on the reference box.
+   CI now **hard-gates** clippy + tests for templates + cli (was advisory).
 
 **C. Performance**
 8. **Morton multi-level linear octree** — coarse occupancy levels so a big-radius

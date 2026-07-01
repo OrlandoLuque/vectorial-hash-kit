@@ -8,6 +8,10 @@
 //! the worktree comparison; included as fixtures so the proof is part of
 //! the repo). Skip if either file is missing — the verification is opt-in.
 
+// This is a one-off proof harness: an explicit id counter and a couple of
+// scaffolding structs that document the geometry are intentional.
+#![allow(clippy::explicit_counter_loop, dead_code)]
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;

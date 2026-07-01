@@ -18,6 +18,10 @@ pub struct TemplateStore {
     pub counter: AtomicU32,
 }
 
+impl Default for TemplateStore {
+    fn default() -> Self { Self::new() }
+}
+
 impl TemplateStore {
     pub fn new() -> Self {
         TemplateStore {
@@ -30,7 +34,7 @@ impl TemplateStore {
     /// Store template with 8-symmetry deduplication. Returns (template_id, symmetry_op, is_new)
     pub fn store_dedup(&self, template_grid: &Matrix, gen_string: &str) -> (u32, &'static str, bool) {
         let transforms = matrix::all_transforms(template_grid);
-        let hashes: Vec<Vec<u8>> = transforms.iter().map(|m| matrix::bin_code(m)).collect();
+        let hashes: Vec<Vec<u8>> = transforms.iter().map(matrix::bin_code).collect();
 
         let mut map = self.templates.lock().unwrap();
 

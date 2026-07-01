@@ -211,6 +211,10 @@ fn run_in_memory(angle_step: f64, scale: f64, grid: i64) {
     println!("Total combinations: {}", store.generation_count());
 }
 
+// Template-grid generation: `angle_idx` / `x` / `y` are the actual coordinates
+// (angle slot + cell column/row), not incidental loop indices — the range
+// loops read as the coordinate maths they are.
+#[allow(clippy::needless_range_loop)]
 fn process_subtask_mem(
     st: &task::SubTask,
     angles: &[f64],

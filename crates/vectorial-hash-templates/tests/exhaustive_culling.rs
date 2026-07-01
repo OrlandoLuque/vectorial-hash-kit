@@ -31,6 +31,10 @@
 //! (add `--features neighbors` to cover the ropes strategy, and
 //! `-- --ignored` for the long campaign).
 
+// Scenario builders keep an explicit entity-id counter (the id is a payload,
+// not just the loop index), so the counter-loop lint doesn't apply.
+#![allow(clippy::explicit_counter_loop)]
+
 use vectorial_hash::{
     PlacedTemplate, Point, Positioned, Rect, Shape, TemplateGrid, Tree, WalkNeighbors,
 };

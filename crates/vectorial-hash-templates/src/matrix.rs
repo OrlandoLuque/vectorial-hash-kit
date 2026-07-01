@@ -1,4 +1,4 @@
-/// 2D matrix operations and binary encoding for template deduplication
+//! 2D matrix operations and binary encoding for template deduplication.
 
 pub type Matrix = Vec<Vec<u8>>; // matrix[x][y] = 0 (OUT), 1 (MAYBE), 2 (IN)
 
@@ -107,7 +107,7 @@ pub fn all_transforms(m: &Matrix) -> Vec<Matrix> {
 /// Binary encoding: 2 bytes header (width, height) + 2 bits per cell
 pub fn bin_code(m: &Matrix) -> Vec<u8> {
     let (tx, ty) = dimensions(m);
-    let mut result = Vec::with_capacity(2 + (tx * ty + 3) / 4);
+    let mut result = Vec::with_capacity(2 + (tx * ty).div_ceil(4));
     result.push(tx as u8);
     result.push(ty as u8);
 

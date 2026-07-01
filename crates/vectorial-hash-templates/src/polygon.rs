@@ -11,6 +11,10 @@ pub struct Polygon {
     pub y_max: f64,
 }
 
+impl Default for Polygon {
+    fn default() -> Self { Self::new() }
+}
+
 impl Polygon {
     pub fn new() -> Self {
         Polygon {
@@ -398,10 +402,8 @@ impl Polygon {
                     {
                         return false;
                     }
-                } else if ints.len() == 2 {
-                    if self.vertices[i].seg.d != 0 || other.vertices[j].seg.d != 0 {
-                        return false;
-                    }
+                } else if ints.len() == 2 && (self.vertices[i].seg.d != 0 || other.vertices[j].seg.d != 0) {
+                    return false;
                 }
             }
         }
@@ -429,10 +431,8 @@ impl Polygon {
                     {
                         return false;
                     }
-                } else if ints.len() == 2 {
-                    if self.vertices[i].seg.d != 0 || other.vertices[j].seg.d != 0 {
-                        return false;
-                    }
+                } else if ints.len() == 2 && (self.vertices[i].seg.d != 0 || other.vertices[j].seg.d != 0) {
+                    return false;
                 }
             }
         }
