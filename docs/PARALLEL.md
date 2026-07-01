@@ -156,10 +156,17 @@ performance feature*, not just a visual one.
 Two headless benchmarks measure the real per-frame budget of the `siege_wgpu`
 demo at **20 000 units, mid-clash** — both warm the sim to the clash first (the
 armies start apart; the early spread frames are cheap and unrepresentative), then
-sweep the thread count. Measured on an RTX 4080 SUPER at 1600×1000:
+sweep the thread count. Measured on an RTX 4080 SUPER at 1600×1000.
+
+> These numbers were taken on the old `clear()`+`insert` **rebuild** path (the
+> `insert` column of the three-way table below). The demo now *keeps* the index
+> (`sync_index`), which raises the CPU-only figures ~1.06–1.4× — see § "The
+> per-frame index: rebuild vs keep". The scaling *shape* (and the GPU-bound
+> plateau) is unchanged; keep just shifts the CPU curve up.
 
 - `cargo run -p vectorial-hash-demos --example siege_cpu_bench --release` — the
-  **CPU sim only** (index rebuild + parallel `decide` + serial `apply`), no GPU.
+  **CPU sim only** (index maintenance + parallel `decide` + serial `apply`), no
+  GPU. Reports all three maintenance strategies (insert / bulk / keep).
 - `SIEGE_BENCH=1 cargo run -p vectorial-hash-demos --bin siege_wgpu --release` —
   the **full pipeline offscreen**: sim + build instances + render to a texture,
   **no window, no present/vsync**, blocking on the GPU each frame.

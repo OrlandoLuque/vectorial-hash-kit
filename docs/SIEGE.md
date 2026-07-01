@@ -17,8 +17,9 @@ cargo run -p vectorial-hash-demos --bin siege_wgpu --release   # wgpu (compariso
 Live (single-threaded wasm build): <https://orlandoluque.github.io/vectorial-hash-kit/siege.html>
 
 - drag left mouse: orbit · scroll: zoom · `P`: pause · `[` / `]`: ± population ·
-  `V`: voxel ↔ smooth terrain · `C`: collisions (boids separation) on/off — A/B
-  the look and the perf of "no two bodies overlap" vs. letting them pile
+  `V`: voxel ↔ smooth terrain (smooth is a lighter mesh — a few fps faster when
+  GPU-bound; see `PERF_NOTES.md`) · `C`: collisions (boids separation) on/off —
+  A/B the look and the perf of "no two bodies overlap" vs. letting them pile
   (see `PARALLEL.md`) (both binaries)
 - `siege_wgpu` extras: `F` free-fly camera (WASD move, Q/E down/up, drag to
   look) ↔ orbit · `K` frustum-culling on/off · an on-screen **pause button**
