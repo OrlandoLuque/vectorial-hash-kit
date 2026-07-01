@@ -21,7 +21,7 @@
 //!   body ring
 //! - `[` / `]` halve / double simulation speed, `Space` pauses, `Esc` quits
 //! - the "tuning (live)" panel: split/merge thresholds (rebuilds the
-//!   structures), per-kind population targets (up to 1200 each), respawn
+//!   structures), per-kind population targets (up to 10000 each), respawn
 //!   delay, speed, fire rate
 //!
 //! The whole simulation runs on ONE thread (only the startup bank
@@ -451,9 +451,9 @@ async fn main() {
             ui.slider(hash!(), "split >", 1f32..12f32, &mut split_f);
             ui.slider(hash!(), "merge <=", 1f32..12f32, &mut merge_f);
             ui.separator();
-            ui.slider(hash!(), "drifters", 0f32..1200f32, &mut drifters_f);
-            ui.slider(hash!(), "hunters", 0f32..1200f32, &mut hunters_f);
-            ui.slider(hash!(), "pulsars", 0f32..1200f32, &mut pulsars_f);
+            ui.slider(hash!(), "drifters", 0f32..10000f32, &mut drifters_f);
+            ui.slider(hash!(), "hunters", 0f32..10000f32, &mut hunters_f);
+            ui.slider(hash!(), "pulsars", 0f32..10000f32, &mut pulsars_f);
             ui.separator();
             ui.slider(hash!(), "respawn s", 0.5f32..10f32, &mut respawn_f);
             ui.slider(hash!(), "speed x", 0.25f32..4f32, &mut speed_f);
