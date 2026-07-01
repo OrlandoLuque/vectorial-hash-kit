@@ -128,18 +128,33 @@ pub fn river_factor(x: f64, z: f64) -> f64 {
 /// ground movement and give ranged **cover** (Total War style) — see [`apply`]
 /// (the wade/forest slowdown) and [`decide`] (halved ranged damage vs a target
 /// in the trees). Flyers (the dragon) pass over untouched.
+/// The seeded copse centres + radii, computed once (they depend only on the map
+/// seed). Avoids recomputing 12 trig calls on every `forest_factor` — which is
+/// hit per ground unit per frame (~20k×) in [`apply`].
+fn forest_copses() -> &'static [(f64, f64, f64)] {
+    static COPSES: std::sync::OnceLock<Vec<(f64, f64, f64)>> = std::sync::OnceLock::new();
+    COPSES.get_or_init(|| {
+        let o = map_seed();
+        (0..6).map(|i| {
+            let a = i as f64;
+            let cx = WORLD * (0.15 + 0.70 * ((a * 1.7 + o).sin() * 0.5 + 0.5));
+            let cz = WORLD * (0.12 + 0.76 * ((a * 2.3 + o * 1.4).cos() * 0.5 + 0.5));
+            let r = WORLD * (0.07 + 0.05 * ((a * 0.9 + o).sin() * 0.5 + 0.5));
+            (cx, cz, r)
+        }).collect()
+    })
+}
+
 pub fn forest_factor(x: f64, z: f64) -> f64 {
-    if river_factor(x, z) > 0.15 { return 0.0; }
-    let o = map_seed();
+    // Cheap copse distance test first — the common case (unit not in any wood) is
+    // a handful of subtracts, no trig, no sqrt. Only pay the river check (trig)
+    // when actually inside a copse.
     let mut f = 0.0_f64;
-    for i in 0..6 {
-        let a = i as f64;
-        let cx = WORLD * (0.15 + 0.70 * ((a * 1.7 + o).sin() * 0.5 + 0.5));
-        let cz = WORLD * (0.12 + 0.76 * ((a * 2.3 + o * 1.4).cos() * 0.5 + 0.5));
-        let r = WORLD * (0.07 + 0.05 * ((a * 0.9 + o).sin() * 0.5 + 0.5));
-        let d = ((x - cx).powi(2) + (z - cz).powi(2)).sqrt();
-        if d < r { let t = 1.0 - d / r; f = f.max(t * t * (3.0 - 2.0 * t)); }
+    for &(cx, cz, r) in forest_copses() {
+        let d2 = (x - cx).powi(2) + (z - cz).powi(2);
+        if d2 < r * r { let t = 1.0 - d2.sqrt() / r; f = f.max(t * t * (3.0 - 2.0 * t)); }
     }
+    if f > 0.0 && river_factor(x, z) > 0.15 { return 0.0; } // nothing grows in the channel
     f
 }
 
@@ -573,7 +588,11 @@ pub fn decide(u: &mut Unit, id: u32, index: &Tree3<IUnit>, smoke: &Tree3<Puff>, 
     let sep_dist = sep.sep_dist(fi, ki); // two bodies of this size shan't overlap
     for (d, it) in index.knn(u.p, 16) {
         if it.id == id { continue; }
-        if d < sep_dist {
+        // Separation acts only *within* an altitude layer: a flying dragon must
+        // not be shoved sideways by the ground troops directly under it (and vice
+        // versa), or it drifts along with — and clumps above — its own army
+        // instead of advancing. Same layer (|Δy| small) → normal body separation.
+        if d < sep_dist && (it.p.y - u.p.y).abs() < 24.0 {
             // Precomputed force table (offset → away·weight) — load + add, no sqrt/div.
             let (fx, fz) = sep.force(fi, ki, it.p.x - u.p.x, it.p.z - u.p.z);
             sep_x += fx; sep_z += fz;
