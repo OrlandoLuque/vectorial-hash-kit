@@ -146,12 +146,21 @@ FPS review: free wins applied, quality-trade-off levers reported).
 - **Forests as LoS cover** (trees block arrows/bolts via a raycast index, like
   smoke) + a **balance** pass (use the HUD).
 
-**Thread-slider retrofit for the critters demos** (user, 2026-06-27) — the same
-live `num_threads` slider in `critters` (2D) and `critters3d` (3D), but it only
-*moves* in the **combat** mode (one `cull` per critter = many queries/frame →
-`cull_many_par` inside the sized pool). In *observe* mode (a single vision cull)
-threads can't help — and that contrast is the point: the slider makes the
-measured crossover (`PARALLEL.md`) visible. Native only; hidden on wasm.
+**Thread-slider retrofit for the critters demos** (user, 2026-06-27) —
+**`critters3d` done**; **2D `critters` deferred.** The 3D combat wave now runs
+decide (serial, `rng`) → cull (parallel) → apply: each firing critter's attack
+volume (a new `AttackVolume` enum unifying the Pulsar sphere + the Hunter/Drifter
+drop) is culled over a live-sized rayon pool, with a panel **threads** slider
+(combat, native, multicore only) and the count in the HUD. Culls are read-only,
+so the kills are identical to the serial path — the slider just makes the
+crossover visible (`PARALLEL.md`), like siege. wasm runs the wave serially.
+- **2D remaining**: the 2D combat lives in the shared `sim.rs`, where
+  `Sim::cull_attack` is `&mut self` (accumulates per-structure timing + the
+  dual-"Both"-mode hit-set mismatch check). Parallelising it means refactoring
+  that bench-depended-on method to a read-only cull + post-hoc stat aggregation
+  and restructuring `Sim::step`'s firing loop — a deliberate change to shared,
+  tested infrastructure for a small payoff (2D culls are cheap), so it's left for
+  a focused pass rather than an autonomous one.
 
 **A. Ray-cast / structure follow-ups (continue the thread)**
 1. ~~**`Octree3` DDA**~~ — **done.** `raycast` (thick capsule), `raycast_dda`,

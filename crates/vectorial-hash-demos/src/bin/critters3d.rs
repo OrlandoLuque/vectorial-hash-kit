@@ -31,6 +31,9 @@
 //! - `C`: cycle cull repetitions (1/50/200/1000) — averages the per-cull time
 //! - `B`: toggle the leaf-box wireframes (extruded columns in projection mode)
 //! - `Space`: pause, `Esc`: quit
+//! - panel **threads** slider (combat, native, multicore only): sizes the rayon
+//!   pool the attack culls fan out over — the many-queries-per-frame crossover
+//!   lever, like the siege demo. wasm runs the wave serially.
 //!
 //! Env: CRITTERS3D_MAX_FRAMES=N exits after N frames (smoke testing) and, when
 //! set, prints a one-line STRESS summary (mean fps / frame ms / cpu ms / bound);
@@ -47,6 +50,10 @@ use macroquad::camera::Camera;
 use macroquad::miniquad::PassAction;
 use macroquad::prelude::*;
 use macroquad::window::get_internal_gl;
+// The combat-wave culls fan out over a live-sized rayon pool (native only; wasm
+// has no threads and runs the same wave serially).
+#[cfg(not(target_arch = "wasm32"))]
+use rayon::prelude::*;
 
 use vectorial_hash::{
     Aabb, MortonGrid3, Octree3, Point, Point3, Positioned, Positioned3, Rect, Shape, Shape3, Sphere3,
@@ -123,6 +130,19 @@ impl Shape3 for DropShape {
             let dt = t - self.length;
             dt * dt + perp2 <= self.max_r * self.max_r
         }
+    }
+}
+
+/// A homogeneous attack volume so a whole combat wave — Pulsar spheres +
+/// Hunter/Drifter drops mixed — culls in one batch (needed to fan the culls
+/// across a thread pool: `cull` wants a single `S: Shape3` per call).
+enum AttackVolume { Sphere(Sphere3), Drop(DropShape) }
+impl Shape3 for AttackVolume {
+    fn bounding_box(&self) -> Aabb {
+        match self { AttackVolume::Sphere(s) => s.bounding_box(), AttackVolume::Drop(d) => d.bounding_box() }
+    }
+    fn contains_point(&self, p: Point3) -> bool {
+        match self { AttackVolume::Sphere(s) => s.contains_point(p), AttackVolume::Drop(d) => d.contains_point(p) }
     }
 }
 
@@ -785,6 +805,19 @@ async fn main() {
     let mut pop_kind: [f32; 3] = { let n = (critters.len() / 3) as f32; [n, n, n] };
     let mut attack_r: f32 = 22.0;
 
+    // Live thread-count control (native): the combat wave is the "many queries
+    // per frame" workload (one attack cull per firing critter), so its culls
+    // fan out over a rayon pool sized by the panel slider — the same crossover
+    // lever the siege demo exposes. wasm has no threads → the wave runs serially.
+    #[cfg(not(target_arch = "wasm32"))]
+    let max_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut cur_threads = max_threads;
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut thread_pool = rayon::ThreadPoolBuilder::new().num_threads(cur_threads).build().unwrap();
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut n_threads_f = max_threads as f32; // f32 backing for the panel slider
+
     // The single ACTIVE index: the structure `M` selects resolves everything
     // (observe vision, combat attacks, persistence). Rebuilt when the structure,
     // world size, or population changes; relocated in place otherwise. The
@@ -1143,6 +1176,16 @@ async fn main() {
         let t_cull_us: f64;
         let mut frame_attacks = 0usize; // combat: predators that attacked this frame
 
+        // Resize the combat cull pool if the thread slider moved (native only).
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let want = (n_threads_f.round() as usize).clamp(1, max_threads);
+            if want != cur_threads {
+                thread_pool = rayon::ThreadPoolBuilder::new().num_threads(want).build().unwrap();
+                cur_threads = want;
+            }
+        }
+
         if sim_mode == SimMode::Observe {
             // The active index (whatever structure M selected) resolves the
             // vision cull. Maintenance cost was paid above as `sync_us`.
@@ -1166,6 +1209,10 @@ async fn main() {
             let mut cull_us = 0.0f64;
             let t_wave = Instant::now();
             if advance {
+                // 1) Decide pass (serial — mutates cooldowns, draws from `rng`):
+                //    who fires this frame, and each firer's attack volume + the
+                //    on-screen effect marker.
+                let mut plan: Vec<(usize, AttackVolume)> = Vec::new();
                 for i in 0..critters.len() {
                     if critters[i].cooldown > 0.0 { continue; } // every kind attacks
                     let kind = critters[i].kind;
@@ -1174,12 +1221,10 @@ async fn main() {
                     critters[i].cooldown = if random_attacks { rng.range(cmin, cmax) } else { cmin };
                     let (cx, cy, cz) = (center.x as f64, center.y as f64, center.z as f64);
                     frame_attacks += 1;
-                    let tc = Instant::now();
-                    let (akind, adir, hit_ids): (AttackKind, Vec3, Vec<usize>) = match kind {
+                    let (akind, adir, vol): (AttackKind, Vec3, AttackVolume) = match kind {
                         2 => {
                             // Pulsar: omnidirectional sphere blast (the 2D circle).
-                            let s = Sphere3::new(cx, cy, cz, attack_r as f64);
-                            (AttackKind::Sphere, Vec3::ZERO, index.cull(&s).into_iter().map(|id| id as usize).collect())
+                            (AttackKind::Sphere, Vec3::ZERO, AttackVolume::Sphere(Sphere3::new(cx, cy, cz, attack_r as f64)))
                         }
                         _ => {
                             // Hunter (1): flamer drop along its heading — it has
@@ -1200,20 +1245,30 @@ async fn main() {
                                 rand_dir(&mut rng)
                             };
                             let tip = center + dir * off;
-                            let s = DropShape {
+                            (AttackKind::Drop, dir, AttackVolume::Drop(DropShape {
                                 tip: Point3::new(tip.x as f64, tip.y as f64, tip.z as f64),
                                 dir: [dir.x as f64, dir.y as f64, dir.z as f64],
                                 length: length as f64,
                                 max_r: maxr as f64,
-                            };
-                            (AttackKind::Drop, dir, index.cull(&s).into_iter().map(|id| id as usize).collect())
+                            }))
                         }
                     };
-                    cull_us += tc.elapsed().as_secs_f64() * 1e6;
                     attacks.push(Attack { center, radius: attack_r, age: 0.0, kind: akind, dir: adir });
-                    for j in hit_ids {
-                        if j != i && !killed[j] { killed[j] = true; } // anyone but the attacker
-                    }
+                    plan.push((i, vol));
+                }
+                // 2) Cull pass — the "many queries per frame" workload. Each attack
+                //    is a read-only cull against the shared index, so fanning them
+                //    over the (live-sized) rayon pool yields the SAME hit sets as
+                //    the serial path — only faster. wasm has no threads → serial.
+                let tc = Instant::now();
+                #[cfg(not(target_arch = "wasm32"))]
+                let results: Vec<(usize, Vec<u32>)> = thread_pool.install(|| plan.par_iter().map(|(i, vol)| (*i, index.cull(vol))).collect());
+                #[cfg(target_arch = "wasm32")]
+                let results: Vec<(usize, Vec<u32>)> = plan.iter().map(|(i, vol)| (*i, index.cull(vol))).collect();
+                cull_us += tc.elapsed().as_secs_f64() * 1e6;
+                // 3) Resolve kills (serial): anyone inside an attack but the caster.
+                for (i, hits) in results {
+                    for id in hits { let j = id as usize; if j != i && !killed[j] { killed[j] = true; } }
                 }
                 // apply kills: burst marker, respawn keeping the kind, flash, count
                 for j in 0..critters.len() {
@@ -1357,7 +1412,13 @@ async fn main() {
         hud(68.0, format!("{}{}", info_str, if paused { "   [PAUSED]" } else { "" }));
         let cull_note = match sim_mode {
             SimMode::Observe => format!("cull {:>8.3} us (rolling avg, x{:>4} reps)", cull_us_avg, cull_reps),
-            SimMode::Combat => format!("cull {:>8.3} us (rolling avg, per attack)", cull_us_avg),
+            SimMode::Combat => {
+                #[cfg(not(target_arch = "wasm32"))]
+                let thr = format!(", {} thread{}", cur_threads, if cur_threads == 1 { "" } else { "s" });
+                #[cfg(target_arch = "wasm32")]
+                let thr = "";
+                format!("cull {:>8.3} us (rolling avg, per attack{})", cull_us_avg, thr)
+            }
         };
         hud(90.0, format!("index: build {:>6.0} us | {}", t_build_us, cull_note));
         let render_note = match render_mode {
@@ -1418,6 +1479,13 @@ async fn main() {
                 "Radius of the centre vision sphere.\nRight-click to type a number."),
             SimMode::Combat => panel.slider("attack r", 4.0, world * 0.5, 5.0, &mut attack_r, 3, &mut editing, &mut edit_buf, &mut slider_drag, None,
                 "Base size of the attacks.\nRight-click to type a number."),
+        }
+        // Combat's attack culls fan out over a rayon pool; the slider sizes it
+        // live (native only; a 1-core box has nothing to tune). Watch cull-us / fps.
+        #[cfg(not(target_arch = "wasm32"))]
+        if sim_mode == SimMode::Combat && max_threads > 1 {
+            panel.slider("threads", 1.0, max_threads as f32, 1.0, &mut n_threads_f, 4, &mut editing, &mut edit_buf, &mut slider_drag, None,
+                "Rayon threads for the combat attack culls\n(the many-queries-per-frame workload).\nDrag and watch cull us / fps change.");
         }
         panel.stepper("world size", &SIZE_STEPS, &mut world, 4, &mut slider_drag,
             "Side of the cube the action lives in.\nStepped powers of 2 -- changing it rebuilds\nthe index and re-bounds the critters.");
