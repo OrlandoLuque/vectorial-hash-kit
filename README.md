@@ -11,7 +11,7 @@ This is a Cargo workspace with several independently-versioned crates.
 | Document | What it is |
 | --- | --- |
 | [`docs/INDEX.md`](docs/INDEX.md) | Map of every doc, crate, test layer, and roadmap pointer in one page. |
-| [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | Methodology + reproducible empirical results for every `vh bench-*` command, plus industry-context references. Five result sections covering single-template culling, per-cell-size selection, descent vs neighbour walk, granularity-as-fallback aggregation, and figure↔grid scale equivalence. |
+| [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | Headline conclusions for the `vh bench-*` culling benchmarks. Full methodology + reproducible result tables (and the raw data) live with the paper in the [research repo](https://github.com/OrlandoLuque/vectorialHash/tree/master/research). |
 | [`docs/DEFECTS_FOUND.md`](docs/DEFECTS_FOUND.md) | Living log of every bug the test suite has caught: reproducer, cause, fix, and which test pins it permanently. |
 | Per-crate READMEs | [`vectorial-hash`](crates/vectorial-hash/README.md), [`vectorial-hash-templates`](crates/vectorial-hash-templates/README.md), [`vectorial-hash-cli`](crates/vectorial-hash-cli/README.md), [`vectorial-hash-demos`](crates/vectorial-hash-demos/README.md). |
 | Publication paper | [`OrlandoLuque/vectorialHash`](https://github.com/OrlandoLuque/vectorialHash) — original May 2019 + June 2026 addendum reporting this reference implementation. |
@@ -35,7 +35,7 @@ cargo run -p vectorial-hash-cli -- generate
 cargo run -p vectorial-hash-cli --release -- compare   # grids 16 + 32
 cargo run -p vectorial-hash-cli --release -- heavy     # grids 16 + 32 + 64 + 128
 
-# runtime cull benchmarks (full results + analysis in docs/BENCHMARKS.md)
+# runtime cull benchmarks (conclusions in docs/BENCHMARKS.md; full study in the research repo)
 cargo run -p vectorial-hash-cli --release -- bench           # tree vs quadtree, single template on/off
 cargo run -p vectorial-hash-cli --release -- bench-sizes     # per-cell-size selection (the paper's scheme)
 cargo run -p vectorial-hash-cli --release -- bench-walk      # descent vs neighbour-walk traversal
