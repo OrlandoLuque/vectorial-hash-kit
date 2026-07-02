@@ -1043,7 +1043,9 @@ async fn main() {
                     let mut best_d2 = f32::INFINITY;
                     for jid in index.cull(&s) {
                         let j = jid as usize;
-                        if j == i { continue; }
+                        // Same stale-index guard as separation below: a pop shrink
+                        // this frame can leave ids past the new end until the rebuild.
+                        if j == i || j >= critters.len() { continue; }
                         let d2 = (critters[j].pos - p).length_squared();
                         if d2 < best_d2 { best_d2 = d2; targets[i] = Some(critters[j].pos); }
                     }
@@ -1107,7 +1109,10 @@ async fn main() {
                     let s = Sphere3::new(p.x as f64, p.y as f64, p.z as f64, SEP_R as f64);
                     for jid in index.cull(&s) {
                         let j = jid as usize;
-                        if j == i { continue; }
+                        // A population shrink pops critters (from the end; id == index)
+                        // BEFORE the index rebuilds further down, so this last-frame
+                        // index can still return ids past the new end — skip those.
+                        if j == i || j >= critters.len() { continue; }
                         let d = p - critters[j].pos;
                         let dist = d.length();
                         if dist > 1e-4 && dist < SEP_R {
