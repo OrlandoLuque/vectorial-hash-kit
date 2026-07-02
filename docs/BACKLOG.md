@@ -15,6 +15,19 @@ autonomously verifiable. User picked **"Todo (A–E)"** + the headline below.
 
 **ORDER (user, 2026-06-27): multithreading FIRST, then `siege`, then the rest.**
 
+**★ NEXT DEMOS (user, 2026-07-02): two new flagship demos, "las dos" — research
+DONE, build queued.** Full design docs (mechanics→query tables, molón shopping
+lists, verified CC0 asset picks, phased build plans):
+- **[HORDE_DESIGN.md](HORDE_DESIGN.md)** — They Are Billions-style zombie assault:
+  noise-field wake cascades (sphere culls), tower k-NN targeting, infection
+  bursts, flow-field swarms, ~100k agents with ~90% dormant (the keep-index
+  showcase). Switchable index structures (Tree3/Morton/2D, user pick).
+- **[FORMATIONS_DESIGN.md](FORMATIONS_DESIGN.md)** — Total War-style army battle:
+  regiment slot formations, contact-line k-NN pairing, **Polyhedron3 flank/rear
+  wedges → morale**, chain routs, charges (raycast corridors), banners.
+- Suggested order: horde first; shared prerequisite: extract generic sim
+  scaffolding (Rng/Fx/projectiles/terrain/sync_index) from `siege_sim`.
+
 **★ PHASE 0 — Multithreading (before the demo).** The `siege` demo is the heavy
 parallel consumer (1k+ units, each doing read queries on the shared index per
 frame). Lay the parallel infra first so the demo is multithreaded from the start:
