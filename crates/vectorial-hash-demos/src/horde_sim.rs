@@ -329,6 +329,8 @@ pub struct Horde {
     /// Fallen zombies: (position, class, time of death) — the renderer's
     /// frozen-pose corpse buffer feeds from this.
     pub corpses: Vec<(Point3, ZClass, f64)>,
+    /// Shot tracers for the renderer: (from, to, time fired) — aged out fast.
+    pub tracers: Vec<(Point3, Point3, f64)>,
     /// Per-structure reload timers (only towers use theirs).
     tower_reload: Vec<f64>,
     /// Dead unit slots for reuse (keeps `id == index` stable for handles).
@@ -441,7 +443,7 @@ impl Horde {
             units, structures,
             zindex: Tree3::new(world, 8), handles: vec![None; n],
             sindex, noise: NoiseGrid::new(96), flow,
-            pending: Vec::new(), corpses: Vec::new(),
+            pending: Vec::new(), corpses: Vec::new(), tracers: Vec::new(),
             tower_reload: vec![0.0; ns], free_slots: Vec::new(),
             tower_threat_mode: false, cc_id,
             wave_k: 0, wave_spawn_t: 50.0, wave_dir: 0.0, wave_announced: false,
@@ -802,6 +804,8 @@ impl Horde {
             let Some(tid) = target else { continue; };
             self.tower_reload[sid] = TOWER_RELOAD;
             self.pending.push((tp, TOWER_NOISE));
+            let zp = self.units[tid as usize].p;
+            self.tracers.push((Point3::new(tp.x, tp.y + 22.0, tp.z), zp, self.now));
             self.units[tid as usize].hp -= TOWER_DMG;
             if self.units[tid as usize].hp <= 0.0 { self.kill_zombie(tid as usize); }
         }
@@ -879,6 +883,7 @@ impl Horde {
         // ---- per-frame defender update
         let mut shot: Vec<(usize, f64)> = Vec::new(); // (zombie id, dmg)
         let mut noise: Vec<(Point3, f64)> = Vec::new();
+        let mut tracer: Vec<(Point3, Point3, f64)> = Vec::new();
         let mut deliveries: Vec<u32> = Vec::new();
         let mut repaired_any = false;
         for d in self.defenders.iter_mut() {
@@ -916,6 +921,7 @@ impl Horde {
                                 d.shots += 1;
                                 shot.push((it.id as usize, d.kind.dmg()));
                                 noise.push((d.p, d.kind.noise()));
+                                tracer.push((Point3::new(d.p.x, d.p.y + 5.0, d.p.z), it.p, 0.0));
                                 // Ranger kite: too close → step back while firing.
                                 if d.kind == DKind::Ranger && dist < 14.0 {
                                     let (dx, dz) = (d.p.x - it.p.x, d.p.z - it.p.z);
@@ -990,6 +996,9 @@ impl Horde {
             if self.units[tid].hp <= 0.0 { self.kill_zombie(tid); }
         }
         for (p, a) in noise { self.pending.push((p, a)); }
+        let now = self.now;
+        self.tracers.extend(tracer.into_iter().map(|(a, b, _)| (a, b, now)));
+        self.tracers.retain(|(_, _, t)| now - t < 0.12); // fast-fade zaps
     }
 
     /// Death: corpse for the renderer, a death rattle (noise), free the slot,
