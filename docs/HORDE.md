@@ -54,21 +54,34 @@ them. (The all-active 100k row is the honest ceiling: the scale-pass levers —
 decision buckets at 4–8 Hz, activation bubbles — are the queued next round.)
 
 **End-to-end rendered FPS** (same machine: RTX 4080 SUPER, 1600×1000, whole map
-in view, no vsync — `HORDE_NOVSYNC=1 HORDE_MAX_FRAMES=N` prints the average):
+in view, no vsync — `HORDE_NOVSYNC=1 HORDE_MAX_FRAMES=N` prints the average;
+`HORDE_NOLOD=1` = the pre-LOD path for the A/B):
 
 ```
-  pop 20 000  →  ~54 fps   (idle or first-wave battle: identical — GPU-bound)
-  pop 50 000  →  ~23 fps
-  pop 100 000 →  ~11 fps
+   pop      everything skinned (old)     LOD render pass (shipped)
+  20 000        ~56 fps                     ~1136 fps    (20×)
+  50 000        ~21 fps                      ~816 fps    (38×)
+ 100 000        ~11 fps                      ~475 fps    (42×)
 ```
 
-The scaling is ~linear in drawn instances: exactly the **vertex-bound wall** the
-crowd research predicted (every zombie is fully GPU-skinned, dormant or not, and
-the instance buffer re-uploads each frame). The CPU sim never matters here
-(0.2–5 ms vs an 18–90 ms GPU frame). That makes the queued render levers — LOD
-tiers (~400/~120 tri), far-field impostors, skipping unmoved instance uploads —
-the whole story for the far-zoom 100k shot; zoomed in, the frustum cull (`K`,
-default on) already recovers most of it.
+The old path was exactly the **vertex-bound wall** the crowd research predicted
+(~1.5–3k skinned verts × every zombie + a full instance-buffer re-upload each
+frame). The shipped render scale pass removes it three ways:
+
+1. **The sleeping carpet is a static instance buffer of ~72-tri slump proxies**,
+   rebuilt only when the sim's `dormant_epoch` moves (a wake/re-sleep/death) —
+   between changes the 100k sleepers cost zero CPU and zero upload. Visual
+   bonus: sleepers are slumped shapes, so a wake wave literally **stands up**
+   out of the carpet into the full animated model.
+2. **Distance LOD for active zombies** (`LOD_DIST` = 620 wu): near = full
+   GPU-skinned glb, far = a standing proxy. Zoomed out the horde is proxies
+   (they're a few pixels anyway); zoom in and the front line becomes real
+   models. Defenders (~50) are always skinned.
+3. **Corpses are append-only**: only new bodies upload each frame.
+
+The CPU sim was never the limit here (0.2–5 ms). Remaining refinement, queued:
+textured billboard impostors to replace the far proxies (nicer silhouettes),
+and the CPU-side decision buckets for the all-active 100k case.
 
 ## The loop
 

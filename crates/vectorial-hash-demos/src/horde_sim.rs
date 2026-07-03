@@ -354,6 +354,12 @@ pub struct Horde {
     pub seed: f64,
     /// Woken-this-frame counter (for HUD/telemetry).
     pub woken_last: usize,
+    /// Bumped whenever the DORMANT SET changes (wake, re-sleep, a sleeper dies,
+    /// a dormant spawn, the final-wave rise) — renderers keep a prebuilt static
+    /// instance buffer for the sleeping carpet and rebuild it only when
+    /// `(run, dormant_epoch)` moves. Positions of sleepers never change, so
+    /// between bumps the buffer is exact.
+    pub dormant_epoch: u64,
     base_pop: usize,
     base_seed: u64,
     // ---- the defense (Commander + mobile defenders + works economy)
@@ -448,7 +454,7 @@ impl Horde {
             tower_threat_mode: false, cc_id,
             wave_k: 0, wave_spawn_t: 50.0, wave_dir: 0.0, wave_announced: false,
             game_over: None, run: 1, kills: 0,
-            rng, now: 0.0, seed: fseed, woken_last: 0,
+            rng, now: 0.0, seed: fseed, woken_last: 0, dormant_epoch: 1,
             base_pop: pop, base_seed: seed,
             defenders: Vec::new(), threat: [0.0; SECTORS], weapons_free: false, cmd_t: 0.0, breach: None,
         };
@@ -503,6 +509,7 @@ impl Horde {
     /// Spawn (or reuse a dead slot for) one zombie. Public for scenario
     /// drivers and tests.
     pub fn spawn_zombie(&mut self, class: ZClass, x: f64, z: f64, state: ZState) {
+        if state == ZState::Dormant { self.dormant_epoch += 1; }
         let y = ground_h(x, z, self.seed) + class.altitude();
         let z0 = Zombie { class, p: Point3::new(x, y, z), vel: (0.0, 0.0), state, hp: class.max_hp(), heard: 0.0, linger: 0.0, groan_t: 1.0, swing_t: 0.5, moved: false };
         match self.free_slots.pop() {
@@ -545,6 +552,7 @@ impl Horde {
             for z in self.units.iter_mut() {
                 if z.alive() && z.dormant() { z.state = ZState::Marching; z.moved = true; }
             }
+            self.dormant_epoch += 1;
         }
         self.wave_k += 1;
         self.wave_spawn_t += 70.0;
@@ -665,6 +673,7 @@ impl Horde {
                 }
             }
         }
+        if self.woken_last > 0 { self.dormant_epoch += 1; }
         self.noise.step(dt);
 
         // 2) decide — read-only on the indices, each zombie writes only itself:
@@ -739,6 +748,7 @@ impl Horde {
         //    swing timers → queued structure hits, groans (next frame's culls).
         let decay = 0.5f64.powf(dt);
         let mut hits: Vec<(u32, f64, Point3, f64)> = Vec::new(); // (sid, dmg, at, noise)
+        let mut slept = false;
         for z in self.units.iter_mut() {
             if !z.alive() { continue; }
             if z.dormant() { if z.heard > 1e-3 { z.heard *= decay; } continue; }
@@ -767,9 +777,10 @@ impl Horde {
                 }
             } else if matches!(z.state, ZState::Investigating { .. }) {
                 z.linger -= dt;
-                if z.linger <= 0.0 { z.state = ZState::Dormant; z.heard = 0.0; z.moved = true; }
+                if z.linger <= 0.0 { z.state = ZState::Dormant; z.heard = 0.0; z.moved = true; slept = true; }
             }
         }
+        if slept { self.dormant_epoch += 1; }
         // Resolve this frame's structure hits (attack noise feeds the wake
         // loop: pounding on a wall is what pulls the map in).
         for (sid, dmg, at, noise) in hits {
@@ -1004,6 +1015,7 @@ impl Horde {
     /// Death: corpse for the renderer, a death rattle (noise), free the slot,
     /// and drop the item from the index immediately (O(1) by handle).
     fn kill_zombie(&mut self, id: usize) {
+        if self.units[id].dormant() { self.dormant_epoch += 1; } // a sleeper died in place
         let (p, class) = (self.units[id].p, self.units[id].class);
         self.corpses.push((p, class, self.now));
         if self.corpses.len() > 45_000 { self.corpses.drain(0..5_000); } // cap the aftermath field

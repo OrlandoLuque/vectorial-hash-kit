@@ -278,6 +278,42 @@ fn unit_box() -> vectorial_hash_demos::model::SkinnedModel {
     SkinnedModel { vertices: verts, indices: idx, joint_frames: vec![glam::Mat4::IDENTITY.to_cols_array_2d()], num_joints: 1, n_frames: 1 }
 }
 
+/// Compose axis-aligned boxes (centre, size) into one static model — the LOD
+/// proxy figures (~72 tris vs ~1.5–3k for a skinned glb).
+fn boxes_model(parts: &[([f32; 3], [f32; 3])]) -> vectorial_hash_demos::model::SkinnedModel {
+    use vectorial_hash_demos::model::SkinnedModel;
+    let unit = unit_box();
+    let (mut verts, mut idx) = (Vec::new(), Vec::new());
+    for (c, s) in parts {
+        let base = verts.len() as u32;
+        for v in &unit.vertices {
+            let mut v2 = *v;
+            // unit_box is XZ-centred with base at y=0 → recentre to (c, s)
+            v2.pos = [c[0] + v.pos[0] * s[0], c[1] - s[1] * 0.5 + v.pos[1] * s[1], c[2] + v.pos[2] * s[2]];
+            verts.push(v2);
+        }
+        idx.extend(unit.indices.iter().map(|i| base + i));
+    }
+    SkinnedModel { vertices: verts, indices: idx, joint_frames: vec![glam::Mat4::IDENTITY.to_cols_array_2d()], num_joints: 1, n_frames: 1 }
+}
+
+/// The sleeping-carpet proxy: a slumped hump + head, base at y=0. Scaled by
+/// class at instance time; when a sleeper WAKES it "stands up" into the full
+/// skinned model — the wake wave is visible as figures rising from the carpet.
+fn slump_proxy() -> vectorial_hash_demos::model::SkinnedModel {
+    boxes_model(&[([0.0, 0.20, 0.0], [0.95, 0.40, 0.55]), ([0.48, 0.16, 0.0], [0.28, 0.32, 0.32])])
+}
+
+/// The far-LOD standing figure for active zombies past the LOD distance.
+fn stand_proxy() -> vectorial_hash_demos::model::SkinnedModel {
+    boxes_model(&[([0.0, 0.45, 0.0], [0.42, 0.90, 0.30]), ([0.0, 1.08, 0.0], [0.30, 0.28, 0.30])])
+}
+
+/// LOD switch distance (camera→unit, wu): nearer = full GPU-skinned model,
+/// farther = the standing proxy. At the default orbit the whole field is proxy
+/// (units are a few pixels); zoom in and the front line turns into real models.
+const LOD_DIST: f32 = 620.0;
+
 // ============================================================ renderer
 
 struct State {
@@ -293,6 +329,15 @@ struct State {
     castle_model: GpuModel,
     cannon_model: GpuModel,
     cannon_inst_buf: wgpu::Buffer,
+    // LOD proxies + the static dormant carpet / append-only corpse buffers.
+    slump_model: GpuModel,
+    stand_model: GpuModel,
+    dormant_buf: wgpu::Buffer,
+    dormant_n: u32,
+    dormant_key: (u32, u64), // (run, dormant_epoch) that built the buffer
+    proxy_buf: wgpu::Buffer, // far-LOD active zombies, rebuilt per frame
+    corpse_buf: wgpu::Buffer,
+    corpse_n: u32,
     line_pipeline: wgpu::RenderPipeline,
     line_buf: wgpu::Buffer,
     line_cap: usize,
@@ -318,6 +363,8 @@ struct State {
     pop: usize,
     paused: bool,
     frustum_cull: bool,
+    /// HORDE_NOLOD=1 → everything fully skinned (the pre-LOD path, for A/B).
+    lod: bool,
     fps: f32,
     last: Instant,
     yaw: f32,
@@ -417,6 +464,12 @@ impl State {
         let cannon_model = build_gpu_model(&device, &cam_buf, &skin_layout, &bytes_of("cannon.glb"));
         let box_model = upload_skinned(&device, &cam_buf, &skin_layout, &unit_box());
         let box_inst_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("box-inst"), size: (1024 * std::mem::size_of::<SkinInstance>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        // LOD proxies + the static/append-only crowd buffers.
+        let slump_model = upload_skinned(&device, &cam_buf, &skin_layout, &slump_proxy());
+        let stand_model = upload_skinned(&device, &cam_buf, &skin_layout, &stand_proxy());
+        let dormant_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("dormant-inst"), size: (MAX_POP * std::mem::size_of::<SkinInstance>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let proxy_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("proxy-inst"), size: ((MAX_POP + 8192) * std::mem::size_of::<SkinInstance>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let corpse_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("corpse-inst"), size: (46_000 * std::mem::size_of::<SkinInstance>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let cannon_inst_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("cannon-inst"), size: (64 * std::mem::size_of::<SkinInstance>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
 
         let seed = std::env::var("HORDE_SEED").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0x40BDE);
@@ -476,6 +529,8 @@ impl State {
             surface, device, queue, config,
             skin_pipeline, models, inst_buf,
             box_model, box_inst_buf, castle_model, cannon_model, cannon_inst_buf,
+            slump_model, stand_model, dormant_buf, dormant_n: 0, dormant_key: (0, 0),
+            proxy_buf, corpse_buf, corpse_n: 0,
             line_pipeline, line_buf, line_cap,
             ui_pipeline, ui_buf, ui_drag: 0,
             #[cfg(not(target_arch = "wasm32"))]
@@ -487,7 +542,7 @@ impl State {
             terrain_pipeline, terrain_vbuf, terrain_ibuf, terrain_nidx: ti.len() as u32,
             cam_buf, cam_bg, depth,
             sim, seed, pop,
-            paused: false, frustum_cull: true, fps: 0.0, last: Instant::now(),
+            paused: false, frustum_cull: true, lod: std::env::var("HORDE_NOLOD").is_err(), fps: 0.0, last: Instant::now(),
             yaw: 0.9, pitch: 0.7, dist: 820.0, dragging: false, last_mouse: (0.0, 0.0),
             free_cam: false, cam_pos: glam::Vec3::ZERO, mv: [false; 6],
             skin_instances: Vec::with_capacity(64 * 1024),
@@ -531,6 +586,13 @@ impl State {
         -Vec3::new(self.pitch.cos() * self.yaw.cos(), self.pitch.sin(), self.pitch.cos() * self.yaw.sin())
     }
 
+    /// The camera eye in world space (orbit or free-fly) — LOD distances key off it.
+    fn eye(&self) -> Vec3 {
+        if self.free_cam { return self.cam_pos; }
+        let target = Vec3::new((WORLD * 0.5) as f32, 12.0, (WORLD * 0.5) as f32);
+        target + Vec3::new(self.dist * self.pitch.cos() * self.yaw.cos(), self.dist * self.pitch.sin(), self.dist * self.pitch.cos() * self.yaw.sin())
+    }
+
     fn camera(&self) -> CameraUniform {
         let (eye, target) = if self.free_cam {
             (self.cam_pos, self.cam_pos + self.forward())
@@ -570,24 +632,76 @@ impl State {
         let do_cull = self.frustum_cull;
         let now = self.sim.now;
 
-        // Zombies + defenders + corpses → buckets per model (one draw per glb).
+        let eye = self.eye();
+
+        // The sleeping carpet: a STATIC instance buffer of slump proxies,
+        // rebuilt only when the dormant set changes (the sim's dormant_epoch) —
+        // between wakes/sleeps/deaths the 100k-sleeper upload cost is ZERO.
+        let key = (self.sim.run, self.sim.dormant_epoch);
+        if !self.lod { self.dormant_n = 0; self.dormant_key = (0, 0); }
+        if self.lod && key != self.dormant_key {
+            let mut di: Vec<SkinInstance> = Vec::with_capacity(self.sim.units.len());
+            for (i, z) in self.sim.units.iter().enumerate() {
+                if !z.alive() || !z.dormant() { continue; }
+                let scale = zscale(z.class) * 0.9;
+                let yaw = (i as f32) * 2.399963; // hashed rest orientation
+                let m = Mat4::from_translation(Vec3::new(z.p.x as f32, z.p.y as f32, z.p.z as f32)) * Mat4::from_rotation_y(yaw) * Mat4::from_scale(Vec3::splat(scale));
+                di.push(SkinInstance { model: m.to_cols_array_2d(), color: ztint(z.class, true), frame_base: 0, _pad: [0; 3] });
+            }
+            di.truncate(MAX_POP);
+            self.queue.write_buffer(&self.dormant_buf, 0, bytemuck::cast_slice(&di));
+            self.dormant_n = di.len() as u32;
+            self.dormant_key = key;
+        }
+
+        // Corpses: append-only — upload only the new bodies since last frame
+        // (full rebuild after a drain/reset shrinks the vec).
+        {
+            let corpses = &self.sim.corpses;
+            let n = corpses.len().min(46_000);
+            let from = if (self.corpse_n as usize) <= n { self.corpse_n as usize } else { 0 };
+            if n > from || from == 0 && n < self.corpse_n as usize {
+                let mut ci: Vec<SkinInstance> = Vec::with_capacity(n - from.min(n));
+                for (p, class, _) in &corpses[from..n] {
+                    let s = zscale(*class);
+                    let m = Mat4::from_translation(Vec3::new(p.x as f32, p.y as f32 + 0.2, p.z as f32)) * Mat4::from_rotation_y((p.x.to_bits() % 628) as f32 * 0.01) * Mat4::from_scale(Vec3::new(s, s * 0.22, s));
+                    ci.push(SkinInstance { model: m.to_cols_array_2d(), color: [0.26, 0.23, 0.21, 0.7], frame_base: 0, _pad: [0; 3] });
+                }
+                if !ci.is_empty() { self.queue.write_buffer(&self.corpse_buf, (from * std::mem::size_of::<SkinInstance>()) as u64, bytemuck::cast_slice(&ci)); }
+                self.corpse_n = n as u32;
+            }
+        }
+
+        // ACTIVE zombies: full skinned model when near (LOD_DIST), the standing
+        // proxy when far; defenders always skinned (there are ~50 of them).
         let mut buckets: Vec<Vec<SkinInstance>> = (0..self.models.len()).map(|_| Vec::new()).collect();
+        let mut proxies: Vec<SkinInstance> = Vec::new();
         for (i, z) in self.sim.units.iter().enumerate() {
             if !z.alive() { continue; }
             let dormant = z.dormant();
+            if self.lod && dormant { continue; } // in the static carpet buffer
             let (x, y, zz) = (z.p.x as f32, z.p.y as f32, z.p.z as f32);
             let scale = zscale(z.class);
             if do_cull && !sphere_in_frustum(&planes, glam::Vec3::new(x, y, zz), scale * 1.6) { continue; }
+            let yaw = (z.vel.1 as f32).atan2(z.vel.0 as f32);
+            let d2 = (Vec3::new(x, y, zz) - eye).length_squared();
+            if self.lod && d2 > LOD_DIST * LOD_DIST {
+                let m = Mat4::from_translation(Vec3::new(x, y, zz)) * Mat4::from_rotation_y(-yaw) * Mat4::from_scale(Vec3::splat(scale));
+                proxies.push(SkinInstance { model: m.to_cols_array_2d(), color: ztint(z.class, false), frame_base: 0, _pad: [0; 3] });
+                continue;
+            }
             let mi = zmodel(z.class);
             let m = &self.models[mi];
             let nf = m.n_frames.max(1);
             let phase = (i as u32 % 8) as f32 / 8.0; // per-instance anim jitter
-            let frame = if dormant { ((phase * nf as f32) as u32) % nf } // frozen, varied poses
+            let frame = if dormant { ((phase * nf as f32) as u32) % nf } // NOLOD A/B path
                 else { (((now as f32 * 1.6 + phase) * nf as f32) as u32) % nf };
-            let yaw = (z.vel.1 as f32).atan2(z.vel.0 as f32);
             let model = Mat4::from_translation(Vec3::new(x, y, zz)) * Mat4::from_rotation_y(-yaw + std::f32::consts::FRAC_PI_2) * Mat4::from_scale(Vec3::splat(scale));
             buckets[mi].push(SkinInstance { model: model.to_cols_array_2d(), color: ztint(z.class, dormant), frame_base: frame * m.num_joints, _pad: [0; 3] });
         }
+        proxies.truncate(MAX_POP + 8192);
+        if !proxies.is_empty() { self.queue.write_buffer(&self.proxy_buf, 0, bytemuck::cast_slice(&proxies)); }
+        let proxy_n = proxies.len() as u32;
         for d in &self.sim.defenders {
             if !d.alive() { continue; }
             let (x, y, zz) = (d.p.x as f32, d.p.y as f32, d.p.z as f32);
@@ -598,16 +712,6 @@ impl State {
             let frame = (((now as f32 * 1.8) * nf as f32) as u32) % nf;
             let model = Mat4::from_translation(Vec3::new(x, y, zz)) * Mat4::from_scale(Vec3::splat(7.0));
             buckets[mi].push(SkinInstance { model: model.to_cols_array_2d(), color: dtint(d.kind), frame_base: frame * m.num_joints, _pad: [0; 3] });
-        }
-        // Corpses: frozen pose, flattened + darkened — the aftermath field.
-        let corpses = &self.sim.corpses;
-        let start = corpses.len().saturating_sub(CORPSE_DRAW);
-        for (p, class, _) in &corpses[start..] {
-            let (x, y, zz) = (p.x as f32, p.y as f32, p.z as f32);
-            if do_cull && !sphere_in_frustum(&planes, glam::Vec3::new(x, y, zz), 8.0) { continue; }
-            let mi = zmodel(*class);
-            let model = Mat4::from_translation(Vec3::new(x, y + 0.4, zz)) * Mat4::from_scale(Vec3::new(zscale(*class), zscale(*class) * 0.18, zscale(*class)));
-            buckets[mi].push(SkinInstance { model: model.to_cols_array_2d(), color: [0.28, 0.24, 0.22, 0.75], frame_base: 0, _pad: [0; 3] });
         }
         self.skin_instances.clear();
         let mut ranges: Vec<(u32, u32)> = Vec::with_capacity(buckets.len());
@@ -714,6 +818,7 @@ impl State {
             tris += (m.nidx as u64 / 3) * (e - s) as u64;
         }
         tris += (self.box_model.nidx as u64 / 3) * box_n as u64 + (self.cannon_model.nidx as u64 / 3) * cannon_n as u64 + self.castle_model.nidx as u64 / 3;
+        tris += (self.slump_model.nidx as u64 / 3) * (self.dormant_n + self.corpse_n) as u64 + (self.stand_model.nidx as u64 / 3) * proxy_n as u64;
         let white = [0.92, 0.94, 0.98, 1.0];
         let hx = sw - 170.0;
         let (wave_k, announced, wdir, eta) = self.sim.wave_info();
@@ -763,6 +868,33 @@ impl State {
             pass.set_index_buffer(self.terrain_ibuf.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..self.terrain_nidx, 0, 0..1);
             pass.set_pipeline(&self.skin_pipeline);
+            // the sleeping carpet — static buffer, zero per-frame CPU/upload
+            if self.dormant_n > 0 {
+                let sm = &self.slump_model;
+                pass.set_bind_group(0, &sm.bind, &[]);
+                pass.set_vertex_buffer(0, sm.vbuf.slice(..));
+                pass.set_vertex_buffer(1, self.dormant_buf.slice(..));
+                pass.set_index_buffer(sm.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..sm.nidx, 0, 0..self.dormant_n);
+            }
+            // the aftermath field — append-only corpse buffer
+            if self.corpse_n > 0 {
+                let sm = &self.slump_model;
+                pass.set_bind_group(0, &sm.bind, &[]);
+                pass.set_vertex_buffer(0, sm.vbuf.slice(..));
+                pass.set_vertex_buffer(1, self.corpse_buf.slice(..));
+                pass.set_index_buffer(sm.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..sm.nidx, 0, 0..self.corpse_n);
+            }
+            // far-LOD active zombies — standing proxies
+            if proxy_n > 0 {
+                let pm = &self.stand_model;
+                pass.set_bind_group(0, &pm.bind, &[]);
+                pass.set_vertex_buffer(0, pm.vbuf.slice(..));
+                pass.set_vertex_buffer(1, self.proxy_buf.slice(..));
+                pass.set_index_buffer(pm.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..pm.nidx, 0, 0..proxy_n);
+            }
             pass.set_vertex_buffer(1, self.inst_buf.slice(..));
             for (mi, m) in self.models.iter().enumerate() {
                 let (s, e) = ranges[mi];
