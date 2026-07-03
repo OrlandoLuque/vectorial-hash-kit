@@ -563,6 +563,10 @@ impl State {
         if pop == self.pop { return; }
         self.pop = pop;
         self.sim = Horde::new(self.seed, pop);
+        // The fresh sim restarts at (run 1, epoch 1) — the same key the old one
+        // started with, so the static dormant carpet would never re-upload.
+        self.dormant_key = (u32::MAX, u64::MAX);
+        self.corpse_n = 0;
     }
 
     #[cfg(not(target_arch = "wasm32"))]

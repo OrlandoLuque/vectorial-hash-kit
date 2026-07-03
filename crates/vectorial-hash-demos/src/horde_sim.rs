@@ -284,6 +284,9 @@ impl DKind {
 pub enum DState {
     /// Fighter: hold the assigned sector post (engage from it).
     Post,
+    /// Ranger sortie: out through the nearest gate to silently clear a nest
+    /// (peacetime only; recalled the moment a wave is announced).
+    Sortie { tx: f64, tz: f64 },
     /// Crew: repairing / rebuilding structure `sid` (needs stock).
     Repairing { sid: u32 },
     /// Porter: hauling to crew `did` (`loaded` = carrying a bundle).
@@ -313,6 +316,21 @@ impl Defender { pub fn alive(&self) -> bool { self.hp > 0.0 } }
 pub const SECTORS: usize = 16;
 pub const CREW_REPAIR: f64 = 30.0; // HP/s while stocked
 pub const PORTER_BUNDLE: f64 = 20.0; // stock per delivery
+
+/// Two-leg routing through the nearest LIVE gate whenever a friendly walk
+/// crosses the wall ring — the gates are the only human passage (zombies just
+/// eat the wall). Returns the waypoint to head for right now.
+fn via_gate(gates: &[(f64, f64)], from: Point3, tx: f64, tz: f64) -> (f64, f64) {
+    let (cx, cz) = (WORLD / 2.0, WORLD / 2.0);
+    let inside = |x: f64, z: f64| ((x - cx).powi(2) + (z - cz).powi(2)).sqrt() < BASE_R + 10.0;
+    if inside(from.x, from.z) == inside(tx, tz) || gates.is_empty() { return (tx, tz); }
+    let g = gates.iter().min_by(|a, b| {
+        let da = ((a.0 - from.x).powi(2) + (a.1 - from.z).powi(2)).sqrt() + ((a.0 - tx).powi(2) + (a.1 - tz).powi(2)).sqrt();
+        let db = ((b.0 - from.x).powi(2) + (b.1 - from.z).powi(2)).sqrt() + ((b.0 - tx).powi(2) + (b.1 - tz).powi(2)).sqrt();
+        da.total_cmp(&db)
+    }).unwrap();
+    if ((g.0 - from.x).powi(2) + (g.1 - from.z).powi(2)).sqrt() > 12.0 { (g.0, g.1) } else { (tx, tz) }
+}
 
 // ----------------------------------------------------------------------- sim
 
@@ -373,6 +391,8 @@ pub struct Horde {
     /// Most recent breach (position, time): drives the porter/crew recall and
     /// keeps repair jobs out of the danger zone for a while.
     pub breach: Option<(Point3, f64)>,
+    /// Structure ids of the four cardinal gates (friendly passage points).
+    pub gates: Vec<usize>,
 }
 
 /// The base layout: a stone wall ring with 4 cardinal gates and towers every
@@ -391,9 +411,17 @@ fn build_base(rng: &mut Rng, seed: f64) -> Vec<Structure> {
         let kind = if gates.contains(&i) { SKind::Gate } else if i % 10 == 5 { SKind::Tower } else { SKind::Wall };
         s.push(Structure { kind, p: at(x, z), hp: kind.max_hp(), pop: 0 });
     }
-    for _ in 0..28 { // houses, scattered inside the ring
-        let (a, r) = (rng.range(0.0, std::f64::consts::TAU), rng.range(30.0, 110.0));
+    // Houses: rejection-sampled so no two buildings interpenetrate (≥16 wu
+    // between houses, ≥26 wu clear of the Command Center / storehouse spots).
+    let mut placed: Vec<(f64, f64)> = Vec::new();
+    let mut tries = 0;
+    while placed.len() < 28 && tries < 600 {
+        tries += 1;
+        let (a, r) = (rng.range(0.0, std::f64::consts::TAU), rng.range(34.0, 110.0));
         let (x, z) = (cx + a.cos() * r, cz + a.sin() * r);
+        if r < 26.0 { continue; }
+        if placed.iter().any(|(px, pz)| { let (dx, dz) = (x - px, z - pz); dx * dx + dz * dz < 16.0 * 16.0 }) { continue; }
+        placed.push((x, z));
         s.push(Structure { kind: SKind::House, p: at(x, z), hp: SKind::House.max_hp(), pop: 5 + (rng.unit() * 15.0) as u32 });
     }
     for q in 0..2 { // storehouses flanking the CC (phase-3 hauling endpoints)
@@ -404,25 +432,45 @@ fn build_base(rng: &mut Rng, seed: f64) -> Vec<Structure> {
     s
 }
 
-/// Scatter the dormant field: nest clusters outside the base, class mix from
-/// the research (~70% walkers, the rest specials).
+/// Scatter the dormant field: nest blobs outside the base, class mix from the
+/// research (~70% walkers, the rest specials). Placement = a **jittered hex
+/// lattice masked by the nest discs**: bodies are ≥ ~1.5 wu apart BY
+/// CONSTRUCTION (no two sleepers share a spot, even where nests overlap), and
+/// sampling the masked points evenly keeps every nest populated.
 pub fn spawn_field(rng: &mut Rng, pop: usize, seed: f64) -> Vec<Zombie> {
     let (cx, cz) = (WORLD / 2.0, WORLD / 2.0);
-    let nests = (pop / 150).max(1);
-    let mut units = Vec::with_capacity(pop);
-    for n in 0..nests {
+    let nests = (pop / 300).clamp(3, 80);
+    const SPACING: f64 = 2.4;
+    // Nest discs sized so their combined area holds `pop` at lattice density.
+    let nr = ((pop as f64 * SPACING * SPACING * 1.5) / (std::f64::consts::PI * nests as f64)).sqrt().clamp(22.0, 130.0);
+    let centers: Vec<(f64, f64)> = (0..nests).map(|_| {
         let a = rng.range(0.0, std::f64::consts::TAU);
-        let r = rng.range(BASE_R + 120.0, WORLD / 2.0 - 60.0);
-        let (nx, nz) = (cx + a.cos() * r, cz + a.sin() * r);
-        let count = pop / nests + usize::from(n < pop % nests);
-        for _ in 0..count {
-            let (da, dr) = (rng.range(0.0, std::f64::consts::TAU), rng.range(0.0, 42.0));
-            let (x, z) = ((nx + da.cos() * dr).clamp(MARGIN, WORLD - MARGIN), (nz + da.sin() * dr).clamp(MARGIN, WORLD - MARGIN));
-            let roll = rng.unit();
-            let class = if roll < 0.70 { ZClass::Walker } else if roll < 0.85 { ZClass::Runner } else if roll < 0.91 { ZClass::Chubby } else if roll < 0.96 { ZClass::Venom } else { ZClass::Harpy };
-            let y = ground_h(x, z, seed) + class.altitude();
-            units.push(Zombie { class, p: Point3::new(x, y, z), vel: (0.0, 0.0), state: ZState::Dormant, hp: class.max_hp(), heard: 0.0, linger: 0.0, groan_t: rng.range(0.5, 2.0), swing_t: 0.0, moved: false });
+        let r = rng.range(BASE_R + 120.0 + nr * 0.4, WORLD / 2.0 - 40.0);
+        (cx + a.cos() * r, cz + a.sin() * r)
+    }).collect();
+    // All jittered lattice points inside some nest disc…
+    let mut spots: Vec<(f64, f64)> = Vec::with_capacity(pop * 2);
+    let rows = (WORLD / SPACING) as usize;
+    for gj in 0..rows {
+        let z0 = gj as f64 * SPACING;
+        for gi in 0..rows {
+            let x0 = gi as f64 * SPACING + (gj % 2) as f64 * SPACING * 0.5;
+            let (x, z) = ((x0 + rng.range(-0.45, 0.45)).clamp(MARGIN, WORLD - MARGIN), (z0 + rng.range(-0.45, 0.45)).clamp(MARGIN, WORLD - MARGIN));
+            if centers.iter().any(|(nx, nz)| { let (dx, dz) = (x - nx, z - nz); dx * dx + dz * dz < nr * nr }) { spots.push((x, z)); }
         }
+    }
+    // …then take an even random sample of exactly `pop` of them.
+    let mut units = Vec::with_capacity(pop);
+    let take = pop.min(spots.len());
+    for k in 0..take {
+        // partial Fisher–Yates: pick the k-th from the remaining tail
+        let j = k + (rng.next() as usize) % (spots.len() - k);
+        spots.swap(k, j);
+        let (x, z) = spots[k];
+        let roll = rng.unit();
+        let class = if roll < 0.70 { ZClass::Walker } else if roll < 0.85 { ZClass::Runner } else if roll < 0.91 { ZClass::Chubby } else if roll < 0.96 { ZClass::Venom } else { ZClass::Harpy };
+        let y = ground_h(x, z, seed) + class.altitude();
+        units.push(Zombie { class, p: Point3::new(x, y, z), vel: (0.0, 0.0), state: ZState::Dormant, hp: class.max_hp(), heard: 0.0, linger: 0.0, groan_t: rng.range(0.5, 2.0), swing_t: 0.0, moved: false });
     }
     units
 }
@@ -457,7 +505,9 @@ impl Horde {
             rng, now: 0.0, seed: fseed, woken_last: 0, dormant_epoch: 1,
             base_pop: pop, base_seed: seed,
             defenders: Vec::new(), threat: [0.0; SECTORS], weapons_free: false, cmd_t: 0.0, breach: None,
+            gates: Vec::new(),
         };
+        h.gates = h.structures.iter().enumerate().filter(|(_, s)| s.kind == SKind::Gate).map(|(i, _)| i).collect();
         h.spawn_defenders();
         h
     }
@@ -530,13 +580,15 @@ impl Horde {
         if self.now < self.wave_spawn_t { return; }
         let k = self.wave_k;
         let is_final = k >= 8;
-        let count = (60.0 * 1.4f64.powi(k.min(8) as i32)) as usize;
+        let count = (150.0 * 1.35f64.powi(k.min(8) as i32)) as usize;
         let dirs: Vec<f64> = if is_final { (0..4).map(|q| q as f64 * std::f64::consts::FRAC_PI_2).collect() } else { vec![self.wave_dir] };
         let (cx, cz) = (WORLD / 2.0, WORLD / 2.0);
         for dir in &dirs {
             for _ in 0..count / dirs.len() {
                 let a = dir + self.rng.range(-0.35, 0.35);
-                let r = self.rng.range(WORLD / 2.0 - 60.0, WORLD / 2.0 - 15.0);
+                // Land close enough to be watchable (marching through the nest
+                // belt also drags alert sleepers along — by design).
+                let r = self.rng.range(400.0, 520.0);
                 let (x, z) = ((cx + a.cos() * r).clamp(MARGIN, WORLD - MARGIN), (cz + a.sin() * r).clamp(MARGIN, WORLD - MARGIN));
                 // Escalating mix: early waves are shambler seas; specials join
                 // from wave 2 (venom/chubby) and wave 4 (harpies).
@@ -648,7 +700,9 @@ impl Horde {
         let events = std::mem::take(&mut self.pending);
         for (p, amount) in &events {
             self.noise.add(p.x, p.z, *amount);
-            let blast = Sphere3::new(p.x, p.y, p.z, MAX_HEAR);
+            // +28: hearing is an XZ ring but the cull is a 3D sphere — a flying
+            // harpy at the very edge of its ring must not slip out vertically.
+            let blast = Sphere3::new(p.x, p.y, p.z, MAX_HEAR + 28.0);
             let heard: Vec<(u32, f64)> = self.zindex.cull(&blast).iter()
                 .filter(|it| it.dormant)
                 .map(|it| { let (dx, dz) = (it.p.x - p.x, it.p.z - p.z); (it.id, (dx * dx + dz * dz).sqrt()) })
@@ -680,6 +734,7 @@ impl Horde {
         //    fans out over rayon on native, serial on wasm (no threads there).
         {
             let (index, sindex, structures, flow) = (&self.zindex, &self.sindex, &self.structures, &self.flow);
+            let defenders = &self.defenders;
             let (units, cx, cz) = (&mut self.units, WORLD / 2.0, WORLD / 2.0);
             let decide_one = |i: usize, z: &mut Zombie| {
                 if !z.alive() { return; }
@@ -701,7 +756,22 @@ impl Horde {
                 // buildings under them).
                 let (dcx, dcz) = (z.p.x - cx, z.p.z - cz);
                 let dc = (dcx * dcx + dcz * dcz).sqrt();
-                if dc < BASE_R + 80.0 {
+                // The nearest HUMAN in sight (TAB: zombies beeline to the
+                // closest human element) — defenders are few, a brute scan
+                // beats indexing them. Chasing overrides the flow field.
+                let mut hunt: Option<(f64, f64, f64)> = None; // (dist, x, z)
+                if dc < BASE_R + 140.0 {
+                    for dfn in defenders.iter() {
+                        if !dfn.alive() { continue; }
+                        let (dx, dz) = (dfn.p.x - z.p.x, dfn.p.z - z.p.z);
+                        let dd = (dx * dx + dz * dz).sqrt();
+                        if dd < z.class.watch() && hunt.map(|(b, _, _)| dd < b).unwrap_or(true) { hunt = Some((dd, dfn.p.x, dfn.p.z)); }
+                    }
+                }
+                // In biting range of a human → stand and maul (the contact pass
+                // applies the damage). Humans in sight beat walls.
+                if let Some((hd, _, _)) = hunt { if hd < 4.0 { z.vel = (0.0, 0.0); return; } }
+                if hunt.is_none() && dc < BASE_R + 80.0 {
                     for (_, it) in sindex.knn(z.p, 4) {
                         if structures[it.id as usize].hp <= 0.0 { continue; }
                         let (dx, dz) = (it.p.x - z.p.x, it.p.z - z.p.z);
@@ -713,16 +783,18 @@ impl Horde {
                         break; // knn is sorted: nearest live one is out of reach
                     }
                 }
-                // Steering: investigators seek their personal spot; marchers
-                // descend the flow field (harpies fly straight over the walls).
-                let (mut vx, mut vz) = match z.state {
-                    ZState::Investigating { tx, tz } => {
+                // Steering: a human in sight beats everything (the beeline);
+                // else investigators seek their spot and marchers descend the
+                // flow field (harpies fly straight over the walls).
+                let (mut vx, mut vz) = match (hunt, z.state) {
+                    (Some((hd, hx, hz)), _) => ((hx - z.p.x) / hd.max(0.5), (hz - z.p.z) / hd.max(0.5)),
+                    (_, ZState::Investigating { tx, tz }) => {
                         let (dx, dz) = (tx - z.p.x, tz - z.p.z);
                         let d = (dx * dx + dz * dz).sqrt();
                         if d > 8.0 { (dx / d, dz / d) } else { (0.0, 0.0) }
                     }
-                    ZState::Marching if z.class == ZClass::Harpy => { let d = dc.max(1.0); (-dcx / d, -dcz / d) }
-                    ZState::Marching => flow.flow_at(z.p.x, z.p.z),
+                    (_, ZState::Marching) if z.class == ZClass::Harpy => { let d = dc.max(1.0); (-dcx / d, -dcz / d) }
+                    (_, ZState::Marching) => flow.flow_at(z.p.x, z.p.z),
                     _ => (0.0, 0.0),
                 };
                 // Separation among the awake (dormant bodies are a carpet the
@@ -735,7 +807,10 @@ impl Horde {
                     if d < 3.0 { vx += sx / d * (3.0 - d) * 0.4; vz += sz / d * (3.0 - d) * 0.4; }
                 }
                 let l = (vx * vx + vz * vz).sqrt();
-                let sp = z.class.speed();
+                // Swarm frenzy: wave zombies (and beeliners) push at 2.2× — at
+                // demo scale a TAB-speed walker reads as standing still.
+                let frenzy = if hunt.is_some() || matches!(z.state, ZState::Marching) { 2.2 } else { 1.0 };
+                let sp = z.class.speed() * frenzy;
                 z.vel = if l > 1e-6 { (vx / l * sp, vz / l * sp) } else { (0.0, 0.0) };
             };
             #[cfg(not(target_arch = "wasm32"))]
@@ -857,13 +932,11 @@ impl Horde {
             let weights: Vec<f64> = self.threat.iter().map(|t| t + 0.3).collect();
             let wsum: f64 = weights.iter().sum();
             let nf = self.defenders.iter().filter(|d| d.kind.fighter() && d.alive()).count().max(1);
-            let mut fi = 0usize;
-            for d in self.defenders.iter_mut().filter(|d| d.kind.fighter() && d.alive()) {
+            for (fi, d) in self.defenders.iter_mut().filter(|d| d.kind.fighter() && d.alive()).enumerate() {
                 let target = (fi as f64 + 0.5) / nf as f64 * wsum;
                 let (mut acc, mut sec) = (0.0, 0usize);
                 for (s, w) in weights.iter().enumerate() { acc += w; if acc >= target { sec = s; break; } }
                 d.sector = sec;
-                fi += 1;
             }
             // Crew job scheduling: most damaged structure, outside the breach
             // danger zone, with a clear safety cull (no awake zombie nearby).
@@ -890,6 +963,32 @@ impl Horde {
                     .map(|(ci, _)| ci);
                 if let Some(ci) = crew { self.defenders[di].state = DState::Hauling { did: ci as u32, loaded: true }; }
             }
+            // Peacetime SORTIE: send a small ranger squad out through the gate
+            // to silently clear the nearest nest (rangers = noise 1; the TAB
+            // map-clearing move). Recalled by the wave warning.
+            let (total_threat, eta) = (self.threat.iter().sum::<f64>(), self.wave_spawn_t - self.now);
+            let out = self.defenders.iter().filter(|d| matches!(d.state, DState::Sortie { .. })).count();
+            if total_threat < 3.0 && (!self.wave_announced || eta > 45.0) && out == 0 {
+                let target = self.zindex.knn(Point3::new(cx, 0.0, cz), 48).into_iter()
+                    .find(|(_, it)| it.dormant)
+                    .map(|(_, it)| it.p);
+                if let Some(tp) = target {
+                    let mut sent = 0;
+                    for d in self.defenders.iter_mut() {
+                        if sent >= 6 { break; }
+                        if d.kind != DKind::Ranger || !d.alive() || d.state != DState::Post || d.hp < d.kind.max_hp() * 0.9 { continue; }
+                        let j = sent as f64 * 2.399963;
+                        d.state = DState::Sortie { tx: (tp.x + j.cos() * (4.0 + sent as f64 * 2.0)).clamp(MARGIN, WORLD - MARGIN), tz: (tp.z + j.sin() * (4.0 + sent as f64 * 2.0)).clamp(MARGIN, WORLD - MARGIN) };
+                        sent += 1;
+                    }
+                }
+            }
+            // Wave warning → everyone home to the walls.
+            if self.wave_announced && eta <= 45.0 {
+                for d in self.defenders.iter_mut() {
+                    if matches!(d.state, DState::Sortie { .. }) { d.state = DState::Post; }
+                }
+            }
         }
         // ---- per-frame defender update
         let mut shot: Vec<(usize, f64)> = Vec::new(); // (zombie id, dmg)
@@ -897,7 +996,9 @@ impl Horde {
         let mut tracer: Vec<(Point3, Point3, f64)> = Vec::new();
         let mut deliveries: Vec<u32> = Vec::new();
         let mut repaired_any = false;
-        for d in self.defenders.iter_mut() {
+        // Live gate mouths — every ring-crossing friendly walk routes via one.
+        let gate_pts: Vec<(f64, f64)> = self.gates.iter().filter(|&&g| self.structures[g].hp > 0.0).map(|&g| (self.structures[g].p.x, self.structures[g].p.z)).collect();
+        for (dix, d) in self.defenders.iter_mut().enumerate() {
             if !d.alive() {
                 d.respawn_t -= dt;
                 if d.respawn_t <= 0.0 { // recruits arrive at the CC
@@ -920,9 +1021,12 @@ impl Horde {
             match d.state {
                 DState::Post => {
                     // Hold the sector post; engage under the noise policy.
+                    // (Routing goes via the gate when returning from a sortie.)
                     let a = (d.sector as f64 + 0.5) / SECTORS as f64 * std::f64::consts::TAU;
                     let jit = (d.shots % 7) as f64 * 0.015; // spread along the wall
-                    walk(d, cx + (a + jit).cos() * (BASE_R - 10.0), cz + (a + jit).sin() * (BASE_R - 10.0), dt, self.seed);
+                    let (px, pz) = (cx + (a + jit).cos() * (BASE_R - 10.0), cz + (a + jit).sin() * (BASE_R - 10.0));
+                    let (wx, wz) = via_gate(&gate_pts, d.p, px, pz);
+                    walk(d, wx, wz, dt, self.seed);
                     d.reload_t -= dt;
                     let may_fire = self.weapons_free || d.kind == DKind::Ranger;
                     if d.reload_t <= 0.0 && may_fire {
@@ -956,9 +1060,37 @@ impl Horde {
                         if s.hp >= s.kind.max_hp() { d.state = DState::Idle; self.flow.dirty = true; }
                     }
                 }
+                DState::Sortie { tx, tz } => {
+                    let (wx, wz) = via_gate(&gate_pts, d.p, tx, tz);
+                    walk(d, wx, wz, dt, self.seed);
+                    d.reload_t -= dt;
+                    if d.reload_t <= 0.0 {
+                        if let Some((dist, it)) = self.zindex.knn(d.p, 1).into_iter().next() {
+                            if dist <= d.kind.range() {
+                                d.reload_t = d.kind.reload();
+                                d.shots += 1;
+                                shot.push((it.id as usize, d.kind.dmg()));
+                                noise.push((d.p, d.kind.noise()));
+                                tracer.push((Point3::new(d.p.x, d.p.y + 5.0, d.p.z), it.p, 0.0));
+                            }
+                        }
+                    }
+                    // nest cleared → home (the Post walk re-enters via the gate)
+                    let clear = self.zindex.knn(Point3::new(tx, 0.0, tz), 1).into_iter().next().map(|(dd, _)| dd > 90.0).unwrap_or(true);
+                    if clear { d.state = DState::Post; }
+                }
                 DState::Hauling { .. } => {} // handled after the loop (needs two defenders at once)
-                DState::Fleeing => { if walk(d, home.x, home.z, dt, self.seed) < 5.0 { d.state = DState::Idle; } }
-                DState::Idle => { if !d.kind.fighter() { walk(d, home.x, home.z, dt, self.seed); } }
+                DState::Fleeing => {
+                    let (wx, wz) = via_gate(&gate_pts, d.p, home.x, home.z);
+                    if walk(d, wx, wz, dt, self.seed) < 5.0 { d.state = DState::Idle; }
+                }
+                DState::Idle => {
+                    if !d.kind.fighter() {
+                        // Personal spot by the storehouse — no stacking on one point.
+                        let j = dix as f64 * 2.399963;
+                        walk(d, home.x + j.cos() * (4.0 + (dix % 6) as f64 * 1.6), home.z + j.sin() * (4.0 + (dix % 6) as f64 * 1.6), dt, self.seed);
+                    }
+                }
             }
         }
         // Porter movement (two-defender interaction — done index-wise to keep
@@ -992,7 +1124,7 @@ impl Horde {
         let mut dead_screams: Vec<Point3> = Vec::new();
         for d in self.defenders.iter_mut() {
             if !d.alive() { continue; }
-            let bite = Sphere3::new(d.p.x, d.p.y, d.p.z, 3.0);
+            let bite = Sphere3::new(d.p.x, d.p.y, d.p.z, 4.5);
             let dps: f64 = self.zindex.cull(&bite).iter().filter(|it| !it.dormant).map(|it| it.class.dmg()).sum();
             if dps > 0.0 {
                 d.hp -= dps * 0.4 * dt;
@@ -1106,6 +1238,8 @@ mod tests {
     #[test]
     fn woken_investigate_then_resettle_dormant() {
         let mut h = Horde::new(21, 3000);
+        h.wave_spawn_t = 1e9;    // no waves — this test is about re-settling
+        h.defenders.clear();     // …and no sorties/towers keeping fights alive
         h.step(1.0 / 60.0);
         h.emit_noise(h.units[0].p, 1000.0); // wake everything nearby
         h.step(1.0 / 60.0);
@@ -1179,13 +1313,16 @@ mod tests {
         let hp0 = h.structures[hid].p;
         let pop = h.structures[hid].pop as usize;
         let (d0, a0) = h.counts();
+        let kills0 = h.kills;
         // A chubby pounding the house (500 HP / 40 dmg ≈ 13 swings).
         h.spawn_zombie(ZClass::Chubby, hp0.x + 2.0, hp0.z, ZState::Attacking { sid: hid as u32 });
         for _ in 0..(20.0 * 60.0) as usize { h.step(1.0 / 60.0); if h.structures[hid].hp <= 0.0 { break; } }
         assert!(h.structures[hid].hp <= 0.0, "house must fall");
         h.step(1.0 / 60.0); // process the infection noise event
         let (d1, a1) = h.counts();
-        assert!(d1 + a1 >= d0 + a0 + pop, "each colonist must rise as a runner: {} -> {}", d0 + a0, d1 + a1);
+        // Rangers on sortie may have picked some off meanwhile — count kills in.
+        let killed = (h.kills - kills0) as usize;
+        assert!(d1 + a1 + killed >= d0 + a0 + pop, "each colonist must rise as a runner: {} -> {} (+{killed} killed)", d0 + a0, d1 + a1);
         assert!(h.units.iter().filter(|z| z.alive() && z.class == ZClass::Runner && matches!(z.state, ZState::Marching)).count() >= pop);
     }
 
@@ -1254,6 +1391,67 @@ mod tests {
         h.destroy_structure(wid + 1);
         let recalled = h.defenders.iter().any(|d| !d.kind.fighter() && d.alive() && d.state == DState::Fleeing);
         assert!(recalled, "porters/crews near a fresh breach must be recalled home");
+    }
+
+    #[test]
+    fn nothing_spawns_on_top_of_anything() {
+        let h = Horde::new(77, 6000);
+        // Houses: no two buildings interpenetrate.
+        let hs: Vec<&Structure> = h.structures.iter().filter(|s| s.kind == SKind::House).collect();
+        for (i, a) in hs.iter().enumerate() {
+            for b in &hs[i + 1..] {
+                let (dx, dz) = (a.p.x - b.p.x, a.p.z - b.p.z);
+                assert!((dx * dx + dz * dz).sqrt() >= 14.0, "houses overlap");
+            }
+        }
+        // Dormant zombies: golden-spiral spacing → nearest neighbour ≥ 1.2 wu.
+        for (i, z) in h.units.iter().enumerate().step_by(53) {
+            let near = h.units.iter().enumerate()
+                .filter(|(j, o)| *j != i && o.alive())
+                .map(|(_, o)| { let (dx, dz) = (o.p.x - z.p.x, o.p.z - z.p.z); dx * dx + dz * dz })
+                .fold(f64::INFINITY, f64::min);
+            assert!(near.sqrt() >= 1.2, "sleepers stacked: nearest at {}", near.sqrt());
+        }
+        // Idle works units spread around the storehouse (personal spots).
+        let mut hq = Horde::new(77, 500);
+        hq.wave_spawn_t = 1e9;
+        for _ in 0..(20.0 * 60.0) as usize { hq.step(1.0 / 60.0); }
+        let works: Vec<&Defender> = hq.defenders.iter().filter(|d| !d.kind.fighter() && d.alive() && d.state == DState::Idle).collect();
+        for (i, a) in works.iter().enumerate() {
+            for b in &works[i + 1..] {
+                let (dx, dz) = (a.p.x - b.p.x, a.p.z - b.p.z);
+                assert!((dx * dx + dz * dz).sqrt() >= 1.0, "idle works units stacked on one spot");
+            }
+        }
+    }
+
+    #[test]
+    fn zombies_beeline_to_the_nearest_human() {
+        let mut h = Horde::new(83, 300);
+        h.wave_spawn_t = 1e9;
+        h.step(1.0 / 60.0);
+        // A walker dropped 30 wu from a posted fighter (inside its watch 40).
+        let post = h.defenders.iter().find(|d| d.kind == DKind::Soldier).unwrap().p;
+        let hp0: f64 = h.defenders.iter().filter(|d| d.alive()).map(|d| d.hp).sum();
+        for k in 0..8 { h.spawn_zombie(ZClass::Runner, post.x + 24.0 + k as f64, post.z + 6.0, ZState::Marching); }
+        for _ in 0..(12.0 * 60.0) as usize { h.step(1.0 / 60.0); }
+        let hp1: f64 = h.defenders.iter().filter(|d| d.alive()).map(|d| d.hp).sum();
+        assert!(hp1 < hp0, "runners in sight must close on and maul the defenders ({hp0} -> {hp1})");
+    }
+
+    #[test]
+    fn rangers_sortie_out_the_gate_in_peacetime() {
+        let mut h = Horde::new(91, 3000);
+        h.wave_spawn_t = 1e9; // eternal peace → the Commander sends clearers
+        let (cx, cz) = (WORLD / 2.0, WORLD / 2.0);
+        let (mut went_out, kills0) = (false, h.kills);
+        for _ in 0..(90.0 * 60.0) as usize {
+            h.step(1.0 / 60.0);
+            if h.defenders.iter().any(|d| d.kind == DKind::Ranger && d.alive() && { let (dx, dz) = (d.p.x - cx, d.p.z - cz); (dx * dx + dz * dz).sqrt() > BASE_R + 12.0 }) { went_out = true; }
+            if went_out && h.kills > kills0 { break; }
+        }
+        assert!(went_out, "rangers must sortie outside the walls in peacetime");
+        assert!(h.kills > kills0, "the sortie must clear sleepers (silently)");
     }
 
     #[test]
