@@ -53,6 +53,23 @@ moved-only `sync_index` and early-outed in `decide`; only wake culls ever touch
 them. (The all-active 100k row is the honest ceiling: the scale-pass levers —
 decision buckets at 4–8 Hz, activation bubbles — are the queued next round.)
 
+**End-to-end rendered FPS** (same machine: RTX 4080 SUPER, 1600×1000, whole map
+in view, no vsync — `HORDE_NOVSYNC=1 HORDE_MAX_FRAMES=N` prints the average):
+
+```
+  pop 20 000  →  ~54 fps   (idle or first-wave battle: identical — GPU-bound)
+  pop 50 000  →  ~23 fps
+  pop 100 000 →  ~11 fps
+```
+
+The scaling is ~linear in drawn instances: exactly the **vertex-bound wall** the
+crowd research predicted (every zombie is fully GPU-skinned, dormant or not, and
+the instance buffer re-uploads each frame). The CPU sim never matters here
+(0.2–5 ms vs an 18–90 ms GPU frame). That makes the queued render levers — LOD
+tiers (~400/~120 tri), far-field impostors, skipping unmoved instance uploads —
+the whole story for the far-zoom 100k shot; zoomed in, the frustum cull (`K`,
+default on) already recovers most of it.
+
 ## The loop
 
 Waves land every ~70 s with a **direction warning + countdown** (banner), then

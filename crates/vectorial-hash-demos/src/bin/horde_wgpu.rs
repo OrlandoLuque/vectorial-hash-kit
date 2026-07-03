@@ -342,7 +342,9 @@ impl State {
             Some(s) => { let caps = s.get_capabilities(&adapter); (caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]), caps.alpha_modes[0]) }
             None => (wgpu::TextureFormat::Rgba8UnormSrgb, wgpu::CompositeAlphaMode::Opaque),
         };
-        let config = wgpu::SurfaceConfiguration { usage: wgpu::TextureUsages::RENDER_ATTACHMENT, format, width: size.width.max(1), height: size.height.max(1), present_mode: wgpu::PresentMode::AutoVsync, desired_maximum_frame_latency: 2, alpha_mode: alpha, view_formats: vec![] };
+        // HORDE_NOVSYNC=1 → uncapped presentation (for FPS measurements).
+        let present = if std::env::var("HORDE_NOVSYNC").is_ok() { wgpu::PresentMode::AutoNoVsync } else { wgpu::PresentMode::AutoVsync };
+        let config = wgpu::SurfaceConfiguration { usage: wgpu::TextureUsages::RENDER_ATTACHMENT, format, width: size.width.max(1), height: size.height.max(1), present_mode: present, desired_maximum_frame_latency: 2, alpha_mode: alpha, view_formats: vec![] };
         if let Some(s) = &surface { s.configure(&device, &config); }
 
         let cam_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("cam"), size: std::mem::size_of::<CameraUniform>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
@@ -921,6 +923,13 @@ async fn run() {
     }
     let mut st = State::new(Some(window.clone()), (1600, 1000)).await;
     let mut frame: u64 = 0;
+    // HORDE_MAX_FRAMES=N → run N frames, print the measured average FPS
+    // (frames past a 60-frame warmup over wall time), then exit — the
+    // end-to-end number: sim + instance build + render + present.
+    #[cfg(not(target_arch = "wasm32"))]
+    let max_frames: Option<u64> = std::env::var("HORDE_MAX_FRAMES").ok().and_then(|s| s.parse().ok());
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut t0: Option<Instant> = None;
 
     let handler = move |event, elwt: &winit::event_loop::EventLoopWindowTarget<()>| {
         elwt.set_control_flow(winit::event_loop::ControlFlow::Poll);
@@ -1008,6 +1017,18 @@ async fn run() {
                     if frame % 15 == 0 {
                         let (d, a) = st.sim.counts();
                         window.set_title(&format!("vectorial-hash — horde (wgpu) · sleep {d} | awake {a} | kills {} · run {} · {:.0} fps{}", st.sim.kills, st.sim.run, st.fps, if st.paused { " · PAUSED" } else { "" }));
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if let Some(m) = max_frames {
+                        if frame == 60 { t0 = Some(Instant::now()); }
+                        if frame >= m {
+                            if let Some(t) = t0 {
+                                let (d, a) = st.sim.counts();
+                                println!("horde_wgpu end-to-end: {:.1} fps avg over {} frames (pop {}, sleep {d}, awake {a}, kills {})",
+                                    (frame - 60) as f64 / t.elapsed().as_secs_f64(), frame - 60, st.pop, st.sim.kills);
+                            }
+                            elwt.exit();
+                        }
                     }
                 }
                 _ => {}
