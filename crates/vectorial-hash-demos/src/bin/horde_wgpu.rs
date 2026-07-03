@@ -152,6 +152,7 @@ const UI_BAR: (f32, f32, f32, f32) = (18.0, 18.0, 280.0, 16.0);      // dormant|
 const UI_SLIDER: (f32, f32, f32, f32) = (18.0, 46.0, 280.0, 12.0);   // population
 const UI_THREADS: (f32, f32, f32, f32) = (18.0, 70.0, 280.0, 12.0);  // rayon pool
 const UI_PAUSE: (f32, f32, f32, f32) = (18.0, 92.0, 96.0, 30.0);     // pause button
+const UI_WAVE: (f32, f32, f32, f32) = (18.0, 130.0, 96.0, 30.0);     // trigger-next-wave button (N key)
 
 #[allow(clippy::too_many_arguments)]
 fn push_quad(v: &mut Vec<UiVertex>, px: f32, py: f32, w: f32, h: f32, color: [f32; 4], sw: f32, sh: f32) {
@@ -1004,6 +1005,10 @@ impl State {
             let running = !self.paused;
             push_quad(&mut ui, px, py, pw, ph, if running { [0.18, 0.34, 0.22, 0.9] } else { [0.42, 0.22, 0.16, 0.95] }, sw, sh);
             push_text(&mut ui, px + 8.0, py + 9.0, 3.0, [0.92, 0.94, 0.98, 1.0], if running { "PAUSE" } else { "PLAY" }, sw, sh);
+            // Bring-it button: summon the next wave (N key does the same).
+            let (wx2, wy2, ww2, wh2) = UI_WAVE;
+            push_quad(&mut ui, wx2, wy2, ww2, wh2, [0.45, 0.14, 0.10, 0.92], sw, sh);
+            push_text(&mut ui, wx2 + 8.0, wy2 + 9.0, 3.0, [1.0, 0.85, 0.6, 1.0], "WAVE", sw, sh);
         }
         let mut tris: u64 = (self.terrain_nidx / 3) as u64;
         for (mi, m) in self.models.iter().enumerate() {
@@ -1337,6 +1342,7 @@ async fn run() {
                         let (mx, my) = (st.last_mouse.0 as f32, st.last_mouse.1 as f32);
                         let hit = |r: (f32, f32, f32, f32)| mx >= r.0 - 8.0 && mx <= r.0 + r.2 + 8.0 && my >= r.1 - 6.0 && my <= r.1 + r.3 + 6.0;
                         if hit(UI_PAUSE) { st.paused = !st.paused; }
+                        else if hit(UI_WAVE) { st.sim.trigger_wave(); }
                         else if hit(UI_SLIDER) { st.ui_drag = 1; st.apply_slider(1, mx); }
                         else if cfg!(not(target_arch = "wasm32")) && hit(UI_THREADS) { st.ui_drag = 2; st.apply_slider(2, mx); }
                         else { st.dragging = true; }
@@ -1355,6 +1361,7 @@ async fn run() {
                     }
                     if pressed { match code {
                         KeyCode::KeyP => st.paused = !st.paused,
+                        KeyCode::KeyN => st.sim.trigger_wave(), // bring the next wave
                         KeyCode::KeyK => st.frustum_cull = !st.frustum_cull,
                         KeyCode::KeyT => st.sim.tower_threat_mode = !st.sim.tower_threat_mode,
                         KeyCode::KeyF => {
@@ -1390,6 +1397,7 @@ async fn run() {
                     match t.phase {
                         winit::event::TouchPhase::Started => {
                             if hit(UI_PAUSE) { st.paused = !st.paused; }
+                            else if hit(UI_WAVE) { st.sim.trigger_wave(); }
                             else if hit(UI_SLIDER) { st.ui_drag = 1; st.apply_slider(1, mx); }
                             else { st.dragging = true; }
                             st.last_mouse = (t.location.x, t.location.y);

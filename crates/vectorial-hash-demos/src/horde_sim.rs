@@ -559,6 +559,19 @@ impl Horde {
         (self.wave_k + 1, self.wave_announced, self.wave_dir, (self.wave_spawn_t - self.now).max(0.0))
     }
 
+    /// Manual wave trigger (the `N` key / WAVE button): not announced yet →
+    /// announce one landing in 5 s; already announced → land it NOW.
+    pub fn trigger_wave(&mut self) {
+        if self.game_over.is_some() { return; }
+        if !self.wave_announced {
+            self.wave_announced = true;
+            self.wave_dir = self.rng.range(0.0, std::f64::consts::TAU);
+            self.wave_spawn_t = self.now + 5.0;
+        } else {
+            self.wave_spawn_t = self.now;
+        }
+    }
+
     /// Spawn (or reuse a dead slot for) one zombie. Public for scenario
     /// drivers and tests.
     pub fn spawn_zombie(&mut self, class: ZClass, x: f64, z: f64, state: ZState) {
