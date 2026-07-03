@@ -773,8 +773,14 @@ impl State {
         // Rebuild the carpet when the dormant set changes, or (throttled) when
         // the camera moved — sleepers inside the LOD bubble are EXCLUDED here
         // and drawn below as full skinned models playing their Idle clip.
+        // BOTH triggers are throttled: during an assault the epoch bumps every
+        // frame (contact wakes, groan wakes, re-sleeps), and rebuilding a 100k
+        // carpet per frame is exactly the cost the static buffer exists to
+        // avoid. A just-woken sleeper may ghost in the carpet for <0.25 s.
+        if self.carpet_t > now { self.carpet_t = -10.0; } // sim.now restarts on run resets
         let eye_moved = (eye - self.carpet_eye).length() > 60.0 && now - self.carpet_t > 0.4;
-        if self.lod && (key != self.dormant_key || eye_moved) {
+        let epoch_moved = key != self.dormant_key && now - self.carpet_t > 0.25;
+        if self.lod && (epoch_moved || eye_moved || self.dormant_key == (0, 0)) {
             let mut di: Vec<BillboardInst> = Vec::with_capacity(self.sim.units.len());
             for (i, z) in self.sim.units.iter().enumerate() {
                 if !z.alive() || !z.dormant() { continue; }
@@ -1424,6 +1430,10 @@ async fn run() {
                     #[cfg(not(target_arch = "wasm32"))]
                     if let Some(m) = max_frames {
                         if frame == 60 { t0 = Some(Instant::now()); }
+                        if frame % 900 == 0 { // periodic telemetry for wave-time diagnosis
+                            let (d, a) = st.sim.counts();
+                            println!("  t={:.0}s fps {:.0} slp {d} act {a} wave {}", st.sim.now, st.fps, st.sim.wave_info().0);
+                        }
                         if frame >= m {
                             if let Some(t) = t0 {
                                 let (d, a) = st.sim.counts();

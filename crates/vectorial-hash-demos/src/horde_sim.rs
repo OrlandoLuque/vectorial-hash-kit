@@ -458,7 +458,9 @@ pub fn spawn_field(rng: &mut Rng, pop: usize, seed: f64) -> Vec<Zombie> {
         let z0 = gj as f64 * SPACING;
         for gi in 0..rows {
             let x0 = gi as f64 * SPACING + (gj % 2) as f64 * SPACING * 0.5;
-            let (x, z) = ((x0 + rng.range(-0.45, 0.45)).clamp(MARGIN, WORLD - MARGIN), (z0 + rng.range(-0.45, 0.45)).clamp(MARGIN, WORLD - MARGIN));
+            // Jitter ±0.3 keeps the worst-case pair at 1.8 wu — above the 1.7
+            // contact-wake radius, so a fresh field has no self-igniting pairs.
+            let (x, z) = ((x0 + rng.range(-0.3, 0.3)).clamp(MARGIN, WORLD - MARGIN), (z0 + rng.range(-0.3, 0.3)).clamp(MARGIN, WORLD - MARGIN));
             if centers.iter().any(|(nx, nz)| { let (dx, dz) = (x - nx, z - nz); dx * dx + dz * dz < nr * nr }) { spots.push((x, z)); }
         }
     }
@@ -825,7 +827,14 @@ impl Horde {
                     let d = (sx * sx + sz * sz).sqrt().max(0.2);
                     let w = if it.dormant { 0.12 } else { 0.4 };
                     if d < 3.0 { vx += sx / d * (3.0 - d) * w; vz += sz / d * (3.0 - d) * w; }
-                    if it.dormant && d < 2.6 { z.bump = it.id; }
+                    // Contact-wake: ONLY the marching column tramples sleepers
+                    // awake, and its radius (1.7) sits below the lattice spacing
+                    // (1.8 worst-case) — two hard-won rules: at radius 2.6 the
+                    // carpet percolated (one wave → 27k active in seconds), and
+                    // when investigators could trample too, crowds at a noise
+                    // site kept re-waking their own sleepers forever (a stuck
+                    // ~80-strong mosh pit).
+                    if matches!(z.state, ZState::Marching) && it.dormant && d < 1.7 { z.bump = it.id; }
                 }
                 let l = (vx * vx + vz * vz).sqrt();
                 // Swarm frenzy: wave zombies (and beeliners) push at 2.2× — at
@@ -844,7 +853,7 @@ impl Horde {
         //    swing timers → queued structure hits, groans (next frame's culls).
         let decay = 0.5f64.powf(dt);
         let mut hits: Vec<(u32, f64, Point3, f64)> = Vec::new(); // (sid, dmg, at, noise)
-        let mut bumped: Vec<u32> = Vec::new(); // sleepers shoved by movers this frame
+        let mut bumped: Vec<u32> = Vec::new(); // sleepers trampled by the marching column
         let mut slept = false;
         for z in self.units.iter_mut() {
             if !z.alive() { continue; }
@@ -863,24 +872,19 @@ impl Horde {
                 z.p = Point3::new(nx, ground_h(nx, nz, self.seed) + z.class.altitude(), nz);
                 z.moved = true;
                 if z.bump != u32::MAX { bumped.push(z.bump); z.bump = u32::MAX; }
-                // Groans only while WALKING (half the class noise): a marching
-                // wave pulls alert sleepers (harpies/venoms) along its path —
-                // the wave grows as it travels — but an arrived, lingering pack
-                // goes quiet, so the field re-settles (no perpetual chain; the
-                // big cascades come from combat noise below).
-                z.groan_t -= dt;
-                if z.groan_t <= 0.0 {
-                    z.groan_t = 3.0 + (z.p.x.to_bits() % 2048) as f64 * 0.001; // deterministic jitter
-                    self.pending.push((z.p, z.class.noise_made() * 0.5));
-                }
+                // Walking is SILENT. Aggro spreads through combat noise and
+                // physical contact only — every groan variant we tried turned
+                // walkers into recruiters and some loop self-sustained (a full
+                // noise avalanche at march-groans, an ~80-strong pilot light at
+                // investigator-groans). TAB agrees: fights are loud, feet aren't.
             } else if matches!(z.state, ZState::Investigating { .. }) {
                 z.linger -= dt;
                 if z.linger <= 0.0 { z.state = ZState::Dormant; z.heard = 0.0; z.moved = true; slept = true; }
             }
         }
         if slept { self.dormant_epoch += 1; }
-        // Shaken awake: shoved sleepers rise and JOIN the march (no noise
-        // threshold — a body dragging over you beats any decibel rule).
+        // Trampled awake (no noise threshold — a body dragging over you beats
+        // any decibel rule): risers join the march.
         let mut rose = false;
         for id in bumped {
             let z = &mut self.units[id as usize];
@@ -1305,10 +1309,10 @@ mod tests {
         h.step(1.0 / 60.0);
         let (_, active0) = h.counts();
         assert!(active0 > 0, "the blast must wake someone");
-        for _ in 0..(60.0 / (1.0 / 60.0)) as usize { h.step(1.0 / 60.0); }
+        for _ in 0..(90.0 / (1.0 / 60.0)) as usize { h.step(1.0 / 60.0); }
         let (_, active1) = h.counts();
-        // March groans may pull a few alert sleepers along the way, but with no
-        // sustained loud source the field must (mostly) re-settle once arrived.
+        // With walking silent and trampling reserved to the marching column,
+        // an investigated noise site must drain back to (near) full sleep.
         assert!(active1 < active0 / 4, "field should re-settle: {active0} -> {active1}");
     }
 
@@ -1491,9 +1495,9 @@ mod tests {
         h.wave_spawn_t = 1e9;
         h.defenders.clear();
         h.step(1.0 / 60.0);
-        // A marcher dropped right on the edge of a sleeper, heading across it.
+        // A marcher dropped right on top of a sleeper, heading across it.
         let sleeper = h.units[0].p;
-        h.spawn_zombie(ZClass::Walker, sleeper.x - 2.2, sleeper.z, ZState::Marching);
+        h.spawn_zombie(ZClass::Walker, sleeper.x - 1.2, sleeper.z, ZState::Marching);
         let (_, active0) = h.counts();
         for _ in 0..(3.0 * 60.0) as usize { h.step(1.0 / 60.0); }
         let (_, active1) = h.counts();
