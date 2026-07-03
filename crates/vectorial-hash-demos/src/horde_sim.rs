@@ -70,10 +70,15 @@ impl ZClass {
     pub fn hear(self) -> f64 { self.watch() * 4.0 }
     pub fn alertness(self) -> f64 { match self { Self::Walker => 2.0, Self::Runner => 3.0, Self::Chubby => 3.0, Self::Venom => 4.0, Self::Harpy => 8.0 } }
     pub fn wake_threshold(self) -> f64 { 1000.0 / self.alertness() }
-    /// Noise a zombie makes while active (groans; attacks/deaths in phase 2).
+    /// Noise a zombie makes while active (groans, attacks, deaths).
     pub fn noise_made(self) -> f64 { match self { Self::Walker => 1.0, Self::Runner => 2.0, _ => 10.0 } }
     pub fn altitude(self) -> f64 { if self == Self::Harpy { 20.0 } else { 0.0 } }
     pub fn index(self) -> usize { match self { Self::Walker => 0, Self::Runner => 1, Self::Chubby => 2, Self::Venom => 3, Self::Harpy => 4 } }
+    /// Attack reach vs structures/defenders: melee-adjacent, except the venom's
+    /// standoff spit (4.5 TAB tiles ≈ 36 wu — outranges the wall line).
+    pub fn reach(self) -> f64 { if self == Self::Venom { 36.0 } else { 4.0 } }
+    /// Target priority for the towers' "highest threat" mode.
+    pub fn threat(self) -> f64 { match self { Self::Chubby => 3.0, Self::Harpy => 2.5, Self::Venom => 2.0, Self::Runner => 1.5, Self::Walker => 1.0 } }
 }
 /// The biggest hearing radius — the single cull radius per noise event.
 pub const MAX_HEAR: f64 = 288.0; // Harpy: 4 × 72
@@ -83,6 +88,11 @@ pub enum ZState {
     Dormant,
     /// Walking to a noise position; lingers there, then re-sleeps.
     Investigating { tx: f64, tz: f64 },
+    /// Wave zombie: follows the flow field toward the Command Center; engages
+    /// structures/defenders on contact. Never re-sleeps.
+    Marching,
+    /// Pounding structure `sid` (swing timer in `Zombie::swing_t`).
+    Attacking { sid: u32 },
 }
 
 #[derive(Clone)]
@@ -99,9 +109,14 @@ pub struct Zombie {
     pub linger: f64,
     /// Countdown to the next groan (active only).
     pub groan_t: f64,
+    /// Attack swing timer (Attacking state).
+    pub swing_t: f64,
     moved: bool,
 }
-impl Zombie { pub fn dormant(&self) -> bool { self.state == ZState::Dormant } }
+impl Zombie {
+    pub fn dormant(&self) -> bool { self.state == ZState::Dormant }
+    pub fn alive(&self) -> bool { self.hp > 0.0 }
+}
 
 /// The lightweight item in the zombie index (same decoupling as siege's
 /// `IUnit`): the parallel decide pass holds `&Tree3<IZombie>` while mutating
@@ -158,6 +173,95 @@ impl NoiseGrid {
     }
 }
 
+// ----------------------------------------------------------------- flow field
+
+/// Coarse flow field guiding wave zombies to the Command Center — the SupCom2
+/// scheme (Game AI Pro ch. 23) at demo scale. **Walls are HIGH COST, not
+/// impassable** (the TAB rule): the flood prefers gates and breaches, and a
+/// half-rebuilt wall gradually deters again as it rises, because cost is a
+/// function of live HP. Integer-cost Dijkstra from the CC cell; per-cell
+/// direction = descend the integration. Rebuilt (throttled) when any structure
+/// changes state.
+pub struct FlowField {
+    pub n: usize,
+    pub cell: f64,
+    pub dir: Vec<(f32, f32)>,
+    integ: Vec<u32>,
+    pub dirty: bool,
+    rebuild_t: f64,
+}
+
+impl FlowField {
+    fn new(n: usize) -> FlowField {
+        FlowField { n, cell: WORLD / n as f64, dir: vec![(0.0, 0.0); n * n], integ: vec![u32::MAX; n * n], dirty: true, rebuild_t: 0.0 }
+    }
+    fn cell_of(&self, x: f64, z: f64) -> (usize, usize) {
+        (((x / self.cell) as usize).min(self.n - 1), ((z / self.cell) as usize).min(self.n - 1))
+    }
+    pub fn flow_at(&self, x: f64, z: f64) -> (f64, f64) {
+        let (i, j) = self.cell_of(x, z);
+        let d = self.dir[j * self.n + i];
+        (d.0 as f64, d.1 as f64)
+    }
+    /// Rebuild cost + integration + directions from live structure HP.
+    fn rebuild(&mut self, structures: &[Structure], cc: Point3) {
+        let n = self.n;
+        // Per-cell traversal cost (milli-units): open ground 100; a live wall
+        // piece adds ~6× ground + a term falling with damage.
+        let mut cost = vec![100u32; n * n];
+        for s in structures {
+            if s.hp <= 0.0 { continue; }
+            let (i, j) = self.cell_of(s.p.x, s.p.z);
+            let add = match s.kind {
+                SKind::Wall | SKind::Tower => 600 + (s.hp * 4.0) as u32,   // stone: up to +4600
+                SKind::Gate => 400 + (s.hp * 2.0) as u32,                  // gates a bit softer → preferred
+                _ => 300,
+            };
+            cost[j * n + i] = cost[j * n + i].saturating_add(add);
+        }
+        // Dijkstra from the CC cell over 8-neighbours (diagonal ×1.41).
+        self.integ.iter_mut().for_each(|v| *v = u32::MAX);
+        let (ci, cj) = self.cell_of(cc.x, cc.z);
+        let mut heap = std::collections::BinaryHeap::new();
+        self.integ[cj * n + ci] = 0;
+        heap.push(std::cmp::Reverse((0u32, ci, cj)));
+        while let Some(std::cmp::Reverse((d, i, j))) = heap.pop() {
+            if d > self.integ[j * n + i] { continue; }
+            for (di, dj, w) in [(-1i64, 0i64, 100u32), (1, 0, 100), (0, -1, 100), (0, 1, 100), (-1, -1, 141), (1, -1, 141), (-1, 1, 141), (1, 1, 141)] {
+                let (ni, nj) = (i as i64 + di, j as i64 + dj);
+                if ni < 0 || nj < 0 || ni >= n as i64 || nj >= n as i64 { continue; }
+                let (ni, nj) = (ni as usize, nj as usize);
+                let nd = d + cost[nj * n + ni] * w / 100;
+                if nd < self.integ[nj * n + ni] { self.integ[nj * n + ni] = nd; heap.push(std::cmp::Reverse((nd, ni, nj))); }
+            }
+        }
+        // Direction = toward the lowest-integration neighbour.
+        for j in 0..n {
+            for i in 0..n {
+                let (mut best, mut bi, mut bj) = (self.integ[j * n + i], i, j);
+                for (di, dj) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)] {
+                    let (ni, nj) = (i as i64 + di, j as i64 + dj);
+                    if ni < 0 || nj < 0 || ni >= n as i64 || nj >= n as i64 { continue; }
+                    let v = self.integ[nj as usize * n + ni as usize];
+                    if v < best { best = v; bi = ni as usize; bj = nj as usize; }
+                }
+                let (dx, dz) = (bi as f64 - i as f64, bj as f64 - j as f64);
+                let l = (dx * dx + dz * dz).sqrt();
+                self.dir[j * n + i] = if l > 0.0 { ((dx / l) as f32, (dz / l) as f32) } else { (0.0, 0.0) };
+            }
+        }
+        self.dirty = false;
+        self.rebuild_t = 1.0; // throttle: at most one rebuild per second
+    }
+}
+
+// ------------------------------------------------------------------ towers
+
+pub const TOWER_RANGE: f64 = 72.0; // 9 TAB tiles
+pub const TOWER_DMG: f64 = 150.0;
+pub const TOWER_RELOAD: f64 = 1.2;
+pub const TOWER_NOISE: f64 = 5.0; // the ballista: quiet per kill — by design
+
 // ----------------------------------------------------------------------- sim
 
 pub struct Horde {
@@ -167,13 +271,37 @@ pub struct Horde {
     handles: Vec<Option<ItemRef>>,
     pub sindex: Tree3<IStruct>,
     pub noise: NoiseGrid,
+    pub flow: FlowField,
     /// Noise events queued for the next step: (position, amount).
     pending: Vec<(Point3, f64)>,
+    /// Fallen zombies: (position, class, time of death) — the renderer's
+    /// frozen-pose corpse buffer feeds from this.
+    pub corpses: Vec<(Point3, ZClass, f64)>,
+    /// Per-structure reload timers (only towers use theirs).
+    tower_reload: Vec<f64>,
+    /// Dead unit slots for reuse (keeps `id == index` stable for handles).
+    free_slots: Vec<u32>,
+    /// Tower targeting: `false` = nearest, `true` = highest threat (TAB's
+    /// configurable modes — toggle live from the renderer).
+    pub tower_threat_mode: bool,
+    cc_id: usize,
+    // Wave scheduler (TAB: direction warning + countdown, escalation, final).
+    pub wave_k: u32,
+    wave_spawn_t: f64,
+    pub wave_dir: f64,
+    pub wave_announced: bool,
+    /// Set when the Command Center falls (defeat) or the final wave is cleared
+    /// (victory): (time it happened, victory?). The run resets ~12 s later.
+    pub game_over: Option<(f64, bool)>,
+    pub run: u32,
+    pub kills: u64,
     pub rng: Rng,
     pub now: f64,
     pub seed: f64,
     /// Woken-this-frame counter (for HUD/telemetry).
     pub woken_last: usize,
+    base_pop: usize,
+    base_seed: u64,
 }
 
 /// The base layout: a stone wall ring with 4 cardinal gates and towers every
@@ -222,7 +350,7 @@ pub fn spawn_field(rng: &mut Rng, pop: usize, seed: f64) -> Vec<Zombie> {
             let roll = rng.unit();
             let class = if roll < 0.70 { ZClass::Walker } else if roll < 0.85 { ZClass::Runner } else if roll < 0.91 { ZClass::Chubby } else if roll < 0.96 { ZClass::Venom } else { ZClass::Harpy };
             let y = ground_h(x, z, seed) + class.altitude();
-            units.push(Zombie { class, p: Point3::new(x, y, z), vel: (0.0, 0.0), state: ZState::Dormant, hp: class.max_hp(), heard: 0.0, linger: 0.0, groan_t: rng.range(0.5, 2.0), moved: false });
+            units.push(Zombie { class, p: Point3::new(x, y, z), vel: (0.0, 0.0), state: ZState::Dormant, hp: class.max_hp(), heard: 0.0, linger: 0.0, groan_t: rng.range(0.5, 2.0), swing_t: 0.0, moved: false });
         }
     }
     units
@@ -242,12 +370,108 @@ impl Horde {
         #[cfg(not(feature = "parallel"))]
         let sindex = Tree3::bulk_load(world, 8, items);
         let n = units.len();
+        let cc_id = structures.iter().position(|s| s.kind == SKind::CommandCenter).expect("base has a CC");
+        let mut flow = FlowField::new(120);
+        flow.rebuild(&structures, structures[cc_id].p);
+        let ns = structures.len();
         Horde {
             units, structures,
             zindex: Tree3::new(world, 8), handles: vec![None; n],
-            sindex, noise: NoiseGrid::new(96),
-            pending: Vec::new(), rng, now: 0.0, seed: fseed, woken_last: 0,
+            sindex, noise: NoiseGrid::new(96), flow,
+            pending: Vec::new(), corpses: Vec::new(),
+            tower_reload: vec![0.0; ns], free_slots: Vec::new(),
+            tower_threat_mode: false, cc_id,
+            wave_k: 0, wave_spawn_t: 50.0, wave_dir: 0.0, wave_announced: false,
+            game_over: None, run: 1, kills: 0,
+            rng, now: 0.0, seed: fseed, woken_last: 0,
+            base_pop: pop, base_seed: seed,
         }
+    }
+
+    /// Full run reset (CC fell, or the final wave was cleared): fresh base +
+    /// dormant field, next run number, escalation restarts.
+    fn reset(&mut self) {
+        let next = Horde::new(self.base_seed.wrapping_add(self.run as u64 * 7919), self.base_pop);
+        let (run, kills, mode) = (self.run + 1, self.kills, self.tower_threat_mode);
+        *self = next;
+        self.run = run;
+        self.kills = kills; // lifetime counter across runs
+        self.tower_threat_mode = mode;
+    }
+
+    /// HUD wave line: (wave number, announced?, direction, seconds to landfall).
+    pub fn wave_info(&self) -> (u32, bool, f64, f64) {
+        (self.wave_k + 1, self.wave_announced, self.wave_dir, (self.wave_spawn_t - self.now).max(0.0))
+    }
+
+    /// Spawn (or reuse a dead slot for) one zombie. Public for scenario
+    /// drivers and tests.
+    pub fn spawn_zombie(&mut self, class: ZClass, x: f64, z: f64, state: ZState) {
+        let y = ground_h(x, z, self.seed) + class.altitude();
+        let z0 = Zombie { class, p: Point3::new(x, y, z), vel: (0.0, 0.0), state, hp: class.max_hp(), heard: 0.0, linger: 0.0, groan_t: 1.0, swing_t: 0.5, moved: false };
+        match self.free_slots.pop() {
+            Some(slot) => { self.units[slot as usize] = z0; } // handle is None (freed at death) → sync inserts
+            None => { self.units.push(z0); self.handles.push(None); }
+        }
+    }
+
+    /// The TAB wave scheduler: warning 30 s ahead with a direction, spawn at an
+    /// edge arc, escalating size/mix; wave 8 is the FINAL — all edges at once
+    /// plus every dormant zombie still alive joins the march.
+    fn step_waves(&mut self) {
+        if self.game_over.is_some() { return; }
+        if !self.wave_announced && self.now >= self.wave_spawn_t - 30.0 {
+            self.wave_announced = true;
+            self.wave_dir = self.rng.range(0.0, std::f64::consts::TAU);
+        }
+        if self.now < self.wave_spawn_t { return; }
+        let k = self.wave_k;
+        let is_final = k >= 8;
+        let count = (60.0 * 1.4f64.powi(k.min(8) as i32)) as usize;
+        let dirs: Vec<f64> = if is_final { (0..4).map(|q| q as f64 * std::f64::consts::FRAC_PI_2).collect() } else { vec![self.wave_dir] };
+        let (cx, cz) = (WORLD / 2.0, WORLD / 2.0);
+        for dir in &dirs {
+            for _ in 0..count / dirs.len() {
+                let a = dir + self.rng.range(-0.35, 0.35);
+                let r = self.rng.range(WORLD / 2.0 - 60.0, WORLD / 2.0 - 15.0);
+                let (x, z) = ((cx + a.cos() * r).clamp(MARGIN, WORLD - MARGIN), (cz + a.sin() * r).clamp(MARGIN, WORLD - MARGIN));
+                // Escalating mix: early waves are shambler seas; specials join
+                // from wave 2 (venom/chubby) and wave 4 (harpies).
+                let roll = self.rng.unit();
+                let class = if k >= 4 && roll > 0.95 { ZClass::Harpy }
+                    else if k >= 2 && roll > 0.88 { ZClass::Venom }
+                    else if k >= 2 && roll > 0.80 { ZClass::Chubby }
+                    else if roll > 0.65 { ZClass::Runner } else { ZClass::Walker };
+                self.spawn_zombie(class, x, z, ZState::Marching);
+            }
+        }
+        if is_final { // the map itself rises
+            for z in self.units.iter_mut() {
+                if z.alive() && z.dormant() { z.state = ZState::Marching; z.moved = true; }
+            }
+        }
+        self.wave_k += 1;
+        self.wave_spawn_t += 70.0;
+        self.wave_announced = false;
+    }
+
+    /// Structure destroyed: dirty the flow field; a populated house detonates
+    /// the **infection cascade** (each colonist → a fresh runner + 50 noise);
+    /// the Command Center falling ends the run.
+    fn destroy_structure(&mut self, sid: usize) {
+        self.structures[sid].hp = 0.0;
+        self.flow.dirty = true;
+        let (kind, p, pop) = (self.structures[sid].kind, self.structures[sid].p, self.structures[sid].pop);
+        if pop > 0 {
+            for c in 0..pop {
+                let ang = c as f64 * 2.399963;
+                let (x, z) = ((p.x + ang.cos() * 3.0).clamp(MARGIN, WORLD - MARGIN), (p.z + ang.sin() * 3.0).clamp(MARGIN, WORLD - MARGIN));
+                self.spawn_zombie(ZClass::Runner, x, z, ZState::Marching);
+            }
+            self.pending.push((p, 50.0 * pop as f64)); // the aggro detonation
+            self.structures[sid].pop = 0;
+        }
+        if kind == SKind::CommandCenter && self.game_over.is_none() { self.game_over = Some((self.now, false)); }
     }
 
     /// Queue a noise event (processed next `step`): the wake mechanism.
@@ -255,9 +479,14 @@ impl Horde {
     /// zombies' own groans feed it now.
     pub fn emit_noise(&mut self, p: Point3, amount: f64) { self.pending.push((p, amount)); }
 
+    /// (dormant, active) — dead slots excluded from both.
     pub fn counts(&self) -> (usize, usize) {
-        let dormant = self.units.iter().filter(|z| z.dormant()).count();
-        (dormant, self.units.len() - dormant)
+        let (mut dormant, mut active) = (0, 0);
+        for z in &self.units {
+            if !z.alive() { continue; }
+            if z.dormant() { dormant += 1; } else { active += 1; }
+        }
+        (dormant, active)
     }
 
     /// Keep the zombie index in sync **without rebuilding** (the siege
@@ -267,6 +496,7 @@ impl Horde {
     /// tests can force the index current after `apply` moved units.
     pub fn sync_index(&mut self) {
         for (i, z) in self.units.iter_mut().enumerate() {
+            if !z.alive() { z.moved = false; continue; } // dead slots await reuse (handle freed at kill)
             match (self.handles[i], z.moved) {
                 (None, _) => { self.handles[i] = self.zindex.insert_ref(IZombie::of(i, z)); z.moved = false; }
                 (Some(_), false) => {}
@@ -279,11 +509,25 @@ impl Horde {
         }
     }
 
-    /// One fixed step: noise events → wake culls → parallel decide → serial
-    /// apply → keep-index sync.
+    /// One fixed step: waves → noise events → wake culls → parallel decide →
+    /// serial apply (movement, swings, towers, destructions) → next frame's
+    /// keep-index sync.
     pub fn step(&mut self, dt: f64) {
         self.now += dt;
         self.sync_index();
+        self.step_waves();
+        // Throttled flow-field rebuild after breaches / repairs.
+        self.flow.rebuild_t -= dt;
+        if self.flow.dirty && self.flow.rebuild_t <= 0.0 {
+            let cc = self.structures[self.cc_id].p;
+            let (flow, structures) = (&mut self.flow, &self.structures);
+            flow.rebuild(structures, cc);
+        }
+        // Run over → reset a few seconds later (victory lap / defeat dirge).
+        if let Some((t0, _)) = self.game_over { if self.now - t0 > 12.0 { self.reset(); return; } }
+        else if self.wave_k > 8 && self.units.iter().all(|z| !z.alive() || z.dormant()) {
+            self.game_over = Some((self.now, true)); // final wave cleared: victory
+        }
 
         // 1) Noise events: each is ONE sphere cull; every dormant zombie within
         //    its own class's hearing radius accumulates; over threshold → wake.
@@ -318,15 +562,55 @@ impl Horde {
         }
         self.noise.step(dt);
 
-        // 2) decide — read-only on the index, each zombie writes only itself:
+        // 2) decide — read-only on the indices, each zombie writes only itself:
         //    fans out over rayon on native, serial on wasm (no threads there).
         {
-            let (index, units) = (&self.zindex, &mut self.units);
+            let (index, sindex, structures, flow) = (&self.zindex, &self.sindex, &self.structures, &self.flow);
+            let (units, cx, cz) = (&mut self.units, WORLD / 2.0, WORLD / 2.0);
             let decide_one = |i: usize, z: &mut Zombie| {
-                let ZState::Investigating { tx, tz } = z.state else { return; };
-                let (dx, dz) = (tx - z.p.x, tz - z.p.z);
-                let dist = (dx * dx + dz * dz).sqrt();
-                let (mut vx, mut vz) = if dist > 8.0 { (dx / dist, dz / dist) } else { (0.0, 0.0) };
+                if !z.alive() { return; }
+                match z.state {
+                    ZState::Dormant => return,
+                    // Already pounding: revalidate the target (it may have died
+                    // to another zombie's swing), stand still.
+                    ZState::Attacking { sid } => {
+                        if structures[sid as usize].hp <= 0.0 { z.state = ZState::Marching; }
+                        z.vel = (0.0, 0.0);
+                        return;
+                    }
+                    _ => {}
+                }
+                // Target acquisition near the base: nearest LIVE structure in
+                // reach (k-NN on the static index; venom's 36-wu standoff spit
+                // engages from outside the wall line; harpies fly at altitude,
+                // so the 3D k-NN naturally skips the wall and finds the inner
+                // buildings under them).
+                let (dcx, dcz) = (z.p.x - cx, z.p.z - cz);
+                let dc = (dcx * dcx + dcz * dcz).sqrt();
+                if dc < BASE_R + 80.0 {
+                    for (_, it) in sindex.knn(z.p, 4) {
+                        if structures[it.id as usize].hp <= 0.0 { continue; }
+                        let (dx, dz) = (it.p.x - z.p.x, it.p.z - z.p.z);
+                        if (dx * dx + dz * dz).sqrt() <= z.class.reach() + 1.5 {
+                            z.state = ZState::Attacking { sid: it.id };
+                            z.vel = (0.0, 0.0);
+                            return;
+                        }
+                        break; // knn is sorted: nearest live one is out of reach
+                    }
+                }
+                // Steering: investigators seek their personal spot; marchers
+                // descend the flow field (harpies fly straight over the walls).
+                let (mut vx, mut vz) = match z.state {
+                    ZState::Investigating { tx, tz } => {
+                        let (dx, dz) = (tx - z.p.x, tz - z.p.z);
+                        let d = (dx * dx + dz * dz).sqrt();
+                        if d > 8.0 { (dx / d, dz / d) } else { (0.0, 0.0) }
+                    }
+                    ZState::Marching if z.class == ZClass::Harpy => { let d = dc.max(1.0); (-dcx / d, -dcz / d) }
+                    ZState::Marching => flow.flow_at(z.p.x, z.p.z),
+                    _ => (0.0, 0.0),
+                };
                 // Separation among the awake (dormant bodies are a carpet the
                 // wave flows around): one small cull per active zombie.
                 let sep = Sphere3::new(z.p.x, z.p.y, z.p.z, 3.0);
@@ -347,13 +631,20 @@ impl Horde {
         }
 
         // 3) apply — serial: integrate movers, decay heard, linger → re-sleep,
-        //    schedule groans (queued for next frame's wake culls).
+        //    swing timers → queued structure hits, groans (next frame's culls).
         let decay = 0.5f64.powf(dt);
+        let mut hits: Vec<(u32, f64, Point3, f64)> = Vec::new(); // (sid, dmg, at, noise)
         for z in self.units.iter_mut() {
+            if !z.alive() { continue; }
             if z.dormant() { if z.heard > 1e-3 { z.heard *= decay; } continue; }
+            if let ZState::Attacking { sid } = z.state {
+                z.swing_t -= dt;
+                if z.swing_t <= 0.0 { z.swing_t = 1.0; hits.push((sid, z.class.dmg(), z.p, z.class.noise_made())); }
+                continue;
+            }
             // Arrival is by DISTANCE to the personal spot, not by velocity —
             // separation jiggle in a dense pack never lets vel hit exact zero.
-            let arrived = match z.state { ZState::Investigating { tx, tz } => { let (dx, dz) = (tx - z.p.x, tz - z.p.z); dx * dx + dz * dz < 9.0 * 9.0 } ZState::Dormant => false };
+            let arrived = match z.state { ZState::Investigating { tx, tz } => { let (dx, dz) = (tx - z.p.x, tz - z.p.z); dx * dx + dz * dz < 9.0 * 9.0 } _ => false };
             if !arrived && (z.vel.0 != 0.0 || z.vel.1 != 0.0) {
                 let nx = (z.p.x + z.vel.0 * dt).clamp(MARGIN, WORLD - MARGIN);
                 let nz = (z.p.z + z.vel.1 * dt).clamp(MARGIN, WORLD - MARGIN);
@@ -363,17 +654,67 @@ impl Horde {
                 // wave pulls alert sleepers (harpies/venoms) along its path —
                 // the wave grows as it travels — but an arrived, lingering pack
                 // goes quiet, so the field re-settles (no perpetual chain; the
-                // big cascades come from combat noise in phase 2).
+                // big cascades come from combat noise below).
                 z.groan_t -= dt;
                 if z.groan_t <= 0.0 {
                     z.groan_t = 3.0 + (z.p.x.to_bits() % 2048) as f64 * 0.001; // deterministic jitter
                     self.pending.push((z.p, z.class.noise_made() * 0.5));
                 }
-            } else {
+            } else if matches!(z.state, ZState::Investigating { .. }) {
                 z.linger -= dt;
-                if z.linger <= 0.0 { z.state = ZState::Dormant; z.heard = 0.0; z.moved = true; continue; }
+                if z.linger <= 0.0 { z.state = ZState::Dormant; z.heard = 0.0; z.moved = true; }
             }
         }
+        // Resolve this frame's structure hits (attack noise feeds the wake
+        // loop: pounding on a wall is what pulls the map in).
+        for (sid, dmg, at, noise) in hits {
+            self.pending.push((at, noise));
+            let s = &mut self.structures[sid as usize];
+            if s.hp <= 0.0 { continue; }
+            s.hp -= dmg;
+            if s.hp <= 0.0 { self.destroy_structure(sid as usize); }
+        }
+        self.step_towers(dt);
+    }
+
+    /// Towers auto-fire: "nearest" = one k-NN(1) per tower per shot;
+    /// "highest threat" = a range cull + score-max (both TAB modes). Every
+    /// shot emits noise — quiet defense doesn't grow the assault, loud does.
+    fn step_towers(&mut self, dt: f64) {
+        for sid in 0..self.structures.len() {
+            if self.structures[sid].kind != SKind::Tower || self.structures[sid].hp <= 0.0 { continue; }
+            self.tower_reload[sid] -= dt;
+            if self.tower_reload[sid] > 0.0 { continue; }
+            let tp = self.structures[sid].p;
+            let target: Option<u32> = if self.tower_threat_mode {
+                let ring = Sphere3::new(tp.x, tp.y, tp.z, TOWER_RANGE);
+                self.zindex.cull(&ring).iter()
+                    .map(|it| { let (dx, dz) = (it.p.x - tp.x, it.p.z - tp.z); (it.id, it.class.threat() / (1.0 + (dx * dx + dz * dz).sqrt() * 0.02)) })
+                    .max_by(|a, b| a.1.total_cmp(&b.1))
+                    .map(|(id, _)| id)
+            } else {
+                self.zindex.knn(tp, 1).into_iter().find(|(d, _)| *d <= TOWER_RANGE).map(|(_, it)| it.id)
+            };
+            let Some(tid) = target else { continue; };
+            self.tower_reload[sid] = TOWER_RELOAD;
+            self.pending.push((tp, TOWER_NOISE));
+            self.units[tid as usize].hp -= TOWER_DMG;
+            if self.units[tid as usize].hp <= 0.0 { self.kill_zombie(tid as usize); }
+        }
+    }
+
+    /// Death: corpse for the renderer, a death rattle (noise), free the slot,
+    /// and drop the item from the index immediately (O(1) by handle).
+    fn kill_zombie(&mut self, id: usize) {
+        let (p, class) = (self.units[id].p, self.units[id].class);
+        self.corpses.push((p, class, self.now));
+        if self.corpses.len() > 45_000 { self.corpses.drain(0..5_000); } // cap the aftermath field
+        self.pending.push((p, class.noise_made()));
+        self.kills += 1;
+        if let Some(h) = self.handles[id].take() { self.zindex.remove_ref(h); }
+        self.units[id].hp = 0.0;
+        self.units[id].moved = false;
+        self.free_slots.push(id as u32);
     }
 }
 
@@ -465,6 +806,116 @@ mod tests {
         // March groans may pull a few alert sleepers along the way, but with no
         // sustained loud source the field must (mostly) re-settle once arrived.
         assert!(active1 < active0 / 4, "field should re-settle: {active0} -> {active1}");
+    }
+
+    #[test]
+    fn flow_field_routes_to_the_cc() {
+        // Descend the flow from an outside point: it must reach the CC (walls
+        // are high cost, not blocking — the gate/weak-spot route exists).
+        let h = Horde::new(5, 300);
+        let cc = h.structures[h.cc_id].p;
+        let (mut x, mut z) = (WORLD / 2.0 + 480.0, WORLD / 2.0 + 90.0);
+        for _ in 0..4000 {
+            let (fx, fz) = h.flow.flow_at(x, z);
+            if fx == 0.0 && fz == 0.0 { break; }
+            x += fx * 5.0; z += fz * 5.0;
+            let d = ((x - cc.x).powi(2) + (z - cc.z).powi(2)).sqrt();
+            if d < 25.0 { return; } // reached
+        }
+        panic!("flow walk never reached the Command Center");
+    }
+
+    #[test]
+    fn towers_fire_kill_and_the_noise_wakes_sleepers() {
+        let mut h = Horde::new(13, 2000);
+        h.step(1.0 / 60.0);
+        // A pack of walkers marching just inside a tower's range.
+        let tid = h.structures.iter().position(|s| s.kind == SKind::Tower).unwrap();
+        let tp = h.structures[tid].p;
+        let (cx, cz) = (WORLD / 2.0, WORLD / 2.0);
+        let out = ((tp.x - cx) / BASE_R, (tp.z - cz) / BASE_R); // outward normal
+        for k in 0..12 {
+            let (x, z) = (tp.x + out.0 * 30.0 + k as f64 * 1.5, tp.z + out.1 * 30.0);
+            h.spawn_zombie(ZClass::Walker, x, z, ZState::Marching);
+        }
+        // Plant a listener: a dormant walker 100 wu out (inside its 160 hear).
+        h.spawn_zombie(ZClass::Walker, tp.x + out.0 * 100.0, tp.z + out.1 * 100.0, ZState::Dormant);
+        let li = h.units.len() - 1;
+        let kills0 = h.kills;
+        let mut max_heard = 0.0f64;
+        for _ in 0..600 { h.step(1.0 / 60.0); max_heard = max_heard.max(h.units[li].heard); } // 10 s of tower fire
+        assert!(h.kills > kills0, "tower must kill walkers in range");
+        assert!(!h.corpses.is_empty(), "kills leave corpses");
+        // The TAB noise economy, verified both ways: the battle noise REACHES
+        // the sleeper (accumulates in `heard`) but a lone ballista is QUIET by
+        // design (~5/shot vs the walker's 500 threshold) — it must NOT wake it.
+        // Big sources (infection bursts, massed battles) do the waking.
+        assert!(max_heard > 0.0, "tower noise must reach the dormant listener");
+        assert!(h.units[li].dormant(), "a lone ballista must not wake walkers (noise-per-kill economy)");
+    }
+
+    #[test]
+    fn infection_cascade_spawns_runners_and_detonates_noise() {
+        let mut h = Horde::new(17, 500);
+        h.step(1.0 / 60.0);
+        // The innermost populated house — safely outside tower range (the
+        // first pick got the attacker shot off the wall: the base defends
+        // itself; this test is about the cascade, not the towers).
+        let (cx, cz) = (WORLD / 2.0, WORLD / 2.0);
+        let hid = h.structures.iter().enumerate()
+            .filter(|(_, s)| s.kind == SKind::House && s.pop > 0)
+            .min_by(|(_, a), (_, b)| { let da = (a.p.x - cx).powi(2) + (a.p.z - cz).powi(2); let db = (b.p.x - cx).powi(2) + (b.p.z - cz).powi(2); da.total_cmp(&db) })
+            .map(|(i, _)| i).unwrap();
+        let hp0 = h.structures[hid].p;
+        let pop = h.structures[hid].pop as usize;
+        let (d0, a0) = h.counts();
+        // A chubby pounding the house (500 HP / 40 dmg ≈ 13 swings).
+        h.spawn_zombie(ZClass::Chubby, hp0.x + 2.0, hp0.z, ZState::Attacking { sid: hid as u32 });
+        for _ in 0..(20.0 * 60.0) as usize { h.step(1.0 / 60.0); if h.structures[hid].hp <= 0.0 { break; } }
+        assert!(h.structures[hid].hp <= 0.0, "house must fall");
+        h.step(1.0 / 60.0); // process the infection noise event
+        let (d1, a1) = h.counts();
+        assert!(d1 + a1 >= d0 + a0 + pop, "each colonist must rise as a runner: {} -> {}", d0 + a0, d1 + a1);
+        assert!(h.units.iter().filter(|z| z.alive() && z.class == ZClass::Runner && matches!(z.state, ZState::Marching)).count() >= pop);
+    }
+
+    #[test]
+    fn wave_spawns_at_the_announced_edge_and_marches_in() {
+        let mut h = Horde::new(23, 300);
+        h.wave_spawn_t = 0.5; // fast-forward the first wave
+        for _ in 0..120 { h.step(1.0 / 60.0); }
+        let marching: Vec<&Zombie> = h.units.iter().filter(|z| z.alive() && matches!(z.state, ZState::Marching)).collect();
+        assert!(!marching.is_empty(), "wave must have spawned");
+        let (cx, cz) = (WORLD / 2.0, WORLD / 2.0);
+        let d0: f64 = marching.iter().map(|z| ((z.p.x - cx).powi(2) + (z.p.z - cz).powi(2)).sqrt()).sum::<f64>() / marching.len() as f64;
+        for _ in 0..600 { h.step(1.0 / 60.0); }
+        let marching2: Vec<&Zombie> = h.units.iter().filter(|z| z.alive() && matches!(z.state, ZState::Marching)).collect();
+        let d1: f64 = marching2.iter().map(|z| ((z.p.x - cx).powi(2) + (z.p.z - cz).powi(2)).sqrt()).sum::<f64>() / marching2.len().max(1) as f64;
+        assert!(d1 < d0 - 30.0, "the wave must close on the base: {d0:.0} -> {d1:.0}");
+    }
+
+    #[test]
+    fn keep_index_consistent_through_combat_churn() {
+        // Deaths (remove_ref), spawns (slot reuse via insert_ref) and movement
+        // (update_ref) all churn the kept index — it must match brute force on
+        // live positions at every sampled frame.
+        let mut h = Horde::new(31, 1500);
+        h.wave_spawn_t = 0.5;
+        for f in 0..900 {
+            h.step(1.0 / 60.0);
+            if f % 30 != 0 { continue; }
+            h.sync_index();
+            let alive = h.units.iter().filter(|z| z.alive()).count();
+            assert_eq!(h.zindex.item_count(), alive, "index count != alive at frame {f}");
+            let c = h.structures[h.cc_id].p;
+            let q = Sphere3::new(c.x, c.y, c.z, 260.0);
+            let mut got: Vec<u32> = h.zindex.cull(&q).iter().map(|it| it.id).collect();
+            let mut want: Vec<u32> = h.units.iter().enumerate()
+                .filter(|(_, z)| z.alive() && { let (dx, dy, dz) = (z.p.x - c.x, z.p.y - c.y, z.p.z - c.z); dx * dx + dy * dy + dz * dz <= 260.0 * 260.0 })
+                .map(|(i, _)| i as u32).collect();
+            got.sort(); want.sort();
+            assert_eq!(got, want, "kept index != brute at frame {f}");
+        }
     }
 
     #[test]
