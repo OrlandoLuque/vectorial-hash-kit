@@ -252,10 +252,15 @@ crossover visible (`PARALLEL.md`), like siege. wasm runs the wave serially.
 8. **Morton multi-level linear octree** — coarse occupancy levels so a big-radius
    cull skips empty blocks instead of scanning every fine cell (2D + 3D).
 9. **Parallel tree bulk-load** — **DONE** (2026-07-01, `Tree3`): `bulk_load` +
-   `bulk_load_par` (top-down partition, par via rayon `join`), brute-force gated,
-   wired into the siege per-frame rebuild. ~1.14× CPU-fps at 12–16 threads.
-   *Remaining (optional):* the same for the 2D `Tree` (the siege rebuild is 3D,
-   so 2D wasn't needed yet).
+   `bulk_load_par` (top-down partition, par via rayon `join`), brute-force gated.
+   Superseded in the demos by keep (`sync_index`); stays the from-scratch static
+   build (horde's structure index uses it).
+   *Remaining — bulk-load PARITY (user, 2026-07-04):* the same for **`Octree3`**
+   (split into 8 octants per level instead of 2 halves; nested `join`s or a
+   `rayon::scope` over the 8 children; same `ItemRef(i) == items[i]` contract,
+   mirror the Tree3 brute-force + par==serial tests) and for the **2D `Tree`**.
+   Library parity items — no demo needs them today (the only bulk-load consumer
+   is horde's static index, on `Tree3`).
 10. **SoA *permanent* leaf storage** — *low priority*: the batch kernel is done
     and measured marginal (~1.0–1.26× end-to-end, descent-dominated); permanent
     storage would only save the materialisation copy. Park unless a workload needs it.
