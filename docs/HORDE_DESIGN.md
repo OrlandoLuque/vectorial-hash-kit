@@ -83,6 +83,40 @@ Community reverse-engineering; the noise model is the load-bearing mechanic.
 | Senses at scale | `cull_many_par` batch reads |
 | Structure A/B | `M`-style toggle: **Tree3 / MortonGrid3 / 2D projection** — dense uniform horde is Morton's home turf (CHOOSING.md) |
 
+## Scenarios & unit logic (approved by the user, 2026-07-02)
+
+**Design centre:** the waves are the *performance* headline and the climax; the
+**noise/wake system is the mechanical star** — a feedback loop made entirely of
+visible spatial queries (tower fires → noise → wake cull → walkers investigate →
+attack noise → more wake), with the emergent irony that **the better you defend,
+the bigger the horde you attract**. Waves without it would just be "siege with
+more bodies"; noise is what gives units logic.
+
+Minimal state machines:
+
+| Unit | States / logic | Queries |
+| --- | --- | --- |
+| **Zombie** | `Dormant → Investigating (walk to noise tile) → Chasing (sight) → Attacking`. Classes: walker / runner / harpy (jumps walls) / venom (range 4.5 outranges walls) / brute (pack shield) | wake = sphere cull (per-class radius+threshold); melee target = k-NN vs static index |
+| **Tower** | `Scanning → Firing (emits noise) → Reloading`; **nearest** vs **highest-threat** modes, toggleable live | k-NN(1) / cull+score-max from a fixed point |
+| **Mobile defender** | Ranger **silent** (noise 1, kites) · soldier (noise 3) · sniper (noise 10, kills specials); patrol the wall, **fall back** when local density exceeds a threshold | density cull around self |
+| **Repair crew** | after each wave, go to the most-damaged wall if no zombies near | safety cull + min-HP scan |
+| **Colonist** | populates buildings; **flees to the centre** when a breach is near; building death → infection burst | threat cull |
+
+Scenarios (same sim; only map, base layout and wave script change — rotate
+between runs or select):
+
+1. **Classic survival** (default): central base, dormant field, ~8 escalating
+   waves with direction warning + countdown, final all-edges wave that also
+   wakes everything left. Base falls or survives → reset, new seed.
+2. **The mountain pass**: base in a valley chokepoint, waves funnel through 2
+   entrances — flow field + density at their most spectacular.
+3. **The river crossing**: reuse siege's rivers + bridges; bridges are
+   chokepoints, venoms fire from the far bank.
+4. **The expedition** (second act between waves): a squad ventures out to
+   **clear dormant nests** — the noise budget seen from the other side: the
+   ranger clears silently; one sniper shot wakes the whole nest and the squad
+   runs home with the horde on its heels.
+
 ## Making it molón (from the crowd-tech research)
 
 Ranked shopping list (effort S/M/L → payoff), full sources in the research
@@ -121,21 +155,30 @@ Wave staging for drama: direction warning banner + countdown (HUD), the wall of
 dots pouring from the announced edge then **bending toward the weakest wall**,
 mixed speeds making the front boil (walkers 0.4 / runners 1.75 / harpies 5).
 
-## Assets (all CC0, verified 2026-07-02)
+## Assets (rule for every demo: reuse what's downloaded first; new packs welcome)
 
+**Already local** (`crates/vectorial-hash-demos/assets/siege/models/`, 16 glb,
+rigged where animated): zombie, skeleton_a, skeleton_sword, slime, bat, mako,
+tentacle (the horde + specials core is basically covered), anne, sharky,
+pirate_captain, henry, witch (defenders: ranger/soldier/sniper reskins), dragon,
+cannon (tower armament), castle, horse. **The demo can start with zero
+downloads** — the horde (zombie+skeletons+slime as chubby, bat as harpy-class
+flyer) and the defenders are already here.
+
+**To download when the phase needs them (all CC0, verified 2026-07-02):**
 - **Walls/gates/towers/houses: Quaternius Ultimate Fantasy RTS** — native glTF,
-  same author/palette as everything we use. Verified pieces: Stone/Wooden Wall,
-  Wall Towers, Watch/Archery Towers, Fortress Gate, Castle Gate, Barracks,
+  same author/palette as our set. Verified pieces: Stone/Wooden Wall, Wall
+  Towers, Watch/Archery Towers, Fortress Gate, Castle Gate, Barracks,
   houses/huts, Town Center. <https://quaternius.com/packs/ultimatefantasyrts.html>
-- **Brutes/runners: Quaternius Ultimate Monsters** — rigged+animated glTF (Orc/
-  Yeti/Demon = chubby-class, Ninja = runner). <https://quaternius.com/packs/ultimatemonsters.html>
+- **Brutes/runners variety: Quaternius Ultimate Monsters** — rigged+animated
+  glTF (Orc/Yeti/Demon = chubby-class, Ninja = runner).
+  <https://quaternius.com/packs/ultimatemonsters.html>
 - **Extra undead skins: KayKit Skeletons** (free tier CC0, rigged glTF).
   <https://kaylousberg.itch.io/kaykit-skeletons>
 - **Barricades/spikes/torches/banners: KayKit Dungeon Remastered** (CC0).
   <https://kaylousberg.itch.io/kaykit-dungeon-remastered>
-- We already have: Quaternius zombies, skeletons, slime, bat, castle.
 - Integration caveat: check animation clip names against `load_glb_clip`'s
-  walk/attack/idle expectations per pack.
+  walk/attack/idle expectations per pack; KayKit rig ≠ Quaternius rig.
 
 ## Build plan (phases, each committable)
 

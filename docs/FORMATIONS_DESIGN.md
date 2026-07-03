@@ -101,8 +101,16 @@ Warhammer for the physics-era mechanics. Marked [M] where single-source.
 8. **Dust** behind cavalry from the density grid.
 9. Kill-cam moment: pick the k-NN pair on a decisive kill, zoom the free camera.
 
-## Assets (all CC0, verified 2026-07-02)
+## Assets (rule for every demo: reuse what's downloaded first; new packs welcome)
 
+**Already local** (`assets/siege/models/`, 16 glb): the whole siege roster —
+knights + horse (cavalry), skeleton_sword / pirates (line infantry reskins),
+sharky/skeleton_a (archers), cannon (artillery), witch/henry (mage/standard
+bearer stand-ins), castle, dragon. **A first playable phase (regiments, slots,
+melee, charges, morale) needs zero downloads** — soldier *variety* is what the
+new packs add.
+
+**To download when the phase needs them (all CC0, verified 2026-07-02):**
 - **Soldiers: KayKit Adventurers** (Knight sword+shield, Ranger bow, crossbow
   loadouts; weapons are separate attachable objects) **+ KayKit Character
   Animations** — **161 humanoid clips** (1H/2H/block melee, bow/crossbow aim +
@@ -115,7 +123,6 @@ Warhammer for the physics-era mechanics. Marked [M] where single-source.
 - **Banners: KayKit Dungeon Remastered**; pole-mounted field standards & siege
   engines: **Kenney Castle Kit** (CC0 glTF, static — animate procedurally like
   our cannon). <https://kenney.nl/assets/castle-kit>
-- We already have: knights/horses (cavalry), cannon (artillery), castle.
 - Same caveat: verify clip naming vs `load_glb_clip` on import; KayKit rig ≠
   Quaternius rig (don't mix clips across families).
 
