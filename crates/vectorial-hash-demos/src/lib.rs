@@ -21,5 +21,8 @@ pub mod sim;
 /// Shared, graphics-free simulation for the `siege` demo — used by both the
 /// macroquad and wgpu binaries so the two renderers can't drift apart.
 pub mod siege_sim;
+/// Shared, graphics-free simulation for the `horde` demo (They Are
+/// Billions-style zombie assault; wgpu renderer) — see `docs/HORDE_DESIGN.md`.
+pub mod horde_sim;
 #[cfg(not(feature = "web-wgpu"))]
 pub mod time;
