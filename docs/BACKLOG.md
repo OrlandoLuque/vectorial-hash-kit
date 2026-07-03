@@ -15,18 +15,20 @@ autonomously verifiable. User picked **"Todo (A–E)"** + the headline below.
 
 **ORDER (user, 2026-06-27): multithreading FIRST, then `siege`, then the rest.**
 
-**★ NEXT DEMOS (user, 2026-07-02): two new flagship demos, "las dos" — research
-DONE, build queued.** Full design docs (mechanics→query tables, molón shopping
-lists, verified CC0 asset picks, phased build plans):
-- **[HORDE_DESIGN.md](HORDE_DESIGN.md)** — They Are Billions-style zombie assault:
-  noise-field wake cascades (sphere culls), tower k-NN targeting, infection
-  bursts, flow-field swarms, ~100k agents with ~90% dormant (the keep-index
-  showcase). Switchable index structures (Tree3/Morton/2D, user pick).
-- **[FORMATIONS_DESIGN.md](FORMATIONS_DESIGN.md)** — Total War-style army battle:
-  regiment slot formations, contact-line k-NN pairing, **Polyhedron3 flank/rear
-  wedges → morale**, chain routs, charges (raycast corridors), banners.
-- Suggested order: horde first; shared prerequisite: extract generic sim
-  scaffolding (Rng/Fx/projectiles/terrain/sync_index) from `siege_sim`.
+**★ NEXT DEMOS (user, 2026-07-02): two new flagship demos, "las dos" — wgpu-direct.**
+- **HORDE — phases 1–3 BUILT (2026-07-02/03)**: `horde_sim` (noise-wake culls,
+  waves, towers, flow field, breaches, infection, Commander/defenders/works
+  economy + breach recall; 13 brute-force-gated tests) + `horde_wgpu` (GPU
+  skinning, dormant frozen poses, corpses, tracers, HUD/wave banner, web build)
+  + `horde_bench` (**100k dormant = 0.42 ms/step** — the keep-index headline).
+  Shipped doc: [HORDE.md](HORDE.md). **Queued rounds** (design in
+  [HORDE_DESIGN.md](HORDE_DESIGN.md)): scale pass (decision buckets 4–8 Hz,
+  activation bubbles, LOD/impostors), molón round (night+torches, blood RT,
+  trauma cam, dust), scenario presets, Tree3↔Morton↔2D live toggle, Quaternius
+  RTS wall models.
+- **FORMATIONS — researched, build queued**: [FORMATIONS_DESIGN.md](FORMATIONS_DESIGN.md)
+  (regiment slot formations, contact k-NN pairing, **Polyhedron3 flank/rear
+  wedges → morale**, chain routs, charges, banners; KayKit asset picks).
 
 **★ PHASE 0 — Multithreading (before the demo).** The `siege` demo is the heavy
 parallel consumer (1k+ units, each doing read queries on the shared index per

@@ -1,7 +1,10 @@
 # HORDE — design doc (They Are Billions-style zombie assault, automatic)
 
-Research notes + build plan for the next flagship demo. Status: **researched
-2026-07-02, not started**. Like siege: self-playing (no player), every mechanic a
+Research notes + build plan for the next flagship demo. Status: **phases 1–3
+BUILT 2026-07-02/03** (sim + combat + defense + the wgpu renderer + web +
+bench; see [HORDE.md](HORDE.md) for the shipped demo — this doc remains the
+design record + the queue for the remaining phases: scale pass, molón round,
+scenario presets, structure toggle, wall models). Like siege: self-playing (no player), every mechanic a
 spatial query, shared graphics-free sim + macroquad and wgpu renderers, native +
 wasm. Companion: [FORMATIONS_DESIGN.md](FORMATIONS_DESIGN.md). Decisions taken
 with the user: build **after/alongside formations** ("las dos"), **switchable
