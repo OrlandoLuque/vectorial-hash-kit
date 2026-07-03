@@ -240,10 +240,6 @@ struct GpuModel {
     bind: wgpu::BindGroup,
     num_joints: u32,
     n_frames: u32,
-    /// Rest-pose bounds for the impostor camera: vertical centre + the ortho
-    /// half-extent that frames the whole model (padded for animation sway).
-    center_y: f32,
-    half: f32,
 }
 
 fn build_gpu_model(device: &wgpu::Device, cam_buf: &wgpu::Buffer, layout: &wgpu::BindGroupLayout, bytes: &[u8]) -> GpuModel {
@@ -265,14 +261,7 @@ fn upload_skinned(device: &wgpu::Device, cam_buf: &wgpu::Buffer, layout: &wgpu::
         wgpu::BindGroupEntry { binding: 0, resource: cam_buf.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 1, resource: bone_buf.as_entire_binding() },
     ] });
-    let (mut lo, mut hi) = (glam::Vec3::splat(f32::INFINITY), glam::Vec3::splat(f32::NEG_INFINITY));
-    for v in &m.vertices {
-        lo = lo.min(glam::Vec3::from_array(v.pos));
-        hi = hi.max(glam::Vec3::from_array(v.pos));
-    }
-    let center_y = (lo.y + hi.y) * 0.5;
-    let half = ((hi.y - lo.y) * 0.5).max(hi.x.abs().max(lo.x.abs()).max(hi.z.abs()).max(lo.z.abs())) * 1.25;
-    GpuModel { vbuf, ibuf, nidx: m.indices.len() as u32, bind, num_joints: m.num_joints as u32, n_frames: m.n_frames as u32, center_y, half: half.max(0.1) }
+    GpuModel { vbuf, ibuf, nidx: m.indices.len() as u32, bind, num_joints: m.num_joints as u32, n_frames: m.n_frames as u32 }
 }
 
 /// A unit box (XZ centred, base at y=0, height 1) as a static `SkinnedModel` —
@@ -316,12 +305,21 @@ const LOD_DIST: f32 = 620.0;
 // breathes), 12 = the death pose (corpses). Captured at startup by photographing
 // each GPU-skinned model with an orbit-pitch ortho camera.
 const IMP_VIEWS: u32 = 8;
+/// Elevation bands (camera pitch tiers): low / orbit / high — the shader picks
+/// the band from the live camera→unit pitch, so top-down views photograph too.
+const IMP_ELEVS: [f32; 3] = [0.17, 0.62, 1.10];
 const IMP_ROWS: u32 = 16;
-const IMP_CELL: u32 = 64;
+const IMP_CELL: u32 = 128;
+// Fixed capture framing: the models are height-≈1 by the loader convention
+// (siege's model_height contract) — the raw REST vertices are bind-pose
+// coordinates and do NOT predict the skinned pose bounds, so mesh-derived
+// framing shrinks the photo. One conservative box for every clip keeps all
+// rows on the same scale.
+const IMP_HALF: f32 = 0.80;
+const IMP_CY: f32 = 0.50;
 const IMP_WALK_FRAMES: u32 = 8;
 const IMP_IDLE_FRAMES: u32 = 4;
 const IMP_DEATH_ROW: u32 = 12;
-const IMP_ELEV: f32 = 0.62; // capture camera pitch (rad) ≈ the default orbit
 
 /// One impostor billboard: camera-facing quad, view/frame picked in-shader.
 /// `mode`: 0 = walking (animated), 1 = idle (slow sway), 2 = death (still).
@@ -493,15 +491,16 @@ impl State {
         // replace the far models. All through the existing skin pipeline.
         let idle_models: Vec<GpuModel> = UNIT_FILES[..5].iter().map(|f| build_gpu_model_prefs(&device, &cam_buf, &skin_layout, &bytes_of(f), &["idle", "fly", "walk"])).collect();
         let death_models: Vec<GpuModel> = UNIT_FILES[..5].iter().map(|f| build_gpu_model_prefs(&device, &cam_buf, &skin_layout, &bytes_of(f), &["death", "hit", "idle"])).collect();
+        let atlas_w = IMP_VIEWS * IMP_ELEVS.len() as u32 * IMP_CELL; // 8 yaws × 3 elevations
         let atlas = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("impostor-atlas"),
-            size: wgpu::Extent3d { width: IMP_VIEWS * IMP_CELL, height: IMP_ROWS * IMP_CELL, depth_or_array_layers: 5 },
+            size: wgpu::Extent3d { width: atlas_w, height: IMP_ROWS * IMP_CELL, depth_or_array_layers: 5 },
             mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
             format, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
         });
         let atlas_depth = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("impostor-depth"),
-            size: wgpu::Extent3d { width: IMP_VIEWS * IMP_CELL, height: IMP_ROWS * IMP_CELL, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d { width: atlas_w, height: IMP_ROWS * IMP_CELL, depth_or_array_layers: 1 },
             mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Depth32Float, usage: wgpu::TextureUsages::RENDER_ATTACHMENT, view_formats: &[],
         }).create_view(&wgpu::TextureViewDescriptor::default());
@@ -510,7 +509,7 @@ impl State {
             let class = [ZClass::Walker, ZClass::Runner, ZClass::Chubby, ZClass::Venom, ZClass::Harpy][ci];
             let (tw_yaw, tw_scale) = ztweak(class);
             let world_scale = zscale(class) * tw_scale;
-            bb_geom[ci] = (walk.half * 2.0 * world_scale, walk.center_y * world_scale);
+            bb_geom[ci] = (IMP_HALF * 2.0 * world_scale, IMP_CY * world_scale);
             let layer_view = atlas.create_view(&wgpu::TextureViewDescriptor { base_array_layer: ci as u32, array_layer_count: Some(1), dimension: Some(wgpu::TextureViewDimension::D2), ..Default::default() });
             // (row, model, that row's frame) — walk cycle, idle sway, death pose.
             let mut shots: Vec<(u32, &GpuModel, u32)> = Vec::new();
@@ -521,35 +520,37 @@ impl State {
             shots.push((IMP_DEATH_ROW, dm, dm.n_frames.max(1) - 1));
             let mut first = true;
             for (row, m, frame) in shots {
-                for v in 0..IMP_VIEWS {
-                    // Ortho camera at orbit-ish pitch, azimuth v/8·τ, framing the model.
-                    let az = v as f32 / IMP_VIEWS as f32 * std::f32::consts::TAU;
-                    let (h, cy) = (m.half, m.center_y);
-                    let dir = Vec3::new(az.cos() * IMP_ELEV.cos(), IMP_ELEV.sin(), az.sin() * IMP_ELEV.cos());
-                    let view = Mat4::look_at_rh(Vec3::new(0.0, cy, 0.0) + dir * (h * 6.0), Vec3::new(0.0, cy, 0.0), Vec3::Y);
-                    let proj = Mat4::orthographic_rh(-h, h, -h, h, 0.1, h * 14.0);
-                    let cam = CameraUniform { vp: (proj * view).to_cols_array_2d(), light: [-0.45, 0.84, -0.30, 0.0], eye_time: [0.0; 4] };
-                    queue.write_buffer(&cam_buf, 0, bytemuck::cast_slice(&[cam]));
-                    let inst = SkinInstance { model: Mat4::from_rotation_y(tw_yaw).to_cols_array_2d(), color: [0.0, 0.0, 0.0, 0.0], frame_base: frame * m.num_joints, _pad: [0; 3] };
-                    queue.write_buffer(&inst_buf, 0, bytemuck::cast_slice(&[inst]));
-                    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-                    {
-                        let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("impostor-shot"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &layer_view, resolve_target: None, ops: wgpu::Operations { load: if first { wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT) } else { wgpu::LoadOp::Load }, store: wgpu::StoreOp::Store } })],
-                            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &atlas_depth, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }),
-                            timestamp_writes: None, occlusion_query_set: None,
-                        });
-                        pass.set_viewport((v * IMP_CELL) as f32, (row * IMP_CELL) as f32, IMP_CELL as f32, IMP_CELL as f32, 0.0, 1.0);
-                        pass.set_pipeline(&skin_pipeline);
-                        pass.set_bind_group(0, &m.bind, &[]);
-                        pass.set_vertex_buffer(0, m.vbuf.slice(..));
-                        pass.set_vertex_buffer(1, inst_buf.slice(..));
-                        pass.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                        pass.draw_indexed(0..m.nidx, 0, 0..1);
+                for (e, elev) in IMP_ELEVS.iter().enumerate() {
+                    for v in 0..IMP_VIEWS {
+                        // Ortho camera: azimuth v/8·τ, this band's pitch, fixed framing.
+                        let az = v as f32 / IMP_VIEWS as f32 * std::f32::consts::TAU;
+                        let (h, cy) = (IMP_HALF, IMP_CY);
+                        let dir = Vec3::new(az.cos() * elev.cos(), elev.sin(), az.sin() * elev.cos());
+                        let view = Mat4::look_at_rh(Vec3::new(0.0, cy, 0.0) + dir * (h * 6.0), Vec3::new(0.0, cy, 0.0), Vec3::Y);
+                        let proj = Mat4::orthographic_rh(-h, h, -h, h, 0.1, h * 14.0);
+                        let cam = CameraUniform { vp: (proj * view).to_cols_array_2d(), light: [-0.45, 0.84, -0.30, 0.0], eye_time: [0.0; 4] };
+                        queue.write_buffer(&cam_buf, 0, bytemuck::cast_slice(&[cam]));
+                        let inst = SkinInstance { model: Mat4::from_rotation_y(tw_yaw).to_cols_array_2d(), color: [0.0, 0.0, 0.0, 0.0], frame_base: frame * m.num_joints, _pad: [0; 3] };
+                        queue.write_buffer(&inst_buf, 0, bytemuck::cast_slice(&[inst]));
+                        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                        {
+                            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("impostor-shot"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &layer_view, resolve_target: None, ops: wgpu::Operations { load: if first { wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT) } else { wgpu::LoadOp::Load }, store: wgpu::StoreOp::Store } })],
+                                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &atlas_depth, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }),
+                                timestamp_writes: None, occlusion_query_set: None,
+                            });
+                            pass.set_viewport(((e as u32 * IMP_VIEWS + v) * IMP_CELL) as f32, (row * IMP_CELL) as f32, IMP_CELL as f32, IMP_CELL as f32, 0.0, 1.0);
+                            pass.set_pipeline(&skin_pipeline);
+                            pass.set_bind_group(0, &m.bind, &[]);
+                            pass.set_vertex_buffer(0, m.vbuf.slice(..));
+                            pass.set_vertex_buffer(1, inst_buf.slice(..));
+                            pass.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                            pass.draw_indexed(0..m.nidx, 0, 0..1);
+                        }
+                        queue.submit(Some(enc.finish()));
+                        first = false;
                     }
-                    queue.submit(Some(enc.finish()));
-                    first = false;
                 }
             }
         }
@@ -1199,22 +1200,27 @@ fn vs(@builtin(vertex_index) vi: u32,
         vec2(-0.5, -0.5), vec2(0.5, -0.5), vec2(0.5, 0.5),
         vec2(-0.5, -0.5), vec2(0.5, 0.5), vec2(-0.5, 0.5));
     let c = corners[vi];
-    // face the camera (cylindrical billboard: horizontal spin only)
+    // face the camera fully (view-plane billboard — stays readable from above)
     let to_cam = cam.eye_time.xyz - pos;
-    let fwd = normalize(vec2(to_cam.x, to_cam.z));
-    let right = vec3<f32>(-fwd.y, 0.0, fwd.x);
-    let world = pos + right * (c.x * size) + vec3<f32>(0.0, c.y * size, 0.0);
-    // atlas view column: the capture azimuth that matches this sight line
+    let dist = max(length(to_cam), 0.001);
+    let dirc = to_cam / dist;
+    let right = normalize(cross(vec3<f32>(0.0, 1.0, 0.0), dirc));
+    let up = normalize(cross(dirc, right));
+    let world = pos + right * (c.x * size) + up * (c.y * size);
+    // atlas view column: yaw sector + elevation band of this sight line
     let a_cam = atan2(to_cam.z, to_cam.x);
     var rel = a_cam - heading;
     rel = rel - TAU * floor(rel / TAU);
     let view = u32(floor(rel / TAU * 8.0 + 0.5)) % 8u;
+    let pitch = atan2(to_cam.y, max(length(vec2(to_cam.x, to_cam.z)), 0.001));
+    var band = 0u; // captured at 0.17 / 0.62 / 1.10 rad
+    if (pitch > 0.86) { band = 2u; } else if (pitch > 0.40) { band = 1u; }
     // frame row by mode
     let t = cam.eye_time.w;
     var row = 12u; // death pose
     if (mode == 0u) { row = u32(floor((t * 1.6 + phase * 8.0) * 8.0)) % 8u; }
     else if (mode == 1u) { row = 8u + u32(floor((t * 0.7 + phase * 4.0) * 4.0)) % 4u; }
-    let u0 = (f32(view) + (c.x + 0.5)) / 8.0;
+    let u0 = (f32(band * 8u + view) + (c.x + 0.5)) / 24.0;
     let v0 = (f32(row) + (0.5 - c.y)) / 16.0;
     var o: VOut;
     o.clip = cam.vp * vec4<f32>(world, 1.0);
