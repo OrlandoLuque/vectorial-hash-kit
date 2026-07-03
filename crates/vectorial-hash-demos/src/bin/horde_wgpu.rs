@@ -294,11 +294,11 @@ fn ztweak(c: ZClass) -> (f32, f32) {
     match c { ZClass::Chubby => (-std::f32::consts::FRAC_PI_2, 0.80), _ => (0.0, 1.0) }
 }
 
-/// LOD switch distance (camera→unit, wu): nearer = full GPU-skinned model,
-/// farther = an **impostor billboard** (a photo of the model). At the default
-/// orbit the whole field is impostors (units are a few pixels anyway); zoom in
-/// and the front line turns into real models.
-const LOD_DIST: f32 = 620.0;
+/// LOD switch distance (camera→unit, wu): only units the camera is REALLY
+/// close to get the full GPU-skinned model — everything else is an impostor
+/// billboard (a photo). Dormant sleepers inside this bubble also upgrade to
+/// the skinned model playing its real Idle clip.
+const LOD_DIST: f32 = 170.0;
 
 // Impostor atlas: per class (texture-array layer), 8 yaw views × 16 rows of
 // 64 px cells — rows 0..8 = walk cycle, 8..12 = idle sway (the dormant carpet
@@ -319,7 +319,8 @@ const IMP_HALF: f32 = 0.80;
 const IMP_CY: f32 = 0.50;
 const IMP_WALK_FRAMES: u32 = 8;
 const IMP_IDLE_FRAMES: u32 = 4;
-const IMP_DEATH_ROW: u32 = 12;
+const IMP_DEATH_BASE: u32 = 12; // rows 12..16: the dying animation (4 frames)
+const IMP_DEATH_FRAMES: u32 = 4;
 
 /// One impostor billboard: camera-facing quad, view/frame picked in-shader.
 /// `mode`: 0 = walking (animated), 1 = idle (slow sway), 2 = death (still).
@@ -348,9 +349,14 @@ struct State {
     bb_bind: wgpu::BindGroup,
     /// Per zombie class: (billboard world size, world y-centre offset).
     bb_geom: [(f32, f32); 5],
+    /// Idle-clip skinned variants — sleepers INSIDE the LOD bubble play the
+    /// real Idle animation as full 3D models.
+    idle_models: Vec<GpuModel>,
     dormant_buf: wgpu::Buffer,
     dormant_n: u32,
     dormant_key: (u32, u64), // (run, dormant_epoch) that built the buffer
+    carpet_eye: Vec3, // eye position the carpet was built for (bubble exclusion)
+    carpet_t: f64,    // when it was built (rebuild throttle on camera moves)
     proxy_buf: wgpu::Buffer, // far-LOD active zombies, rebuilt per frame
     corpse_buf: wgpu::Buffer,
     corpse_n: u32,
@@ -516,8 +522,10 @@ impl State {
             for r in 0..IMP_WALK_FRAMES { shots.push((r, walk, r * walk.n_frames.max(1) / IMP_WALK_FRAMES)); }
             let idm = &idle_models[ci];
             for k in 0..IMP_IDLE_FRAMES { shots.push((IMP_WALK_FRAMES + k, idm, k * idm.n_frames.max(1) / IMP_IDLE_FRAMES)); }
+            // The dying animation: 4 frames spread over the Death clip, ending
+            // on its final pose (corpses play it once, then hold).
             let dm = &death_models[ci];
-            shots.push((IMP_DEATH_ROW, dm, dm.n_frames.max(1) - 1));
+            for k in 0..IMP_DEATH_FRAMES { shots.push((IMP_DEATH_BASE + k, dm, k * (dm.n_frames.max(1) - 1) / (IMP_DEATH_FRAMES - 1).max(1))); }
             let mut first = true;
             for (row, m, frame) in shots {
                 for (e, elev) in IMP_ELEVS.iter().enumerate() {
@@ -646,7 +654,8 @@ impl State {
             surface, device, queue, config,
             skin_pipeline, models, inst_buf,
             box_model, box_inst_buf, castle_model, cannon_model, cannon_inst_buf,
-            bb_pipeline, bb_bind, bb_geom, dormant_buf, dormant_n: 0, dormant_key: (0, 0),
+            bb_pipeline, bb_bind, bb_geom, idle_models, dormant_buf, dormant_n: 0, dormant_key: (0, 0),
+            carpet_eye: Vec3::new(f32::MAX, 0.0, 0.0), carpet_t: -10.0,
             proxy_buf, corpse_buf, corpse_n: 0,
             line_pipeline, line_buf, line_cap,
             ui_pipeline, ui_buf, ui_drag: 0,
@@ -760,13 +769,19 @@ impl State {
         // between wakes/sleeps/deaths the 100k-sleeper upload cost is ZERO.
         let key = (self.sim.run, self.sim.dormant_epoch);
         if !self.lod { self.dormant_n = 0; self.dormant_key = (0, 0); }
-        if self.lod && key != self.dormant_key {
+        // Rebuild the carpet when the dormant set changes, or (throttled) when
+        // the camera moved — sleepers inside the LOD bubble are EXCLUDED here
+        // and drawn below as full skinned models playing their Idle clip.
+        let eye_moved = (eye - self.carpet_eye).length() > 60.0 && now - self.carpet_t > 0.4;
+        if self.lod && (key != self.dormant_key || eye_moved) {
             let mut di: Vec<BillboardInst> = Vec::with_capacity(self.sim.units.len());
             for (i, z) in self.sim.units.iter().enumerate() {
                 if !z.alive() || !z.dormant() { continue; }
+                let (x, y, zz) = (z.p.x as f32, z.p.y as f32, z.p.z as f32);
+                if (Vec3::new(x, y, zz) - eye).length_squared() < LOD_DIST * LOD_DIST { continue; } // skinned below
                 let (size, cy) = self.bb_geom[zmodel(z.class)];
                 di.push(BillboardInst {
-                    pos: [z.p.x as f32, z.p.y as f32 + cy, z.p.z as f32],
+                    pos: [x, y + cy, zz],
                     size, heading: (i as f32) * 2.399963, phase: (i % 97) as f32 * 0.0103,
                     mode: 1, layer: zmodel(z.class) as u32,
                     tint: [0.0, 0.0, 0.0, 0.30], // sleepers read darker
@@ -776,6 +791,8 @@ impl State {
             self.queue.write_buffer(&self.dormant_buf, 0, bytemuck::cast_slice(&di));
             self.dormant_n = di.len() as u32;
             self.dormant_key = key;
+            self.carpet_eye = eye;
+            self.carpet_t = now;
         }
 
         // Corpses: append-only — upload only the new bodies since last frame
@@ -786,13 +803,14 @@ impl State {
             let from = if (self.corpse_n as usize) <= n { self.corpse_n as usize } else { 0 };
             if n > from || from == 0 && n < self.corpse_n as usize {
                 let mut ci: Vec<BillboardInst> = Vec::with_capacity(n - from.min(n));
-                for (p, class, _) in &corpses[from..n] {
+                for (p, class, died_at) in &corpses[from..n] {
                     let (size, cy) = self.bb_geom[zmodel(*class)];
                     ci.push(BillboardInst {
-                        pos: [p.x as f32, p.y as f32 + cy * 0.4, p.z as f32],
-                        size: size * 0.9, heading: (p.x.to_bits() % 628) as f32 * 0.01, phase: 0.0,
+                        pos: [p.x as f32, p.y as f32 + cy * 0.55, p.z as f32],
+                        size: size * 0.95, heading: (p.x.to_bits() % 628) as f32 * 0.01,
+                        phase: *died_at as f32, // the shader plays the Death clip once from this instant
                         mode: 2, layer: zmodel(*class) as u32,
-                        tint: [0.05, 0.03, 0.03, 0.45], // cold bodies
+                        tint: [0.05, 0.03, 0.03, 0.40], // cold bodies
                     });
                 }
                 if !ci.is_empty() { self.queue.write_buffer(&self.corpse_buf, (from * std::mem::size_of::<BillboardInst>()) as u64, bytemuck::cast_slice(&ci)); }
@@ -847,12 +865,39 @@ impl State {
             let model = Mat4::from_translation(Vec3::new(x, y, zz)) * Mat4::from_scale(Vec3::splat(7.0));
             buckets[mi].push(SkinInstance { model: model.to_cols_array_2d(), color: dtint(d.kind), frame_base: frame * m.num_joints, _pad: [0; 3] });
         }
+        // Sleepers inside the LOD bubble: full skinned models playing their
+        // REAL Idle clip (one index cull around the eye finds them).
+        let mut idle_buckets: Vec<Vec<SkinInstance>> = (0..5).map(|_| Vec::new()).collect();
+        if self.lod {
+            use vectorial_hash::Sphere3;
+            let near = Sphere3::new(eye.x as f64, eye.y as f64, eye.z as f64, LOD_DIST as f64 + 8.0);
+            for it in self.sim.zindex.cull(&near) {
+                if !it.dormant { continue; }
+                let (x, y, zz) = (it.p.x as f32, it.p.y as f32, it.p.z as f32);
+                if (Vec3::new(x, y, zz) - eye).length_squared() >= LOD_DIST * LOD_DIST { continue; }
+                if do_cull && !sphere_in_frustum(&planes, Vec3::new(x, y, zz), 12.0) { continue; }
+                let mi = zmodel(it.class);
+                let m = &self.idle_models[mi];
+                let nf = m.n_frames.max(1);
+                let phase = (it.id % 8) as f32 / 8.0;
+                let frame = (((now as f32 * 0.7 + phase) * nf as f32) as u32) % nf;
+                let (tw_yaw, tw_scale) = ztweak(it.class);
+                let model = Mat4::from_translation(Vec3::new(x, y, zz)) * Mat4::from_rotation_y(it.id as f32 * 2.399963 + tw_yaw) * Mat4::from_scale(Vec3::splat(zscale(it.class) * tw_scale));
+                idle_buckets[mi].push(SkinInstance { model: model.to_cols_array_2d(), color: ztint(it.class, true), frame_base: frame * m.num_joints, _pad: [0; 3] });
+            }
+        }
         self.skin_instances.clear();
         let mut ranges: Vec<(u32, u32)> = Vec::with_capacity(buckets.len());
         for b in &buckets {
             let start = self.skin_instances.len() as u32;
             self.skin_instances.extend_from_slice(b);
             ranges.push((start, self.skin_instances.len() as u32));
+        }
+        let mut idle_ranges: Vec<(u32, u32)> = Vec::with_capacity(5);
+        for b in &idle_buckets {
+            let start = self.skin_instances.len() as u32;
+            self.skin_instances.extend_from_slice(b);
+            idle_ranges.push((start, self.skin_instances.len() as u32));
         }
         let cap = MAX_POP + CORPSE_DRAW + 4096;
         if self.skin_instances.len() > cap { self.skin_instances.truncate(cap); }
@@ -1050,6 +1095,15 @@ impl State {
                 pass.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..m.nidx, 0, s..e);
             }
+            // near sleepers — the Idle-clip skinned variants
+            for (mi, m) in self.idle_models.iter().enumerate() {
+                let (s, e) = idle_ranges[mi];
+                if s == e { continue; }
+                pass.set_bind_group(0, &m.bind, &[]);
+                pass.set_vertex_buffer(0, m.vbuf.slice(..));
+                pass.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..m.nidx, 0, s..e);
+            }
             // the Command Center castle (1 instance parked at the buffer tail)
             let cm = &self.castle_model;
             pass.set_bind_group(0, &cm.bind, &[]);
@@ -1217,9 +1271,13 @@ fn vs(@builtin(vertex_index) vi: u32,
     if (pitch > 0.86) { band = 2u; } else if (pitch > 0.40) { band = 1u; }
     // frame row by mode
     let t = cam.eye_time.w;
-    var row = 12u; // death pose
+    var row = 12u;
     if (mode == 0u) { row = u32(floor((t * 1.6 + phase * 8.0) * 8.0)) % 8u; }
     else if (mode == 1u) { row = 8u + u32(floor((t * 0.7 + phase * 4.0) * 4.0)) % 4u; }
+    else { // death: play the clip ONCE from the instant of death, then hold
+        let local = max(t - phase, 0.0);
+        row = 12u + min(u32(local * 5.0), 3u);
+    }
     let u0 = (f32(band * 8u + view) + (c.x + 0.5)) / 24.0;
     let v0 = (f32(row) + (0.5 - c.y)) / 16.0;
     var o: VOut;
