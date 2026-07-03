@@ -28,7 +28,7 @@ use rayon::prelude::*;
 
 // ---------------------------------------------------------------- world config
 
-pub const WORLD: f64 = 1200.0; // map side, world units
+pub const WORLD: f64 = 1800.0; // map side, world units — roomy: the horde needs somewhere to sleep
 pub const SKY: f64 = 64.0; // index height (terrain amp ~6 + flyer altitude)
 pub const BASE_R: f64 = 150.0; // wall ring radius around the map centre
 const MARGIN: f64 = 2.0;
@@ -111,6 +111,9 @@ pub struct Zombie {
     pub groan_t: f64,
     /// Attack swing timer (Attacking state).
     pub swing_t: f64,
+    /// A sleeper this mover shoved this frame (u32::MAX = none): contact wakes
+    /// — the wave shakes the carpet awake instead of jamming against it.
+    bump: u32,
     moved: bool,
 }
 impl Zombie {
@@ -470,7 +473,7 @@ pub fn spawn_field(rng: &mut Rng, pop: usize, seed: f64) -> Vec<Zombie> {
         let roll = rng.unit();
         let class = if roll < 0.70 { ZClass::Walker } else if roll < 0.85 { ZClass::Runner } else if roll < 0.91 { ZClass::Chubby } else if roll < 0.96 { ZClass::Venom } else { ZClass::Harpy };
         let y = ground_h(x, z, seed) + class.altitude();
-        units.push(Zombie { class, p: Point3::new(x, y, z), vel: (0.0, 0.0), state: ZState::Dormant, hp: class.max_hp(), heard: 0.0, linger: 0.0, groan_t: rng.range(0.5, 2.0), swing_t: 0.0, moved: false });
+        units.push(Zombie { class, p: Point3::new(x, y, z), vel: (0.0, 0.0), state: ZState::Dormant, hp: class.max_hp(), heard: 0.0, linger: 0.0, groan_t: rng.range(0.5, 2.0), swing_t: 0.0, bump: u32::MAX, moved: false });
     }
     units
 }
@@ -561,7 +564,7 @@ impl Horde {
     pub fn spawn_zombie(&mut self, class: ZClass, x: f64, z: f64, state: ZState) {
         if state == ZState::Dormant { self.dormant_epoch += 1; }
         let y = ground_h(x, z, self.seed) + class.altitude();
-        let z0 = Zombie { class, p: Point3::new(x, y, z), vel: (0.0, 0.0), state, hp: class.max_hp(), heard: 0.0, linger: 0.0, groan_t: 1.0, swing_t: 0.5, moved: false };
+        let z0 = Zombie { class, p: Point3::new(x, y, z), vel: (0.0, 0.0), state, hp: class.max_hp(), heard: 0.0, linger: 0.0, groan_t: 1.0, swing_t: 0.5, bump: u32::MAX, moved: false };
         match self.free_slots.pop() {
             Some(slot) => { self.units[slot as usize] = z0; } // handle is None (freed at death) → sync inserts
             None => { self.units.push(z0); self.handles.push(None); }
@@ -588,7 +591,7 @@ impl Horde {
                 let a = dir + self.rng.range(-0.35, 0.35);
                 // Land close enough to be watchable (marching through the nest
                 // belt also drags alert sleepers along — by design).
-                let r = self.rng.range(400.0, 520.0);
+                let r = self.rng.range(WORLD * 0.30, WORLD * 0.38);
                 let (x, z) = ((cx + a.cos() * r).clamp(MARGIN, WORLD - MARGIN), (cz + a.sin() * r).clamp(MARGIN, WORLD - MARGIN));
                 // Escalating mix: early waves are shambler seas; specials join
                 // from wave 2 (venom/chubby) and wave 4 (harpies).
@@ -797,14 +800,19 @@ impl Horde {
                     (_, ZState::Marching) => flow.flow_at(z.p.x, z.p.z),
                     _ => (0.0, 0.0),
                 };
-                // Separation among the awake (dormant bodies are a carpet the
-                // wave flows around): one small cull per active zombie.
+                // Separation: full strength among the awake, WEAK against the
+                // dormant carpet (the wave pushes through) — and shoving a
+                // sleeper WAKES it (recorded here, resolved serially in apply):
+                // a column rolling over a nest recruits it instead of jamming.
+                z.bump = u32::MAX;
                 let sep = Sphere3::new(z.p.x, z.p.y, z.p.z, 3.0);
                 for it in index.cull(&sep) {
                     if it.id as usize == i || (it.p.y - z.p.y).abs() > 12.0 { continue; }
                     let (sx, sz) = (z.p.x - it.p.x, z.p.z - it.p.z);
                     let d = (sx * sx + sz * sz).sqrt().max(0.2);
-                    if d < 3.0 { vx += sx / d * (3.0 - d) * 0.4; vz += sz / d * (3.0 - d) * 0.4; }
+                    let w = if it.dormant { 0.12 } else { 0.4 };
+                    if d < 3.0 { vx += sx / d * (3.0 - d) * w; vz += sz / d * (3.0 - d) * w; }
+                    if it.dormant && d < 2.6 { z.bump = it.id; }
                 }
                 let l = (vx * vx + vz * vz).sqrt();
                 // Swarm frenzy: wave zombies (and beeliners) push at 2.2× — at
@@ -823,6 +831,7 @@ impl Horde {
         //    swing timers → queued structure hits, groans (next frame's culls).
         let decay = 0.5f64.powf(dt);
         let mut hits: Vec<(u32, f64, Point3, f64)> = Vec::new(); // (sid, dmg, at, noise)
+        let mut bumped: Vec<u32> = Vec::new(); // sleepers shoved by movers this frame
         let mut slept = false;
         for z in self.units.iter_mut() {
             if !z.alive() { continue; }
@@ -840,6 +849,7 @@ impl Horde {
                 let nz = (z.p.z + z.vel.1 * dt).clamp(MARGIN, WORLD - MARGIN);
                 z.p = Point3::new(nx, ground_h(nx, nz, self.seed) + z.class.altitude(), nz);
                 z.moved = true;
+                if z.bump != u32::MAX { bumped.push(z.bump); z.bump = u32::MAX; }
                 // Groans only while WALKING (half the class noise): a marching
                 // wave pulls alert sleepers (harpies/venoms) along its path —
                 // the wave grows as it travels — but an arrived, lingering pack
@@ -856,6 +866,19 @@ impl Horde {
             }
         }
         if slept { self.dormant_epoch += 1; }
+        // Shaken awake: shoved sleepers rise and JOIN the march (no noise
+        // threshold — a body dragging over you beats any decibel rule).
+        let mut rose = false;
+        for id in bumped {
+            let z = &mut self.units[id as usize];
+            if !z.alive() || !z.dormant() { continue; }
+            z.state = ZState::Marching;
+            z.heard = 0.0;
+            z.moved = true;
+            rose = true;
+            self.woken_last += 1;
+        }
+        if rose { self.dormant_epoch += 1; }
         // Resolve this frame's structure hits (attack noise feeds the wake
         // loop: pounding on a wall is what pulls the map in).
         for (sid, dmg, at, noise) in hits {
@@ -1038,8 +1061,11 @@ impl Horde {
                     let swarmed = self.zindex.cull(&crowd).iter().filter(|it| !it.dormant).count() >= 5;
                     let post_r = if swarmed || d.hp < d.kind.max_hp() * 0.35 { BASE_R - 48.0 } else { BASE_R - 10.0 };
                     let a = (d.sector as f64 + 0.5) / SECTORS as f64 * std::f64::consts::TAU;
-                    let jit = (d.shots % 7) as f64 * 0.015; // spread along the wall
-                    let (px, pz) = (cx + (a + jit).cos() * post_r, cz + (a + jit).sin() * post_r);
+                    // Personal spot within the sector (golden jitter by index) —
+                    // fighters spread along the wall instead of stacking.
+                    let jit = ((dix % 9) as f64 - 4.0) * 0.022;
+                    let ro = (dix % 4) as f64 * 2.2;
+                    let (px, pz) = (cx + (a + jit).cos() * (post_r - ro), cz + (a + jit).sin() * (post_r - ro));
                     let (wx, wz) = via_gate(&gate_pts, d.p, px, pz);
                     walk(d, wx, wz, dt, self.seed);
                     d.reload_t -= dt;
@@ -1221,8 +1247,11 @@ mod tests {
             .map(|(i, _)| i).collect();
         h.emit_noise(p, 400.0);
         h.step(1.0 / 60.0);
-        let got: Vec<usize> = h.units.iter().enumerate().filter(|(_, z)| !z.dormant()).map(|(i, _)| i).collect();
-        assert_eq!(want, got, "woken set != brute-force wake rule");
+        // NOISE-woken only (Investigating): contact-woken sleepers (a woken
+        // mover shoves a neighbour → it rises Marching) are a separate,
+        // deliberate mechanic with its own test.
+        let got: Vec<usize> = h.units.iter().enumerate().filter(|(_, z)| matches!(z.state, ZState::Investigating { .. })).map(|(i, _)| i).collect();
+        assert_eq!(want, got, "noise-woken set != brute-force wake rule");
         assert!(h.units.iter().all(|z| !z.dormant() || z.class != ZClass::Harpy || true)); // (harpies inside radius woke — covered by set equality)
         assert!(got.iter().all(|&i| h.units[i].class != ZClass::Walker), "amount 400 must not wake walkers (threshold 500)");
     }
@@ -1441,6 +1470,22 @@ mod tests {
                 assert!((dx * dx + dz * dz).sqrt() >= 1.0, "idle works units stacked on one spot");
             }
         }
+    }
+
+    #[test]
+    fn a_marching_column_shakes_sleepers_awake_by_contact() {
+        let mut h = Horde::new(97, 300);
+        h.wave_spawn_t = 1e9;
+        h.defenders.clear();
+        h.step(1.0 / 60.0);
+        // A marcher dropped right on the edge of a sleeper, heading across it.
+        let sleeper = h.units[0].p;
+        h.spawn_zombie(ZClass::Walker, sleeper.x - 2.2, sleeper.z, ZState::Marching);
+        let (_, active0) = h.counts();
+        for _ in 0..(3.0 * 60.0) as usize { h.step(1.0 / 60.0); }
+        let (_, active1) = h.counts();
+        assert!(active1 > active0, "contact must shake sleepers awake (no noise threshold): {active0} -> {active1}");
+        assert!(h.units.iter().take(20).any(|z| z.alive() && matches!(z.state, ZState::Marching) && z.class != ZClass::Walker || matches!(z.state, ZState::Marching)), "the shaken sleeper joins the march");
     }
 
     #[test]
