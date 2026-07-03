@@ -262,6 +262,58 @@ pub const TOWER_DMG: f64 = 150.0;
 pub const TOWER_RELOAD: f64 = 1.2;
 pub const TOWER_NOISE: f64 = 5.0; // the ballista: quiet per kill — by design
 
+// --------------------------------------------------------------- defenders
+
+/// Mobile defender kinds (HORDE_DESIGN.md layer 2) + the works economy
+/// (layer 3: crews repair, porters haul the materials that pace all repair).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DKind { Ranger, Soldier, Sniper, Crew, Porter }
+impl DKind {
+    pub fn max_hp(self) -> f64 { match self { Self::Ranger => 60.0, Self::Soldier => 120.0, Self::Sniper => 150.0, Self::Crew => 60.0, Self::Porter => 40.0 } }
+    pub fn dmg(self) -> f64 { match self { Self::Ranger => 10.0, Self::Soldier => 15.0, Self::Sniper => 100.0, _ => 0.0 } }
+    pub fn range(self) -> f64 { match self { Self::Ranger => 48.0, Self::Soldier => 40.0, Self::Sniper => 64.0, _ => 0.0 } }
+    pub fn reload(self) -> f64 { match self { Self::Ranger => 0.6, Self::Soldier => 1.0, Self::Sniper => 2.5, _ => 1.0 } }
+    /// Noise per shot — the ranger is the silent one (the whole discipline
+    /// policy hinges on this asymmetry).
+    pub fn noise(self) -> f64 { match self { Self::Ranger => 1.0, Self::Soldier => 3.0, Self::Sniper => 10.0, _ => 0.0 } }
+    pub fn speed(self) -> f64 { match self { Self::Ranger => 22.0, Self::Soldier => 18.0, Self::Sniper => 16.0, Self::Crew => 14.0, Self::Porter => 16.0 } }
+    pub fn fighter(self) -> bool { matches!(self, Self::Ranger | Self::Soldier | Self::Sniper) }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum DState {
+    /// Fighter: hold the assigned sector post (engage from it).
+    Post,
+    /// Crew: repairing / rebuilding structure `sid` (needs stock).
+    Repairing { sid: u32 },
+    /// Porter: hauling to crew `did` (`loaded` = carrying a bundle).
+    Hauling { did: u32, loaded: bool },
+    /// Works unit recalled home (breach alarm / danger) — runs, then idles.
+    Fleeing,
+    /// Waiting for a job at home (crews/porters), or respawning (fighters,
+    /// timer in `respawn_t`).
+    Idle,
+}
+
+#[derive(Clone)]
+pub struct Defender {
+    pub kind: DKind,
+    pub p: Point3,
+    pub hp: f64,
+    pub state: DState,
+    pub sector: usize,
+    pub reload_t: f64,
+    pub respawn_t: f64,
+    /// Crew: repair stock (a porter delivery = +20; repair burns 2/s).
+    pub stock: f64,
+    pub shots: u64,
+}
+impl Defender { pub fn alive(&self) -> bool { self.hp > 0.0 } }
+
+pub const SECTORS: usize = 16;
+pub const CREW_REPAIR: f64 = 30.0; // HP/s while stocked
+pub const PORTER_BUNDLE: f64 = 20.0; // stock per delivery
+
 // ----------------------------------------------------------------------- sim
 
 pub struct Horde {
@@ -302,6 +354,17 @@ pub struct Horde {
     pub woken_last: usize,
     base_pop: usize,
     base_seed: u64,
+    // ---- the defense (Commander + mobile defenders + works economy)
+    pub defenders: Vec<Defender>,
+    /// Per-sector threat (Commander's map, refreshed at 1 Hz).
+    pub threat: [f64; SECTORS],
+    /// Noise discipline: `false` → only rangers engage (silent clearing);
+    /// flips when a wave commits near the walls.
+    pub weapons_free: bool,
+    cmd_t: f64,
+    /// Most recent breach (position, time): drives the porter/crew recall and
+    /// keeps repair jobs out of the danger zone for a while.
+    pub breach: Option<(Point3, f64)>,
 }
 
 /// The base layout: a stone wall ring with 4 cardinal gates and towers every
@@ -374,7 +437,7 @@ impl Horde {
         let mut flow = FlowField::new(120);
         flow.rebuild(&structures, structures[cc_id].p);
         let ns = structures.len();
-        Horde {
+        let mut h = Horde {
             units, structures,
             zindex: Tree3::new(world, 8), handles: vec![None; n],
             sindex, noise: NoiseGrid::new(96), flow,
@@ -385,7 +448,38 @@ impl Horde {
             game_over: None, run: 1, kills: 0,
             rng, now: 0.0, seed: fseed, woken_last: 0,
             base_pop: pop, base_seed: seed,
-        }
+            defenders: Vec::new(), threat: [0.0; SECTORS], weapons_free: false, cmd_t: 0.0, breach: None,
+        };
+        h.spawn_defenders();
+        h
+    }
+
+    /// The garrison: fighters spread around the ring, works units at the
+    /// storehouses. Fixed roster (the pop slider scales zombies, not defense).
+    fn spawn_defenders(&mut self) {
+        let (cx, cz) = (WORLD / 2.0, WORLD / 2.0);
+        let home = self.structures.iter().find(|s| s.kind == SKind::Storehouse).map(|s| s.p).unwrap_or(Point3::new(cx, 0.0, cz));
+        let spawn = |kind: DKind, n: usize, ds: &mut Vec<Defender>| {
+            for k in 0..n {
+                let a = (ds.len() as f64) * 2.399963;
+                let (x, z) = match kind.fighter() {
+                    true => (cx + a.cos() * (BASE_R - 10.0), cz + a.sin() * (BASE_R - 10.0)),
+                    false => (home.x + a.cos() * (4.0 + k as f64), home.z + a.sin() * (4.0 + k as f64)),
+                };
+                ds.push(Defender {
+                    kind, p: Point3::new(x, ground_h(x, z, self.seed), z), hp: kind.max_hp(),
+                    state: if kind.fighter() { DState::Post } else { DState::Idle },
+                    sector: (ds.len()) % SECTORS, reload_t: 0.0, respawn_t: 0.0, stock: 0.0, shots: 0,
+                });
+            }
+        };
+        let mut ds = Vec::new();
+        spawn(DKind::Ranger, 20, &mut ds);
+        spawn(DKind::Soldier, 12, &mut ds);
+        spawn(DKind::Sniper, 6, &mut ds);
+        spawn(DKind::Crew, 4, &mut ds);
+        spawn(DKind::Porter, 8, &mut ds);
+        self.defenders = ds;
     }
 
     /// Full run reset (CC fell, or the final wave was cleared): fresh base +
@@ -472,6 +566,15 @@ impl Horde {
             self.structures[sid].pop = 0;
         }
         if kind == SKind::CommandCenter && self.game_over.is_none() { self.game_over = Some((self.now, false)); }
+        // Breach alarm: the Commander RECALLS works units (porters, crews) in
+        // the danger zone — they drop the job and run home; repair jobs stay
+        // out of this zone for a while (see the crew scheduler).
+        self.breach = Some((p, self.now));
+        for d in self.defenders.iter_mut() {
+            if d.kind.fighter() || !d.alive() { continue; }
+            let (dx, dz) = (d.p.x - p.x, d.p.z - p.z);
+            if (dx * dx + dz * dz).sqrt() < 150.0 { d.state = DState::Fleeing; }
+        }
     }
 
     /// Queue a noise event (processed next `step`): the wake mechanism.
@@ -675,6 +778,7 @@ impl Horde {
             if s.hp <= 0.0 { self.destroy_structure(sid as usize); }
         }
         self.step_towers(dt);
+        self.step_defenders(dt);
     }
 
     /// Towers auto-fire: "nearest" = one k-NN(1) per tower per shot;
@@ -701,6 +805,191 @@ impl Horde {
             self.units[tid as usize].hp -= TOWER_DMG;
             if self.units[tid as usize].hp <= 0.0 { self.kill_zombie(tid as usize); }
         }
+    }
+
+    /// The defense pass: the Commander (1 Hz — sector threat map, wave
+    /// anticipation, noise discipline, job scheduling) + per-frame defender
+    /// FSMs (fighters post/engage/kite, crews repair, porters haul, recalled
+    /// units flee home) + zombie contact damage on defenders.
+    fn step_defenders(&mut self, dt: f64) {
+        let (cx, cz) = (WORLD / 2.0, WORLD / 2.0);
+        let home = self.structures.iter().find(|s| s.kind == SKind::Storehouse && s.hp > 0.0).map(|s| s.p)
+            .unwrap_or(self.structures[self.cc_id].p);
+        // ---- Commander tick (1 Hz)
+        self.cmd_t -= dt;
+        if self.cmd_t <= 0.0 {
+            self.cmd_t = 1.0;
+            // Sector threat: one counting cull per sector + wave anticipation
+            // (pre-position while the countdown runs — looks like foresight).
+            let (mut total, mut peak) = (0.0, 0.0f64);
+            for s in 0..SECTORS {
+                let a = (s as f64 + 0.5) / SECTORS as f64 * std::f64::consts::TAU;
+                let mid = Point3::new(cx + a.cos() * BASE_R, 0.0, cz + a.sin() * BASE_R);
+                let ring = Sphere3::new(mid.x, mid.y, mid.z, 110.0);
+                let mut t = self.zindex.cull(&ring).iter().filter(|it| !it.dormant).count() as f64;
+                if self.wave_announced {
+                    let mut da = (a - self.wave_dir).abs(); if da > std::f64::consts::PI { da = std::f64::consts::TAU - da; }
+                    let eta = (self.wave_spawn_t - self.now).max(0.0);
+                    if da < 0.7 { t += 25.0 * (1.0 - eta / 30.0).clamp(0.0, 1.0); }
+                }
+                self.threat[s] = t;
+                total += t;
+                peak = peak.max(t);
+            }
+            // Noise discipline: silence until a wave commits near the walls.
+            self.weapons_free = total > 25.0 || peak > 12.0;
+            // Fighter assignment ∝ sector threat (deterministic split).
+            let weights: Vec<f64> = self.threat.iter().map(|t| t + 0.3).collect();
+            let wsum: f64 = weights.iter().sum();
+            let nf = self.defenders.iter().filter(|d| d.kind.fighter() && d.alive()).count().max(1);
+            let mut fi = 0usize;
+            for d in self.defenders.iter_mut().filter(|d| d.kind.fighter() && d.alive()) {
+                let target = (fi as f64 + 0.5) / nf as f64 * wsum;
+                let (mut acc, mut sec) = (0.0, 0usize);
+                for (s, w) in weights.iter().enumerate() { acc += w; if acc >= target { sec = s; break; } }
+                d.sector = sec;
+                fi += 1;
+            }
+            // Crew job scheduling: most damaged structure, outside the breach
+            // danger zone, with a clear safety cull (no awake zombie nearby).
+            let danger = self.breach.filter(|(_, t)| self.now - t < 20.0);
+            for di in 0..self.defenders.len() {
+                if self.defenders[di].kind != DKind::Crew || !self.defenders[di].alive() || self.defenders[di].state != DState::Idle { continue; }
+                let mut best: Option<(usize, f64)> = None;
+                for (si, s) in self.structures.iter().enumerate() {
+                    let missing = s.kind.max_hp() - s.hp;
+                    if missing <= 0.0 { continue; }
+                    if let Some((bp, _)) = danger { let (dx, dz) = (s.p.x - bp.x, s.p.z - bp.z); if (dx * dx + dz * dz).sqrt() < 120.0 { continue; } }
+                    let guard = Sphere3::new(s.p.x, s.p.y, s.p.z, 60.0);
+                    if self.zindex.cull(&guard).iter().any(|it| !it.dormant) { continue; }
+                    if best.map(|(_, m)| missing > m).unwrap_or(true) { best = Some((si, missing)); }
+                }
+                if let Some((si, _)) = best { self.defenders[di].state = DState::Repairing { sid: si as u32 }; }
+            }
+            // Porter job scheduling: feed the hungriest repairing crew.
+            for di in 0..self.defenders.len() {
+                if self.defenders[di].kind != DKind::Porter || !self.defenders[di].alive() || self.defenders[di].state != DState::Idle { continue; }
+                let crew = self.defenders.iter().enumerate()
+                    .filter(|(_, c)| c.kind == DKind::Crew && c.alive() && matches!(c.state, DState::Repairing { .. }) && c.stock < 30.0)
+                    .min_by(|(_, a), (_, b)| a.stock.total_cmp(&b.stock))
+                    .map(|(ci, _)| ci);
+                if let Some(ci) = crew { self.defenders[di].state = DState::Hauling { did: ci as u32, loaded: true }; }
+            }
+        }
+        // ---- per-frame defender update
+        let mut shot: Vec<(usize, f64)> = Vec::new(); // (zombie id, dmg)
+        let mut noise: Vec<(Point3, f64)> = Vec::new();
+        let mut deliveries: Vec<u32> = Vec::new();
+        let mut repaired_any = false;
+        for d in self.defenders.iter_mut() {
+            if !d.alive() {
+                d.respawn_t -= dt;
+                if d.respawn_t <= 0.0 { // recruits arrive at the CC
+                    d.hp = d.kind.max_hp();
+                    d.p = Point3::new(cx, ground_h(cx, cz, self.seed), cz);
+                    d.state = if d.kind.fighter() { DState::Post } else { DState::Idle };
+                }
+                continue;
+            }
+            let walk = |d: &mut Defender, tx: f64, tz: f64, dt: f64, seed: f64| -> f64 {
+                let (dx, dz) = (tx - d.p.x, tz - d.p.z);
+                let dist = (dx * dx + dz * dz).sqrt();
+                if dist > 2.0 {
+                    let sp = d.kind.speed().min(dist / dt);
+                    let (nx, nz) = ((d.p.x + dx / dist * sp * dt).clamp(MARGIN, WORLD - MARGIN), (d.p.z + dz / dist * sp * dt).clamp(MARGIN, WORLD - MARGIN));
+                    d.p = Point3::new(nx, ground_h(nx, nz, seed), nz);
+                }
+                dist
+            };
+            match d.state {
+                DState::Post => {
+                    // Hold the sector post; engage under the noise policy.
+                    let a = (d.sector as f64 + 0.5) / SECTORS as f64 * std::f64::consts::TAU;
+                    let jit = (d.shots % 7) as f64 * 0.015; // spread along the wall
+                    walk(d, cx + (a + jit).cos() * (BASE_R - 10.0), cz + (a + jit).sin() * (BASE_R - 10.0), dt, self.seed);
+                    d.reload_t -= dt;
+                    let may_fire = self.weapons_free || d.kind == DKind::Ranger;
+                    if d.reload_t <= 0.0 && may_fire {
+                        if let Some((dist, it)) = self.zindex.knn(d.p, 1).into_iter().next() {
+                            if dist <= d.kind.range() {
+                                d.reload_t = d.kind.reload();
+                                d.shots += 1;
+                                shot.push((it.id as usize, d.kind.dmg()));
+                                noise.push((d.p, d.kind.noise()));
+                                // Ranger kite: too close → step back while firing.
+                                if d.kind == DKind::Ranger && dist < 14.0 {
+                                    let (dx, dz) = (d.p.x - it.p.x, d.p.z - it.p.z);
+                                    let l = (dx * dx + dz * dz).sqrt().max(0.5);
+                                    let (nx, nz) = ((d.p.x + dx / l * 6.0).clamp(MARGIN, WORLD - MARGIN), (d.p.z + dz / l * 6.0).clamp(MARGIN, WORLD - MARGIN));
+                                    d.p = Point3::new(nx, ground_h(nx, nz, self.seed), nz);
+                                }
+                            }
+                        }
+                    }
+                }
+                DState::Repairing { sid } => {
+                    let s = &mut self.structures[sid as usize];
+                    if s.hp >= s.kind.max_hp() { d.state = DState::Idle; continue; }
+                    if walk(d, s.p.x + 3.0, s.p.z, dt, self.seed) < 6.0 && d.stock > 0.0 {
+                        let was_dead = s.hp <= 0.0;
+                        s.hp = (s.hp + CREW_REPAIR * dt).min(s.kind.max_hp());
+                        d.stock = (d.stock - 2.0 * dt).max(0.0);
+                        repaired_any = true;
+                        if was_dead && s.hp > 0.0 { self.flow.dirty = true; } // rubble rises: costs return
+                        if s.hp >= s.kind.max_hp() { d.state = DState::Idle; self.flow.dirty = true; }
+                    }
+                }
+                DState::Hauling { .. } => {} // handled after the loop (needs two defenders at once)
+                DState::Fleeing => { if walk(d, home.x, home.z, dt, self.seed) < 5.0 { d.state = DState::Idle; } }
+                DState::Idle => { if !d.kind.fighter() { walk(d, home.x, home.z, dt, self.seed); } }
+            }
+        }
+        // Porter movement (two-defender interaction — done index-wise to keep
+        // the borrow checker happy).
+        for di in 0..self.defenders.len() {
+            let DState::Hauling { did, loaded } = self.defenders[di].state else { continue; };
+            if !self.defenders[di].alive() { continue; }
+            let target = if loaded { self.defenders[did as usize].p } else { home };
+            let (dx, dz) = (target.x - self.defenders[di].p.x, target.z - self.defenders[di].p.z);
+            let dist = (dx * dx + dz * dz).sqrt();
+            if dist > 3.0 {
+                let sp = DKind::Porter.speed().min(dist / dt);
+                let d = &mut self.defenders[di];
+                let (nx, nz) = ((d.p.x + dx / dist * sp * dt).clamp(MARGIN, WORLD - MARGIN), (d.p.z + dz / dist * sp * dt).clamp(MARGIN, WORLD - MARGIN));
+                d.p = Point3::new(nx, ground_h(nx, nz, self.seed), nz);
+            } else if loaded {
+                deliveries.push(did);
+                self.defenders[di].state = DState::Hauling { did, loaded: false };
+            } else {
+                self.defenders[di].state = DState::Idle; // back home, bundle ready
+            }
+            // A crew that stopped repairing releases its porter mid-route.
+            if loaded && !matches!(self.defenders[did as usize].state, DState::Repairing { .. }) {
+                self.defenders[di].state = DState::Fleeing;
+            }
+        }
+        for did in deliveries { self.defenders[did as usize].stock += PORTER_BUNDLE; }
+        if repaired_any { /* flow cost of a rising wall is refreshed on completion/rise — cheap enough */ }
+        // Zombie contact damage on defenders (one small cull per defender) —
+        // porters caught on a haul route die screaming (a noise event).
+        let mut dead_screams: Vec<Point3> = Vec::new();
+        for d in self.defenders.iter_mut() {
+            if !d.alive() { continue; }
+            let bite = Sphere3::new(d.p.x, d.p.y, d.p.z, 3.0);
+            let dps: f64 = self.zindex.cull(&bite).iter().filter(|it| !it.dormant).map(|it| it.class.dmg()).sum();
+            if dps > 0.0 {
+                d.hp -= dps * 0.4 * dt;
+                if d.hp <= 0.0 { d.respawn_t = if d.kind.fighter() { 25.0 } else { 30.0 }; dead_screams.push(d.p); }
+            }
+        }
+        for p in dead_screams { self.pending.push((p, 10.0)); }
+        // Resolve defender shots.
+        for (tid, dmg) in shot {
+            if !self.units[tid].alive() { continue; }
+            self.units[tid].hp -= dmg;
+            if self.units[tid].hp <= 0.0 { self.kill_zombie(tid); }
+        }
+        for (p, a) in noise { self.pending.push((p, a)); }
     }
 
     /// Death: corpse for the renderer, a death rattle (noise), free the slot,
@@ -892,6 +1181,58 @@ mod tests {
         let marching2: Vec<&Zombie> = h.units.iter().filter(|z| z.alive() && matches!(z.state, ZState::Marching)).collect();
         let d1: f64 = marching2.iter().map(|z| ((z.p.x - cx).powi(2) + (z.p.z - cz).powi(2)).sqrt()).sum::<f64>() / marching2.len().max(1) as f64;
         assert!(d1 < d0 - 30.0, "the wave must close on the base: {d0:.0} -> {d1:.0}");
+    }
+
+    #[test]
+    fn commander_prepositions_fighters_on_wave_warning() {
+        let mut h = Horde::new(3, 200);
+        h.wave_spawn_t = 25.0; // warning window opens immediately (spawn-30)
+        for _ in 0..(4.0 * 60.0) as usize { h.step(1.0 / 60.0); } // 4 commander tics
+        assert!(h.wave_announced, "warning must be up");
+        let fighters: Vec<&Defender> = h.defenders.iter().filter(|d| d.kind.fighter() && d.alive()).collect();
+        let near = fighters.iter().filter(|d| {
+            let a = (d.sector as f64 + 0.5) / SECTORS as f64 * std::f64::consts::TAU;
+            let mut da = (a - h.wave_dir).abs(); if da > std::f64::consts::PI { da = std::f64::consts::TAU - da; }
+            da < 0.8
+        }).count();
+        assert!(near * 2 >= fighters.len(), "most fighters should pre-position toward the announced direction ({near}/{})", fighters.len());
+    }
+
+    #[test]
+    fn noise_discipline_snipers_hold_until_a_wave_commits() {
+        let mut h = Horde::new(41, 200);
+        h.wave_spawn_t = 1e9; // no scheduled waves in this test
+        let tid = h.structures.iter().position(|s| s.kind == SKind::Tower).unwrap();
+        let tp = h.structures[tid].p;
+        let (cx, cz) = (WORLD / 2.0, WORLD / 2.0);
+        let out = ((tp.x - cx) / BASE_R, (tp.z - cz) / BASE_R);
+        // A trickle (6 walkers): below the committed threshold → rangers only.
+        for k in 0..6 { h.spawn_zombie(ZClass::Walker, tp.x + out.0 * (20.0 + k as f64 * 2.0), tp.z + out.1 * 20.0, ZState::Marching); }
+        for _ in 0..(10.0 * 60.0) as usize { h.step(1.0 / 60.0); }
+        assert!(!h.weapons_free, "6 walkers must not trip weapons-free");
+        let sniper_shots: u64 = h.defenders.iter().filter(|d| d.kind == DKind::Sniper).map(|d| d.shots).sum();
+        assert_eq!(sniper_shots, 0, "snipers must hold fire under noise discipline");
+        // A committed wave (60): threat crosses the threshold → weapons free.
+        for k in 0..60 { h.spawn_zombie(ZClass::Walker, tp.x + out.0 * (25.0 + (k % 10) as f64 * 2.0), tp.z + out.1 * (25.0 + (k / 10) as f64 * 2.0), ZState::Marching); }
+        for _ in 0..(8.0 * 60.0) as usize { h.step(1.0 / 60.0); if h.weapons_free { break; } }
+        assert!(h.weapons_free, "a 60-strong push must trip weapons-free");
+    }
+
+    #[test]
+    fn crews_repair_with_hauled_stock_and_the_breach_recall() {
+        let mut h = Horde::new(51, 200);
+        h.wave_spawn_t = 1e9;
+        let wid = h.structures.iter().position(|s| s.kind == SKind::Wall).unwrap();
+        h.structures[wid].hp = 300.0; // battle scar
+        // Peace: crew gets the job, a porter hauls a bundle, HP rises — repair
+        // is IMPOSSIBLE without a delivery (crews start with stock 0), so any
+        // HP gain proves the whole hauling chain.
+        for _ in 0..(40.0 * 60.0) as usize { h.step(1.0 / 60.0); if h.structures[wid].hp > 450.0 { break; } }
+        assert!(h.structures[wid].hp > 450.0, "hauled stock must repair the wall: hp={}", h.structures[wid].hp);
+        // Sudden breach next door → the Commander recalls works units nearby.
+        h.destroy_structure(wid + 1);
+        let recalled = h.defenders.iter().any(|d| !d.kind.fighter() && d.alive() && d.state == DState::Fleeing);
+        assert!(recalled, "porters/crews near a fresh breach must be recalled home");
     }
 
     #[test]
