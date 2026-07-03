@@ -939,7 +939,10 @@ impl Horde {
                 d.sector = sec;
             }
             // Crew job scheduling: most damaged structure, outside the breach
-            // danger zone, with a clear safety cull (no awake zombie nearby).
+            // danger zone. The safety cull only fears zombies that are INSIDE
+            // the ring (or flying over it) — a horde pounding the far side of a
+            // standing wall is exactly when repairing it matters most: the
+            // repair-vs-pounding race, with the wall in between.
             let danger = self.breach.filter(|(_, t)| self.now - t < 20.0);
             for di in 0..self.defenders.len() {
                 if self.defenders[di].kind != DKind::Crew || !self.defenders[di].alive() || self.defenders[di].state != DState::Idle { continue; }
@@ -948,8 +951,13 @@ impl Horde {
                     let missing = s.kind.max_hp() - s.hp;
                     if missing <= 0.0 { continue; }
                     if let Some((bp, _)) = danger { let (dx, dz) = (s.p.x - bp.x, s.p.z - bp.z); if (dx * dx + dz * dz).sqrt() < 120.0 { continue; } }
-                    let guard = Sphere3::new(s.p.x, s.p.y, s.p.z, 60.0);
-                    if self.zindex.cull(&guard).iter().any(|it| !it.dormant) { continue; }
+                    let guard = Sphere3::new(s.p.x, s.p.y, s.p.z, 55.0);
+                    let inside_threat = self.zindex.cull(&guard).iter().any(|it| {
+                        if it.dormant { return false; }
+                        let (dx, dz) = (it.p.x - cx, it.p.z - cz);
+                        (dx * dx + dz * dz).sqrt() < BASE_R + 2.0 // through a breach, or flying over
+                    });
+                    if inside_threat { continue; }
                     if best.map(|(_, m)| missing > m).unwrap_or(true) { best = Some((si, missing)); }
                 }
                 if let Some((si, _)) = best { self.defenders[di].state = DState::Repairing { sid: si as u32 }; }
@@ -963,28 +971,29 @@ impl Horde {
                     .map(|(ci, _)| ci);
                 if let Some(ci) = crew { self.defenders[di].state = DState::Hauling { did: ci as u32, loaded: true }; }
             }
-            // Peacetime SORTIE: send a small ranger squad out through the gate
-            // to silently clear the nearest nest (rangers = noise 1; the TAB
-            // map-clearing move). Recalled by the wave warning.
+            // SORTIE: send a ranger squad out through the gate to silently
+            // clear the nearest nest (rangers = noise 1; the TAB map-clearing
+            // move). Runs in every lull — recalled when a wave gets close.
             let (total_threat, eta) = (self.threat.iter().sum::<f64>(), self.wave_spawn_t - self.now);
             let out = self.defenders.iter().filter(|d| matches!(d.state, DState::Sortie { .. })).count();
-            if total_threat < 3.0 && (!self.wave_announced || eta > 45.0) && out == 0 {
+            if total_threat < 8.0 && (!self.wave_announced || eta > 25.0) && out == 0 {
                 let target = self.zindex.knn(Point3::new(cx, 0.0, cz), 48).into_iter()
                     .find(|(_, it)| it.dormant)
                     .map(|(_, it)| it.p);
                 if let Some(tp) = target {
                     let mut sent = 0;
                     for d in self.defenders.iter_mut() {
-                        if sent >= 6 { break; }
+                        if sent >= 10 { break; }
                         if d.kind != DKind::Ranger || !d.alive() || d.state != DState::Post || d.hp < d.kind.max_hp() * 0.9 { continue; }
                         let j = sent as f64 * 2.399963;
                         d.state = DState::Sortie { tx: (tp.x + j.cos() * (4.0 + sent as f64 * 2.0)).clamp(MARGIN, WORLD - MARGIN), tz: (tp.z + j.sin() * (4.0 + sent as f64 * 2.0)).clamp(MARGIN, WORLD - MARGIN) };
+                        d.respawn_t = 30.0; // sortie clock: come home after ~30 s regardless
                         sent += 1;
                     }
                 }
             }
-            // Wave warning → everyone home to the walls.
-            if self.wave_announced && eta <= 45.0 {
+            // Wave closing in → everyone home to the walls.
+            if self.wave_announced && eta <= 25.0 {
                 for d in self.defenders.iter_mut() {
                     if matches!(d.state, DState::Sortie { .. }) { d.state = DState::Post; }
                 }
@@ -1022,9 +1031,15 @@ impl Horde {
                 DState::Post => {
                     // Hold the sector post; engage under the noise policy.
                     // (Routing goes via the gate when returning from a sortie.)
+                    // FALL BACK when swarmed: zombies inside biting distance of
+                    // the post line → step to the inner line and fight from
+                    // there (they live to hold the second ring).
+                    let crowd = Sphere3::new(d.p.x, d.p.y, d.p.z, 16.0);
+                    let swarmed = self.zindex.cull(&crowd).iter().filter(|it| !it.dormant).count() >= 5;
+                    let post_r = if swarmed || d.hp < d.kind.max_hp() * 0.35 { BASE_R - 48.0 } else { BASE_R - 10.0 };
                     let a = (d.sector as f64 + 0.5) / SECTORS as f64 * std::f64::consts::TAU;
                     let jit = (d.shots % 7) as f64 * 0.015; // spread along the wall
-                    let (px, pz) = (cx + (a + jit).cos() * (BASE_R - 10.0), cz + (a + jit).sin() * (BASE_R - 10.0));
+                    let (px, pz) = (cx + (a + jit).cos() * post_r, cz + (a + jit).sin() * post_r);
                     let (wx, wz) = via_gate(&gate_pts, d.p, px, pz);
                     walk(d, wx, wz, dt, self.seed);
                     d.reload_t -= dt;
@@ -1061,6 +1076,9 @@ impl Horde {
                     }
                 }
                 DState::Sortie { tx, tz } => {
+                    // The sortie clock: whatever happens, come home after it runs out.
+                    d.respawn_t -= dt;
+                    if d.respawn_t <= 0.0 { d.state = DState::Post; continue; }
                     let (wx, wz) = via_gate(&gate_pts, d.p, tx, tz);
                     walk(d, wx, wz, dt, self.seed);
                     d.reload_t -= dt;

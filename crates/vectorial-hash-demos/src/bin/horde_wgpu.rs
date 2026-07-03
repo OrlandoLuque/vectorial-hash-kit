@@ -64,13 +64,16 @@ fn ztint(c: ZClass, dormant: bool) -> [f32; 4] {
         ZClass::Harpy => [0.60, 0.30, 0.30, a],
     }
 }
+// Strong colour-coding (the alpha is the mix weight toward the tint): green =
+// ranger, red = soldier, blue = sniper, yellow = crew, white = porter (who
+// also carries a visible brown bundle while hauling).
 fn dtint(k: DKind) -> [f32; 4] {
     match k {
-        DKind::Ranger => [0.30, 0.75, 0.45, 0.30],
-        DKind::Soldier => [0.80, 0.35, 0.25, 0.30],
-        DKind::Sniper => [0.30, 0.45, 0.95, 0.30],
-        DKind::Crew => [0.90, 0.75, 0.30, 0.35],
-        DKind::Porter => [0.90, 0.90, 0.85, 0.30],
+        DKind::Ranger => [0.20, 0.90, 0.40, 0.55],
+        DKind::Soldier => [0.95, 0.30, 0.20, 0.55],
+        DKind::Sniper => [0.25, 0.45, 1.00, 0.55],
+        DKind::Crew => [1.00, 0.85, 0.20, 0.60],
+        DKind::Porter => [0.95, 0.95, 0.92, 0.60],
     }
 }
 
@@ -746,14 +749,28 @@ impl State {
             };
             if s.kind == SKind::CommandCenter { continue; }
             let destroyed = s.hp <= 0.0;
-            // damage: darken + redden toward destruction; rubble is a low slab
-            col = [col[0] * (0.45 + 0.55 * frac) + 0.18 * (1.0 - frac), col[1] * (0.45 + 0.55 * frac), col[2] * (0.45 + 0.55 * frac)];
+            // Damage must READ from orbit: lerp hard toward glowing red-brown
+            // as HP drops (full = clean stone, half = clearly wounded, near
+            // death = alarm red); rubble is a charred low slab.
+            let dmg = 1.0 - frac;
+            let wound = [0.85, 0.16, 0.10];
+            col = [col[0] + (wound[0] - col[0]) * dmg, col[1] + (wound[1] - col[1]) * dmg, col[2] + (wound[2] - col[2]) * dmg];
+            if destroyed { col = [0.16, 0.13, 0.11]; }
             let h = if destroyed { sy * 0.14 } else { sy * (0.35 + 0.65 * frac) };
             let m = Mat4::from_translation(Vec3::new(x, y, zz)) * Mat4::from_rotation_y(-ang) * Mat4::from_scale(Vec3::new(sx, h, sz));
             box_inst.push(SkinInstance { model: m.to_cols_array_2d(), color: [col[0], col[1], col[2], 0.0], frame_base: 0, _pad: [0; 3] });
             if s.kind == SKind::Tower && !destroyed {
                 let cm = Mat4::from_translation(Vec3::new(x, y + h, zz)) * Mat4::from_rotation_y(-ang + std::f32::consts::FRAC_PI_2) * Mat4::from_scale(Vec3::splat(7.0));
                 cannon_inst.push(SkinInstance { model: cm.to_cols_array_2d(), color: [0.2, 0.2, 0.22, 0.25], frame_base: 0, _pad: [0; 3] });
+            }
+        }
+        // Loaded porters carry a visible brown bundle — the supply line reads
+        // at a glance (and you can tell who the porters are).
+        for d in &self.sim.defenders {
+            if !d.alive() { continue; }
+            if let vectorial_hash_demos::horde_sim::DState::Hauling { loaded: true, .. } = d.state {
+                let m = Mat4::from_translation(Vec3::new(d.p.x as f32, d.p.y as f32 + 7.6, d.p.z as f32)) * Mat4::from_scale(Vec3::new(3.2, 2.4, 3.2));
+                box_inst.push(SkinInstance { model: m.to_cols_array_2d(), color: [0.52, 0.36, 0.18, 0.0], frame_base: 0, _pad: [0; 3] });
             }
         }
         box_inst.truncate(1024);
@@ -836,6 +853,14 @@ impl State {
         push_text(&mut ui, hx, 120.0, 3.0, white, &format!("THR {}", self.n_threads), sw, sh);
         let mode = if self.sim.tower_threat_mode { "T: THREAT" } else { "T: NEAR" };
         push_text(&mut ui, hx, 138.0, 3.0, [0.9, 0.85, 0.5, 1.0], mode, sw, sh);
+        // Ring integrity: average HP of the wall line (walls+gates+towers).
+        let (mut got_hp, mut max_hp) = (0.0f64, 0.0f64);
+        for s in &self.sim.structures {
+            if matches!(s.kind, SKind::Wall | SKind::Gate | SKind::Tower) { got_hp += s.hp.max(0.0); max_hp += s.kind.max_hp(); }
+        }
+        let wal = (got_hp / max_hp.max(1.0) * 100.0) as u32;
+        let walc = if wal > 70 { [0.55, 1.0, 0.60, 1.0] } else if wal > 35 { [1.0, 0.85, 0.4, 1.0] } else { [1.0, 0.45, 0.35, 1.0] };
+        push_text(&mut ui, hx, 156.0, 3.0, walc, &format!("WAL {wal}"), sw, sh);
         // Wave banner — centre-top, with compass direction + countdown.
         if announced {
             let (dx, dz) = (wdir.cos(), wdir.sin());
