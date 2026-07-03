@@ -100,7 +100,7 @@ Minimal state machines:
 | **Tower** | `Scanning → Firing (emits noise) → Reloading`; **nearest** vs **highest-threat** modes, toggleable live | k-NN(1) / cull+score-max from a fixed point |
 | **Mobile defender** | Ranger **silent** (noise 1, kites) · soldier (noise 3) · sniper (noise 10, kills specials); patrol the wall, **fall back** when local density exceeds a threshold | density cull around self |
 | **Repair crew** | after each wave, go to the most-damaged wall if no zombies near | safety cull + min-HP scan |
-| **Colonist** | populates buildings; **flees to the centre** when a breach is near; building death → infection burst | threat cull |
+| **Colonist** | populates buildings; idle ones **haul materials** (storehouse → repair crew — the ant lines that pace all repair); **flees to the centre** when a breach is near; building death → infection burst | threat cull; haul job = k-NN nearest stocked storehouse/crew |
 
 ### Defender AI — three layers (TAB's brain is the player; ours is an AI)
 
@@ -134,10 +134,15 @@ Fall-back trigger: density cull around self, or low HP.
   detail that **construction-in-progress already has partial HP** (progress =
   HP), so a half-rebuilt wall already slows the flood and its flow-field cost
   rises *gradually* as it grows.
-- **Pacing without an economy**: one global "materials" trickle caps repair
-  throughput so **waves leave scars** (instant infinite repair would kill the
-  drama). A counter, not an economy.
-- Optional molón: colonists carry materials to crews — ant lines between waves.
+- **Pacing without an economy — hauled, not abstract (confirmed)**: repair
+  throughput is capped by **colonists physically carrying materials** from the
+  storehouse to the crews — a crew only works while stocked, so the pacing
+  counter *is* the ant line you see trotting across the base between waves.
+  Colonist FSM gains a `Hauling` state (idle colonists claim delivery jobs:
+  nearest stocked storehouse → crew, k-NN); haul routes near a hot sector are
+  dangerous — a caught porter is one more infection burst, so the Commander's
+  safety cull also gates hauling. Waves still leave scars (repair is bounded by
+  porter round-trips), and the whole economy stays: jobs + walking, no numbers.
 
 Scenarios (same sim; only map, base layout and wave script change — rotate
 between runs or select):
