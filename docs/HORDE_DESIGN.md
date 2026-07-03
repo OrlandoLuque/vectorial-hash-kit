@@ -102,6 +102,43 @@ Minimal state machines:
 | **Repair crew** | after each wave, go to the most-damaged wall if no zombies near | safety cull + min-HP scan |
 | **Colonist** | populates buildings; **flees to the centre** when a breach is near; building death → infection burst | threat cull |
 
+### Defender AI — three layers (TAB's brain is the player; ours is an AI)
+
+**Layer 1 — the Commander** (the "player", ~1 Hz, cheap):
+- **Sector threat map**: wall split into ~12–16 sectors; counting cull of active
+  zombies near each + **anticipation from the wave warning** (pre-position
+  before the wave lands — what makes it look smart). Honest note: at ~16
+  sectors this layer is brute force; the index shines at the individual layer.
+- **Assignment with hysteresis**: defenders ∝ threat; quiet sectors donate
+  troops to hot ones (visible troop movements = free molón).
+- **Noise discipline** (one rule, emergent restraint): no wave committed →
+  only rangers engage (silent clearing); wall-adjacent density > threshold →
+  **weapons free** (snipers/cannons — the horde is already coming).
+- **Fall-back order**: outer-ring segment destroyed + density inside → abandon
+  sector, man the second ring (TAB's concentric meta).
+- Between waves: schedules the **expeditions** (scenario 4) — nearest dormant
+  nest, ranger squad, abort on wake.
+
+**Layer 2 — individual FSM**: `Post → Engage → FallBack → Rally`, flavoured by
+class — ranger **kites** (distance band [min,max] via k-NN, fires retreating,
+noise 1); soldier holds (higher fall-back threshold); sniper targets
+**specials first** (class-filtered cull: venom > harpy > brute), not nearest.
+Fall-back trigger: density cull around self, or low HP.
+
+**Layer 3 — repair & rebuild** (the minimal economy — yes to both):
+- **Limited crews (N)** + job queue: damaged segments sorted by
+  `damage × sector-quietness`; claim only if the **safety cull** is clear (no
+  active zombie within R); travel, repair at X HP/s, **flee** on threat
+  (re-check with hysteresis).
+- **Rebuild destroyed segments**: same crews, slower — using the researched TAB
+  detail that **construction-in-progress already has partial HP** (progress =
+  HP), so a half-rebuilt wall already slows the flood and its flow-field cost
+  rises *gradually* as it grows.
+- **Pacing without an economy**: one global "materials" trickle caps repair
+  throughput so **waves leave scars** (instant infinite repair would kill the
+  drama). A counter, not an economy.
+- Optional molón: colonists carry materials to crews — ant lines between waves.
+
 Scenarios (same sim; only map, base layout and wave script change — rotate
 between runs or select):
 
