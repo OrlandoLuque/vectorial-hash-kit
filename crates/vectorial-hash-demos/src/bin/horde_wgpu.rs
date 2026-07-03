@@ -134,7 +134,7 @@ fn build_terrain(seed: f64) -> (Vec<TVertex>, Vec<u32>) {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct CameraUniform { vp: [[f32; 4]; 4], light: [f32; 4] }
+struct CameraUniform { vp: [[f32; 4]; 4], light: [f32; 4], eye_time: [f32; 4] } // eye.xyz + sim time (billboards)
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -240,10 +240,20 @@ struct GpuModel {
     bind: wgpu::BindGroup,
     num_joints: u32,
     n_frames: u32,
+    /// Rest-pose bounds for the impostor camera: vertical centre + the ortho
+    /// half-extent that frames the whole model (padded for animation sway).
+    center_y: f32,
+    half: f32,
 }
 
 fn build_gpu_model(device: &wgpu::Device, cam_buf: &wgpu::Buffer, layout: &wgpu::BindGroupLayout, bytes: &[u8]) -> GpuModel {
-    let m = vectorial_hash_demos::model::load_unit_model(bytes, ANIM_FRAMES, MOVE_PREFS);
+    build_gpu_model_prefs(device, cam_buf, layout, bytes, MOVE_PREFS)
+}
+
+/// Like [`build_gpu_model`] but with an explicit clip preference — the impostor
+/// atlas photographs the Idle clip (dormant carpet) and the Death pose (corpses).
+fn build_gpu_model_prefs(device: &wgpu::Device, cam_buf: &wgpu::Buffer, layout: &wgpu::BindGroupLayout, bytes: &[u8], prefs: &[&str]) -> GpuModel {
+    let m = vectorial_hash_demos::model::load_unit_model(bytes, ANIM_FRAMES, prefs);
     upload_skinned(device, cam_buf, layout, &m)
 }
 
@@ -255,7 +265,14 @@ fn upload_skinned(device: &wgpu::Device, cam_buf: &wgpu::Buffer, layout: &wgpu::
         wgpu::BindGroupEntry { binding: 0, resource: cam_buf.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 1, resource: bone_buf.as_entire_binding() },
     ] });
-    GpuModel { vbuf, ibuf, nidx: m.indices.len() as u32, bind, num_joints: m.num_joints as u32, n_frames: m.n_frames as u32 }
+    let (mut lo, mut hi) = (glam::Vec3::splat(f32::INFINITY), glam::Vec3::splat(f32::NEG_INFINITY));
+    for v in &m.vertices {
+        lo = lo.min(glam::Vec3::from_array(v.pos));
+        hi = hi.max(glam::Vec3::from_array(v.pos));
+    }
+    let center_y = (lo.y + hi.y) * 0.5;
+    let half = ((hi.y - lo.y) * 0.5).max(hi.x.abs().max(lo.x.abs()).max(hi.z.abs()).max(lo.z.abs())) * 1.25;
+    GpuModel { vbuf, ibuf, nidx: m.indices.len() as u32, bind, num_joints: m.num_joints as u32, n_frames: m.n_frames as u32, center_y, half: half.max(0.1) }
 }
 
 /// A unit box (XZ centred, base at y=0, height 1) as a static `SkinnedModel` —
@@ -281,41 +298,36 @@ fn unit_box() -> vectorial_hash_demos::model::SkinnedModel {
     SkinnedModel { vertices: verts, indices: idx, joint_frames: vec![glam::Mat4::IDENTITY.to_cols_array_2d()], num_joints: 1, n_frames: 1 }
 }
 
-/// Compose axis-aligned boxes (centre, size) into one static model — the LOD
-/// proxy figures (~72 tris vs ~1.5–3k for a skinned glb).
-fn boxes_model(parts: &[([f32; 3], [f32; 3])]) -> vectorial_hash_demos::model::SkinnedModel {
-    use vectorial_hash_demos::model::SkinnedModel;
-    let unit = unit_box();
-    let (mut verts, mut idx) = (Vec::new(), Vec::new());
-    for (c, s) in parts {
-        let base = verts.len() as u32;
-        for v in &unit.vertices {
-            let mut v2 = *v;
-            // unit_box is XZ-centred with base at y=0 → recentre to (c, s)
-            v2.pos = [c[0] + v.pos[0] * s[0], c[1] - s[1] * 0.5 + v.pos[1] * s[1], c[2] + v.pos[2] * s[2]];
-            verts.push(v2);
-        }
-        idx.extend(unit.indices.iter().map(|i| base + i));
-    }
-    SkinnedModel { vertices: verts, indices: idx, joint_frames: vec![glam::Mat4::IDENTITY.to_cols_array_2d()], num_joints: 1, n_frames: 1 }
-}
-
-/// The sleeping-carpet proxy: a slumped hump + head, base at y=0. Scaled by
-/// class at instance time; when a sleeper WAKES it "stands up" into the full
-/// skinned model — the wake wave is visible as figures rising from the carpet.
-fn slump_proxy() -> vectorial_hash_demos::model::SkinnedModel {
-    boxes_model(&[([0.0, 0.20, 0.0], [0.95, 0.40, 0.55]), ([0.48, 0.16, 0.0], [0.28, 0.32, 0.32])])
-}
-
-/// The far-LOD standing figure for active zombies past the LOD distance.
-fn stand_proxy() -> vectorial_hash_demos::model::SkinnedModel {
-    boxes_model(&[([0.0, 0.45, 0.0], [0.42, 0.90, 0.30]), ([0.0, 1.08, 0.0], [0.30, 0.28, 0.30])])
+/// Per-model orientation/size corrections (the slime faces +X — same tweak as
+/// siege's `model_tweak`, and it reads big). Baked into the impostor photos at
+/// capture time, applied live on the skinned path.
+fn ztweak(c: ZClass) -> (f32, f32) {
+    match c { ZClass::Chubby => (-std::f32::consts::FRAC_PI_2, 0.80), _ => (0.0, 1.0) }
 }
 
 /// LOD switch distance (camera→unit, wu): nearer = full GPU-skinned model,
-/// farther = the standing proxy. At the default orbit the whole field is proxy
-/// (units are a few pixels); zoom in and the front line turns into real models.
+/// farther = an **impostor billboard** (a photo of the model). At the default
+/// orbit the whole field is impostors (units are a few pixels anyway); zoom in
+/// and the front line turns into real models.
 const LOD_DIST: f32 = 620.0;
+
+// Impostor atlas: per class (texture-array layer), 8 yaw views × 16 rows of
+// 64 px cells — rows 0..8 = walk cycle, 8..12 = idle sway (the dormant carpet
+// breathes), 12 = the death pose (corpses). Captured at startup by photographing
+// each GPU-skinned model with an orbit-pitch ortho camera.
+const IMP_VIEWS: u32 = 8;
+const IMP_ROWS: u32 = 16;
+const IMP_CELL: u32 = 64;
+const IMP_WALK_FRAMES: u32 = 8;
+const IMP_IDLE_FRAMES: u32 = 4;
+const IMP_DEATH_ROW: u32 = 12;
+const IMP_ELEV: f32 = 0.62; // capture camera pitch (rad) ≈ the default orbit
+
+/// One impostor billboard: camera-facing quad, view/frame picked in-shader.
+/// `mode`: 0 = walking (animated), 1 = idle (slow sway), 2 = death (still).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct BillboardInst { pos: [f32; 3], size: f32, heading: f32, phase: f32, mode: u32, layer: u32, tint: [f32; 4] }
 
 // ============================================================ renderer
 
@@ -332,9 +344,12 @@ struct State {
     castle_model: GpuModel,
     cannon_model: GpuModel,
     cannon_inst_buf: wgpu::Buffer,
-    // LOD proxies + the static dormant carpet / append-only corpse buffers.
-    slump_model: GpuModel,
-    stand_model: GpuModel,
+    // Impostor billboards (the "photos"): pipeline + atlas + per-class geometry,
+    // and the static dormant carpet / append-only corpse buffers.
+    bb_pipeline: wgpu::RenderPipeline,
+    bb_bind: wgpu::BindGroup,
+    /// Per zombie class: (billboard world size, world y-centre offset).
+    bb_geom: [(f32, f32); 5],
     dormant_buf: wgpu::Buffer,
     dormant_n: u32,
     dormant_key: (u32, u64), // (run, dormant_epoch) that built the buffer
@@ -467,13 +482,111 @@ impl State {
         let cannon_model = build_gpu_model(&device, &cam_buf, &skin_layout, &bytes_of("cannon.glb"));
         let box_model = upload_skinned(&device, &cam_buf, &skin_layout, &unit_box());
         let box_inst_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("box-inst"), size: (1024 * std::mem::size_of::<SkinInstance>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        // LOD proxies + the static/append-only crowd buffers.
-        let slump_model = upload_skinned(&device, &cam_buf, &skin_layout, &slump_proxy());
-        let stand_model = upload_skinned(&device, &cam_buf, &skin_layout, &stand_proxy());
-        let dormant_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("dormant-inst"), size: (MAX_POP * std::mem::size_of::<SkinInstance>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        let proxy_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("proxy-inst"), size: ((MAX_POP + 8192) * std::mem::size_of::<SkinInstance>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        let corpse_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("corpse-inst"), size: (46_000 * std::mem::size_of::<SkinInstance>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        // Billboard instance buffers (48 B each — half a SkinInstance).
+        let dormant_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("dormant-inst"), size: (MAX_POP * std::mem::size_of::<BillboardInst>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let proxy_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("proxy-inst"), size: ((MAX_POP + 8192) * std::mem::size_of::<BillboardInst>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let corpse_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("corpse-inst"), size: (46_000 * std::mem::size_of::<BillboardInst>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let cannon_inst_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("cannon-inst"), size: (64 * std::mem::size_of::<SkinInstance>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+
+        // ---- Impostor atlas: photograph every zombie model (walk / idle /
+        // death) from 8 yaw angles into a texture array, then billboards
+        // replace the far models. All through the existing skin pipeline.
+        let idle_models: Vec<GpuModel> = UNIT_FILES[..5].iter().map(|f| build_gpu_model_prefs(&device, &cam_buf, &skin_layout, &bytes_of(f), &["idle", "fly", "walk"])).collect();
+        let death_models: Vec<GpuModel> = UNIT_FILES[..5].iter().map(|f| build_gpu_model_prefs(&device, &cam_buf, &skin_layout, &bytes_of(f), &["death", "hit", "idle"])).collect();
+        let atlas = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("impostor-atlas"),
+            size: wgpu::Extent3d { width: IMP_VIEWS * IMP_CELL, height: IMP_ROWS * IMP_CELL, depth_or_array_layers: 5 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
+        });
+        let atlas_depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("impostor-depth"),
+            size: wgpu::Extent3d { width: IMP_VIEWS * IMP_CELL, height: IMP_ROWS * IMP_CELL, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float, usage: wgpu::TextureUsages::RENDER_ATTACHMENT, view_formats: &[],
+        }).create_view(&wgpu::TextureViewDescriptor::default());
+        let mut bb_geom = [(0.0f32, 0.0f32); 5];
+        for (ci, walk) in models[..5].iter().enumerate() {
+            let class = [ZClass::Walker, ZClass::Runner, ZClass::Chubby, ZClass::Venom, ZClass::Harpy][ci];
+            let (tw_yaw, tw_scale) = ztweak(class);
+            let world_scale = zscale(class) * tw_scale;
+            bb_geom[ci] = (walk.half * 2.0 * world_scale, walk.center_y * world_scale);
+            let layer_view = atlas.create_view(&wgpu::TextureViewDescriptor { base_array_layer: ci as u32, array_layer_count: Some(1), dimension: Some(wgpu::TextureViewDimension::D2), ..Default::default() });
+            // (row, model, that row's frame) — walk cycle, idle sway, death pose.
+            let mut shots: Vec<(u32, &GpuModel, u32)> = Vec::new();
+            for r in 0..IMP_WALK_FRAMES { shots.push((r, walk, r * walk.n_frames.max(1) / IMP_WALK_FRAMES)); }
+            let idm = &idle_models[ci];
+            for k in 0..IMP_IDLE_FRAMES { shots.push((IMP_WALK_FRAMES + k, idm, k * idm.n_frames.max(1) / IMP_IDLE_FRAMES)); }
+            let dm = &death_models[ci];
+            shots.push((IMP_DEATH_ROW, dm, dm.n_frames.max(1) - 1));
+            let mut first = true;
+            for (row, m, frame) in shots {
+                for v in 0..IMP_VIEWS {
+                    // Ortho camera at orbit-ish pitch, azimuth v/8·τ, framing the model.
+                    let az = v as f32 / IMP_VIEWS as f32 * std::f32::consts::TAU;
+                    let (h, cy) = (m.half, m.center_y);
+                    let dir = Vec3::new(az.cos() * IMP_ELEV.cos(), IMP_ELEV.sin(), az.sin() * IMP_ELEV.cos());
+                    let view = Mat4::look_at_rh(Vec3::new(0.0, cy, 0.0) + dir * (h * 6.0), Vec3::new(0.0, cy, 0.0), Vec3::Y);
+                    let proj = Mat4::orthographic_rh(-h, h, -h, h, 0.1, h * 14.0);
+                    let cam = CameraUniform { vp: (proj * view).to_cols_array_2d(), light: [-0.45, 0.84, -0.30, 0.0], eye_time: [0.0; 4] };
+                    queue.write_buffer(&cam_buf, 0, bytemuck::cast_slice(&[cam]));
+                    let inst = SkinInstance { model: Mat4::from_rotation_y(tw_yaw).to_cols_array_2d(), color: [0.0, 0.0, 0.0, 0.0], frame_base: frame * m.num_joints, _pad: [0; 3] };
+                    queue.write_buffer(&inst_buf, 0, bytemuck::cast_slice(&[inst]));
+                    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                    {
+                        let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("impostor-shot"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &layer_view, resolve_target: None, ops: wgpu::Operations { load: if first { wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT) } else { wgpu::LoadOp::Load }, store: wgpu::StoreOp::Store } })],
+                            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &atlas_depth, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }),
+                            timestamp_writes: None, occlusion_query_set: None,
+                        });
+                        pass.set_viewport((v * IMP_CELL) as f32, (row * IMP_CELL) as f32, IMP_CELL as f32, IMP_CELL as f32, 0.0, 1.0);
+                        pass.set_pipeline(&skin_pipeline);
+                        pass.set_bind_group(0, &m.bind, &[]);
+                        pass.set_vertex_buffer(0, m.vbuf.slice(..));
+                        pass.set_vertex_buffer(1, inst_buf.slice(..));
+                        pass.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..m.nidx, 0, 0..1);
+                    }
+                    queue.submit(Some(enc.finish()));
+                    first = false;
+                }
+            }
+        }
+        // Billboard pipeline: camera + the atlas array + a sampler; the quad is
+        // generated from the vertex index (no vertex buffer), faced in-shader.
+        let atlas_view = atlas.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor { label: Some("impostor-sampler"), mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, address_mode_u: wgpu::AddressMode::ClampToEdge, address_mode_v: wgpu::AddressMode::ClampToEdge, ..Default::default() });
+        let bb_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bb-l"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+            ],
+        });
+        let bb_bind = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("bb-bg"), layout: &bb_layout, entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: cam_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&atlas_view) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
+        ] });
+        let bb_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("bb-shader"), source: wgpu::ShaderSource::Wgsl(BB_SHADER.into()) });
+        let bb_pipe_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("bb-pl"), bind_group_layouts: &[&bb_layout], push_constant_ranges: &[] });
+        let bb_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("bb-pipe"),
+            layout: Some(&bb_pipe_layout),
+            vertex: wgpu::VertexState {
+                module: &bb_shader,
+                entry_point: "vs",
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<BillboardInst>() as u64, step_mode: wgpu::VertexStepMode::Instance, attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32, 2 => Float32, 3 => Float32, 4 => Uint32, 5 => Uint32, 6 => Float32x4] }],
+            },
+            fragment: Some(wgpu::FragmentState { module: &bb_shader, entry_point: "fs", compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })] }),
+            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState { format: wgpu::TextureFormat::Depth32Float, depth_write_enabled: true, depth_compare: wgpu::CompareFunction::Less, stencil: Default::default(), bias: Default::default() }),
+            multisample: Default::default(),
+            multiview: None,
+        });
 
         let seed = std::env::var("HORDE_SEED").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0x40BDE);
         let pop = std::env::var("HORDE_POP").ok().and_then(|s| s.parse().ok()).unwrap_or(20_000).clamp(2_000, MAX_POP);
@@ -532,7 +645,7 @@ impl State {
             surface, device, queue, config,
             skin_pipeline, models, inst_buf,
             box_model, box_inst_buf, castle_model, cannon_model, cannon_inst_buf,
-            slump_model, stand_model, dormant_buf, dormant_n: 0, dormant_key: (0, 0),
+            bb_pipeline, bb_bind, bb_geom, dormant_buf, dormant_n: 0, dormant_key: (0, 0),
             proxy_buf, corpse_buf, corpse_n: 0,
             line_pipeline, line_buf, line_cap,
             ui_pipeline, ui_buf, ui_drag: 0,
@@ -609,8 +722,8 @@ impl State {
         };
         let view = Mat4::look_at_rh(eye, target, Vec3::Y);
         let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
-        let proj = Mat4::perspective_rh(45f32.to_radians(), aspect, 1.0, 4000.0);
-        CameraUniform { vp: (proj * view).to_cols_array_2d(), light: [-0.45, 0.84, -0.30, 0.0] }
+        let proj = Mat4::perspective_rh(45f32.to_radians(), aspect, 1.0, 5200.0);
+        CameraUniform { vp: (proj * view).to_cols_array_2d(), light: [-0.45, 0.84, -0.30, 0.0], eye_time: [eye.x, eye.y, eye.z, self.sim.now as f32] }
     }
 
     fn update_and_render(&mut self) {
@@ -647,13 +760,16 @@ impl State {
         let key = (self.sim.run, self.sim.dormant_epoch);
         if !self.lod { self.dormant_n = 0; self.dormant_key = (0, 0); }
         if self.lod && key != self.dormant_key {
-            let mut di: Vec<SkinInstance> = Vec::with_capacity(self.sim.units.len());
+            let mut di: Vec<BillboardInst> = Vec::with_capacity(self.sim.units.len());
             for (i, z) in self.sim.units.iter().enumerate() {
                 if !z.alive() || !z.dormant() { continue; }
-                let scale = zscale(z.class) * 0.9;
-                let yaw = (i as f32) * 2.399963; // hashed rest orientation
-                let m = Mat4::from_translation(Vec3::new(z.p.x as f32, z.p.y as f32, z.p.z as f32)) * Mat4::from_rotation_y(yaw) * Mat4::from_scale(Vec3::splat(scale));
-                di.push(SkinInstance { model: m.to_cols_array_2d(), color: ztint(z.class, true), frame_base: 0, _pad: [0; 3] });
+                let (size, cy) = self.bb_geom[zmodel(z.class)];
+                di.push(BillboardInst {
+                    pos: [z.p.x as f32, z.p.y as f32 + cy, z.p.z as f32],
+                    size, heading: (i as f32) * 2.399963, phase: (i % 97) as f32 * 0.0103,
+                    mode: 1, layer: zmodel(z.class) as u32,
+                    tint: [0.0, 0.0, 0.0, 0.30], // sleepers read darker
+                });
             }
             di.truncate(MAX_POP);
             self.queue.write_buffer(&self.dormant_buf, 0, bytemuck::cast_slice(&di));
@@ -662,19 +778,23 @@ impl State {
         }
 
         // Corpses: append-only — upload only the new bodies since last frame
-        // (full rebuild after a drain/reset shrinks the vec).
+        // (full rebuild after a drain/reset shrinks the vec). Death-pose photo.
         {
             let corpses = &self.sim.corpses;
             let n = corpses.len().min(46_000);
             let from = if (self.corpse_n as usize) <= n { self.corpse_n as usize } else { 0 };
             if n > from || from == 0 && n < self.corpse_n as usize {
-                let mut ci: Vec<SkinInstance> = Vec::with_capacity(n - from.min(n));
+                let mut ci: Vec<BillboardInst> = Vec::with_capacity(n - from.min(n));
                 for (p, class, _) in &corpses[from..n] {
-                    let s = zscale(*class);
-                    let m = Mat4::from_translation(Vec3::new(p.x as f32, p.y as f32 + 0.2, p.z as f32)) * Mat4::from_rotation_y((p.x.to_bits() % 628) as f32 * 0.01) * Mat4::from_scale(Vec3::new(s, s * 0.22, s));
-                    ci.push(SkinInstance { model: m.to_cols_array_2d(), color: [0.26, 0.23, 0.21, 0.7], frame_base: 0, _pad: [0; 3] });
+                    let (size, cy) = self.bb_geom[zmodel(*class)];
+                    ci.push(BillboardInst {
+                        pos: [p.x as f32, p.y as f32 + cy * 0.4, p.z as f32],
+                        size: size * 0.9, heading: (p.x.to_bits() % 628) as f32 * 0.01, phase: 0.0,
+                        mode: 2, layer: zmodel(*class) as u32,
+                        tint: [0.05, 0.03, 0.03, 0.45], // cold bodies
+                    });
                 }
-                if !ci.is_empty() { self.queue.write_buffer(&self.corpse_buf, (from * std::mem::size_of::<SkinInstance>()) as u64, bytemuck::cast_slice(&ci)); }
+                if !ci.is_empty() { self.queue.write_buffer(&self.corpse_buf, (from * std::mem::size_of::<BillboardInst>()) as u64, bytemuck::cast_slice(&ci)); }
                 self.corpse_n = n as u32;
             }
         }
@@ -682,7 +802,7 @@ impl State {
         // ACTIVE zombies: full skinned model when near (LOD_DIST), the standing
         // proxy when far; defenders always skinned (there are ~50 of them).
         let mut buckets: Vec<Vec<SkinInstance>> = (0..self.models.len()).map(|_| Vec::new()).collect();
-        let mut proxies: Vec<SkinInstance> = Vec::new();
+        let mut proxies: Vec<BillboardInst> = Vec::new();
         for (i, z) in self.sim.units.iter().enumerate() {
             if !z.alive() { continue; }
             let dormant = z.dormant();
@@ -693,17 +813,23 @@ impl State {
             let yaw = (z.vel.1 as f32).atan2(z.vel.0 as f32);
             let d2 = (Vec3::new(x, y, zz) - eye).length_squared();
             if self.lod && d2 > LOD_DIST * LOD_DIST {
-                let m = Mat4::from_translation(Vec3::new(x, y, zz)) * Mat4::from_rotation_y(-yaw) * Mat4::from_scale(Vec3::splat(scale));
-                proxies.push(SkinInstance { model: m.to_cols_array_2d(), color: ztint(z.class, false), frame_base: 0, _pad: [0; 3] });
+                // Far: a walking impostor (photo billboard, animated in-shader).
+                let (size, cy) = self.bb_geom[zmodel(z.class)];
+                proxies.push(BillboardInst {
+                    pos: [x, y + cy, zz], size, heading: -yaw,
+                    phase: (i % 89) as f32 * 0.0112,
+                    mode: 0, layer: zmodel(z.class) as u32, tint: [0.0, 0.0, 0.0, 0.0],
+                });
                 continue;
             }
+            let (tw_yaw, tw_scale) = ztweak(z.class);
             let mi = zmodel(z.class);
             let m = &self.models[mi];
             let nf = m.n_frames.max(1);
             let phase = (i as u32 % 8) as f32 / 8.0; // per-instance anim jitter
             let frame = if dormant { ((phase * nf as f32) as u32) % nf } // NOLOD A/B path
                 else { (((now as f32 * 1.6 + phase) * nf as f32) as u32) % nf };
-            let model = Mat4::from_translation(Vec3::new(x, y, zz)) * Mat4::from_rotation_y(-yaw + std::f32::consts::FRAC_PI_2) * Mat4::from_scale(Vec3::splat(scale));
+            let model = Mat4::from_translation(Vec3::new(x, y, zz)) * Mat4::from_rotation_y(-yaw + std::f32::consts::FRAC_PI_2 + tw_yaw) * Mat4::from_scale(Vec3::splat(scale * tw_scale));
             buckets[mi].push(SkinInstance { model: model.to_cols_array_2d(), color: ztint(z.class, dormant), frame_base: frame * m.num_joints, _pad: [0; 3] });
         }
         proxies.truncate(MAX_POP + 8192);
@@ -839,7 +965,7 @@ impl State {
             tris += (m.nidx as u64 / 3) * (e - s) as u64;
         }
         tris += (self.box_model.nidx as u64 / 3) * box_n as u64 + (self.cannon_model.nidx as u64 / 3) * cannon_n as u64 + self.castle_model.nidx as u64 / 3;
-        tris += (self.slump_model.nidx as u64 / 3) * (self.dormant_n + self.corpse_n) as u64 + (self.stand_model.nidx as u64 / 3) * proxy_n as u64;
+        tris += 2 * (self.dormant_n + self.corpse_n + proxy_n) as u64; // impostor quads
         let white = [0.92, 0.94, 0.98, 1.0];
         let hx = sw - 170.0;
         let (wave_k, announced, wdir, eta) = self.sim.wave_info();
@@ -896,34 +1022,24 @@ impl State {
             pass.set_vertex_buffer(0, self.terrain_vbuf.slice(..));
             pass.set_index_buffer(self.terrain_ibuf.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..self.terrain_nidx, 0, 0..1);
-            pass.set_pipeline(&self.skin_pipeline);
-            // the sleeping carpet — static buffer, zero per-frame CPU/upload
+            // Impostor billboards: the sleeping carpet (static buffer, zero
+            // per-frame CPU), the aftermath corpses (append-only), and the far
+            // actives — all photos from the atlas, faced + animated in-shader.
+            pass.set_pipeline(&self.bb_pipeline);
+            pass.set_bind_group(0, &self.bb_bind, &[]);
             if self.dormant_n > 0 {
-                let sm = &self.slump_model;
-                pass.set_bind_group(0, &sm.bind, &[]);
-                pass.set_vertex_buffer(0, sm.vbuf.slice(..));
-                pass.set_vertex_buffer(1, self.dormant_buf.slice(..));
-                pass.set_index_buffer(sm.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..sm.nidx, 0, 0..self.dormant_n);
+                pass.set_vertex_buffer(0, self.dormant_buf.slice(..));
+                pass.draw(0..6, 0..self.dormant_n);
             }
-            // the aftermath field — append-only corpse buffer
             if self.corpse_n > 0 {
-                let sm = &self.slump_model;
-                pass.set_bind_group(0, &sm.bind, &[]);
-                pass.set_vertex_buffer(0, sm.vbuf.slice(..));
-                pass.set_vertex_buffer(1, self.corpse_buf.slice(..));
-                pass.set_index_buffer(sm.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..sm.nidx, 0, 0..self.corpse_n);
+                pass.set_vertex_buffer(0, self.corpse_buf.slice(..));
+                pass.draw(0..6, 0..self.corpse_n);
             }
-            // far-LOD active zombies — standing proxies
             if proxy_n > 0 {
-                let pm = &self.stand_model;
-                pass.set_bind_group(0, &pm.bind, &[]);
-                pass.set_vertex_buffer(0, pm.vbuf.slice(..));
-                pass.set_vertex_buffer(1, self.proxy_buf.slice(..));
-                pass.set_index_buffer(pm.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..pm.nidx, 0, 0..proxy_n);
+                pass.set_vertex_buffer(0, self.proxy_buf.slice(..));
+                pass.draw(0..6, 0..proxy_n);
             }
+            pass.set_pipeline(&self.skin_pipeline);
             pass.set_vertex_buffer(1, self.inst_buf.slice(..));
             for (mi, m) in self.models.iter().enumerate() {
                 let (s, e) = ranges[mi];
@@ -1060,6 +1176,60 @@ fn vs(@location(0) p: vec2<f32>, @location(1) color: vec4<f32>) -> VOut {
 }
 @fragment
 fn fs(in: VOut) -> @location(0) vec4<f32> { return in.color; }
+"#;
+
+// Impostor billboards: a camera-facing quad per instance (no vertex buffer —
+// corners from the vertex index); the shader picks the atlas VIEW column from
+// the camera→instance azimuth vs the instance heading, and the FRAME row from
+// the mode (0 walk cycle · 1 idle sway · 2 death pose) + time. Alpha-cutout.
+const BB_SHADER: &str = r#"
+struct Camera { vp: mat4x4<f32>, light: vec4<f32>, eye_time: vec4<f32> };
+@group(0) @binding(0) var<uniform> cam: Camera;
+@group(0) @binding(1) var atlas: texture_2d_array<f32>;
+@group(0) @binding(2) var samp: sampler;
+struct VOut { @builtin(position) clip: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) tint: vec4<f32>, @location(2) layer: u32 };
+const TAU: f32 = 6.2831853;
+@vertex
+fn vs(@builtin(vertex_index) vi: u32,
+      @location(0) pos: vec3<f32>, @location(1) size: f32, @location(2) heading: f32,
+      @location(3) phase: f32, @location(4) mode: u32, @location(5) layer: u32,
+      @location(6) tint: vec4<f32>) -> VOut {
+    // corner of a unit quad (two triangles, centre-anchored)
+    var corners = array<vec2<f32>, 6>(
+        vec2(-0.5, -0.5), vec2(0.5, -0.5), vec2(0.5, 0.5),
+        vec2(-0.5, -0.5), vec2(0.5, 0.5), vec2(-0.5, 0.5));
+    let c = corners[vi];
+    // face the camera (cylindrical billboard: horizontal spin only)
+    let to_cam = cam.eye_time.xyz - pos;
+    let fwd = normalize(vec2(to_cam.x, to_cam.z));
+    let right = vec3<f32>(-fwd.y, 0.0, fwd.x);
+    let world = pos + right * (c.x * size) + vec3<f32>(0.0, c.y * size, 0.0);
+    // atlas view column: the capture azimuth that matches this sight line
+    let a_cam = atan2(to_cam.z, to_cam.x);
+    var rel = a_cam - heading;
+    rel = rel - TAU * floor(rel / TAU);
+    let view = u32(floor(rel / TAU * 8.0 + 0.5)) % 8u;
+    // frame row by mode
+    let t = cam.eye_time.w;
+    var row = 12u; // death pose
+    if (mode == 0u) { row = u32(floor((t * 1.6 + phase * 8.0) * 8.0)) % 8u; }
+    else if (mode == 1u) { row = 8u + u32(floor((t * 0.7 + phase * 4.0) * 4.0)) % 4u; }
+    let u0 = (f32(view) + (c.x + 0.5)) / 8.0;
+    let v0 = (f32(row) + (0.5 - c.y)) / 16.0;
+    var o: VOut;
+    o.clip = cam.vp * vec4<f32>(world, 1.0);
+    o.uv = vec2(u0, v0);
+    o.tint = tint;
+    o.layer = layer;
+    return o;
+}
+@fragment
+fn fs(in: VOut) -> @location(0) vec4<f32> {
+    let px = textureSample(atlas, samp, in.uv, in.layer);
+    if (px.a < 0.5) { discard; }
+    let rgb = mix(px.rgb, in.tint.rgb, in.tint.a);
+    return vec4<f32>(rgb, 1.0);
+}
 "#;
 
 #[cfg(not(target_arch = "wasm32"))]
