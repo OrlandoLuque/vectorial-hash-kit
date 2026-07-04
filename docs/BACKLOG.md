@@ -16,16 +16,30 @@ autonomously verifiable. User picked **"Todo (A–E)"** + the headline below.
 **ORDER (user, 2026-06-27): multithreading FIRST, then `siege`, then the rest.**
 
 **★ NEXT DEMOS (user, 2026-07-02): two new flagship demos, "las dos" — wgpu-direct.**
-- **HORDE — phases 1–3 BUILT (2026-07-02/03)**: `horde_sim` (noise-wake culls,
-  waves, towers, flow field, breaches, infection, Commander/defenders/works
-  economy + breach recall; 13 brute-force-gated tests) + `horde_wgpu` (GPU
-  skinning, dormant frozen poses, corpses, tracers, HUD/wave banner, web build)
-  + `horde_bench` (**100k dormant = 0.42 ms/step** — the keep-index headline).
-  Shipped doc: [HORDE.md](HORDE.md). **Queued rounds** (design in
-  [HORDE_DESIGN.md](HORDE_DESIGN.md)): scale pass (decision buckets 4–8 Hz,
-  activation bubbles, LOD/impostors), molón round (night+torches, blood RT,
-  trauma cam, dust), scenario presets, Tree3↔Morton↔2D live toggle, Quaternius
-  RTS wall models.
+- **HORDE — BUILT through the render scale pass (2026-07-02/06)**: `horde_sim`
+  (noise-wake culls, waves + manual `N` trigger, towers, flow field, breaches,
+  infection, Commander/defenders/sorties via gates, works economy + breach
+  recall, contact trampling — 17 brute-force-gated tests) + `horde_wgpu`
+  (**impostor billboards**: startup-photographed atlas, 8 yaws × 3 elevation
+  bands × walk/idle/death clips; skinned models only in the camera bubble;
+  static carpet + append-only corpses; playtest-driven fixes). Headlines:
+  **100k dormant = 0.42 ms/step (sim) and ~740 fps rendered**; wave-time FPS
+  fixed by closing 3 feedback loops (carpet rebuilds, contact percolation,
+  walking noise). Shipped doc: [HORDE.md](HORDE.md).
+  **HORDE queue (priority order):**
+  1. **Decision buckets 4–8 Hz** (user: "sí") — the CPU lever: active zombies
+     re-decide every N frames (staggered by id; vel already caches between
+     decides), full-rate near the walls if needed. Target: ~110k active from
+     10 fps → 40-60+. Measure with horde_bench + wave telemetry.
+  2. Impostor **elevation-band blending** — only if the band switch is visible
+     when flying the camera up/down (user to confirm).
+  3. **Scenario presets** (mountain pass / river crossing / the expedition) —
+     scripted layouts over the same sim, HORDE_DESIGN § Scenarios.
+  4. **Molón round**: night assaults + torch lighting (clustered forward),
+     blood render-target, trauma camera, dust billboards.
+  5. **Tree3 ↔ Morton ↔ 2D live toggle** (`M`, user picked "ambos conmutables").
+  6. **Quaternius Ultimate Fantasy RTS** wall/tower/house models to replace the
+     procedural boxes (pack vetted in HORDE_DESIGN).
 - **FORMATIONS — researched, build queued**: [FORMATIONS_DESIGN.md](FORMATIONS_DESIGN.md)
   (regiment slot formations, contact k-NN pairing, **Polyhedron3 flank/rear
   wedges → morale**, chain routs, charges, banners; KayKit asset picks).

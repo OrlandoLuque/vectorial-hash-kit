@@ -15,9 +15,19 @@ cargo run -p vectorial-hash-demos --bin horde_wgpu --release --features parallel
 
 Live (WebGPU): <https://orlandoluque.github.io/vectorial-hash-kit/horde_wgpu.html>
 
-- drag: orbit · scroll: zoom · `P`/button: pause · `[` `]` + slider: population
-  (2 000 – 100 000) · `T`: tower targeting (nearest ↔ highest-threat) · `K`:
-  frustum cull · `F`: free-fly (WASD/QE) · thread slider (native).
+- drag: orbit · scroll: zoom · `P`/button: pause · **`N`/WAVE button: summon
+  the next wave** (announce at 5 s; press again to land it NOW) · `[` `]` +
+  slider: population (2 000 – 100 000) · `T`: tower targeting (nearest ↔
+  highest-threat) · `K`: frustum cull · `F`: free-fly (WASD/QE) · thread
+  slider (native).
+- Contact matters: a marching column **tramples sleepers awake** as it rolls
+  over them (walking is silent — aggro spreads via combat noise and touch).
+- Rendering: **impostor billboards** ("photos" of each model: 8 yaws × 3
+  elevation bands × walk/idle/death frames, captured at startup) draw
+  everything beyond ~170 wu; the camera bubble gets real GPU-skinned models
+  (sleepers in it play their real Idle clip); corpses play the Death clip once
+  from the moment they fall. The sleeping carpet is a static buffer (zero
+  upload between changes, throttled rebuilds).
 - Design + research (the TAB noise model with numbers, scenarios, defender AI):
   [HORDE_DESIGN.md](HORDE_DESIGN.md). Sim: `src/horde_sim.rs` (graphics-free,
   brute-force-gated tests); renderer: `src/bin/horde_wgpu.rs`.
@@ -93,11 +103,23 @@ ant lines are the repair pacing) and the towers' own noise quietly pulls
 stragglers in. The Command Center falling = defeat; clearing the final wave =
 survival; either way the run resets with a fresh map a few seconds later.
 
+## Where the frame budget lives now (measured)
+
+Drawing is solved (impostors: 100k dormant ≈ 740+ fps) and sleeping is solved
+(keep-index: 0.42 ms). The one remaining cost is **thinking while awake**:
+~1 µs/zombie/frame of queries (separation cull + flow + targeting +
+`update_ref`). CPU-only: ~35k active = 93 fps, ~110k active = 10 fps — and the
+rendered FPS matches that curve exactly (the GPU idles). Three feedback loops
+that used to ignite the whole map in seconds (per-frame carpet rebuilds,
+contact-wake percolation, walking noise) are fixed; a wave now recruits
+linearly along its path and via wall-combat noise.
+
 ## Still queued
 
-Scale pass (decision buckets, activation bubbles, LOD tiers, impostors), the
-molón round (night assaults + torches, blood render-target, trauma camera,
-dust), scenario presets (mountain pass / river crossing / the expedition), the
-index-structure live toggle (Tree3 ↔ Morton ↔ 2D), and the Quaternius Ultimate
-Fantasy RTS wall/tower models to replace the procedural boxes. See
+**Decision buckets 4–8 Hz** (the CPU lever for the all-active case — approved),
+elevation-band blending for the impostors if the switch shows, the molón round
+(night assaults + torches, blood render-target, trauma camera, dust), scenario
+presets (mountain pass / river crossing / the expedition), the index-structure
+live toggle (Tree3 ↔ Morton ↔ 2D), and the Quaternius Ultimate Fantasy RTS
+wall/tower models to replace the procedural boxes. See
 [HORDE_DESIGN.md](HORDE_DESIGN.md) + [BACKLOG.md](BACKLOG.md).
