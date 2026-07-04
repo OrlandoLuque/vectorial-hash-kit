@@ -372,6 +372,8 @@ pub struct Horde {
     pub kills: u64,
     pub rng: Rng,
     pub now: f64,
+    /// Frame counter — staggers the decision buckets.
+    frame: u64,
     pub seed: f64,
     /// Woken-this-frame counter (for HUD/telemetry).
     pub woken_last: usize,
@@ -507,7 +509,7 @@ impl Horde {
             tower_threat_mode: false, cc_id,
             wave_k: 0, wave_spawn_t: 50.0, wave_dir: 0.0, wave_announced: false,
             game_over: None, run: 1, kills: 0,
-            rng, now: 0.0, seed: fseed, woken_last: 0, dormant_epoch: 1,
+            rng, now: 0.0, frame: 0, seed: fseed, woken_last: 0, dormant_epoch: 1,
             base_pop: pop, base_seed: seed,
             defenders: Vec::new(), threat: [0.0; SECTORS], weapons_free: false, cmd_t: 0.0, breach: None,
             gates: Vec::new(),
@@ -697,6 +699,7 @@ impl Horde {
     /// keep-index sync.
     pub fn step(&mut self, dt: f64) {
         self.now += dt;
+        self.frame += 1;
         self.sync_index();
         self.step_waves();
         // Throttled flow-field rebuild after breaches / repairs.
@@ -753,6 +756,7 @@ impl Horde {
         {
             let (index, sindex, structures, flow) = (&self.zindex, &self.sindex, &self.structures, &self.flow);
             let defenders = &self.defenders;
+            let frame = self.frame;
             let (units, cx, cz) = (&mut self.units, WORLD / 2.0, WORLD / 2.0);
             let decide_one = |i: usize, z: &mut Zombie| {
                 if !z.alive() { return; }
@@ -766,6 +770,15 @@ impl Horde {
                         return;
                     }
                     _ => {}
+                }
+                // DECISION BUCKETS: away from the walls a zombie re-decides at
+                // 15 Hz (staggered by id) — its cached velocity keeps it walking
+                // between decisions, movement/heard/swings still run every
+                // frame. Near the walls (combat) everyone thinks at full rate.
+                {
+                    let (dx0, dz0) = (z.p.x - cx, z.p.z - cz);
+                    let near_combat = (dx0 * dx0 + dz0 * dz0).sqrt() < BASE_R + 60.0;
+                    if !near_combat && (frame + i as u64) % 4 != 0 { return; } // keep cached vel
                 }
                 // Target acquisition near the base: nearest LIVE structure in
                 // reach (k-NN on the static index; venom's 36-wu standoff spit
