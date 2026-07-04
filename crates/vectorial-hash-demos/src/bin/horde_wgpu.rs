@@ -1253,7 +1253,7 @@ struct Camera { vp: mat4x4<f32>, light: vec4<f32>, eye_time: vec4<f32> };
 @group(0) @binding(0) var<uniform> cam: Camera;
 @group(0) @binding(1) var atlas: texture_2d_array<f32>;
 @group(0) @binding(2) var samp: sampler;
-struct VOut { @builtin(position) clip: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) tint: vec4<f32>, @location(2) layer: u32 };
+struct VOut { @builtin(position) clip: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) tint: vec4<f32>, @location(2) layer: u32, @location(3) uv2: vec2<f32>, @location(4) bandmix: f32 };
 const TAU: f32 = 6.2831853;
 @vertex
 fn vs(@builtin(vertex_index) vi: u32,
@@ -1277,9 +1277,12 @@ fn vs(@builtin(vertex_index) vi: u32,
     var rel = a_cam - heading;
     rel = rel - TAU * floor(rel / TAU);
     let view = u32(floor(rel / TAU * 8.0 + 0.5)) % 8u;
+    // continuous elevation band (captured at 0.17 / 0.62 / 1.10 rad) → blend
+    // the two nearest bands so climbing the camera never pops
     let pitch = atan2(to_cam.y, max(length(vec2(to_cam.x, to_cam.z)), 0.001));
-    var band = 0u; // captured at 0.17 / 0.62 / 1.10 rad
-    if (pitch > 0.86) { band = 2u; } else if (pitch > 0.40) { band = 1u; }
+    let bandf = clamp((pitch - 0.17) / 0.465, 0.0, 2.0); // 0.17→0, 0.635→1, 1.10→2
+    let b0 = u32(floor(bandf));
+    let b1 = min(b0 + 1u, 2u);
     // frame row by mode
     let t = cam.eye_time.w;
     var row = 12u;
@@ -1289,18 +1292,21 @@ fn vs(@builtin(vertex_index) vi: u32,
         let local = max(t - phase, 0.0);
         row = 12u + min(u32(local * 5.0), 3u);
     }
-    let u0 = (f32(band * 8u + view) + (c.x + 0.5)) / 24.0;
     let v0 = (f32(row) + (0.5 - c.y)) / 16.0;
     var o: VOut;
     o.clip = cam.vp * vec4<f32>(world, 1.0);
-    o.uv = vec2(u0, v0);
+    o.uv = vec2((f32(b0 * 8u + view) + (c.x + 0.5)) / 24.0, v0);
+    o.uv2 = vec2((f32(b1 * 8u + view) + (c.x + 0.5)) / 24.0, v0);
+    o.bandmix = fract(bandf);
     o.tint = tint;
     o.layer = layer;
     return o;
 }
 @fragment
 fn fs(in: VOut) -> @location(0) vec4<f32> {
-    let px = textureSample(atlas, samp, in.uv, in.layer);
+    let pa = textureSample(atlas, samp, in.uv, in.layer);
+    let pb = textureSample(atlas, samp, in.uv2, in.layer);
+    let px = mix(pa, pb, in.bandmix);
     if (px.a < 0.5) { discard; }
     let rgb = mix(px.rgb, in.tint.rgb, in.tint.a);
     return vec4<f32>(rgb, 1.0);
