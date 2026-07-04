@@ -27,10 +27,11 @@ autonomously verifiable. User picked **"Todo (A–E)"** + the headline below.
   fixed by closing 3 feedback loops (carpet rebuilds, contact percolation,
   walking noise). Shipped doc: [HORDE.md](HORDE.md).
   **HORDE queue (priority order):**
-  1. **Decision buckets 4–8 Hz** (user: "sí") — the CPU lever: active zombies
-     re-decide every N frames (staggered by id; vel already caches between
-     decides), full-rate near the walls if needed. Target: ~110k active from
-     10 fps → 40-60+. Measure with horde_bench + wave telemetry.
+  1. ~~**Decision buckets 4–8 Hz**~~ — **DONE** (2026-07-06): far-from-walls
+     actives re-decide at 15 Hz (staggered; cached vel walks between), full
+     rate inside BASE_R+60. With the dynamics fixes (silent walking killed the
+     per-frame wake-cull storm): 100k pop mass assault 100 ms → **4.9 ms with
+     62k active (205 fps ceiling)**.
   2. Impostor **elevation-band blending** — only if the band switch is visible
      when flying the camera up/down (user to confirm).
   3. **Scenario presets** (mountain pass / river crossing / the expedition) —
