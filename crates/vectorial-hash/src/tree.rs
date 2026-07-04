@@ -285,6 +285,49 @@ impl<T: Positioned> Tree<T> {
         }
     }
 
+    /// Build a tree from **all `items` at once** — a top-down partition (the
+    /// same `pick_split` rule `divide` uses) rather than N `insert`s. Handle `i`
+    /// addresses `items[i]` (so `ItemRef(i)` is stable, as after inserting in
+    /// order) — the same contract as [`crate::Tree3::bulk_load`]. Items are
+    /// assumed within `bbox`. Under the `neighbors` feature the leaf ropes are
+    /// rebuilt geometrically after the build (as [`Tree::deserialize`] does).
+    pub fn bulk_load(bbox: Rect, item_limit: usize, items: Vec<T>) -> Self {
+        assert!(item_limit >= 1, "item_limit must be >= 1");
+        let min_cell = bbox.width.max(bbox.height) * 1e-12;
+        let n = items.len();
+        let mut nodes: Vec<Node<T>> = Vec::new();
+        let mut locs = vec![ItemLoc { node: NodeId(0), slot: 0 }; n];
+        let indexed: Vec<(u32, T)> = items.into_iter().enumerate().map(|(i, it)| (i as u32, it)).collect();
+        build2_serial(&mut nodes, &mut locs, item_limit, min_cell, bbox, None, indexed);
+        #[allow(unused_mut)]
+        let mut tree = Tree { nodes, free: Vec::new(), locs, free_handles: Vec::new(), item_limit, merge_limit: item_limit, min_cell, root: NodeId(0) };
+        #[cfg(feature = "neighbors")]
+        tree.rebuild_ropes();
+        tree
+    }
+
+    /// Parallel [`Tree::bulk_load`] (feature `parallel`): the top-down partition
+    /// — the O(n log n) work — fans out over rayon (`join` per split); the arena
+    /// flatten is a cheap serial tail. The 2D sibling of
+    /// [`crate::Tree3::bulk_load_par`] (see `docs/PARALLEL.md`).
+    #[cfg(feature = "parallel")]
+    pub fn bulk_load_par(bbox: Rect, item_limit: usize, items: Vec<T>) -> Self
+    where T: Send {
+        assert!(item_limit >= 1, "item_limit must be >= 1");
+        let min_cell = bbox.width.max(bbox.height) * 1e-12;
+        let n = items.len();
+        let indexed: Vec<(u32, T)> = items.into_iter().enumerate().map(|(i, it)| (i as u32, it)).collect();
+        let build = build2_par(item_limit, min_cell, bbox, indexed);
+        let mut nodes: Vec<Node<T>> = Vec::new();
+        let mut locs = vec![ItemLoc { node: NodeId(0), slot: 0 }; n];
+        flatten2(&mut nodes, &mut locs, bbox, None, build);
+        #[allow(unused_mut)]
+        let mut tree = Tree { nodes, free: Vec::new(), locs, free_handles: Vec::new(), item_limit, merge_limit: item_limit, min_cell, root: NodeId(0) };
+        #[cfg(feature = "neighbors")]
+        tree.rebuild_ropes();
+        tree
+    }
+
     /// Walk parents up from `leaf` until one whose bbox contains `point`.
     /// Returns `None` if the search escapes the root (`point` out of bounds).
     fn ascend_to_lca(&self, leaf: NodeId, point: Point) -> Option<NodeId> {
@@ -1024,6 +1067,12 @@ impl<T: Positioned> Tree<T> {
 /// - Rectangles split along the long axis so both children are closer to square.
 /// - Squares pick the axis that distributes items most evenly.
 fn pick_split<T: Positioned>(bbox: Rect, items: &[T]) -> (Rect, Rect) {
+    pick_split_by(bbox, items, T::position)
+}
+
+/// The rule behind [`pick_split`], generic over how an element exposes its
+/// position — shared with the bulk build, whose elements are `(handle, item)`.
+fn pick_split_by<E>(bbox: Rect, items: &[E], pos: impl Fn(&E) -> Point) -> (Rect, Rect) {
     if bbox.width > bbox.height {
         let half = bbox.width / 2.0;
         (
@@ -1039,8 +1088,8 @@ fn pick_split<T: Positioned>(bbox: Rect, items: &[T]) -> (Rect, Rect) {
     } else {
         let mid_x = bbox.x + bbox.width / 2.0;
         let mid_y = bbox.y + bbox.height / 2.0;
-        let left = items.iter().filter(|it| it.position().x < mid_x).count();
-        let top = items.iter().filter(|it| it.position().y < mid_y).count();
+        let left = items.iter().map(&pos).filter(|p| p.x < mid_x).count();
+        let top = items.iter().map(&pos).filter(|p| p.y < mid_y).count();
         let n = items.len() as i64;
         let vert_balance = (2 * left as i64 - n).abs();
         let horz_balance = (2 * top as i64 - n).abs();
@@ -1058,6 +1107,85 @@ fn pick_split<T: Positioned>(bbox: Rect, items: &[T]) -> (Rect, Rect) {
             )
         }
     }
+}
+
+// ------------------------------------------------------------- bulk build
+// Shared top-down build for `Tree::bulk_load` / `bulk_load_par` — the 2D mirror
+// of `tree3::build3_serial`/`build3_par`, splitting with the same `pick_split`
+// rule `divide` uses incrementally.
+
+/// A node should split iff it overflows `item_limit`, hasn't hit the `min_cell`
+/// floor, and its items aren't all at one point (inseparable) — mirrors `divide`.
+fn splittable2<T: Positioned>(items: &[(u32, T)], item_limit: usize, min_cell: f64, bbox: Rect) -> bool {
+    items.len() > item_limit
+        && bbox.width.max(bbox.height) > min_cell
+        && { let first = items[0].1.position(); !items.iter().all(|(_, it)| it.position() == first) }
+}
+
+/// Recursively build the arena in DFS order. Returns the new node's id.
+fn build2_serial<T: Positioned>(nodes: &mut Vec<Node<T>>, locs: &mut [ItemLoc], item_limit: usize, min_cell: f64, bbox: Rect, parent: Option<NodeId>, items: Vec<(u32, T)>) -> NodeId {
+    let id = NodeId(nodes.len() as u32);
+    nodes.push(Node::new_leaf(bbox, parent));
+    if !splittable2(&items, item_limit, min_cell, bbox) {
+        let node = &mut nodes[id.0 as usize];
+        for (h, it) in items {
+            let slot = node.items.len() as u32;
+            locs[h as usize] = ItemLoc { node: id, slot };
+            node.items.push(it); node.hs.push(h);
+        }
+        return id;
+    }
+    let (ab, bb) = pick_split_by(bbox, &items, |e| e.1.position());
+    let (mut ai, mut bi) = (Vec::new(), Vec::new());
+    for (h, it) in items { if ab.contains(it.position()) { ai.push((h, it)); } else { bi.push((h, it)); } }
+    let a = build2_serial(nodes, locs, item_limit, min_cell, ab, Some(id), ai);
+    let b = build2_serial(nodes, locs, item_limit, min_cell, bb, Some(id), bi);
+    nodes[id.0 as usize].children = Some([a, b]);
+    id
+}
+
+/// A subtree built off-arena (so the recursion can fan out over threads). Unlike
+/// `tree3::Build3`, the split rects ride along: `pick_split`'s square case is
+/// item-balance-dependent, so the boxes can't be recomputed on flatten.
+#[cfg(feature = "parallel")]
+enum Build2<T> { Leaf(Vec<(u32, T)>), Split(Rect, Rect, Box<Build2<T>>, Box<Build2<T>>) }
+
+/// Parallel partition (rayon `join` per split) producing a [`Build2`] tree.
+#[cfg(feature = "parallel")]
+fn build2_par<T: Positioned + Send>(item_limit: usize, min_cell: f64, bbox: Rect, items: Vec<(u32, T)>) -> Build2<T> {
+    if !splittable2(&items, item_limit, min_cell, bbox) { return Build2::Leaf(items); }
+    let (ab, bb) = pick_split_by(bbox, &items, |e| e.1.position());
+    let (mut ai, mut bi) = (Vec::new(), Vec::new());
+    for (h, it) in items { if ab.contains(it.position()) { ai.push((h, it)); } else { bi.push((h, it)); } }
+    let (a, b) = rayon::join(
+        || build2_par(item_limit, min_cell, ab, ai),
+        || build2_par(item_limit, min_cell, bb, bi),
+    );
+    Build2::Split(ab, bb, Box::new(a), Box::new(b))
+}
+
+/// Serial flatten of a [`Build2`] tree into the arena (cheap tail after the
+/// parallel partition), using the split rects stored at partition time.
+#[cfg(feature = "parallel")]
+fn flatten2<T: Positioned>(nodes: &mut Vec<Node<T>>, locs: &mut [ItemLoc], bbox: Rect, parent: Option<NodeId>, build: Build2<T>) -> NodeId {
+    let id = NodeId(nodes.len() as u32);
+    nodes.push(Node::new_leaf(bbox, parent));
+    match build {
+        Build2::Leaf(items) => {
+            let node = &mut nodes[id.0 as usize];
+            for (h, it) in items {
+                let slot = node.items.len() as u32;
+                locs[h as usize] = ItemLoc { node: id, slot };
+                node.items.push(it); node.hs.push(h);
+            }
+        }
+        Build2::Split(ab, bb, a, b) => {
+            let ca = flatten2(nodes, locs, ab, Some(id), *a);
+            let cb = flatten2(nodes, locs, bb, Some(id), *b);
+            nodes[id.0 as usize].children = Some([ca, cb]);
+        }
+    }
+    id
 }
 
 // ------------------------------------------------------------- serialization
@@ -1766,5 +1894,68 @@ mod tests {
     #[test]
     fn lca_ropes_strategy_matches_legacy_state() {
         assert_eq!(relocate_under(UpdateStrategy::LcaRopes), relocate_under(UpdateStrategy::Legacy));
+    }
+
+    #[test]
+    fn bulk_load_matches_insert_and_brute_force() {
+        // A tree built with `bulk_load` (one top-down partition) must answer
+        // `cull` exactly like an insert-by-insert tree and brute force, and its
+        // handles must be stable: `ItemRef(i)` addresses `items[i]`.
+        use crate::Shape;
+        let mut x = 0x2DB7_41F5u64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x >> 11) as f64 / (1u64 << 53) as f64 };
+        let world = Rect::new(0.0, 0.0, 256.0, 256.0);
+        let pts: Vec<Pt> = (0..3000).map(|_| Pt(Point::new(rng() * 256.0, rng() * 256.0))).collect();
+        let bulk = Tree::<Pt>::bulk_load(world, 8, pts.clone());
+        let mut ins = Tree::<Pt>::new(world, 8);
+        for p in &pts { ins.insert(*p); }
+        for (cx, cy, r) in [(128.0,128.0,40.0),(40.0,40.0,60.0),(250.0,250.0,30.0),(0.0,0.0,100.0)] {
+            let disc = Disc { cx, cy, r };
+            let mut want: Vec<(u64,u64)> = pts.iter().filter(|p| disc.contains_point(p.0))
+                .map(|p| (p.0.x.to_bits(), p.0.y.to_bits())).collect();
+            let mut got: Vec<(u64,u64)> = bulk.cull(&disc).iter()
+                .map(|p| (p.0.x.to_bits(), p.0.y.to_bits())).collect();
+            let mut ivs: Vec<(u64,u64)> = ins.cull(&disc).iter()
+                .map(|p| (p.0.x.to_bits(), p.0.y.to_bits())).collect();
+            want.sort(); got.sort(); ivs.sort();
+            assert_eq!(want, got, "bulk_load cull != brute for disc ({cx},{cy}) r={r}");
+            assert_eq!(want, ivs, "insert-built cull != brute for disc ({cx},{cy}) r={r}");
+        }
+        assert_eq!(bulk.item_count(), pts.len(), "bulk_load dropped items");
+        // Handle stability: remove_ref(i) yields exactly items[i].
+        let mut t = Tree::<Pt>::bulk_load(world, 8, pts.clone());
+        for i in (0..pts.len()).step_by(97) {
+            let got = t.remove_ref(ItemRef(i as u32)).expect("handle i must resolve");
+            assert_eq!(got.0.x.to_bits(), pts[i].0.x.to_bits(), "ItemRef({i}) addressed the wrong item");
+            assert_eq!(got.0.y.to_bits(), pts[i].0.y.to_bits(), "ItemRef({i}) addressed the wrong item");
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn bulk_load_par_matches_serial() {
+        // The parallel partition must produce a structurally identical tree to
+        // the serial one — same cull answers, same stable handles.
+        let mut x = 0x7A11_2D2Du64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x >> 11) as f64 / (1u64 << 53) as f64 };
+        let world = Rect::new(0.0, 0.0, 256.0, 256.0);
+        let pts: Vec<Pt> = (0..8000).map(|_| Pt(Point::new(rng() * 256.0, rng() * 256.0))).collect();
+        let ser = Tree::<Pt>::bulk_load(world, 8, pts.clone());
+        let par = Tree::<Pt>::bulk_load_par(world, 8, pts.clone());
+        for (cx, cy, r) in [(128.0,128.0,50.0),(200.0,60.0,45.0),(0.0,0.0,300.0)] {
+            let disc = Disc { cx, cy, r };
+            let mut a: Vec<(u64,u64)> = ser.cull(&disc).iter().map(|p| (p.0.x.to_bits(), p.0.y.to_bits())).collect();
+            let mut b: Vec<(u64,u64)> = par.cull(&disc).iter().map(|p| (p.0.x.to_bits(), p.0.y.to_bits())).collect();
+            a.sort(); b.sort();
+            assert_eq!(a, b, "bulk_load_par cull != serial for disc ({cx},{cy}) r={r}");
+        }
+        // Handles must map the same way in both.
+        let mut sr = Tree::<Pt>::bulk_load(world, 8, pts.clone());
+        let mut pr = Tree::<Pt>::bulk_load_par(world, 8, pts.clone());
+        for i in (0..pts.len()).step_by(131) {
+            let a = sr.remove_ref(ItemRef(i as u32)).unwrap();
+            let b = pr.remove_ref(ItemRef(i as u32)).unwrap();
+            assert_eq!(a.0.x.to_bits(), b.0.x.to_bits(), "par handle {i} differs from serial");
+        }
     }
 }

@@ -35,7 +35,8 @@ let hits: Vec<Vec<&T>> = tree.cull_many(&shapes);
 let hits: Vec<Vec<&T>> = tree.cull_many_par(&shapes);
 
 // Feature `parallel` — build a whole tree from all items at once, top-down
-// partition fanned over threads (the per-frame-rebuild lever; see below):
+// partition fanned over threads (the per-frame-rebuild lever; see below).
+// Exists on `Tree3`, `Octree3` (8-way fan) and the 2D `Tree`:
 let tree = Tree3::bulk_load_par(bounds, item_limit, items); // serial: bulk_load
 ```
 

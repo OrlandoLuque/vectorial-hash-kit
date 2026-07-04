@@ -270,12 +270,11 @@ crossover visible (`PARALLEL.md`), like siege. wasm runs the wave serially.
    `bulk_load_par` (top-down partition, par via rayon `join`), brute-force gated.
    Superseded in the demos by keep (`sync_index`); stays the from-scratch static
    build (horde's structure index uses it).
-   *Remaining — bulk-load PARITY (user, 2026-07-04):* the same for **`Octree3`**
-   (split into 8 octants per level instead of 2 halves; nested `join`s or a
-   `rayon::scope` over the 8 children; same `ItemRef(i) == items[i]` contract,
-   mirror the Tree3 brute-force + par==serial tests) and for the **2D `Tree`**.
-   Library parity items — no demo needs them today (the only bulk-load consumer
-   is horde's static index, on `Tree3`).
+   *Remaining — bulk-load PARITY (user, 2026-07-04):* **DONE** (2026-07-06):
+   `Octree3::bulk_load`/`bulk_load_par` (8 octants per level, nested `join`s
+   fan the children) and the 2D `Tree` (its `pick_split` rule, ropes rebuilt
+   under `neighbors`); same `ItemRef(i) == items[i]` contract, Tree3's
+   brute-force + par==serial tests mirrored on both.
 10. **SoA *permanent* leaf storage** — *low priority*: the batch kernel is done
     and measured marginal (~1.0–1.26× end-to-end, descent-dominated); permanent
     storage would only save the materialisation copy. Park unless a workload needs it.

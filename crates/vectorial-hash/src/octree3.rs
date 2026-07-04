@@ -138,6 +138,40 @@ impl<T: Positioned3> Octree3<T> {
         }
     }
 
+    /// Build an octree from **all `items` at once** — a top-down partition (the
+    /// same 8-octant midpoint split `divide` uses) rather than N `insert`s.
+    /// Handle `i` addresses `items[i]` (so `ItemRef(i)` is stable, as after
+    /// inserting in order) — the same contract as [`crate::Tree3::bulk_load`].
+    /// Items are assumed within `bbox` (as the demos' clamped positions are).
+    pub fn bulk_load(bbox: Aabb, item_limit: usize, items: Vec<T>) -> Self {
+        assert!(item_limit >= 1, "item_limit must be >= 1");
+        let min_cell = bbox.w.max(bbox.h).max(bbox.d) * 1e-12;
+        let n = items.len();
+        let mut nodes: Vec<ONode<T>> = Vec::new();
+        let mut locs = vec![OItemLoc { node: ONodeId(0), slot: 0 }; n];
+        let indexed: Vec<(u32, T)> = items.into_iter().enumerate().map(|(i, it)| (i as u32, it)).collect();
+        build8_serial(&mut nodes, &mut locs, item_limit, min_cell, bbox, None, indexed);
+        Octree3 { nodes, free: Vec::new(), locs, free_handles: Vec::new(), item_limit, merge_limit: item_limit, min_cell, root: ONodeId(0) }
+    }
+
+    /// Parallel [`Octree3::bulk_load`] (feature `parallel`): the top-down
+    /// partition — the O(n log n) work — fans the **8 octants** out over rayon
+    /// (nested `join`s per split); the arena flatten is a cheap serial tail.
+    /// The 8-way sibling of [`crate::Tree3::bulk_load_par`] (see `docs/PARALLEL.md`).
+    #[cfg(feature = "parallel")]
+    pub fn bulk_load_par(bbox: Aabb, item_limit: usize, items: Vec<T>) -> Self
+    where T: Send {
+        assert!(item_limit >= 1, "item_limit must be >= 1");
+        let min_cell = bbox.w.max(bbox.h).max(bbox.d) * 1e-12;
+        let n = items.len();
+        let indexed: Vec<(u32, T)> = items.into_iter().enumerate().map(|(i, it)| (i as u32, it)).collect();
+        let build = build8_par(item_limit, min_cell, bbox, indexed);
+        let mut nodes: Vec<ONode<T>> = Vec::new();
+        let mut locs = vec![OItemLoc { node: ONodeId(0), slot: 0 }; n];
+        flatten8(&mut nodes, &mut locs, bbox, None, build);
+        Octree3 { nodes, free: Vec::new(), locs, free_handles: Vec::new(), item_limit, merge_limit: item_limit, min_cell, root: ONodeId(0) }
+    }
+
     fn divide(&mut self, id: ONodeId) {
         let (b, items, hs) = {
             let n = self.get_mut(id);
@@ -546,6 +580,108 @@ impl<T: Positioned3> Octree3<T> {
     }
 }
 
+// ------------------------------------------------------------- bulk build
+// Shared top-down build for `Octree3::bulk_load` / `bulk_load_par`. Splits every
+// level into the 8 octants at the box midpoint — the same rule `divide` uses
+// incrementally, in the same sx-fastest order, so item routing matches `locate`.
+
+/// The eight octant boxes of `b`, in `divide`'s order (sz, sy, sx nested).
+fn octants8(b: Aabb) -> [Aabb; 8] {
+    let (hw, hh, hd) = (b.w / 2.0, b.h / 2.0, b.d / 2.0);
+    std::array::from_fn(|i| Aabb::new(
+        b.x + (i & 1) as f64 * hw, b.y + ((i >> 1) & 1) as f64 * hh, b.z + (i >> 2) as f64 * hd,
+        hw, hh, hd,
+    ))
+}
+
+/// A node should split iff it overflows `item_limit`, hasn't hit the `min_cell`
+/// floor, and its items aren't all at one point (inseparable) — mirrors `divide`.
+fn splittable8<T: Positioned3>(items: &[(u32, T)], item_limit: usize, min_cell: f64, bbox: Aabb) -> bool {
+    items.len() > item_limit
+        && bbox.w.max(bbox.h).max(bbox.d) > min_cell
+        && { let first = items[0].1.position(); !items.iter().all(|(_, it)| it.position() == first) }
+}
+
+/// Route each item to the first octant containing its position (as `locate` does).
+fn partition8<T: Positioned3>(octs: &[Aabb; 8], items: Vec<(u32, T)>) -> [Vec<(u32, T)>; 8] {
+    let mut parts: [Vec<(u32, T)>; 8] = std::array::from_fn(|_| Vec::new());
+    for (h, it) in items {
+        let p = it.position();
+        let k = octs.iter().position(|o| o.contains(p)).expect("octants tile the parent");
+        parts[k].push((h, it));
+    }
+    parts
+}
+
+/// Recursively build the arena in DFS order. Returns the new node's id.
+fn build8_serial<T: Positioned3>(nodes: &mut Vec<ONode<T>>, locs: &mut [OItemLoc], item_limit: usize, min_cell: f64, bbox: Aabb, parent: Option<ONodeId>, items: Vec<(u32, T)>) -> ONodeId {
+    let id = ONodeId(nodes.len() as u32);
+    nodes.push(ONode { bbox, parent, children: None, items: Vec::new(), hs: Vec::new() });
+    if !splittable8(&items, item_limit, min_cell, bbox) {
+        let node = &mut nodes[id.0 as usize];
+        for (h, it) in items {
+            let slot = node.items.len() as u32;
+            locs[h as usize] = OItemLoc { node: id, slot };
+            node.items.push(it); node.hs.push(h);
+        }
+        return id;
+    }
+    let octs = octants8(bbox);
+    let parts = partition8(&octs, items);
+    let mut kids = [ONodeId(0); 8];
+    for ((kid, ob), part) in kids.iter_mut().zip(octs).zip(parts) { *kid = build8_serial(nodes, locs, item_limit, min_cell, ob, Some(id), part); }
+    nodes[id.0 as usize].children = Some(kids);
+    id
+}
+
+/// A subtree built off-arena (so the recursion can fan out over threads); the
+/// octant boxes are recomputed on flatten (deterministic), so they aren't stored.
+#[cfg(feature = "parallel")]
+enum Build8<T> { Leaf(Vec<(u32, T)>), Split(Box<[Build8<T>; 8]>) }
+
+/// Parallel partition (nested rayon `join`s fanning the 8 octants) → a [`Build8`].
+#[cfg(feature = "parallel")]
+fn build8_par<T: Positioned3 + Send>(item_limit: usize, min_cell: f64, bbox: Aabb, items: Vec<(u32, T)>) -> Build8<T> {
+    if !splittable8(&items, item_limit, min_cell, bbox) { return Build8::Leaf(items); }
+    let octs = octants8(bbox);
+    let [p0, p1, p2, p3, p4, p5, p6, p7] = partition8(&octs, items);
+    let (((b0, b1), (b2, b3)), ((b4, b5), (b6, b7))) = rayon::join(
+        || rayon::join(
+            || rayon::join(|| build8_par(item_limit, min_cell, octs[0], p0), || build8_par(item_limit, min_cell, octs[1], p1)),
+            || rayon::join(|| build8_par(item_limit, min_cell, octs[2], p2), || build8_par(item_limit, min_cell, octs[3], p3)),
+        ),
+        || rayon::join(
+            || rayon::join(|| build8_par(item_limit, min_cell, octs[4], p4), || build8_par(item_limit, min_cell, octs[5], p5)),
+            || rayon::join(|| build8_par(item_limit, min_cell, octs[6], p6), || build8_par(item_limit, min_cell, octs[7], p7)),
+        ),
+    );
+    Build8::Split(Box::new([b0, b1, b2, b3, b4, b5, b6, b7]))
+}
+
+/// Serial flatten of a [`Build8`] tree into the arena (cheap tail after the
+/// parallel partition). Recomputes the octant boxes with `octants8`.
+#[cfg(feature = "parallel")]
+fn flatten8<T: Positioned3>(nodes: &mut Vec<ONode<T>>, locs: &mut [OItemLoc], bbox: Aabb, parent: Option<ONodeId>, build: Build8<T>) -> ONodeId {
+    let id = ONodeId(nodes.len() as u32);
+    nodes.push(ONode { bbox, parent, children: None, items: Vec::new(), hs: Vec::new() });
+    match build {
+        Build8::Leaf(items) => {
+            let node = &mut nodes[id.0 as usize];
+            for (h, it) in items {
+                let slot = node.items.len() as u32;
+                locs[h as usize] = OItemLoc { node: id, slot };
+                node.items.push(it); node.hs.push(h);
+            }
+        }
+        Build8::Split(subs) => {
+            let mut kids = [ONodeId(0); 8];
+            for ((kid, ob), sub) in kids.iter_mut().zip(octants8(bbox)).zip(*subs) { *kid = flatten8(nodes, locs, ob, Some(id), sub); }
+            nodes[id.0 as usize].children = Some(kids);
+        }
+    }
+    id
+}
+
 // ------------------------------------------------------------- serialization
 
 const OCTREE3_MAGIC: &[u8; 4] = b"VHO3";
@@ -916,6 +1052,69 @@ mod tests {
             let mut got: Vec<u32> = tree.cull(&sphere).iter().map(|m| m.id).collect();
             want.sort(); got.sort();
             assert_eq!(want, got, "octree handle-churn cull != brute ({cx},{cy},{cz}) r={r}");
+        }
+    }
+
+    #[test]
+    fn octree_bulk_load_matches_insert_and_brute_force() {
+        // An octree built with `bulk_load` (one top-down 8-way partition) must
+        // answer `cull` exactly like an insert-by-insert octree and brute force,
+        // and its handles must be stable: `ItemRef(i)` addresses `items[i]`.
+        let mut x = 0x0C7B_1D06u64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x >> 11) as f64 / (1u64 << 53) as f64 };
+        let world = Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0);
+        let pts: Vec<P> = (0..3000).map(|_| P(Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0))).collect();
+        let bulk = Octree3::<P>::bulk_load(world, 8, pts.clone());
+        let mut ins = Octree3::<P>::new(world, 8);
+        for p in &pts { ins.insert(*p); }
+        for (cx, cy, cz, r) in [(128.0,128.0,128.0,40.0),(40.0,40.0,40.0,60.0),(250.0,250.0,250.0,30.0),(0.0,0.0,0.0,100.0)] {
+            let sphere = Sphere3::new(cx, cy, cz, r).with_raster();
+            let mut want: Vec<(u64,u64,u64)> = pts.iter().filter(|p| sphere.contains_point(p.0))
+                .map(|p| (p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits())).collect();
+            let mut got: Vec<(u64,u64,u64)> = bulk.cull(&sphere).iter()
+                .map(|p| (p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits())).collect();
+            let mut ivs: Vec<(u64,u64,u64)> = ins.cull(&sphere).iter()
+                .map(|p| (p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits())).collect();
+            want.sort(); got.sort(); ivs.sort();
+            assert_eq!(want, got, "octree bulk_load cull != brute for sphere ({cx},{cy},{cz}) r={r}");
+            assert_eq!(want, ivs, "octree insert-built cull != brute for sphere ({cx},{cy},{cz}) r={r}");
+        }
+        assert_eq!(bulk.item_count(), pts.len(), "bulk_load dropped items");
+        // Handle stability: remove_ref(i) yields exactly items[i].
+        let mut t = Octree3::<P>::bulk_load(world, 8, pts.clone());
+        for i in (0..pts.len()).step_by(97) {
+            let got = t.remove_ref(ItemRef(i as u32)).expect("handle i must resolve");
+            assert_eq!(got.0.x.to_bits(), pts[i].0.x.to_bits(), "ItemRef({i}) addressed the wrong item");
+            assert_eq!(got.0.z.to_bits(), pts[i].0.z.to_bits(), "ItemRef({i}) addressed the wrong item");
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn octree_bulk_load_par_matches_serial() {
+        // The parallel 8-way partition must produce a structurally identical
+        // octree to the serial one — same cull answers, same stable handles.
+        let mut x = 0x0C7E_5EEDu64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x >> 11) as f64 / (1u64 << 53) as f64 };
+        let world = Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0);
+        let pts: Vec<P> = (0..8000).map(|_| P(Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0))).collect();
+        let ser = Octree3::<P>::bulk_load(world, 8, pts.clone());
+        let par = Octree3::<P>::bulk_load_par(world, 8, pts.clone());
+        for (cx, cy, cz, r) in [(128.0,128.0,128.0,50.0),(200.0,60.0,90.0,45.0),(0.0,0.0,0.0,300.0)] {
+            let s = Sphere3::new(cx, cy, cz, r);
+            let sphere = if r <= 100.0 { s.with_raster() } else { s }; // don't raster a world-covering sphere
+            let mut a: Vec<(u64,u64,u64)> = ser.cull(&sphere).iter().map(|p| (p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits())).collect();
+            let mut b: Vec<(u64,u64,u64)> = par.cull(&sphere).iter().map(|p| (p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits())).collect();
+            a.sort(); b.sort();
+            assert_eq!(a, b, "octree bulk_load_par cull != serial for sphere ({cx},{cy},{cz}) r={r}");
+        }
+        // Handles must map the same way in both.
+        let mut sr = Octree3::<P>::bulk_load(world, 8, pts.clone());
+        let mut pr = Octree3::<P>::bulk_load_par(world, 8, pts.clone());
+        for i in (0..pts.len()).step_by(131) {
+            let a = sr.remove_ref(ItemRef(i as u32)).unwrap();
+            let b = pr.remove_ref(ItemRef(i as u32)).unwrap();
+            assert_eq!(a.0.x.to_bits(), b.0.x.to_bits(), "par handle {i} differs from serial");
         }
     }
 }
