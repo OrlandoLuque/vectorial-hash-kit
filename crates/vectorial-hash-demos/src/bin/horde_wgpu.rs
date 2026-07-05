@@ -258,6 +258,7 @@ const UI_SLIDER: (f32, f32, f32, f32) = (18.0, 46.0, 280.0, 12.0);   // populati
 const UI_THREADS: (f32, f32, f32, f32) = (18.0, 70.0, 280.0, 12.0);  // rayon pool
 const UI_PAUSE: (f32, f32, f32, f32) = (18.0, 92.0, 96.0, 30.0);     // pause button
 const UI_WAVE: (f32, f32, f32, f32) = (18.0, 130.0, 96.0, 30.0);     // trigger-next-wave button (N key)
+const UI_ALL: (f32, f32, f32, f32) = (18.0, 168.0, 96.0, 30.0);      // wake-every-sleeper button (A key)
 
 #[allow(clippy::too_many_arguments)]
 fn push_quad(v: &mut Vec<UiVertex>, px: f32, py: f32, w: f32, h: f32, color: [f32; 4], sw: f32, sh: f32) {
@@ -1255,6 +1256,11 @@ impl State {
             let (wx2, wy2, ww2, wh2) = UI_WAVE;
             push_quad(&mut ui, wx2, wy2, ww2, wh2, [0.45, 0.14, 0.10, 0.92], sw, sh);
             push_text(&mut ui, wx2 + 8.0, wy2 + 9.0, 3.0, [1.0, 0.85, 0.6, 1.0], "WAVE", sw, sh);
+            // Wake-all button: rouse every sleeper at once (A key) — the "what
+            // does 100k active cost" stress button.
+            let (ax, ay, aw, ah) = UI_ALL;
+            push_quad(&mut ui, ax, ay, aw, ah, [0.30, 0.10, 0.36, 0.92], sw, sh);
+            push_text(&mut ui, ax + 8.0, ay + 9.0, 3.0, [0.95, 0.75, 1.0, 1.0], "ALL", sw, sh);
         }
         let mut tris: u64 = (self.terrain_nidx / 3) as u64;
         for (mi, m) in self.models.iter().enumerate() {
@@ -1685,6 +1691,9 @@ async fn run() {
         web_sys::window().and_then(|w| w.document()).and_then(|d| d.body()).expect("body").append_child(&canvas).expect("append canvas");
     }
     let mut st = State::new(Some(window.clone()), (1600, 1000)).await;
+    // HORDE_WAKE_ALL=1 → rouse the whole horde at boot (the 100k-active bench).
+    #[cfg(not(target_arch = "wasm32"))]
+    if std::env::var("HORDE_WAKE_ALL").is_ok() { st.sim.wake_all(); }
     let mut frame: u64 = 0;
     // HORDE_MAX_FRAMES=N → run N frames, print the measured average FPS
     // (frames past a 60-frame warmup over wall time), then exit — the
@@ -1706,6 +1715,7 @@ async fn run() {
                         let hit = |r: (f32, f32, f32, f32)| mx >= r.0 - 8.0 && mx <= r.0 + r.2 + 8.0 && my >= r.1 - 6.0 && my <= r.1 + r.3 + 6.0;
                         if hit(UI_PAUSE) { st.paused = !st.paused; }
                         else if hit(UI_WAVE) { st.sim.trigger_wave(); }
+                        else if hit(UI_ALL) { st.sim.wake_all(); }
                         else if hit(UI_SLIDER) { st.ui_drag = 1; st.apply_slider(1, mx); }
                         else if cfg!(not(target_arch = "wasm32")) && hit(UI_THREADS) { st.ui_drag = 2; st.apply_slider(2, mx); }
                         else { st.dragging = true; }
@@ -1730,6 +1740,8 @@ async fn run() {
                         KeyCode::KeyG => { let sc = st.sim.scenario.next(); st.set_scenario(sc); } // cycle the map preset
                         KeyCode::KeyM => { let zm = st.sim.zmode.next(); st.sim.set_zmode(zm); }   // Tree3 ↔ Morton, live
                         KeyCode::KeyL => st.night = !st.night, // night assault + torches
+                        KeyCode::KeyO => { let m = !st.sim.flow_multi(); st.sim.set_flow_multi(m); } // flow goal: CC ↔ every building
+                        KeyCode::KeyA => { st.sim.wake_all(); }  // wake EVERY sleeper (the 100k-active stress test)
                         KeyCode::KeyF => {
                             st.free_cam = !st.free_cam;
                             if st.free_cam {
@@ -1785,7 +1797,7 @@ async fn run() {
                     frame += 1;
                     if frame % 15 == 0 {
                         let (d, a) = st.sim.counts();
-                        window.set_title(&format!("vectorial-hash — horde (wgpu) · map {} [G] · index {} [M]{} · sleep {d} | awake {a} | kills {} · run {} · {:.0} fps{}", st.sim.scenario.label(), st.sim.zmode.label(), if st.night { " · NIGHT [L]" } else { "" }, st.sim.kills, st.sim.run, st.fps, if st.paused { " · PAUSED" } else { "" }));
+                        window.set_title(&format!("vectorial-hash — horde (wgpu) · map {} [G] · index {} [M] · goal {} [O]{} · sleep {d} | awake {a} | kills {} · run {} · {:.0} fps{}", st.sim.scenario.label(), st.sim.zmode.label(), if st.sim.flow_multi() { "BUILDINGS" } else { "CC" }, if st.night { " · NIGHT [L]" } else { "" }, st.sim.kills, st.sim.run, st.fps, if st.paused { " · PAUSED" } else { "" }));
                     }
                     #[cfg(not(target_arch = "wasm32"))]
                     if let Some(m) = max_frames {

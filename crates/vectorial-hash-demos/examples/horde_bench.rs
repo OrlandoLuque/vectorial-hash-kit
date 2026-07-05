@@ -11,7 +11,7 @@
 //! ```
 
 use std::time::Instant;
-use vectorial_hash_demos::horde_sim::{Horde, ZState, WORLD};
+use vectorial_hash_demos::horde_sim::{Horde, Scenario, SKind, ZState, WORLD};
 
 fn measure(h: &mut Horde, secs: f64) -> (f64, usize) {
     let dt = 1.0 / 60.0;
@@ -62,4 +62,26 @@ fn main() {
             pop, ms_a, 1000.0 / ms_a, ms_b, 1000.0 / ms_b, act_b, ms_c, 1000.0 / ms_c, act_c);
     }
     println!("\nreading: the dormant column is the keep-index headline — the sleepers'\nmaintenance is ~free (skipped by the moved-only sync), so cost scales with the\nACTIVE front, not the indexed population.");
+
+    // ---- the flow-field experiment: single-CC goal vs the user's multi-source
+    // idea (0-seed at EVERY live building, one flood). Time a rebuild in each
+    // mode (min-of-N, warm) — the point is that N goals cost ~the same as 1,
+    // because it's still a single Dijkstra; more seeds just start it wider.
+    println!("\nflow-field rebuild — single-CC goal vs multi-building (the multi-source idea):");
+    println!("{:>18} | {:>18} {:>18}", "map (150-cell)", "single-CC", "multi-building");
+    for sc in [Scenario::Classic, Scenario::Patches] {
+        let mut h = Horde::with_scenario(7, 5000, sc);
+        let goals = h.structures.iter().filter(|s| s.hp > 0.0 && matches!(s.kind, SKind::House | SKind::Storehouse | SKind::CommandCenter)).count();
+        let bench = |h: &mut Horde, multi: bool| -> f64 {
+            h.set_flow_multi(multi);
+            h.force_flow_rebuild(); // warm
+            let mut best = f64::MAX;
+            for _ in 0..200 { let t = Instant::now(); h.force_flow_rebuild(); best = best.min(t.elapsed().as_secs_f64()); }
+            best * 1e6 // microseconds
+        };
+        let one = bench(&mut h, false);
+        let many = bench(&mut h, true);
+        println!("{:>18} | {:>13.1} us {:>13.1} us   ({goals} building goals)", sc.label(), one, many);
+    }
+    println!("reading: seeding every building barely moves the rebuild cost — it's one\nDijkstra either way — but the field now points each zombie at its NEAREST\nbuilding and re-routes to the next as buildings fall (the `O` toggle).");
 }

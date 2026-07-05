@@ -341,11 +341,20 @@ pub struct FlowField {
     integ: Vec<u32>,
     pub dirty: bool,
     rebuild_t: f64,
+    /// The `O` toggle — the user's multi-source idea: `false` = single goal
+    /// (the CC), `true` = seed 0 at EVERY live building and flood once, so the
+    /// field points every zombie at its NEAREST building and re-routes to the
+    /// next as buildings fall. N goals cost the same one flood as 1 goal.
+    pub multi: bool,
 }
+
+/// Is this the kind of structure the horde wants to reach (a multi-goal seed)?
+/// Buildings, not the wall ring — walls are cost, not a destination.
+fn is_goal(k: SKind) -> bool { matches!(k, SKind::House | SKind::Storehouse | SKind::CommandCenter) }
 
 impl FlowField {
     fn new(n: usize) -> FlowField {
-        FlowField { n, cell: WORLD / n as f64, dir: vec![(0.0, 0.0); n * n], integ: vec![u32::MAX; n * n], dirty: true, rebuild_t: 0.0 }
+        FlowField { n, cell: WORLD / n as f64, dir: vec![(0.0, 0.0); n * n], integ: vec![u32::MAX; n * n], dirty: true, rebuild_t: 0.0, multi: false }
     }
     fn cell_of(&self, x: f64, z: f64) -> (usize, usize) {
         (((x / self.cell) as usize).min(self.n - 1), ((z / self.cell) as usize).min(self.n - 1))
@@ -388,12 +397,23 @@ impl FlowField {
             };
             cost[j * n + i] = cost[j * n + i].saturating_add(add);
         }
-        // Dijkstra from the CC cell over 8-neighbours (diagonal ×1.41).
+        // Multi-source Dijkstra over 8-neighbours (diagonal ×1.41). Seeds =
+        // just the CC (baseline) or EVERY live building (the `multi` toggle):
+        // a genuine multi-source flood — the integration field then holds the
+        // distance to the NEAREST goal, so one pass serves any number of them.
         self.integ.iter_mut().for_each(|v| *v = u32::MAX);
-        let (ci, cj) = self.cell_of(cc.x, cc.z);
         let mut heap = std::collections::BinaryHeap::new();
-        self.integ[cj * n + ci] = 0;
-        heap.push(std::cmp::Reverse((0u32, ci, cj)));
+        let seed = |integ: &mut Vec<u32>, heap: &mut std::collections::BinaryHeap<_>, x: f64, z: f64| {
+            let (ci, cj) = (((x / self.cell) as usize).min(n - 1), ((z / self.cell) as usize).min(n - 1));
+            if !blocked[cj * n + ci] && integ[cj * n + ci] != 0 { integ[cj * n + ci] = 0; heap.push(std::cmp::Reverse((0u32, ci, cj))); }
+        };
+        if self.multi {
+            let mut any = false;
+            for s in structures { if s.hp > 0.0 && is_goal(s.kind) { seed(&mut self.integ, &mut heap, s.p.x, s.p.z); any = true; } }
+            if !any { seed(&mut self.integ, &mut heap, cc.x, cc.z); } // all buildings gone → the CC (which is one anyway)
+        } else {
+            seed(&mut self.integ, &mut heap, cc.x, cc.z);
+        }
         while let Some(std::cmp::Reverse((d, i, j))) = heap.pop() {
             if d > self.integ[j * n + i] { continue; }
             for (di, dj, w) in [(-1i64, 0i64, 100u32), (1, 0, 100), (0, -1, 100), (0, 1, 100), (-1, -1, 141), (1, -1, 141), (-1, 1, 141), (1, 1, 141)] {
@@ -901,17 +921,29 @@ impl Horde {
     /// dormant field, next run number, escalation restarts.
     fn reset(&mut self) {
         let next = Horde::with_scenario(self.base_seed.wrapping_add(self.run as u64 * 7919), self.base_pop, self.scenario);
-        let (run, kills, mode, zm) = (self.run + 1, self.kills, self.tower_threat_mode, self.zmode);
+        let (run, kills, mode, zm, multi) = (self.run + 1, self.kills, self.tower_threat_mode, self.zmode, self.flow.multi);
         *self = next;
         self.run = run;
         self.kills = kills; // lifetime counter across runs
         self.tower_threat_mode = mode;
         self.set_zmode(zm); // no-op when it was already the default Tree
+        self.set_flow_multi(multi); // preserve the flow-goal mode across runs
     }
 
     /// HUD wave line: (wave number, announced?, direction, seconds to landfall).
     pub fn wave_info(&self) -> (u32, bool, f64, f64) {
         (self.wave_k + 1, self.wave_announced, self.wave_dir, (self.wave_spawn_t - self.now).max(0.0))
+    }
+
+    /// Wake EVERY dormant zombie into the march at once (the `A`/ALL button) —
+    /// the "what does 100k active cost" stress button. Returns how many rose.
+    pub fn wake_all(&mut self) -> usize {
+        let mut rose = 0;
+        for z in self.units.iter_mut() {
+            if z.alive() && z.dormant() { z.state = ZState::Marching; z.heard = 0.0; z.moved = true; rose += 1; }
+        }
+        if rose > 0 { self.dormant_epoch += 1; }
+        rose
     }
 
     /// Manual wave trigger (the `N` key / WAVE button): not announced yet →
@@ -1080,6 +1112,23 @@ impl Horde {
         self.handles = vec![None; self.units.len()];
         self.zmorton.clear();
         self.sync_index(); // queryable immediately (renderers cull between steps)
+    }
+
+    /// The `O` toggle — flow-field goal mode: single CC vs multi-building
+    /// (the user's multi-source idea). Forces a rebuild next step.
+    pub fn set_flow_multi(&mut self, multi: bool) {
+        if self.flow.multi == multi { return; }
+        self.flow.multi = multi;
+        self.flow.dirty = true;
+        self.flow.rebuild_t = 0.0;
+    }
+    pub fn flow_multi(&self) -> bool { self.flow.multi }
+
+    /// Force one flow-field rebuild now (benchmarks / tests) — the single-CC or
+    /// multi-building flood, timed in isolation.
+    pub fn force_flow_rebuild(&mut self) {
+        let cc = self.structures[self.cc_id].p;
+        self.flow.rebuild(&self.structures, cc, &self.pass_grid, self.pass_n, self.pass_cell);
     }
 
     /// Is (x,z) passable ground for walkers? (Classic: everywhere. Pass: below
@@ -2128,6 +2177,59 @@ mod tests {
                 assert!(h.passable(d.p.x, d.p.z), "{sc:?}: defender {:?} in blocked terrain at ({:.0},{:.0})", d.kind, d.p.x, d.p.z);
             }
         }
+    }
+
+    #[test]
+    fn multigoal_field_reaches_live_buildings_and_reroutes_as_they_fall() {
+        // The user's multi-source idea, debugged: with the multi flow field
+        // every live building is a 0-seed, and a zombie descending from any
+        // ring bearing arrives at a LIVE building — and when buildings are
+        // destroyed the field re-routes to the next nearest live one (no
+        // zombie is ever left marching toward a dead building).
+        let mut h = Horde::with_scenario(19, 3000, Scenario::Classic);
+        h.set_flow_multi(true);
+        h.step(1.0 / 60.0); // build the field
+        assert!(h.flow_multi());
+        let (cx, cz) = (WORLD / 2.0, WORLD / 2.0);
+        // helper: descend the field from (x,z), return the cell you settle in
+        let settle = |h: &Horde, mut x: f64, mut z: f64| -> (f64, f64) {
+            for _ in 0..6000 { let (dx, dz) = h.flow.flow_at(x, z); if dx == 0.0 && dz == 0.0 { break; } x += dx * 4.0; z += dz * 4.0; }
+            (x, z)
+        };
+        // nearest LIVE goal building to a point, and its distance
+        let nearest_live = |h: &Horde, x: f64, z: f64| -> f64 {
+            h.structures.iter().filter(|s| s.hp > 0.0 && super::is_goal(s.kind))
+                .map(|s| ((s.p.x - x).powi(2) + (s.p.z - z).powi(2)).sqrt())
+                .fold(f64::MAX, f64::min)
+        };
+        // every live building is a seed (integ 0 at its cell) — reachable as a destination
+        for s in h.structures.iter().filter(|s| s.hp > 0.0 && super::is_goal(s.kind)) {
+            assert!(h.flow.reachable(s.p.x, s.p.z), "live building not in the field");
+        }
+        // from 12 ring bearings, descending lands on a live building
+        let check_all_bearings_hit_a_live_building = |h: &Horde| {
+            let mut hit = 0;
+            for q in 0..12 {
+                let a = q as f64 * std::f64::consts::TAU / 12.0 + 0.05;
+                let (sx, sz) = (cx + a.cos() * WORLD * 0.33, cz + a.sin() * WORLD * 0.33);
+                let (fx, fz) = settle(h, sx.clamp(MARGIN, WORLD - MARGIN), sz.clamp(MARGIN, WORLD - MARGIN));
+                if nearest_live(h, fx, fz) < 30.0 { hit += 1; }
+            }
+            hit
+        };
+        assert!(check_all_bearings_hit_a_live_building(&h) >= 10, "multi field: zombies don't converge on live buildings");
+        // Now destroy every building EXCEPT the CC + one house, rebuild, and
+        // confirm the field re-routed: bearings still land on a LIVE building.
+        let mut kept_house = false;
+        for s in h.structures.iter_mut() {
+            if s.kind == SKind::House && !kept_house { kept_house = true; continue; }
+            if matches!(s.kind, SKind::House | SKind::Storehouse) { s.hp = 0.0; }
+        }
+        h.flow.dirty = true; h.flow.rebuild_t = 0.0;
+        h.step(1.0 / 60.0);
+        let live_goals = h.structures.iter().filter(|s| s.hp > 0.0 && super::is_goal(s.kind)).count();
+        assert!(live_goals >= 2, "should still have the CC + one house alive");
+        assert!(check_all_bearings_hit_a_live_building(&h) >= 10, "after demolition the field must re-route to the survivors, not dead buildings");
     }
 
     #[test]

@@ -63,9 +63,27 @@ autonomously verifiable. User picked **"Todo (A–E)"** + the headline below.
      (The 2D leg of "ambos conmutables" would need a projection layer —
      queued behind the TAB-map research.)
   6. **Quaternius Ultimate Fantasy RTS** wall/tower/house models to replace
-     the procedural boxes (pack vetted in HORDE_DESIGN). **Blocked on a
-     MANUAL download**: quaternius.com is JS-driven, the direct zip URLs
-     404 — grab the pack by hand into `assets/siege/models/` and say so.
+     the procedural boxes. **PACK NOW ON DISK** (user downloaded it):
+     `assets/siege/Ultimate Fantasy RTS-glb.zip` — glb files ready. Wiring
+     job (next): pick `Stone Wall.glb`, `Stone Wall Towers.glb`/`Stone
+     Tower.glb`, `Castle Gate.glb`, `Castle.glb`/`Castle Fortress.glb` (CC),
+     `House*.glb`, `Storage House.glb`, `Barracks.glb`; unzip into
+     `assets/siege/models/`, map onto `SKind` in `horde_wgpu` replacing the
+     instanced boxes (mind per-model yaw/scale like `model_tweak`; check clip
+     names — these are static props, no rig). The web build fetches from
+     `docs/models/`, so add them there + rebuild the wasm too.
+  7. ~~**Multi-goal flow field**~~ — **DONE** (2026-07-07): the user's
+     multi-source idea. `O` toggle seeds 0 at every live building, one flood
+     (multi-source Dijkstra); re-routes to survivors as buildings fall
+     (brute-force test). Measured: 31 goals ≈ the single-CC rebuild cost
+     (one Dijkstra either way). Docs: HORDE.md § "The multi-goal flow field".
+     Follow-ups (queued): make it the DEFAULT if it reads better in play;
+     a per-building "who's nearest" tint; D\* Lite only if moving goals ever
+     want a field.
+  8. ~~**"Wake all" button + 100k-active FPS**~~ — **DONE** (2026-07-07): `A`
+     key + ALL button (`wake_all`) rouse every sleeper at once. Measured:
+     **100k ALL active = ~79 fps rendered** (RTX 4080 SUPER, no vsync) — the
+     honest worst-case ceiling. `HORDE_WAKE_ALL=1` boots straight into it.
 - **FORMATIONS — BUILT (2026-07-06 night)**: `formations_sim` (graphics-free,
   11 brute-force-gated tests: k-NN melee pairing, sector flank/rear vs brute
   angles, the kill-roll curve, charge-corridor raycast, volleys with honest

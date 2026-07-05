@@ -16,12 +16,14 @@ cargo run -p vectorial-hash-demos --bin horde_wgpu --release --features parallel
 Live (WebGPU): <https://orlandoluque.github.io/vectorial-hash-kit/horde_wgpu.html>
 
 - drag: orbit · scroll: zoom · `P`/button: pause · **`N`/WAVE button: summon
-  the next wave** (announce at 5 s; press again to land it NOW) · **`G`: map
-  scenario** (OPEN → PASS → RIVER → FOREST → PATCHES) · **`M`: index
-  structure** (TREE3 ↔ MORTON, live) · **`L`: night assault** (torches on the
-  ring) · `[` `]` + slider: population (2 000 – 100 000) · `T`: tower
-  targeting (nearest ↔ highest-threat) · `K`: frustum cull · `F`: free-fly
-  (WASD/QE) · thread slider (native).
+  the next wave** (announce at 5 s; press again to land it NOW) · **`A`/ALL
+  button: wake every sleeper at once** (the "what does 100k active cost"
+  stress button) · **`G`: map scenario** (OPEN → PASS → RIVER → FOREST →
+  PATCHES) · **`M`: index structure** (TREE3 ↔ MORTON, live) · **`O`: flow
+  goal** (the CC ↔ every building — the multi-source field) · **`L`: night
+  assault** (torches on the ring) · `[` `]` + slider: population
+  (2 000 – 100 000) · `T`: tower targeting (nearest ↔ highest-threat) · `K`:
+  frustum cull · `F`: free-fly (WASD/QE) · thread slider (native).
 - Contact matters: a marching column **tramples sleepers awake** as it rolls
   over them (walking is silent — aggro spreads via combat noise and touch).
 - Rendering: **impostor billboards** ("photos" of each model: 8 yaws × 3
@@ -50,6 +52,7 @@ Live (WebGPU): <https://orlandoluque.github.io/vectorial-hash-kit/horde_wgpu.htm
 | Static base | built once with **`bulk_load`** (`bulk_load_par` with `--features parallel`) |
 | The dormant horde | **keep-index**: sleepers never move → skipped by the moved-only sync |
 | The horde's minimum paths (`G` scenarios) | blocked cells (ridge/water/woods) **never relax** in the flow-field Dijkstra — the flood funnels through the pass gaps / causeways / forest trails on its own |
+| The multi-goal flood (`O`) | seed 0 at **every live building** and flood once — a **multi-source Dijkstra**: the field holds distance-to-nearest-goal, so N goals cost the same one flood as 1, and it re-routes to the survivors as buildings fall (measured: 31 goals ≈ 1 200 µs, *identical* to the single-CC rebuild) |
 | The defenders' minimum paths | **A\*** over the same passability grid: one search per ranger-squad sortie (out the gate, along the trails) + a trail home on recall |
 | The index itself (`M`) | live **Tree3 (keep, `update_ref`) ↔ MortonGrid3 (clear+reinsert per frame)** behind one query enum — the CHOOSING.md trade-off, watchable in the fps counter |
 
@@ -142,6 +145,47 @@ All of it brute-force-gated: flow reaches the CC from 8 bearings per
 scenario, no ground unit ever stands in a blocked cell, PATCHES stays >90%
 connected and in a sane open-fraction band across 10 seeds, Morton culls ==
 Tree culls == brute force.
+
+## Wake the whole horde (`A`) — 100k active, measured
+
+The `A` key / ALL button (`wake_all`) rouses **every** sleeper into the march
+at once — the worst case the demo can produce. Rendered end-to-end with all
+100 000 zombies awake and marching (RTX 4080 SUPER, 1600×1000, no vsync):
+**~79 fps** (`HORDE_POP=100000 HORDE_WAKE_ALL=1 HORDE_NOVSYNC=1
+HORDE_MAX_FRAMES=600`). That's the honest ceiling with the entire indexed
+population active — every zombie thinking, moving and re-syncing every frame,
+plus the impostor draw for all of them. Normal play never wakes everything at
+once (only the final wave does), so this is the stress bound, not the
+steady state.
+
+## The multi-goal flow field (`O`) — the user's idea, measured
+
+The baseline flow field floods from **one** goal (the CC). A colony has many
+buildings, though, and TAB zombies want to level all of them. The user's idea:
+*put a 0 on every goal cell and propagate outward (1, 2, 3…), with the
+relaxation "if I'm a 2 and a neighbour is 4+, I become a 3" — then agents just
+walk downhill.* That is exactly a **multi-source BFS/Dijkstra integration
+field** (the relaxation IS edge relaxation), and the horde already ran the
+single-goal version. The `O` toggle turns on the multi-source variant: seed 0
+at **every live building**, one flood; the field then holds the distance to
+each zombie's *nearest* building and re-routes to the survivors as buildings
+fall — verified by a brute-force test (12 ring bearings all descend to a LIVE
+building, before and after half the colony is demolished).
+
+The headline the user predicted — **N goals cost the same as 1** — measured
+(`examples/horde_bench`, 150-cell field, 31 building goals):
+
+```
+   map      single-CC goal      multi-building (31 goals)
+  OPEN      1225 µs             1200 µs     (slightly FASTER)
+  PATCHES    748 µs              743 µs
+```
+
+It's one Dijkstra either way; more seeds just start the wavefront wider, so it
+terminates a touch sooner. Moving targets (the ~50 defenders) are deliberately
+*not* in the field — reflooding per frame would be the "locura" the user
+flagged; zombies find them with a cheap local brute-scan k-NN instead. (The
+named incremental option for moving goals is **D\* Lite**; overkill at 50.)
 
 ## The molón round (`L`)
 
