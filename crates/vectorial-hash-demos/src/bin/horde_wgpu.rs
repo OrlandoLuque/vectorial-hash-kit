@@ -186,10 +186,10 @@ fn build_trees(sim: &Horde) -> Vec<SkinInstance> {
             let ty = terrain_h(tx, tz, sim.seed, sim.scenario) as f32;
             let (tx, tz) = (tx as f32, tz as f32);
             let trunk = Mat4::from_translation(Vec3::new(tx, ty, tz)) * Mat4::from_scale(Vec3::new(1.6, 7.0 * s, 1.6));
-            v.push(SkinInstance { model: trunk.to_cols_array_2d(), color: [0.34, 0.23, 0.13, 0.0], frame_base: 0, _pad: [0; 3] });
+            v.push(SkinInstance { model: trunk.to_cols_array_2d(), color: [0.34, 0.23, 0.13, 1.0], frame_base: 0, _pad: [0; 3] });
             let g = 0.28 + ((hsh >> 20) & 0xf) as f32 / 15.0 * 0.10;
             let canopy = Mat4::from_translation(Vec3::new(tx, ty + 6.5 * s, tz)) * Mat4::from_scale(Vec3::new(6.5 * s, 5.5 * s, 6.5 * s));
-            v.push(SkinInstance { model: canopy.to_cols_array_2d(), color: [0.10, g, 0.10, 0.0], frame_base: 0, _pad: [0; 3] });
+            v.push(SkinInstance { model: canopy.to_cols_array_2d(), color: [0.10, g, 0.10, 1.0], frame_base: 0, _pad: [0; 3] });
         }
     }
     v.truncate(TREE_CAP);
@@ -1135,7 +1135,9 @@ impl State {
             if destroyed { col = [0.16, 0.13, 0.11]; }
             let h = if destroyed { sy * 0.14 } else { sy * (0.35 + 0.65 * frac) };
             let m = Mat4::from_translation(Vec3::new(x, y, zz)) * Mat4::from_rotation_y(-ang) * Mat4::from_scale(Vec3::new(sx, h, sz));
-            box_inst.push(SkinInstance { model: m.to_cols_array_2d(), color: [col[0], col[1], col[2], 0.0], frame_base: 0, _pad: [0; 3] });
+            // tint.a = 1.0: the box's vertices are white, the instance colour IS
+            // the colour (a=0 meant "keep vertex white" — the HP red never showed).
+            box_inst.push(SkinInstance { model: m.to_cols_array_2d(), color: [col[0], col[1], col[2], 1.0], frame_base: 0, _pad: [0; 3] });
             if s.kind == SKind::Tower && !destroyed {
                 let cm = Mat4::from_translation(Vec3::new(x, y + h, zz)) * Mat4::from_rotation_y(-ang + std::f32::consts::FRAC_PI_2) * Mat4::from_scale(Vec3::splat(7.0));
                 cannon_inst.push(SkinInstance { model: cm.to_cols_array_2d(), color: [0.2, 0.2, 0.22, 0.25], frame_base: 0, _pad: [0; 3] });
@@ -1147,7 +1149,7 @@ impl State {
             if !d.alive() { continue; }
             if let vectorial_hash_demos::horde_sim::DState::Hauling { loaded: true, .. } = d.state {
                 let m = Mat4::from_translation(Vec3::new(d.p.x as f32, d.p.y as f32 + 7.6, d.p.z as f32)) * Mat4::from_scale(Vec3::new(3.2, 2.4, 3.2));
-                box_inst.push(SkinInstance { model: m.to_cols_array_2d(), color: [0.52, 0.36, 0.18, 0.0], frame_base: 0, _pad: [0; 3] });
+                box_inst.push(SkinInstance { model: m.to_cols_array_2d(), color: [0.52, 0.36, 0.18, 1.0], frame_base: 0, _pad: [0; 3] });
             }
         }
         box_inst.truncate(1024);
