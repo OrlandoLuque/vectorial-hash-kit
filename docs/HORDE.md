@@ -16,10 +16,12 @@ cargo run -p vectorial-hash-demos --bin horde_wgpu --release --features parallel
 Live (WebGPU): <https://orlandoluque.github.io/vectorial-hash-kit/horde_wgpu.html>
 
 - drag: orbit · scroll: zoom · `P`/button: pause · **`N`/WAVE button: summon
-  the next wave** (announce at 5 s; press again to land it NOW) · `[` `]` +
-  slider: population (2 000 – 100 000) · `T`: tower targeting (nearest ↔
-  highest-threat) · `K`: frustum cull · `F`: free-fly (WASD/QE) · thread
-  slider (native).
+  the next wave** (announce at 5 s; press again to land it NOW) · **`G`: map
+  scenario** (OPEN → PASS → RIVER → FOREST) · **`M`: index structure**
+  (TREE3 ↔ MORTON, live) · **`L`: night assault** (torches on the ring) ·
+  `[` `]` + slider: population (2 000 – 100 000) · `T`: tower targeting
+  (nearest ↔ highest-threat) · `K`: frustum cull · `F`: free-fly (WASD/QE) ·
+  thread slider (native).
 - Contact matters: a marching column **tramples sleepers awake** as it rolls
   over them (walking is silent — aggro spreads via combat noise and touch).
 - Rendering: **impostor billboards** ("photos" of each model: 8 yaws × 3
@@ -47,6 +49,9 @@ Live (WebGPU): <https://orlandoluque.github.io/vectorial-hash-kit/horde_wgpu.htm
 | Crew/porter safety | repair jobs gated by a **safety cull**; a breach **recalls** works units in radius |
 | Static base | built once with **`bulk_load`** (`bulk_load_par` with `--features parallel`) |
 | The dormant horde | **keep-index**: sleepers never move → skipped by the moved-only sync |
+| The horde's minimum paths (`G` scenarios) | blocked cells (ridge/water/woods) **never relax** in the flow-field Dijkstra — the flood funnels through the pass gaps / causeways / forest trails on its own |
+| The defenders' minimum paths | **A\*** over the same passability grid: one search per ranger-squad sortie (out the gate, along the trails) + a trail home on recall |
+| The index itself (`M`) | live **Tree3 (keep, `update_ref`) ↔ MortonGrid3 (clear+reinsert per frame)** behind one query enum — the CHOOSING.md trade-off, watchable in the fps counter |
 
 ## The headline (measured, `examples/horde_bench`, 16 threads)
 
@@ -114,12 +119,34 @@ that used to ignite the whole map in seconds (per-frame carpet rebuilds,
 contact-wake percolation, walking noise) are fixed; a wave now recruits
 linearly along its path and via wall-combat noise.
 
+## Scenarios (`G`) — the same sim, four worlds
+
+**OPEN** is the classic ring-in-a-field. **PASS** raises a rock ridge at
+r≈330 with three gap passes; **RIVER** carves a meandering channel with two
+causeway crossings; **FOREST** is impassable woods with a carved base
+clearing, four winding gate trails, nest clearings and connectors — the
+walkable network is *visible* as gaps in the tree canopy. Impassable terrain
+turns both routing systems into real minimum-path solvers (table above);
+ground units axis-slide along blocked edges, harpies just fly over, wave
+landings resample until they hit passable, *reachable* ground. All of it
+brute-force-gated: flow reaches the CC from 8 bearings per scenario, no
+ground unit ever stands in a blocked cell, Morton culls == Tree culls ==
+brute force.
+
+## The molón round (`L`)
+
+Night assaults: the sun drops to a cold moon and up to 64 **torches** light
+the ring (towers, gates, every 7th wall piece, the CC — a fallen tower's
+light dies with it), flickering per-pixel in the terrain/skin/billboard
+shaders. Fresh corpses spill **blood pools** and a **kill ring** (ground
+decals, one instanced draw); breaches, wave landings and the run ending
+kick a **trauma camera** (rotational shake ∝ trauma², the GDC rule).
+
 ## Still queued
 
-**Decision buckets 4–8 Hz** (the CPU lever for the all-active case — approved),
-elevation-band blending for the impostors if the switch shows, the molón round
-(night assaults + torches, blood render-target, trauma camera, dust), scenario
-presets (mountain pass / river crossing / the expedition), the index-structure
-live toggle (Tree3 ↔ Morton ↔ 2D), and the Quaternius Ultimate Fantasy RTS
-wall/tower models to replace the procedural boxes. See
-[HORDE_DESIGN.md](HORDE_DESIGN.md) + [BACKLOG.md](BACKLOG.md).
+The Quaternius Ultimate Fantasy RTS wall/tower models to replace the
+procedural boxes (manual download — the page is JS-driven), researching
+TAB's actual map-generation algorithm for a TAB-like path-network scenario
+option, and the user's own horde min-path idea (the flow field above is the
+baseline to compare against). See [HORDE_DESIGN.md](HORDE_DESIGN.md) +
+[BACKLOG.md](BACKLOG.md).

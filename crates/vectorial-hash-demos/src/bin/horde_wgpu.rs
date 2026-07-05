@@ -34,6 +34,7 @@ use vectorial_hash_demos::horde_sim::{ground_h, is_forest, is_water, terrain_h, 
 use vectorial_hash_demos::siege_sim::{ANIM_FRAMES, MOVE_PREFS};
 
 const MAX_POP: usize = 100_000; // dormant-field slider ceiling (instance-buffer cap)
+const DECAL_CAP: usize = 8_192; // blood pools + kill rings on screen at once
 const CORPSE_DRAW: usize = 32_000; // most-recent corpses drawn (aftermath field)
 
 /// The models this demo needs (all already in `assets/siege/models/`; the web
@@ -197,9 +198,20 @@ fn build_trees(sim: &Horde) -> Vec<SkinInstance> {
 
 // ============================================================ gpu types
 
+/// One uniform for every 3D pipeline. `night_torch` = (night 0/1, torch count,
+/// 0, 0); `torches` = xyz + falloff radius — filled only at night, so the day
+/// path never pays the fragment loop.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct CameraUniform { vp: [[f32; 4]; 4], light: [f32; 4], eye_time: [f32; 4] } // eye.xyz + sim time (billboards)
+struct CameraUniform { vp: [[f32; 4]; 4], light: [f32; 4], eye_time: [f32; 4], night_torch: [f32; 4], torches: [[f32; 4]; 64] }
+
+const NO_TORCHES: [[f32; 4]; 64] = [[0.0; 4]; 64];
+
+/// Ground decal instance: blood pools (kind 0) and expanding kill rings
+/// (kind 1) — flat quads over the terrain, age drives fade/expansion in-shader.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct DecalInst { pos: [f32; 3], size: f32, age: f32, kind: u32, _pad: [f32; 2] }
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -408,6 +420,16 @@ struct State {
     box_inst_buf: wgpu::Buffer,
     tree_inst_buf: wgpu::Buffer, // Forest scenario: static trunk+canopy boxes
     tree_n: u32,
+    // ---- the molón round: night+torches, blood/kill-ring decals, trauma cam
+    night: bool,
+    trauma: f32,
+    decal_pipeline: wgpu::RenderPipeline,
+    decal_buf: wgpu::Buffer,
+    decals: Vec<([f32; 3], f64, u8)>, // (pos, born, kind 0=blood 1=ring)
+    decal_seen_corpses: usize,
+    last_breach: f64,
+    last_wave_k: u32,
+    was_over: bool,
     castle_model: GpuModel,
     cannon_model: GpuModel,
     cannon_inst_buf: wgpu::Buffer,
@@ -605,7 +627,7 @@ impl State {
                         let dir = Vec3::new(az.cos() * elev.cos(), elev.sin(), az.sin() * elev.cos());
                         let view = Mat4::look_at_rh(Vec3::new(0.0, cy, 0.0) + dir * (h * 6.0), Vec3::new(0.0, cy, 0.0), Vec3::Y);
                         let proj = Mat4::orthographic_rh(-h, h, -h, h, 0.1, h * 14.0);
-                        let cam = CameraUniform { vp: (proj * view).to_cols_array_2d(), light: [-0.45, 0.84, -0.30, 0.0], eye_time: [0.0; 4] };
+                        let cam = CameraUniform { vp: (proj * view).to_cols_array_2d(), light: [-0.45, 0.84, -0.30, 0.0], eye_time: [0.0; 4], night_torch: [0.0; 4], torches: NO_TORCHES };
                         queue.write_buffer(&cam_buf, 0, bytemuck::cast_slice(&[cam]));
                         let inst = SkinInstance { model: Mat4::from_rotation_y(tw_yaw).to_cols_array_2d(), color: [0.0, 0.0, 0.0, 0.0], frame_base: frame * m.num_joints, _pad: [0; 3] };
                         queue.write_buffer(&inst_buf, 0, bytemuck::cast_slice(&[inst]));
@@ -713,6 +735,21 @@ impl State {
         });
         let ui_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("ui-v"), size: (16384 * std::mem::size_of::<UiVertex>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
 
+        // Ground decals (blood pools + kill rings): flat instanced quads,
+        // alpha-blended over the terrain, no depth writes.
+        let decal_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("decal-shader"), source: wgpu::ShaderSource::Wgsl(DECAL_SHADER.into()) });
+        let decal_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("decal-pipe"),
+            layout: Some(&pipe_layout),
+            vertex: wgpu::VertexState { module: &decal_shader, entry_point: "vs", compilation_options: Default::default(), buffers: &[wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<DecalInst>() as u64, step_mode: wgpu::VertexStepMode::Instance, attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32, 2 => Float32, 3 => Uint32] }] },
+            fragment: Some(wgpu::FragmentState { module: &decal_shader, entry_point: "fs", compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
+            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState { format: wgpu::TextureFormat::Depth32Float, depth_write_enabled: false, depth_compare: wgpu::CompareFunction::Less, stencil: Default::default(), bias: Default::default() }),
+            multisample: Default::default(),
+            multiview: None,
+        });
+        let decal_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("decal-inst"), size: (DECAL_CAP * std::mem::size_of::<DecalInst>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+
         let depth = make_depth(&device, &config);
         #[cfg(not(target_arch = "wasm32"))]
         let max_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
@@ -723,6 +760,8 @@ impl State {
             surface, device, queue, config,
             skin_pipeline, models, inst_buf,
             box_model, box_inst_buf, tree_inst_buf, tree_n: 0, castle_model, cannon_model, cannon_inst_buf,
+            night: false, trauma: 0.0, decal_pipeline, decal_buf, decals: Vec::new(),
+            decal_seen_corpses: 0, last_breach: -1.0, last_wave_k: 0, was_over: false,
             bb_pipeline, bb_bind, bb_geom, idle_models, dormant_buf, dormant_n: 0, dormant_key: (0, 0),
             carpet_eye: Vec3::new(f32::MAX, 0.0, 0.0), carpet_t: -10.0,
             proxy_buf, corpse_buf, corpse_n: 0,
@@ -820,9 +859,40 @@ impl State {
             (target + Vec3::new(self.dist * self.pitch.cos() * self.yaw.cos(), self.dist * self.pitch.sin(), self.dist * self.pitch.cos() * self.yaw.sin()), target)
         };
         let view = Mat4::look_at_rh(eye, target, Vec3::Y);
+        // Trauma camera: breaches/defeats charge `trauma`; shake is trauma²
+        // ROTATIONAL noise in camera space (the GDC rule — translation shake
+        // reads as jelly, rotation reads as impact).
+        let t = self.sim.now as f32;
+        let sh = self.trauma * self.trauma;
+        let shake = Mat4::from_rotation_x(sh * 0.012 * (t * 47.0 + 1.7).sin()) * Mat4::from_rotation_y(sh * 0.016 * (t * 31.0).sin());
         let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
         let proj = Mat4::perspective_rh(45f32.to_radians(), aspect, 1.0, 5200.0);
-        CameraUniform { vp: (proj * view).to_cols_array_2d(), light: [-0.45, 0.84, -0.30, 0.0], eye_time: [eye.x, eye.y, eye.z, self.sim.now as f32] }
+        // Torches: only at night, only on LIVE ring pieces (a fallen tower's
+        // light dies with it). Count 0 by day = the shaders skip the loop.
+        let mut torches = NO_TORCHES;
+        let mut tn = 0usize;
+        if self.night {
+            let mut wall_i = 0usize;
+            for s in &self.sim.structures {
+                if tn >= torches.len() { break; }
+                if s.hp <= 0.0 { continue; }
+                let (add, dy, r) = match s.kind {
+                    SKind::Tower => (true, 26.0, 135.0),
+                    SKind::Gate => (true, 14.0, 110.0),
+                    SKind::CommandCenter => (true, 48.0, 200.0),
+                    SKind::Wall => { wall_i += 1; (wall_i % 7 == 0, 16.0, 95.0) }
+                    _ => (false, 0.0, 0.0),
+                };
+                if add { torches[tn] = [s.p.x as f32, s.p.y as f32 + dy, s.p.z as f32, r]; tn += 1; }
+            }
+        }
+        CameraUniform {
+            vp: (proj * shake * view).to_cols_array_2d(),
+            light: [-0.45, 0.84, -0.30, 0.0],
+            eye_time: [eye.x, eye.y, eye.z, self.sim.now as f32],
+            night_torch: [if self.night { 1.0 } else { 0.0 }, tn as f32, 0.0, 0.0],
+            torches,
+        }
     }
 
     fn update_and_render(&mut self) {
@@ -912,6 +982,46 @@ impl State {
                 self.corpse_n = n as u32;
             }
         }
+
+        // ---- the molón round: event → trauma + decals
+        // Every fresh corpse spills a blood pool + a kill ring at its feet.
+        {
+            let cs = self.sim.corpses.len();
+            if cs < self.decal_seen_corpses { self.decal_seen_corpses = 0; self.decals.clear(); } // drain/reset
+            for k in self.decal_seen_corpses..cs {
+                let (p, _, t) = self.sim.corpses[k];
+                let pos = [p.x as f32, p.y as f32 + 0.35, p.z as f32];
+                self.decals.push((pos, t, 0));
+                self.decals.push((pos, t, 1));
+            }
+            self.decal_seen_corpses = cs;
+            // Breach! — kick the camera and stamp a big ring at the hole.
+            if let Some((bp, bt)) = self.sim.breach {
+                if bt != self.last_breach as f64 && now - bt < 0.5 {
+                    self.last_breach = bt;
+                    self.trauma = (self.trauma + 0.55).min(1.0);
+                    self.decals.push(([bp.x as f32, bp.y as f32 + 0.4, bp.z as f32], bt, 1));
+                }
+            }
+            // A wave landing rumbles; the run ending slams.
+            let wk = self.sim.wave_info().0;
+            if wk != self.last_wave_k { if self.last_wave_k != 0 { self.trauma = (self.trauma + 0.35).min(1.0); } self.last_wave_k = wk; }
+            let over = self.sim.game_over.is_some();
+            if over && !self.was_over { self.trauma = 1.0; }
+            self.was_over = over;
+            self.trauma = (self.trauma - dt as f32 * 1.1).max(0.0);
+            // Age out (blood dries in 22 s, rings die in 0.9 s) + cap.
+            self.decals.retain(|&(_, born, kind)| { let a = now - born; if kind == 0 { (0.0..22.0).contains(&a) } else { (0.0..0.9).contains(&a) } });
+            if self.decals.len() > DECAL_CAP { let cut = self.decals.len() - DECAL_CAP; self.decals.drain(0..cut); }
+        }
+        let decal_n = {
+            let di: Vec<DecalInst> = self.decals.iter().map(|&(pos, born, kind)| {
+                let (life, size) = if kind == 0 { (22.0, 3.4 + (pos[0].to_bits() % 5) as f32 * 0.5) } else { (0.9, 16.0) };
+                DecalInst { pos, size, age: ((now - born) / life).clamp(0.0, 1.0) as f32, kind: kind as u32, _pad: [0.0; 2] }
+            }).collect();
+            if !di.is_empty() { self.queue.write_buffer(&self.decal_buf, 0, bytemuck::cast_slice(&di)); }
+            di.len() as u32
+        };
 
         // ACTIVE zombies: full skinned model when near (LOD_DIST), the standing
         // proxy when far; defenders always skinned (there are ~50 of them).
@@ -1158,7 +1268,7 @@ impl State {
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.42, g: 0.50, b: 0.62, a: 1.0 }), store: wgpu::StoreOp::Store } })],
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(if self.night { wgpu::Color { r: 0.030, g: 0.040, b: 0.085, a: 1.0 } } else { wgpu::Color { r: 0.42, g: 0.50, b: 0.62, a: 1.0 } }), store: wgpu::StoreOp::Store } })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &self.depth, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }),
                 timestamp_writes: None, occlusion_query_set: None,
             });
@@ -1227,6 +1337,13 @@ impl State {
                 pass.set_index_buffer(bm.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..bm.nidx, 0, 0..self.tree_n);
             }
+            // ground decals (blood + kill rings) — over the terrain, no depth writes
+            if decal_n > 0 {
+                pass.set_pipeline(&self.decal_pipeline);
+                pass.set_bind_group(0, &self.cam_bg, &[]);
+                pass.set_vertex_buffer(0, self.decal_buf.slice(..));
+                pass.draw(0..6, 0..decal_n);
+            }
             // tower cannons
             if cannon_n > 0 {
                 let km = &self.cannon_model;
@@ -1259,11 +1376,33 @@ fn make_depth(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgp
         .create_view(&wgpu::TextureViewDescriptor::default())
 }
 
+// Night+torch lighting (shared shape across skin/terrain/billboard shaders):
+// `night_torch.x` fades the sun down to a cold moon; `torches[0..y]` are warm
+// point lights with quadratic-ish falloff and a per-torch flicker. By day the
+// torch count is 0 and the loop never runs.
 const SKIN_SHADER: &str = r#"
-struct Camera { vp: mat4x4<f32>, light: vec4<f32> };
+struct Camera { vp: mat4x4<f32>, light: vec4<f32>, eye_time: vec4<f32>, night_torch: vec4<f32>, torches: array<vec4<f32>, 64> };
 @group(0) @binding(0) var<uniform> cam: Camera;
 @group(0) @binding(1) var<storage, read> bones: array<mat4x4<f32>>;
-struct VOut { @builtin(position) clip: vec4<f32>, @location(0) color: vec4<f32>, @location(1) normal: vec3<f32> };
+struct VOut { @builtin(position) clip: vec4<f32>, @location(0) color: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) wpos: vec3<f32> };
+fn torch_light(wp: vec3<f32>) -> vec3<f32> {
+    var acc = vec3<f32>(0.0);
+    let n = u32(cam.night_torch.y);
+    for (var i = 0u; i < n; i = i + 1u) {
+        let t = cam.torches[i];
+        let att = clamp(1.0 - distance(wp, t.xyz) / t.w, 0.0, 1.0);
+        let fl = 0.82 + 0.18 * sin(cam.eye_time.w * (7.0 + f32(i % 5u)) + f32(i) * 1.7);
+        acc = acc + vec3<f32>(1.0, 0.62, 0.28) * att * att * fl;
+    }
+    return acc;
+}
+fn shade(base: vec3<f32>, normal: vec3<f32>, wp: vec3<f32>) -> vec3<f32> {
+    let night = cam.night_torch.x;
+    let diff = max(dot(normalize(normal), normalize(cam.light.xyz)), 0.0);
+    var lit = base * (mix(0.40, 0.13, night) + mix(0.60, 0.14, night) * diff);
+    lit = mix(lit, lit * vec3<f32>(0.72, 0.80, 1.10), night * 0.65); // cold moon
+    return lit + base * torch_light(wp) * night;
+}
 @vertex
 fn vs(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>, @location(2) joints: vec4<u32>, @location(3) weights: vec4<f32>,
       @location(10) vcolor: vec4<f32>,
@@ -1285,31 +1424,47 @@ fn vs(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>, @location(2) joints:
     o.clip = cam.vp * world;
     o.normal = (model * vec4<f32>(sn, 0.0)).xyz;
     o.color = vec4<f32>(mix(vcolor.rgb, tint.rgb, tint.a), 1.0);
+    o.wpos = world.xyz;
     return o;
 }
 @fragment
 fn fs(in: VOut) -> @location(0) vec4<f32> {
-    let diff = max(dot(normalize(in.normal), normalize(cam.light.xyz)), 0.0);
-    return vec4<f32>(in.color.rgb * (0.40 + 0.60 * diff), 1.0);
+    return vec4<f32>(shade(in.color.rgb, in.normal, in.wpos), 1.0);
 }
 "#;
 
 const TERRAIN_SHADER: &str = r#"
-struct Camera { vp: mat4x4<f32>, light: vec4<f32> };
+struct Camera { vp: mat4x4<f32>, light: vec4<f32>, eye_time: vec4<f32>, night_torch: vec4<f32>, torches: array<vec4<f32>, 64> };
 @group(0) @binding(0) var<uniform> cam: Camera;
-struct VOut { @builtin(position) clip: vec4<f32>, @location(0) color: vec4<f32>, @location(1) normal: vec3<f32> };
+struct VOut { @builtin(position) clip: vec4<f32>, @location(0) color: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) wpos: vec3<f32> };
+fn torch_light(wp: vec3<f32>) -> vec3<f32> {
+    var acc = vec3<f32>(0.0);
+    let n = u32(cam.night_torch.y);
+    for (var i = 0u; i < n; i = i + 1u) {
+        let t = cam.torches[i];
+        let att = clamp(1.0 - distance(wp, t.xyz) / t.w, 0.0, 1.0);
+        let fl = 0.82 + 0.18 * sin(cam.eye_time.w * (7.0 + f32(i % 5u)) + f32(i) * 1.7);
+        acc = acc + vec3<f32>(1.0, 0.62, 0.28) * att * att * fl;
+    }
+    return acc;
+}
 @vertex
 fn vs(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>, @location(2) col: vec4<f32>) -> VOut {
     var o: VOut;
     o.clip = cam.vp * vec4<f32>(p, 1.0);
     o.color = col;
     o.normal = n;
+    o.wpos = p;
     return o;
 }
 @fragment
 fn fs(in: VOut) -> @location(0) vec4<f32> {
+    let night = cam.night_torch.x;
     let diff = max(dot(normalize(in.normal), normalize(cam.light.xyz)), 0.0);
-    return vec4<f32>(in.color.rgb * (0.40 + 0.60 * diff), 1.0);
+    var lit = in.color.rgb * (mix(0.40, 0.13, night) + mix(0.60, 0.14, night) * diff);
+    lit = mix(lit, lit * vec3<f32>(0.72, 0.80, 1.10), night * 0.65);
+    lit = lit + in.color.rgb * torch_light(in.wpos) * night;
+    return vec4<f32>(lit, 1.0);
 }
 "#;
 
@@ -1326,6 +1481,45 @@ fn vs(@location(0) p: vec3<f32>, @location(1) color: vec4<f32>) -> VOut {
 }
 @fragment
 fn fs(in: VOut) -> @location(0) vec4<f32> { return in.color; }
+"#;
+
+// Ground decals: kind 0 = blood pool (soft-edged dark red blot, slow fade),
+// kind 1 = kill ring (a thin band expanding from the centre, fast fade — the
+// dust shockwave of a fresh corpse). `age` arrives 0..1.
+const DECAL_SHADER: &str = r#"
+struct Camera { vp: mat4x4<f32>, light: vec4<f32>, eye_time: vec4<f32> };
+@group(0) @binding(0) var<uniform> cam: Camera;
+struct VOut { @builtin(position) clip: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) age: f32, @location(2) @interpolate(flat) kind: u32 };
+@vertex
+fn vs(@builtin(vertex_index) vi: u32,
+      @location(0) pos: vec3<f32>, @location(1) size: f32, @location(2) age: f32, @location(3) kind: u32) -> VOut {
+    var corners = array<vec2<f32>, 6>(
+        vec2(-1.0, -1.0), vec2(1.0, -1.0), vec2(1.0, 1.0),
+        vec2(-1.0, -1.0), vec2(1.0, 1.0), vec2(-1.0, 1.0));
+    let c = corners[vi];
+    let world = vec3<f32>(pos.x + c.x * size, pos.y, pos.z + c.y * size);
+    var o: VOut;
+    o.clip = cam.vp * vec4<f32>(world, 1.0);
+    o.uv = c;
+    o.age = age;
+    o.kind = kind;
+    return o;
+}
+@fragment
+fn fs(in: VOut) -> @location(0) vec4<f32> {
+    let r = length(in.uv);
+    if (in.kind == 0u) {
+        // blood: irregular blot (angular wobble), darkening as it dries
+        let a0 = atan2(in.uv.y, in.uv.x);
+        let edge = 0.72 + 0.16 * sin(a0 * 5.0) * sin(a0 * 3.0 + 1.3);
+        let a = smoothstep(edge + 0.22, edge - 0.10, r) * (1.0 - in.age) * 0.82;
+        return vec4<f32>(0.30, 0.02, 0.02, a);
+    }
+    // kill ring: a band expanding from the centre
+    let rr = 0.12 + in.age * 0.88;
+    let a = (1.0 - smoothstep(0.0, 0.12, abs(r - rr))) * (1.0 - in.age) * 0.75;
+    return vec4<f32>(0.92, 0.84, 0.62, a);
+}
 "#;
 
 const UI_SHADER: &str = r#"
@@ -1346,12 +1540,22 @@ fn fs(in: VOut) -> @location(0) vec4<f32> { return in.color; }
 // the camera→instance azimuth vs the instance heading, and the FRAME row from
 // the mode (0 walk cycle · 1 idle sway · 2 death pose) + time. Alpha-cutout.
 const BB_SHADER: &str = r#"
-struct Camera { vp: mat4x4<f32>, light: vec4<f32>, eye_time: vec4<f32> };
+struct Camera { vp: mat4x4<f32>, light: vec4<f32>, eye_time: vec4<f32>, night_torch: vec4<f32>, torches: array<vec4<f32>, 64> };
 @group(0) @binding(0) var<uniform> cam: Camera;
 @group(0) @binding(1) var atlas: texture_2d_array<f32>;
 @group(0) @binding(2) var samp: sampler;
-struct VOut { @builtin(position) clip: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) tint: vec4<f32>, @location(2) layer: u32, @location(3) uv2: vec2<f32>, @location(4) bandmix: f32 };
+struct VOut { @builtin(position) clip: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) tint: vec4<f32>, @location(2) layer: u32, @location(3) uv2: vec2<f32>, @location(4) bandmix: f32, @location(5) wpos: vec3<f32> };
 const TAU: f32 = 6.2831853;
+fn torch_light(wp: vec3<f32>) -> vec3<f32> {
+    var acc = vec3<f32>(0.0);
+    let n = u32(cam.night_torch.y);
+    for (var i = 0u; i < n; i = i + 1u) {
+        let t = cam.torches[i];
+        let att = clamp(1.0 - distance(wp, t.xyz) / t.w, 0.0, 1.0);
+        acc = acc + vec3<f32>(1.0, 0.62, 0.28) * att * att;
+    }
+    return acc;
+}
 @vertex
 fn vs(@builtin(vertex_index) vi: u32,
       @location(0) pos: vec3<f32>, @location(1) size: f32, @location(2) heading: f32,
@@ -1397,6 +1601,7 @@ fn vs(@builtin(vertex_index) vi: u32,
     o.bandmix = fract(bandf);
     o.tint = tint;
     o.layer = layer;
+    o.wpos = pos;
     return o;
 }
 @fragment
@@ -1405,7 +1610,10 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
     let pb = textureSample(atlas, samp, in.uv2, in.layer);
     let px = mix(pa, pb, in.bandmix);
     if (px.a < 0.5) { discard; }
-    let rgb = mix(px.rgb, in.tint.rgb, in.tint.a);
+    var rgb = mix(px.rgb, in.tint.rgb, in.tint.a);
+    let night = cam.night_torch.x;
+    rgb = mix(rgb, rgb * vec3<f32>(0.20, 0.24, 0.36), night); // moonlit photos
+    rgb = rgb + mix(px.rgb, in.tint.rgb, in.tint.a) * torch_light(in.wpos) * night;
     return vec4<f32>(rgb, 1.0);
 }
 "#;
@@ -1475,6 +1683,7 @@ async fn run() {
                         KeyCode::KeyT => st.sim.tower_threat_mode = !st.sim.tower_threat_mode,
                         KeyCode::KeyG => { let sc = st.sim.scenario.next(); st.set_scenario(sc); } // cycle the map preset
                         KeyCode::KeyM => { let zm = st.sim.zmode.next(); st.sim.set_zmode(zm); }   // Tree3 ↔ Morton, live
+                        KeyCode::KeyL => st.night = !st.night, // night assault + torches
                         KeyCode::KeyF => {
                             st.free_cam = !st.free_cam;
                             if st.free_cam {
@@ -1530,7 +1739,7 @@ async fn run() {
                     frame += 1;
                     if frame % 15 == 0 {
                         let (d, a) = st.sim.counts();
-                        window.set_title(&format!("vectorial-hash — horde (wgpu) · map {} [G] · index {} [M] · sleep {d} | awake {a} | kills {} · run {} · {:.0} fps{}", st.sim.scenario.label(), st.sim.zmode.label(), st.sim.kills, st.sim.run, st.fps, if st.paused { " · PAUSED" } else { "" }));
+                        window.set_title(&format!("vectorial-hash — horde (wgpu) · map {} [G] · index {} [M]{} · sleep {d} | awake {a} | kills {} · run {} · {:.0} fps{}", st.sim.scenario.label(), st.sim.zmode.label(), if st.night { " · NIGHT [L]" } else { "" }, st.sim.kills, st.sim.run, st.fps, if st.paused { " · PAUSED" } else { "" }));
                     }
                     #[cfg(not(target_arch = "wasm32"))]
                     if let Some(m) = max_frames {
