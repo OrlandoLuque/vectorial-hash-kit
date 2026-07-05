@@ -48,11 +48,20 @@ autonomously verifiable. User picked **"Todo (A–E)"** + the headline below.
        as a scenario option in the demo, IF none of the existing carved
        scenarios (Pass gaps / River causeways / Forest trails) already reads
        equivalent. Compare visually first; only then build.
-  4. **Molón round**: night assaults + torch lighting (clustered forward),
-     blood render-target, trauma camera, dust billboards.
-  5. **Tree3 ↔ Morton ↔ 2D live toggle** (`M`, user picked "ambos conmutables").
-  6. **Quaternius Ultimate Fantasy RTS** wall/tower/house models to replace the
-     procedural boxes (pack vetted in HORDE_DESIGN).
+  4. ~~**Molón round**~~ — **DONE** (2026-07-06): `L` night + ≤64 flickering
+     torch point-lights in every shader (a fallen tower's light dies with
+     it), blood-pool + kill-ring ground decals, trauma camera (rotational,
+     ∝ trauma²; breaches/waves/run-end charge it), night clear colour.
+  5. ~~**Tree3 ↔ Morton live toggle**~~ — **DONE** (2026-07-06): `M`, the
+     `ZQuery` borrow enum over every query site; Morton = honest
+     clear+reinsert per frame at levels=5 (levels=7 shredded the 68-wu y
+     axis: one wake blast touched 270k cells). Morton==Tree==brute gated.
+     (The 2D leg of "ambos conmutables" would need a projection layer —
+     queued behind the TAB-map research.)
+  6. **Quaternius Ultimate Fantasy RTS** wall/tower/house models to replace
+     the procedural boxes (pack vetted in HORDE_DESIGN). **Blocked on a
+     MANUAL download**: quaternius.com is JS-driven, the direct zip URLs
+     404 — grab the pack by hand into `assets/siege/models/` and say so.
 - **FORMATIONS — BUILT (2026-07-06 night)**: `formations_sim` (graphics-free,
   11 brute-force-gated tests: k-NN melee pairing, sector flank/rear vs brute
   angles, the kill-roll curve, charge-corridor raycast, volleys with honest
