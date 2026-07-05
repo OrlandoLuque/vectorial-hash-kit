@@ -19,7 +19,7 @@
 //!
 //! No combat yet (phase 2: towers, wall HP, breaches, infection, waves).
 
-use vectorial_hash::{Aabb, ItemRef, Point3, Positioned3, Sphere3, Tree3};
+use vectorial_hash::{Aabb, ItemRef, Point3, Positioned3, Shape3, Sphere3, Tree3};
 
 pub use crate::siege_sim::Rng;
 
@@ -176,6 +176,110 @@ impl NoiseGrid {
     }
 }
 
+// ----------------------------------------------------------------- scenarios
+
+/// Map presets (HORDE_DESIGN § Scenarios) — same sim, different worlds. The
+/// impassable ones (Pass / River / Forest) turn the flow field into a real
+/// minimum-path system: blocked cells never relax in the Dijkstra, so the
+/// horde funnels through the passes / bridges / forest trails. (The user has
+/// an alternative min-path idea for the horde — baseline to compare against.)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Scenario { Classic, Pass, River, Forest }
+impl Scenario {
+    pub fn label(self) -> &'static str { match self { Self::Classic => "OPEN", Self::Pass => "PASS", Self::River => "RIVER", Self::Forest => "FOREST" } }
+    pub fn next(self) -> Scenario { match self { Self::Classic => Self::Pass, Self::Pass => Self::River, Self::River => Self::Forest, Self::Forest => Self::Classic } }
+}
+
+/// Scenario-aware terrain height (pure): the Pass raises a ring ridge with
+/// three gap passes; the River carves a meandering channel. (Forest keeps the
+/// base heightfield — the trees are blockers, not hills.)
+pub fn terrain_h(x: f64, z: f64, seed: f64, sc: Scenario) -> f64 {
+    let base = ground_h(x, z, seed);
+    let (cx, cz) = (WORLD / 2.0, WORLD / 2.0);
+    match sc {
+        Scenario::Pass => {
+            let d = ((x - cx).powi(2) + (z - cz).powi(2)).sqrt();
+            let band = 1.0 - ((d - 330.0).abs() / 46.0).min(1.0); // ring ridge at r≈330
+            let a = (z - cz).atan2(x - cx);
+            let gap = [0.5f64, 2.6, 4.7].iter().map(|g| { let mut da = (a - g).abs(); if da > std::f64::consts::PI { da = std::f64::consts::TAU - da; } (1.0 - da / 0.22).max(0.0) }).fold(0.0f64, f64::max);
+            base + 58.0 * band * band * (1.0 - gap).max(0.0)
+        }
+        Scenario::River => {
+            let zr = cz - 250.0 + 70.0 * (x * 0.008 + seed * 3.0).sin();
+            let band = 1.0 - ((z - zr).abs() / 42.0).min(1.0);
+            let mut h = base - 9.0 * band * band;
+            // Causeway decks at the two carved crossings: the channel blends
+            // back up to bank level so units cross ON something, not in water.
+            for bx in [cx - 330.0, cx + 330.0] {
+                let deck = 1.0 - ((x - bx).abs() / 13.0).min(1.0);
+                if deck > 0.0 { h += (base + 0.6 - h) * deck.sqrt(); }
+            }
+            h
+        }
+        _ => base,
+    }
+}
+
+/// Is (x,z) water in the River scenario? (bridges are carved in the pass grid)
+pub fn is_water(x: f64, z: f64, seed: f64, sc: Scenario) -> bool {
+    if sc != Scenario::River { return false; }
+    let zr = (WORLD / 2.0) - 250.0 + 70.0 * (x * 0.008 + seed * 3.0).sin();
+    (z - zr).abs() < 30.0
+}
+
+/// The forest mask (Forest scenario): dense value-noise woods; clearings and
+/// trails are carved into the pass grid at build time.
+pub fn is_forest(x: f64, z: f64, seed: f64) -> f64 { // 0..1 density
+    fn h(ix: i64, iz: i64, s: i64) -> f64 {
+        let mut n = (ix.wrapping_mul(374761393)) ^ (iz.wrapping_mul(668265263)) ^ s.wrapping_mul(1274126177);
+        n = (n ^ (n >> 13)).wrapping_mul(1103515245);
+        ((n ^ (n >> 16)) & 0xffff) as f64 / 65535.0
+    }
+    let s = (seed * 1e6) as i64 ^ 0x5157;
+    let (ix, iz) = ((x * 0.011).floor() as i64, (z * 0.011).floor() as i64);
+    let (fx, fz) = (x * 0.011 - (x * 0.011).floor(), z * 0.011 - (z * 0.011).floor());
+    let (sx, sz) = (fx * fx * (3.0 - 2.0 * fx), fz * fz * (3.0 - 2.0 * fz));
+    let (a, b, c, d) = (h(ix, iz, s), h(ix + 1, iz, s), h(ix, iz + 1, s), h(ix + 1, iz + 1, s));
+    a + (b - a) * sx + (c - a) * sz + (a - b - c + d) * sx * sz
+}
+
+/// A* over the pass grid — the DEFENDERS' minimum paths (sorties through the
+/// forest trails / over the bridges). One search per squad dispatch, waypoints
+/// decimated to every ~4 cells. Returns empty if unreachable.
+fn astar_path(grid: &[bool], n: usize, cell: f64, from: (f64, f64), to: (f64, f64)) -> Vec<(f64, f64)> {
+    let idx = |x: f64, z: f64| -> (usize, usize) { (((x / cell) as usize).min(n - 1), ((z / cell) as usize).min(n - 1)) };
+    let (s, g) = (idx(from.0, from.1), idx(to.0, to.1));
+    if !grid[s.1 * n + s.0] || !grid[g.1 * n + g.0] { return Vec::new(); }
+    let hcost = |i: usize, j: usize| { let (dx, dz) = ((i as i64 - g.0 as i64).abs(), (j as i64 - g.1 as i64).abs()); (dx.max(dz) * 100 + dx.min(dz) * 41) as u32 };
+    let mut best = vec![u32::MAX; n * n];
+    let mut prev = vec![u32::MAX; n * n];
+    let mut heap = std::collections::BinaryHeap::new();
+    best[s.1 * n + s.0] = 0;
+    heap.push(std::cmp::Reverse((hcost(s.0, s.1), 0u32, s.0, s.1)));
+    while let Some(std::cmp::Reverse((_, d, i, j))) = heap.pop() {
+        if (i, j) == g { break; }
+        if d > best[j * n + i] { continue; }
+        for (di, dj, w) in [(-1i64, 0i64, 100u32), (1, 0, 100), (0, -1, 100), (0, 1, 100), (-1, -1, 141), (1, -1, 141), (-1, 1, 141), (1, 1, 141)] {
+            let (ni, nj) = (i as i64 + di, j as i64 + dj);
+            if ni < 0 || nj < 0 || ni >= n as i64 || nj >= n as i64 { continue; }
+            let (ni, nj) = (ni as usize, nj as usize);
+            if !grid[nj * n + ni] { continue; }
+            let nd = d + w;
+            if nd < best[nj * n + ni] {
+                best[nj * n + ni] = nd;
+                prev[nj * n + ni] = (j * n + i) as u32;
+                heap.push(std::cmp::Reverse((nd + hcost(ni, nj), nd, ni, nj)));
+            }
+        }
+    }
+    if best[g.1 * n + g.0] == u32::MAX { return Vec::new(); }
+    let mut cells = Vec::new();
+    let mut cur = g.1 * n + g.0;
+    while cur != s.1 * n + s.0 { cells.push(cur); let p = prev[cur]; if p == u32::MAX { break; } cur = p as usize; }
+    cells.reverse();
+    cells.iter().step_by(4).chain(cells.last()).map(|&c| (((c % n) as f64 + 0.5) * cell, ((c / n) as f64 + 0.5) * cell)).collect()
+}
+
 // ----------------------------------------------------------------- flow field
 
 /// Coarse flow field guiding wave zombies to the Command Center — the SupCom2
@@ -206,12 +310,29 @@ impl FlowField {
         let d = self.dir[j * self.n + i];
         (d.0 as f64, d.1 as f64)
     }
+    /// Did the last integration reach this cell? `false` = walled off from the
+    /// CC (an unconnected forest pocket, deep woods, outside everything).
+    pub fn reachable(&self, x: f64, z: f64) -> bool {
+        let (i, j) = self.cell_of(x, z);
+        self.integ[j * self.n + i] != u32::MAX
+    }
     /// Rebuild cost + integration + directions from live structure HP.
-    fn rebuild(&mut self, structures: &[Structure], cc: Point3) {
+    /// Impassable pass-grid cells (ridge / water / woods) never relax — the
+    /// flood pours through the carved passes/bridges/trails: the horde's
+    /// minimum paths fall out of the same Dijkstra that handles breaches.
+    fn rebuild(&mut self, structures: &[Structure], cc: Point3, pass: &[bool], pn: usize, pcell: f64) {
         let n = self.n;
         // Per-cell traversal cost (milli-units): open ground 100; a live wall
         // piece adds ~6× ground + a term falling with damage.
         let mut cost = vec![100u32; n * n];
+        let mut blocked = vec![false; n * n];
+        for j in 0..n {
+            for i in 0..n {
+                let (x, z) = ((i as f64 + 0.5) * self.cell, (j as f64 + 0.5) * self.cell);
+                let pi = ((z / pcell) as usize).min(pn - 1) * pn + ((x / pcell) as usize).min(pn - 1);
+                blocked[j * n + i] = !pass[pi];
+            }
+        }
         for s in structures {
             if s.hp <= 0.0 { continue; }
             let (i, j) = self.cell_of(s.p.x, s.p.z);
@@ -234,6 +355,7 @@ impl FlowField {
                 let (ni, nj) = (i as i64 + di, j as i64 + dj);
                 if ni < 0 || nj < 0 || ni >= n as i64 || nj >= n as i64 { continue; }
                 let (ni, nj) = (ni as usize, nj as usize);
+                if blocked[nj * n + ni] { continue; }
                 let nd = d + cost[nj * n + ni] * w / 100;
                 if nd < self.integ[nj * n + ni] { self.integ[nj * n + ni] = nd; heap.push(std::cmp::Reverse((nd, ni, nj))); }
             }
@@ -313,6 +435,9 @@ pub struct Defender {
     /// Crew: repair stock (a porter delivery = +20; repair burns 2/s).
     pub stock: f64,
     pub shots: u64,
+    /// A* waypoints over the pass grid (sortie out along the forest trails /
+    /// causeways, and the trail home) — empty means walk straight.
+    pub path: Vec<(f64, f64)>,
 }
 impl Defender { pub fn alive(&self) -> bool { self.hp > 0.0 } }
 
@@ -398,13 +523,43 @@ pub struct Horde {
     pub breach: Option<(Point3, f64)>,
     /// Structure ids of the four cardinal gates (friendly passage points).
     pub gates: Vec<usize>,
+    /// Map preset — decides terrain features + the passability grid.
+    pub scenario: Scenario,
+    /// Passability at flow-grid resolution (Pass ridges, River water, Forest
+    /// woods = false; trails/bridges/passes carved true). Classic: all true.
+    pub pass_grid: Vec<bool>,
+    pub pass_n: usize,
+    pub pass_cell: f64,
+    /// Zombie-index mode (the `M` toggle): keep-maintained Tree3, or a
+    /// rebuilt-per-frame MortonGrid3 — the structure trade-off, live.
+    pub zmode: ZMode,
+    zmorton: vectorial_hash::MortonGrid3<IZombie>,
+}
+
+/// The live index-structure toggle (docs/CHOOSING.md trade-offs, on screen):
+/// Tree3 is keep-maintained (`update_ref`, sleepers skipped); MortonGrid3 has
+/// no in-place handles, so its side of the switch is a clear+reinsert of every
+/// LIVE zombie per frame — the rebuild-vs-keep comparison, watchable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ZMode { Tree, Morton }
+impl ZMode {
+    pub fn label(self) -> &'static str { match self { Self::Tree => "TREE3", Self::Morton => "MORTON" } }
+    pub fn next(self) -> ZMode { match self { Self::Tree => Self::Morton, Self::Morton => Self::Tree } }
+}
+
+/// A borrow of whichever zombie index is live — one query surface so the wake
+/// blasts / separation / towers / defenders don't care which structure answers.
+pub enum ZQuery<'a> { Tree(&'a Tree3<IZombie>), Morton(&'a vectorial_hash::MortonGrid3<IZombie>) }
+impl<'a> ZQuery<'a> {
+    pub fn cull<S: Shape3>(&self, s: &S) -> Vec<&'a IZombie> { match self { Self::Tree(t) => t.cull(s), Self::Morton(m) => m.cull(s) } }
+    pub fn knn(&self, p: Point3, k: usize) -> Vec<(f64, &'a IZombie)> { match self { Self::Tree(t) => t.knn(p, k), Self::Morton(m) => m.knn(p, k) } }
 }
 
 /// The base layout: a stone wall ring with 4 cardinal gates and towers every
 /// few segments, houses + storehouses inside, the Command Center dead centre.
-fn build_base(rng: &mut Rng, seed: f64) -> Vec<Structure> {
+fn build_base(rng: &mut Rng, seed: f64, sc: Scenario) -> Vec<Structure> {
     let (cx, cz) = (WORLD / 2.0, WORLD / 2.0);
-    let at = |x: f64, z: f64| Point3::new(x, ground_h(x, z, seed), z);
+    let at = |x: f64, z: f64| Point3::new(x, terrain_h(x, z, seed, sc), z);
     let mut s = Vec::new();
     let segs = (std::f64::consts::TAU * BASE_R / 8.0) as usize; // one wall piece ≈ every 8 wu
     let step = std::f64::consts::TAU / segs as f64;
@@ -442,18 +597,10 @@ fn build_base(rng: &mut Rng, seed: f64) -> Vec<Structure> {
 /// lattice masked by the nest discs**: bodies are ≥ ~1.5 wu apart BY
 /// CONSTRUCTION (no two sleepers share a spot, even where nests overlap), and
 /// sampling the masked points evenly keeps every nest populated.
-pub fn spawn_field(rng: &mut Rng, pop: usize, seed: f64) -> Vec<Zombie> {
-    let (cx, cz) = (WORLD / 2.0, WORLD / 2.0);
-    let nests = (pop / 300).clamp(3, 80);
+fn spawn_field_at(rng: &mut Rng, pop: usize, seed: f64, sc: Scenario, centers: &[(f64, f64)], nr: f64, grid: &[bool], pn: usize, pcell: f64) -> Vec<Zombie> {
     const SPACING: f64 = 2.4;
-    // Nest discs sized so their combined area holds `pop` at lattice density.
-    let nr = ((pop as f64 * SPACING * SPACING * 1.5) / (std::f64::consts::PI * nests as f64)).sqrt().clamp(22.0, 130.0);
-    let centers: Vec<(f64, f64)> = (0..nests).map(|_| {
-        let a = rng.range(0.0, std::f64::consts::TAU);
-        let r = rng.range(BASE_R + 120.0 + nr * 0.4, WORLD / 2.0 - 40.0);
-        (cx + a.cos() * r, cz + a.sin() * r)
-    }).collect();
-    // All jittered lattice points inside some nest disc…
+    let pass = |x: f64, z: f64| grid[((z / pcell) as usize).min(pn - 1) * pn + ((x / pcell) as usize).min(pn - 1)];
+    // All jittered lattice points inside some nest disc, on PASSABLE ground…
     let mut spots: Vec<(f64, f64)> = Vec::with_capacity(pop * 2);
     let rows = (WORLD / SPACING) as usize;
     for gj in 0..rows {
@@ -463,6 +610,7 @@ pub fn spawn_field(rng: &mut Rng, pop: usize, seed: f64) -> Vec<Zombie> {
             // Jitter ±0.3 keeps the worst-case pair at 1.8 wu — above the 1.7
             // contact-wake radius, so a fresh field has no self-igniting pairs.
             let (x, z) = ((x0 + rng.range(-0.3, 0.3)).clamp(MARGIN, WORLD - MARGIN), (z0 + rng.range(-0.3, 0.3)).clamp(MARGIN, WORLD - MARGIN));
+            if !pass(x, z) { continue; }
             if centers.iter().any(|(nx, nz)| { let (dx, dz) = (x - nx, z - nz); dx * dx + dz * dz < nr * nr }) { spots.push((x, z)); }
         }
     }
@@ -476,18 +624,97 @@ pub fn spawn_field(rng: &mut Rng, pop: usize, seed: f64) -> Vec<Zombie> {
         let (x, z) = spots[k];
         let roll = rng.unit();
         let class = if roll < 0.70 { ZClass::Walker } else if roll < 0.85 { ZClass::Runner } else if roll < 0.91 { ZClass::Chubby } else if roll < 0.96 { ZClass::Venom } else { ZClass::Harpy };
-        let y = ground_h(x, z, seed) + class.altitude();
+        let y = terrain_h(x, z, seed, sc) + class.altitude();
         units.push(Zombie { class, p: Point3::new(x, y, z), vel: (0.0, 0.0), state: ZState::Dormant, hp: class.max_hp(), heard: 0.0, linger: 0.0, groan_t: rng.range(0.5, 2.0), swing_t: 0.0, bump: u32::MAX, moved: false });
     }
     units
 }
 
 impl Horde {
-    pub fn new(seed: u64, pop: usize) -> Horde {
+    pub fn new(seed: u64, pop: usize) -> Horde { Self::with_scenario(seed, pop, Scenario::Classic) }
+
+    pub fn with_scenario(seed: u64, pop: usize, sc: Scenario) -> Horde {
         let fseed = (seed % 100_000) as f64 * 0.013 + 0.29;
         let mut rng = Rng::new(seed | 1);
-        let structures = build_base(&mut rng, fseed);
-        let units = spawn_field(&mut rng, pop, fseed);
+        let structures = build_base(&mut rng, fseed, sc);
+        // ---- the passability grid (flow resolution): ridges / water / woods
+        // block; passes / bridges / trails / clearings are carved true.
+        let (pn, pcell) = (150usize, WORLD / 150.0);
+        let (cx, cz) = (WORLD / 2.0, WORLD / 2.0);
+        let mut grid = vec![true; pn * pn];
+        for j in 0..pn {
+            for i in 0..pn {
+                let (x, z) = ((i as f64 + 0.5) * pcell, (j as f64 + 0.5) * pcell);
+                grid[j * pn + i] = match sc {
+                    Scenario::Classic => true,
+                    Scenario::Pass => terrain_h(x, z, fseed, sc) - ground_h(x, z, fseed) < 24.0, // below half-ridge
+                    Scenario::River => !is_water(x, z, fseed, sc),
+                    Scenario::Forest => is_forest(x, z, fseed) < 0.46,
+                };
+            }
+        }
+        let set_disc = |grid: &mut Vec<bool>, x: f64, z: f64, r: f64, v: bool| {
+            let (i0, i1) = ((((x - r) / pcell).max(0.0)) as usize, (((x + r) / pcell) as usize).min(pn - 1));
+            let (j0, j1) = ((((z - r) / pcell).max(0.0)) as usize, (((z + r) / pcell) as usize).min(pn - 1));
+            for j in j0..=j1 { for i in i0..=i1 {
+                let (px, pz) = ((i as f64 + 0.5) * pcell, (j as f64 + 0.5) * pcell);
+                if (px - x).powi(2) + (pz - z).powi(2) <= r * r { grid[j * pn + i] = v; }
+            } }
+        };
+        if sc == Scenario::River { // two bridges over the channel
+            for bx in [cx - 330.0, cx + 330.0] {
+                let zr = cz - 250.0 + 70.0 * (bx * 0.008 + fseed * 3.0).sin();
+                for k in 0..9 { set_disc(&mut grid, bx, zr - 40.0 + k as f64 * 10.0, 14.0, true); }
+            }
+        }
+        // Nest centres (need passable ground except in Forest, where we carve).
+        let nests = (pop / 300).clamp(3, 80);
+        let nr = ((pop as f64 * 2.4 * 2.4 * 1.5) / (std::f64::consts::PI * nests as f64)).sqrt().clamp(22.0, 130.0);
+        let mut centers: Vec<(f64, f64)> = Vec::with_capacity(nests);
+        let mut tries = 0;
+        while centers.len() < nests && tries < nests * 40 {
+            tries += 1;
+            let a = rng.range(0.0, std::f64::consts::TAU);
+            let r = rng.range(BASE_R + 120.0 + nr * 0.4, WORLD / 2.0 - 40.0);
+            let (x, z) = (cx + a.cos() * r, cz + a.sin() * r);
+            let ci = ((z / pcell) as usize).min(pn - 1) * pn + ((x / pcell) as usize).min(pn - 1);
+            if sc != Scenario::Forest && !grid[ci] { continue; }
+            centers.push((x, z));
+        }
+        if sc == Scenario::Forest {
+            // Carve the map: base clearing, a winding trail from each gate to
+            // the map edge, a clearing per nest, and a connector from each
+            // nest to its nearest trail point — guaranteed minimum paths.
+            set_disc(&mut grid, cx, cz, BASE_R + 70.0, true);
+            let mut trail_pts: Vec<(f64, f64)> = Vec::new();
+            for q in 0..4 {
+                let a0 = q as f64 * std::f64::consts::FRAC_PI_2;
+                let mut r = BASE_R;
+                while r < WORLD / 2.0 - 10.0 {
+                    let a = a0 + 0.5 * ((r - BASE_R) * 0.012 + q as f64).sin();
+                    let (x, z) = ((cx + a.cos() * r).clamp(4.0, WORLD - 4.0), (cz + a.sin() * r).clamp(4.0, WORLD - 4.0));
+                    set_disc(&mut grid, x, z, 15.0, true);
+                    trail_pts.push((x, z));
+                    r += 10.0;
+                }
+            }
+            for &(nx, nz) in &centers {
+                set_disc(&mut grid, nx, nz, nr + 10.0, true);
+                if let Some(&(tx, tz)) = trail_pts.iter().min_by(|a, b| {
+                    let da = (a.0 - nx).powi(2) + (a.1 - nz).powi(2);
+                    let db = (b.0 - nx).powi(2) + (b.1 - nz).powi(2);
+                    da.total_cmp(&db)
+                }) {
+                    let d = ((tx - nx).powi(2) + (tz - nz).powi(2)).sqrt().max(1.0);
+                    let steps = (d / 9.0) as usize + 1;
+                    for k in 0..=steps {
+                        let t = k as f64 / steps as f64;
+                        set_disc(&mut grid, nx + (tx - nx) * t, nz + (tz - nz) * t, 11.0, true);
+                    }
+                }
+            }
+        }
+        let units = spawn_field_at(&mut rng, pop, fseed, sc, &centers, nr, &grid, pn, pcell);
         let world = Aabb::new(0.0, -8.0, 0.0, WORLD, SKY + 8.0, WORLD);
         // Static index: built ONCE from all structures — the bulk-load case.
         let items: Vec<IStruct> = structures.iter().enumerate().map(|(i, s)| IStruct { id: i as u32, p: s.p, kind: s.kind }).collect();
@@ -498,7 +725,7 @@ impl Horde {
         let n = units.len();
         let cc_id = structures.iter().position(|s| s.kind == SKind::CommandCenter).expect("base has a CC");
         let mut flow = FlowField::new(120);
-        flow.rebuild(&structures, structures[cc_id].p);
+        flow.rebuild(&structures, structures[cc_id].p, &grid, pn, pcell);
         let ns = structures.len();
         let mut h = Horde {
             units, structures,
@@ -513,6 +740,12 @@ impl Horde {
             base_pop: pop, base_seed: seed,
             defenders: Vec::new(), threat: [0.0; SECTORS], weapons_free: false, cmd_t: 0.0, breach: None,
             gates: Vec::new(),
+            scenario: sc, pass_grid: grid, pass_n: pn, pass_cell: pcell,
+            // Morton levels = 5 → 56-wu xz cells: the wake blasts (r≈344, the
+            // dominant cull) touch ~6k cells instead of the 270k that levels=7
+            // costs (the grid splits EVERY axis 2^levels ways — on a 68-wu-tall
+            // world the y axis shreds into confetti and big culls pay for it).
+            zmode: ZMode::Tree, zmorton: vectorial_hash::MortonGrid3::new(world, 5),
         };
         h.gates = h.structures.iter().enumerate().filter(|(_, s)| s.kind == SKind::Gate).map(|(i, _)| i).collect();
         h.spawn_defenders();
@@ -532,9 +765,10 @@ impl Horde {
                     false => (home.x + a.cos() * (4.0 + k as f64), home.z + a.sin() * (4.0 + k as f64)),
                 };
                 ds.push(Defender {
-                    kind, p: Point3::new(x, ground_h(x, z, self.seed), z), hp: kind.max_hp(),
+                    kind, p: Point3::new(x, terrain_h(x, z, self.seed, self.scenario), z), hp: kind.max_hp(),
                     state: if kind.fighter() { DState::Post } else { DState::Idle },
                     sector: (ds.len()) % SECTORS, reload_t: 0.0, respawn_t: 0.0, stock: 0.0, shots: 0,
+                    path: Vec::new(),
                 });
             }
         };
@@ -550,12 +784,13 @@ impl Horde {
     /// Full run reset (CC fell, or the final wave was cleared): fresh base +
     /// dormant field, next run number, escalation restarts.
     fn reset(&mut self) {
-        let next = Horde::new(self.base_seed.wrapping_add(self.run as u64 * 7919), self.base_pop);
-        let (run, kills, mode) = (self.run + 1, self.kills, self.tower_threat_mode);
+        let next = Horde::with_scenario(self.base_seed.wrapping_add(self.run as u64 * 7919), self.base_pop, self.scenario);
+        let (run, kills, mode, zm) = (self.run + 1, self.kills, self.tower_threat_mode, self.zmode);
         *self = next;
         self.run = run;
         self.kills = kills; // lifetime counter across runs
         self.tower_threat_mode = mode;
+        self.set_zmode(zm); // no-op when it was already the default Tree
     }
 
     /// HUD wave line: (wave number, announced?, direction, seconds to landfall).
@@ -580,7 +815,7 @@ impl Horde {
     /// drivers and tests.
     pub fn spawn_zombie(&mut self, class: ZClass, x: f64, z: f64, state: ZState) {
         if state == ZState::Dormant { self.dormant_epoch += 1; }
-        let y = ground_h(x, z, self.seed) + class.altitude();
+        let y = terrain_h(x, z, self.seed, self.scenario) + class.altitude();
         let z0 = Zombie { class, p: Point3::new(x, y, z), vel: (0.0, 0.0), state, hp: class.max_hp(), heard: 0.0, linger: 0.0, groan_t: 1.0, swing_t: 0.5, bump: u32::MAX, moved: false };
         match self.free_slots.pop() {
             Some(slot) => { self.units[slot as usize] = z0; } // handle is None (freed at death) → sync inserts
@@ -605,11 +840,20 @@ impl Horde {
         let (cx, cz) = (WORLD / 2.0, WORLD / 2.0);
         for dir in &dirs {
             for _ in 0..count / dirs.len() {
-                let a = dir + self.rng.range(-0.35, 0.35);
                 // Land close enough to be watchable (marching through the nest
-                // belt also drags alert sleepers along — by design).
-                let r = self.rng.range(WORLD * 0.30, WORLD * 0.38);
-                let (x, z) = ((cx + a.cos() * r).clamp(MARGIN, WORLD - MARGIN), (cz + a.sin() * r).clamp(MARGIN, WORLD - MARGIN));
+                // belt also drags alert sleepers along — by design). Resample
+                // until the spot is passable — in Forest that puts the landing
+                // on trails/clearings, in Pass outside the ridge's shadow.
+                let (mut x, mut z) = (cx, cz);
+                for _try in 0..40 {
+                    let a = dir + self.rng.range(-0.35, 0.35);
+                    let r = self.rng.range(WORLD * 0.30, WORLD * 0.38);
+                    x = (cx + a.cos() * r).clamp(MARGIN, WORLD - MARGIN);
+                    z = (cz + a.sin() * r).clamp(MARGIN, WORLD - MARGIN);
+                    // Passable AND connected — never strand a wave in a forest
+                    // pocket the flow field can't route out of.
+                    if self.passable(x, z) && self.flow.reachable(x, z) { break; }
+                }
                 // Escalating mix: early waves are shambler seas; specials join
                 // from wave 2 (venom/chubby) and wave 4 (harpies).
                 let roll = self.rng.unit();
@@ -680,18 +924,52 @@ impl Horde {
     /// Runs at the top of every [`step`](Horde::step); public so renderers /
     /// tests can force the index current after `apply` moved units.
     pub fn sync_index(&mut self) {
-        for (i, z) in self.units.iter_mut().enumerate() {
-            if !z.alive() { z.moved = false; continue; } // dead slots await reuse (handle freed at kill)
-            match (self.handles[i], z.moved) {
-                (None, _) => { self.handles[i] = self.zindex.insert_ref(IZombie::of(i, z)); z.moved = false; }
-                (Some(_), false) => {}
-                (Some(h), true) => {
-                    let it = IZombie::of(i, z);
-                    if !self.zindex.update_ref(h, |s| *s = it) { self.handles[i] = self.zindex.insert_ref(it); }
+        match self.zmode {
+            ZMode::Tree => for (i, z) in self.units.iter_mut().enumerate() {
+                if !z.alive() { z.moved = false; continue; } // dead slots await reuse (handle freed at kill)
+                match (self.handles[i], z.moved) {
+                    (None, _) => { self.handles[i] = self.zindex.insert_ref(IZombie::of(i, z)); z.moved = false; }
+                    (Some(_), false) => {}
+                    (Some(h), true) => {
+                        let it = IZombie::of(i, z);
+                        if !self.zindex.update_ref(h, |s| *s = it) { self.handles[i] = self.zindex.insert_ref(it); }
+                        z.moved = false;
+                    }
+                }
+            },
+            // Morton has no in-place handles: its side of the `M` toggle is the
+            // honest rebuild — clear + reinsert every LIVE zombie, every frame.
+            ZMode::Morton => {
+                self.zmorton.clear();
+                for (i, z) in self.units.iter_mut().enumerate() {
                     z.moved = false;
+                    if z.alive() { self.zmorton.insert(IZombie::of(i, z)); }
                 }
             }
         }
+    }
+
+    /// The live index the queries should hit right now (`M` toggle).
+    pub fn zq(&self) -> ZQuery<'_> {
+        match self.zmode { ZMode::Tree => ZQuery::Tree(&self.zindex), ZMode::Morton => ZQuery::Morton(&self.zmorton) }
+    }
+
+    /// Switch the zombie-index structure live. Both sides start empty and the
+    /// next sync fills the active one; handles only mean anything to the tree.
+    pub fn set_zmode(&mut self, m: ZMode) {
+        if m == self.zmode { return; }
+        self.zmode = m;
+        let world = Aabb::new(0.0, -8.0, 0.0, WORLD, SKY + 8.0, WORLD);
+        self.zindex = Tree3::new(world, 8);
+        self.handles = vec![None; self.units.len()];
+        self.zmorton.clear();
+        self.sync_index(); // queryable immediately (renderers cull between steps)
+    }
+
+    /// Is (x,z) passable ground for walkers? (Classic: everywhere. Pass: below
+    /// the ridge. River: land + the causeways. Forest: clearings + trails.)
+    pub fn passable(&self, x: f64, z: f64) -> bool {
+        self.pass_grid[((z / self.pass_cell) as usize).min(self.pass_n - 1) * self.pass_n + ((x / self.pass_cell) as usize).min(self.pass_n - 1)]
     }
 
     /// One fixed step: waves → noise events → wake culls → parallel decide →
@@ -707,7 +985,7 @@ impl Horde {
         if self.flow.dirty && self.flow.rebuild_t <= 0.0 {
             let cc = self.structures[self.cc_id].p;
             let (flow, structures) = (&mut self.flow, &self.structures);
-            flow.rebuild(structures, cc);
+            flow.rebuild(structures, cc, &self.pass_grid, self.pass_n, self.pass_cell);
         }
         // Run over → reset a few seconds later (victory lap / defeat dirge).
         if let Some((t0, _)) = self.game_over { if self.now - t0 > 12.0 { self.reset(); return; } }
@@ -724,7 +1002,7 @@ impl Horde {
             // +28: hearing is an XZ ring but the cull is a 3D sphere — a flying
             // harpy at the very edge of its ring must not slip out vertically.
             let blast = Sphere3::new(p.x, p.y, p.z, MAX_HEAR + 28.0);
-            let heard: Vec<(u32, f64)> = self.zindex.cull(&blast).iter()
+            let heard: Vec<(u32, f64)> = self.zq().cull(&blast).iter()
                 .filter(|it| it.dormant)
                 .map(|it| { let (dx, dz) = (it.p.x - p.x, it.p.z - p.z); (it.id, (dx * dx + dz * dz).sqrt()) })
                 .collect();
@@ -754,7 +1032,9 @@ impl Horde {
         // 2) decide — read-only on the indices, each zombie writes only itself:
         //    fans out over rayon on native, serial on wasm (no threads there).
         {
-            let (index, sindex, structures, flow) = (&self.zindex, &self.sindex, &self.structures, &self.flow);
+            let index = match self.zmode { ZMode::Tree => ZQuery::Tree(&self.zindex), ZMode::Morton => ZQuery::Morton(&self.zmorton) };
+            let index = &index;
+            let (sindex, structures, flow) = (&self.sindex, &self.structures, &self.flow);
             let defenders = &self.defenders;
             let frame = self.frame;
             let (units, cx, cz) = (&mut self.units, WORLD / 2.0, WORLD / 2.0);
@@ -868,6 +1148,8 @@ impl Horde {
         let mut hits: Vec<(u32, f64, Point3, f64)> = Vec::new(); // (sid, dmg, at, noise)
         let mut bumped: Vec<u32> = Vec::new(); // sleepers trampled by the marching column
         let mut slept = false;
+        let (pg, pn, pcell, sc) = (&self.pass_grid, self.pass_n, self.pass_cell, self.scenario);
+        let pass = |x: f64, z: f64| pg[((z / pcell) as usize).min(pn - 1) * pn + ((x / pcell) as usize).min(pn - 1)];
         for z in self.units.iter_mut() {
             if !z.alive() { continue; }
             if z.dormant() { if z.heard > 1e-3 { z.heard *= decay; } continue; }
@@ -880,10 +1162,19 @@ impl Horde {
             // separation jiggle in a dense pack never lets vel hit exact zero.
             let arrived = match z.state { ZState::Investigating { tx, tz } => { let (dx, dz) = (tx - z.p.x, tz - z.p.z); dx * dx + dz * dz < 9.0 * 9.0 } _ => false };
             if !arrived && (z.vel.0 != 0.0 || z.vel.1 != 0.0) {
-                let nx = (z.p.x + z.vel.0 * dt).clamp(MARGIN, WORLD - MARGIN);
-                let nz = (z.p.z + z.vel.1 * dt).clamp(MARGIN, WORLD - MARGIN);
-                z.p = Point3::new(nx, ground_h(nx, nz, self.seed) + z.class.altitude(), nz);
-                z.moved = true;
+                let mut nx = (z.p.x + z.vel.0 * dt).clamp(MARGIN, WORLD - MARGIN);
+                let mut nz = (z.p.z + z.vel.1 * dt).clamp(MARGIN, WORLD - MARGIN);
+                // Impassable terrain (ridge / water / woods): ground classes
+                // SLIDE along the blocked edge (axis drop); harpies fly over.
+                if z.class.altitude() == 0.0 && !pass(nx, nz) {
+                    if pass(nx, z.p.z) { nz = z.p.z; }
+                    else if pass(z.p.x, nz) { nx = z.p.x; }
+                    else { nx = z.p.x; nz = z.p.z; }
+                }
+                if nx != z.p.x || nz != z.p.z {
+                    z.p = Point3::new(nx, terrain_h(nx, nz, self.seed, sc) + z.class.altitude(), nz);
+                    z.moved = true;
+                }
                 if z.bump != u32::MAX { bumped.push(z.bump); z.bump = u32::MAX; }
                 // Walking is SILENT. Aggro spreads through combat noise and
                 // physical contact only — every groan variant we tried turned
@@ -933,14 +1224,17 @@ impl Horde {
             let tp = self.structures[sid].p;
             let target: Option<u32> = if self.tower_threat_mode {
                 let ring = Sphere3::new(tp.x, tp.y, tp.z, TOWER_RANGE);
-                self.zindex.cull(&ring).iter()
+                self.zq().cull(&ring).iter()
                     .map(|it| { let (dx, dz) = (it.p.x - tp.x, it.p.z - tp.z); (it.id, it.class.threat() / (1.0 + (dx * dx + dz * dz).sqrt() * 0.02)) })
                     .max_by(|a, b| a.1.total_cmp(&b.1))
                     .map(|(id, _)| id)
             } else {
-                self.zindex.knn(tp, 1).into_iter().find(|(d, _)| *d <= TOWER_RANGE).map(|(_, it)| it.id)
+                self.zq().knn(tp, 1).into_iter().find(|(d, _)| *d <= TOWER_RANGE).map(|(_, it)| it.id)
             };
             let Some(tid) = target else { continue; };
+            // Morton mode rebuilds next frame, so a zombie another tower just
+            // killed can still be served this frame — never shoot a corpse.
+            if !self.units[tid as usize].alive() { continue; }
             self.tower_reload[sid] = TOWER_RELOAD;
             self.pending.push((tp, TOWER_NOISE));
             let zp = self.units[tid as usize].p;
@@ -969,7 +1263,7 @@ impl Horde {
                 let a = (s as f64 + 0.5) / SECTORS as f64 * std::f64::consts::TAU;
                 let mid = Point3::new(cx + a.cos() * BASE_R, 0.0, cz + a.sin() * BASE_R);
                 let ring = Sphere3::new(mid.x, mid.y, mid.z, 110.0);
-                let mut t = self.zindex.cull(&ring).iter().filter(|it| !it.dormant).count() as f64;
+                let mut t = self.zq().cull(&ring).iter().filter(|it| !it.dormant).count() as f64;
                 if self.wave_announced {
                     let mut da = (a - self.wave_dir).abs(); if da > std::f64::consts::PI { da = std::f64::consts::TAU - da; }
                     let eta = (self.wave_spawn_t - self.now).max(0.0);
@@ -1005,7 +1299,7 @@ impl Horde {
                     if missing <= 0.0 { continue; }
                     if let Some((bp, _)) = danger { let (dx, dz) = (s.p.x - bp.x, s.p.z - bp.z); if (dx * dx + dz * dz).sqrt() < 120.0 { continue; } }
                     let guard = Sphere3::new(s.p.x, s.p.y, s.p.z, 55.0);
-                    let inside_threat = self.zindex.cull(&guard).iter().any(|it| {
+                    let inside_threat = self.zq().cull(&guard).iter().any(|it| {
                         if it.dormant { return false; }
                         let (dx, dz) = (it.p.x - cx, it.p.z - cz);
                         (dx * dx + dz * dz).sqrt() < BASE_R + 2.0 // through a breach, or flying over
@@ -1030,16 +1324,25 @@ impl Horde {
             let (total_threat, eta) = (self.threat.iter().sum::<f64>(), self.wave_spawn_t - self.now);
             let out = self.defenders.iter().filter(|d| matches!(d.state, DState::Sortie { .. })).count();
             if total_threat < 8.0 && (!self.wave_announced || eta > 25.0) && out == 0 {
-                let target = self.zindex.knn(Point3::new(cx, 0.0, cz), 48).into_iter()
+                let target = self.zq().knn(Point3::new(cx, 0.0, cz), 48).into_iter()
                     .find(|(_, it)| it.dormant)
                     .map(|(_, it)| it.p);
                 if let Some(tp) = target {
+                    // One A* over the pass grid per squad dispatch — the
+                    // DEFENDERS' minimum paths (out the gate nearest the nest,
+                    // then along the forest trails / over a causeway). Empty
+                    // (Classic, or unreachable) = walk straight as before.
+                    let gate = self.gates.iter().map(|&g| self.structures[g].p)
+                        .min_by(|a, b| { let da = (a.x - tp.x).powi(2) + (a.z - tp.z).powi(2); let db = (b.x - tp.x).powi(2) + (b.z - tp.z).powi(2); da.total_cmp(&db) })
+                        .map(|g| (g.x, g.z)).unwrap_or((cx, cz));
+                    let spath = astar_path(&self.pass_grid, self.pass_n, self.pass_cell, gate, (tp.x, tp.z));
                     let mut sent = 0;
                     for d in self.defenders.iter_mut() {
                         if sent >= 10 { break; }
                         if d.kind != DKind::Ranger || !d.alive() || d.state != DState::Post || d.hp < d.kind.max_hp() * 0.9 { continue; }
                         let j = sent as f64 * 2.399963;
                         d.state = DState::Sortie { tx: (tp.x + j.cos() * (4.0 + sent as f64 * 2.0)).clamp(MARGIN, WORLD - MARGIN), tz: (tp.z + j.sin() * (4.0 + sent as f64 * 2.0)).clamp(MARGIN, WORLD - MARGIN) };
+                        d.path = spath.clone();
                         d.respawn_t = 30.0; // sortie clock: come home after ~30 s regardless
                         sent += 1;
                     }
@@ -1060,26 +1363,35 @@ impl Horde {
         let mut repaired_any = false;
         // Live gate mouths — every ring-crossing friendly walk routes via one.
         let gate_pts: Vec<(f64, f64)> = self.gates.iter().filter(|&&g| self.structures[g].hp > 0.0).map(|&g| (self.structures[g].p.x, self.structures[g].p.z)).collect();
+        // Field-precise borrows the defenders' iter_mut can live beside: the
+        // live zombie index (either mode) + the pass grid for the walk slide.
+        let zq = match self.zmode { ZMode::Tree => ZQuery::Tree(&self.zindex), ZMode::Morton => ZQuery::Morton(&self.zmorton) };
+        let (pg2, pn2, pc2, sc, seed) = (&self.pass_grid, self.pass_n, self.pass_cell, self.scenario, self.seed);
+        let pass2 = move |x: f64, z: f64| pg2[((z / pc2) as usize).min(pn2 - 1) * pn2 + ((x / pc2) as usize).min(pn2 - 1)];
+        let walk = move |d: &mut Defender, tx: f64, tz: f64, dt: f64| -> f64 {
+            let (dx, dz) = (tx - d.p.x, tz - d.p.z);
+            let dist = (dx * dx + dz * dz).sqrt();
+            if dist > 2.0 {
+                let sp = d.kind.speed().min(dist / dt);
+                let (mut nx, mut nz) = ((d.p.x + dx / dist * sp * dt).clamp(MARGIN, WORLD - MARGIN), (d.p.z + dz / dist * sp * dt).clamp(MARGIN, WORLD - MARGIN));
+                if !pass2(nx, nz) { // slide along the blocked edge (axis drop)
+                    if pass2(nx, d.p.z) { nz = d.p.z; } else if pass2(d.p.x, nz) { nx = d.p.x; } else { nx = d.p.x; nz = d.p.z; }
+                }
+                d.p = Point3::new(nx, terrain_h(nx, nz, seed, sc), nz);
+            }
+            dist
+        };
         for (dix, d) in self.defenders.iter_mut().enumerate() {
             if !d.alive() {
                 d.respawn_t -= dt;
                 if d.respawn_t <= 0.0 { // recruits arrive at the CC
                     d.hp = d.kind.max_hp();
-                    d.p = Point3::new(cx, ground_h(cx, cz, self.seed), cz);
+                    d.p = Point3::new(cx, terrain_h(cx, cz, seed, sc), cz);
                     d.state = if d.kind.fighter() { DState::Post } else { DState::Idle };
+                    d.path.clear();
                 }
                 continue;
             }
-            let walk = |d: &mut Defender, tx: f64, tz: f64, dt: f64, seed: f64| -> f64 {
-                let (dx, dz) = (tx - d.p.x, tz - d.p.z);
-                let dist = (dx * dx + dz * dz).sqrt();
-                if dist > 2.0 {
-                    let sp = d.kind.speed().min(dist / dt);
-                    let (nx, nz) = ((d.p.x + dx / dist * sp * dt).clamp(MARGIN, WORLD - MARGIN), (d.p.z + dz / dist * sp * dt).clamp(MARGIN, WORLD - MARGIN));
-                    d.p = Point3::new(nx, ground_h(nx, nz, seed), nz);
-                }
-                dist
-            };
             match d.state {
                 DState::Post => {
                     // Hold the sector post; engage under the noise policy.
@@ -1088,7 +1400,7 @@ impl Horde {
                     // the post line → step to the inner line and fight from
                     // there (they live to hold the second ring).
                     let crowd = Sphere3::new(d.p.x, d.p.y, d.p.z, 16.0);
-                    let swarmed = self.zindex.cull(&crowd).iter().filter(|it| !it.dormant).count() >= 5;
+                    let swarmed = zq.cull(&crowd).iter().filter(|it| !it.dormant).count() >= 5;
                     let post_r = if swarmed || d.hp < d.kind.max_hp() * 0.35 { BASE_R - 48.0 } else { BASE_R - 10.0 };
                     let a = (d.sector as f64 + 0.5) / SECTORS as f64 * std::f64::consts::TAU;
                     // Personal spot within the sector (golden jitter by index) —
@@ -1096,12 +1408,17 @@ impl Horde {
                     let jit = ((dix % 9) as f64 - 4.0) * 0.022;
                     let ro = (dix % 4) as f64 * 2.2;
                     let (px, pz) = (cx + (a + jit).cos() * (post_r - ro), cz + (a + jit).sin() * (post_r - ro));
-                    let (wx, wz) = via_gate(&gate_pts, d.p, px, pz);
-                    walk(d, wx, wz, dt, self.seed);
+                    // A ranger back from a sortie retraces its stored trail
+                    // home first (the A* minimum path), then the normal post walk.
+                    let (wx, wz) = if let Some(&(w0x, w0z)) = d.path.first() {
+                        if (w0x - d.p.x).powi(2) + (w0z - d.p.z).powi(2) < 36.0 { d.path.remove(0); }
+                        d.path.first().copied().unwrap_or_else(|| via_gate(&gate_pts, d.p, px, pz))
+                    } else { via_gate(&gate_pts, d.p, px, pz) };
+                    walk(d, wx, wz, dt);
                     d.reload_t -= dt;
                     let may_fire = self.weapons_free || d.kind == DKind::Ranger;
                     if d.reload_t <= 0.0 && may_fire {
-                        if let Some((dist, it)) = self.zindex.knn(d.p, 1).into_iter().next() {
+                        if let Some((dist, it)) = zq.knn(d.p, 1).into_iter().next() {
                             if dist <= d.kind.range() {
                                 d.reload_t = d.kind.reload();
                                 d.shots += 1;
@@ -1113,7 +1430,7 @@ impl Horde {
                                     let (dx, dz) = (d.p.x - it.p.x, d.p.z - it.p.z);
                                     let l = (dx * dx + dz * dz).sqrt().max(0.5);
                                     let (nx, nz) = ((d.p.x + dx / l * 6.0).clamp(MARGIN, WORLD - MARGIN), (d.p.z + dz / l * 6.0).clamp(MARGIN, WORLD - MARGIN));
-                                    d.p = Point3::new(nx, ground_h(nx, nz, self.seed), nz);
+                                    if pass2(nx, nz) { d.p = Point3::new(nx, terrain_h(nx, nz, seed, sc), nz); }
                                 }
                             }
                         }
@@ -1122,7 +1439,7 @@ impl Horde {
                 DState::Repairing { sid } => {
                     let s = &mut self.structures[sid as usize];
                     if s.hp >= s.kind.max_hp() { d.state = DState::Idle; continue; }
-                    if walk(d, s.p.x + 3.0, s.p.z, dt, self.seed) < 6.0 && d.stock > 0.0 {
+                    if walk(d, s.p.x + 3.0, s.p.z, dt) < 6.0 && d.stock > 0.0 {
                         let was_dead = s.hp <= 0.0;
                         s.hp = (s.hp + CREW_REPAIR * dt).min(s.kind.max_hp());
                         d.stock = (d.stock - 2.0 * dt).max(0.0);
@@ -1132,14 +1449,34 @@ impl Horde {
                     }
                 }
                 DState::Sortie { tx, tz } => {
-                    // The sortie clock: whatever happens, come home after it runs out.
+                    // The sortie clock: whatever happens, come home after it
+                    // runs out; ditto once the nest reads clear. Both exits
+                    // store an A* trail home (rangers deep in the forest
+                    // retrace a minimum path to the nearest gate, not a
+                    // straight line into the woods).
                     d.respawn_t -= dt;
-                    if d.respawn_t <= 0.0 { d.state = DState::Post; continue; }
-                    let (wx, wz) = via_gate(&gate_pts, d.p, tx, tz);
-                    walk(d, wx, wz, dt, self.seed);
+                    let clear = zq.knn(Point3::new(tx, 0.0, tz), 1).into_iter().next().map(|(dd, _)| dd > 90.0).unwrap_or(true);
+                    if d.respawn_t <= 0.0 || clear {
+                        let g = gate_pts.iter().copied().min_by(|a, b| {
+                            let da = (a.0 - d.p.x).powi(2) + (a.1 - d.p.z).powi(2);
+                            let db = (b.0 - d.p.x).powi(2) + (b.1 - d.p.z).powi(2);
+                            da.total_cmp(&db)
+                        }).unwrap_or((cx, cz));
+                        d.path = astar_path(pg2, pn2, pc2, (d.p.x, d.p.z), g);
+                        d.state = DState::Post;
+                        continue;
+                    }
+                    // Follow the outbound waypoints, then close on the target.
+                    let (mut gx, mut gz) = (tx, tz);
+                    while let Some(&(w0x, w0z)) = d.path.first() {
+                        if (w0x - d.p.x).powi(2) + (w0z - d.p.z).powi(2) < 36.0 { d.path.remove(0); continue; }
+                        gx = w0x; gz = w0z; break;
+                    }
+                    let (wx, wz) = via_gate(&gate_pts, d.p, gx, gz);
+                    walk(d, wx, wz, dt);
                     d.reload_t -= dt;
                     if d.reload_t <= 0.0 {
-                        if let Some((dist, it)) = self.zindex.knn(d.p, 1).into_iter().next() {
+                        if let Some((dist, it)) = zq.knn(d.p, 1).into_iter().next() {
                             if dist <= d.kind.range() {
                                 d.reload_t = d.kind.reload();
                                 d.shots += 1;
@@ -1149,20 +1486,17 @@ impl Horde {
                             }
                         }
                     }
-                    // nest cleared → home (the Post walk re-enters via the gate)
-                    let clear = self.zindex.knn(Point3::new(tx, 0.0, tz), 1).into_iter().next().map(|(dd, _)| dd > 90.0).unwrap_or(true);
-                    if clear { d.state = DState::Post; }
                 }
                 DState::Hauling { .. } => {} // handled after the loop (needs two defenders at once)
                 DState::Fleeing => {
                     let (wx, wz) = via_gate(&gate_pts, d.p, home.x, home.z);
-                    if walk(d, wx, wz, dt, self.seed) < 5.0 { d.state = DState::Idle; }
+                    if walk(d, wx, wz, dt) < 5.0 { d.state = DState::Idle; }
                 }
                 DState::Idle => {
                     if !d.kind.fighter() {
                         // Personal spot by the storehouse — no stacking on one point.
                         let j = dix as f64 * 2.399963;
-                        walk(d, home.x + j.cos() * (4.0 + (dix % 6) as f64 * 1.6), home.z + j.sin() * (4.0 + (dix % 6) as f64 * 1.6), dt, self.seed);
+                        walk(d, home.x + j.cos() * (4.0 + (dix % 6) as f64 * 1.6), home.z + j.sin() * (4.0 + (dix % 6) as f64 * 1.6), dt);
                     }
                 }
             }
@@ -1178,8 +1512,9 @@ impl Horde {
             if dist > 3.0 {
                 let sp = DKind::Porter.speed().min(dist / dt);
                 let d = &mut self.defenders[di];
-                let (nx, nz) = ((d.p.x + dx / dist * sp * dt).clamp(MARGIN, WORLD - MARGIN), (d.p.z + dz / dist * sp * dt).clamp(MARGIN, WORLD - MARGIN));
-                d.p = Point3::new(nx, ground_h(nx, nz, self.seed), nz);
+                let (mut nx, mut nz) = ((d.p.x + dx / dist * sp * dt).clamp(MARGIN, WORLD - MARGIN), (d.p.z + dz / dist * sp * dt).clamp(MARGIN, WORLD - MARGIN));
+                if !pass2(nx, nz) { if pass2(nx, d.p.z) { nz = d.p.z; } else if pass2(d.p.x, nz) { nx = d.p.x; } else { nx = d.p.x; nz = d.p.z; } }
+                d.p = Point3::new(nx, terrain_h(nx, nz, seed, sc), nz);
             } else if loaded {
                 deliveries.push(did);
                 self.defenders[di].state = DState::Hauling { did, loaded: false };
@@ -1199,7 +1534,7 @@ impl Horde {
         for d in self.defenders.iter_mut() {
             if !d.alive() { continue; }
             let bite = Sphere3::new(d.p.x, d.p.y, d.p.z, 4.5);
-            let dps: f64 = self.zindex.cull(&bite).iter().filter(|it| !it.dormant).map(|it| it.class.dmg()).sum();
+            let dps: f64 = zq.cull(&bite).iter().filter(|it| !it.dormant).map(|it| it.class.dmg()).sum();
             if dps > 0.0 {
                 d.hp -= dps * 0.4 * dt;
                 if d.hp <= 0.0 { d.respawn_t = if d.kind.fighter() { 25.0 } else { 30.0 }; dead_screams.push(d.p); }
@@ -1590,5 +1925,94 @@ mod tests {
             got.sort(); want.sort();
             assert_eq!(got, want, "kept index diverged from live positions at frame {f}");
         }
+    }
+
+    #[test]
+    fn scenario_flow_funnels_through_the_carvings_to_the_cc() {
+        // From several bearings on the wave-spawn ring, descending the flow
+        // field must reach the base in every impassable scenario — i.e. the
+        // Dijkstra actually routes through the pass gaps / causeways / trails.
+        for sc in [Scenario::Pass, Scenario::River, Scenario::Forest] {
+            let h = Horde::with_scenario(11, 3000, sc);
+            let (cx, cz) = (WORLD / 2.0, WORLD / 2.0);
+            let mut reached = 0;
+            for q in 0..8 {
+                let a = q as f64 * std::f64::consts::FRAC_PI_4 + 0.1;
+                let mut start = None;
+                'scan: for rr in [WORLD * 0.34, WORLD * 0.31, WORLD * 0.37, WORLD * 0.28] {
+                    for da in [0.0f64, 0.1, -0.1, 0.2, -0.2, 0.3, -0.3] {
+                        let (x, z) = (cx + (a + da).cos() * rr, cz + (a + da).sin() * rr);
+                        if x > MARGIN && z > MARGIN && x < WORLD - MARGIN && z < WORLD - MARGIN
+                            && h.passable(x, z) && h.flow.reachable(x, z) { start = Some((x, z)); break 'scan; }
+                    }
+                }
+                let Some((mut x, mut z)) = start else { continue; };
+                for _ in 0..6000 {
+                    let (dx, dz) = h.flow.flow_at(x, z);
+                    if dx == 0.0 && dz == 0.0 { break; }
+                    x += dx * 4.0; z += dz * 4.0;
+                    let (ex, ez) = (x - cx, z - cz);
+                    if (ex * ex + ez * ez).sqrt() < BASE_R { reached += 1; break; }
+                }
+            }
+            assert!(reached >= 6, "{sc:?}: only {reached}/8 bearings routed to the base");
+        }
+    }
+
+    #[test]
+    fn scenario_movement_respects_impassable_ground() {
+        // 20 s of a landed wave in each carved scenario: no ground unit —
+        // zombie or defender — may ever stand in a blocked cell (the slide).
+        for sc in [Scenario::Pass, Scenario::River, Scenario::Forest] {
+            let mut h = Horde::with_scenario(7, 4000, sc);
+            h.trigger_wave(); h.trigger_wave(); // announce, then land NOW
+            for _ in 0..600 { h.step(1.0 / 30.0); }
+            for z in h.units.iter().filter(|z| z.alive() && z.class.altitude() == 0.0) {
+                assert!(h.passable(z.p.x, z.p.z), "{sc:?}: ground zombie in blocked terrain at ({:.0},{:.0}) state {:?}", z.p.x, z.p.z, z.state);
+            }
+            for d in h.defenders.iter().filter(|d| d.alive()) {
+                assert!(h.passable(d.p.x, d.p.z), "{sc:?}: defender {:?} in blocked terrain at ({:.0},{:.0})", d.kind, d.p.x, d.p.z);
+            }
+        }
+    }
+
+    #[test]
+    fn morton_mode_matches_the_tree_and_brute_force() {
+        // The `M` toggle: at the same instant both structures must answer any
+        // cull identically (and match brute force over the live units), and
+        // the sim must keep running correctly on the Morton side.
+        let mut h = Horde::new(23, 3000);
+        h.trigger_wave(); h.trigger_wave();
+        for _ in 0..120 { h.step(1.0 / 30.0); }
+        h.sync_index(); // bring the tree current with post-apply positions
+        let probes = [(WORLD / 2.0, 0.0, WORLD / 2.0, BASE_R + 80.0), (WORLD / 2.0 + 200.0, 0.0, WORLD / 2.0, 150.0), (WORLD * 0.3, 0.0, WORLD * 0.6, 260.0)];
+        let cull_ids = |h: &Horde| -> Vec<Vec<u32>> {
+            probes.iter().map(|&(x, y, z, r)| {
+                let mut v: Vec<u32> = h.zq().cull(&Sphere3::new(x, y, z, r)).iter().map(|it| it.id).collect();
+                v.sort(); v
+            }).collect()
+        };
+        let tree_ids = cull_ids(&h);
+        let counts0 = h.counts();
+        h.set_zmode(ZMode::Morton);
+        assert_eq!(h.zmode, ZMode::Morton);
+        let mort_ids = cull_ids(&h);
+        assert_eq!(tree_ids, mort_ids, "Morton culls diverge from the tree's");
+        assert_eq!(h.counts(), counts0, "the switch must not touch the sim");
+        for (k, &(x, y, z, r)) in probes.iter().enumerate() {
+            let mut brute: Vec<u32> = h.units.iter().enumerate()
+                .filter(|(_, u)| u.alive() && { let (dx, dy, dz) = (u.p.x - x, u.p.y - y, u.p.z - z); dx * dx + dy * dy + dz * dz <= r * r })
+                .map(|(i, _)| i as u32).collect();
+            brute.sort();
+            assert_eq!(mort_ids[k], brute, "probe {k} != brute force");
+        }
+        // Run a stretch of real battle on Morton (kills, wakes, spawns), then
+        // switch back — both transitions must leave a healthy index.
+        for _ in 0..120 { h.step(1.0 / 30.0); }
+        h.set_zmode(ZMode::Tree);
+        for _ in 0..60 { h.step(1.0 / 30.0); }
+        h.sync_index();
+        let alive = h.units.iter().filter(|z| z.alive()).count();
+        assert_eq!(h.zindex.item_count(), alive, "tree lost items across the round-trip");
     }
 }

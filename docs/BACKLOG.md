@@ -34,8 +34,20 @@ autonomously verifiable. User picked **"Todo (A–E)"** + the headline below.
      62k active (205 fps ceiling)**.
   2. Impostor **elevation-band blending** — only if the band switch is visible
      when flying the camera up/down (user to confirm).
-  3. **Scenario presets** (mountain pass / river crossing / the expedition) —
-     scripted layouts over the same sim, HORDE_DESIGN § Scenarios.
+  3. **Scenario presets** (mountain pass / river crossing / forest paths) —
+     IN PROGRESS (2026-07-06 night): sim side landed (terrain_h per scenario,
+     passability grid, flow field skips blocked cells = the horde's min-paths,
+     A* sortie routing = the defenders', movement slide, reachable wave
+     landings, `M` Tree3↔Morton toggle); renderer keys/visuals pending.
+     - **PENDING DISCUSSION (user, next session): their own idea for the
+       horde's minimum paths** — tonight's flow-field-over-blocked-cells is
+       the baseline to compare against.
+     - **NEW (user, 2026-07-06): research how They Are Billions GENERATES its
+       maps** — determine an algorithm producing TAB-like path networks
+       (distribution, relative widths, nooks/recovecos, clearings) and add it
+       as a scenario option in the demo, IF none of the existing carved
+       scenarios (Pass gaps / River causeways / Forest trails) already reads
+       equivalent. Compare visually first; only then build.
   4. **Molón round**: night assaults + torch lighting (clustered forward),
      blood render-target, trauma camera, dust billboards.
   5. **Tree3 ↔ Morton ↔ 2D live toggle** (`M`, user picked "ambos conmutables").

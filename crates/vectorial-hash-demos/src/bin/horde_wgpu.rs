@@ -29,7 +29,7 @@ use winit::{
     window::WindowBuilder,
 };
 
-use vectorial_hash_demos::horde_sim::{ground_h, DKind, Horde, SKind, ZClass, BASE_R, WORLD};
+use vectorial_hash_demos::horde_sim::{ground_h, is_forest, is_water, terrain_h, DKind, Horde, SKind, Scenario, ZClass, BASE_R, WORLD};
 // Generic glb-baking knobs shared with the siege loader.
 use vectorial_hash_demos::siege_sim::{ANIM_FRAMES, MOVE_PREFS};
 
@@ -96,17 +96,20 @@ struct TVertex { pos: [f32; 3], normal: [f32; 3], color: [f32; 4] }
 
 /// One smooth mesh from the horde heightfield: grass ramp, dust ring around the
 /// base (trampled ground), darker rim toward the map edge (where the dead wait).
-fn build_terrain(seed: f64) -> (Vec<TVertex>, Vec<u32>) {
-    const RES: usize = 200;
+/// Scenario dressing on top: Pass = rock ridge (snow-dusted crest), River =
+/// water channel + plank-coloured causeway decks, Forest = dark woods floor.
+fn build_terrain(seed: f64, sc: Scenario) -> (Vec<TVertex>, Vec<u32>) {
+    const RES: usize = 240;
     let step = WORLD / RES as f64;
     let (cx, cz) = (WORLD / 2.0, WORLD / 2.0);
     let (mut v, mut idx) = (Vec::with_capacity((RES + 1) * (RES + 1)), Vec::new());
+    let mix3 = |a: [f32; 3], b: [f32; 3], t: f32| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
     for iz in 0..=RES {
         for ix in 0..=RES {
             let (x, z) = (ix as f64 * step, iz as f64 * step);
-            let h = ground_h(x, z, seed);
-            let hx = ground_h(x + step, z, seed) - ground_h(x - step, z, seed);
-            let hz = ground_h(x, z + step, seed) - ground_h(x, z - step, seed);
+            let h = terrain_h(x, z, seed, sc);
+            let hx = terrain_h(x + step, z, seed, sc) - terrain_h(x - step, z, seed, sc);
+            let hz = terrain_h(x, z + step, seed, sc) - terrain_h(x, z - step, seed, sc);
             let n = Vec3::new((-hx / (2.0 * step)) as f32, 1.0, (-hz / (2.0 * step)) as f32).normalize();
             let dc = ((x - cx).powi(2) + (z - cz).powi(2)).sqrt();
             // colour: trampled dust inside the walls → grass → sickly rim
@@ -115,8 +118,38 @@ fn build_terrain(seed: f64) -> (Vec<TVertex>, Vec<u32>) {
             let grass = [0.30 + 0.06 * (h as f32 * 0.15).sin(), 0.44, 0.24];
             let dust = [0.52, 0.44, 0.32];
             let rim = [0.30, 0.32, 0.24];
-            let mix3 = |a: [f32; 3], b: [f32; 3], t: f32| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
-            let c = mix3(mix3(grass, dust, t_dust), rim, t_rim);
+            let mut c = mix3(mix3(grass, dust, t_dust), rim, t_rim);
+            match sc {
+                Scenario::Pass => {
+                    // Ridge above the base field reads as rock; the crest gets
+                    // a snow dusting so the gap passes pop from orbit.
+                    let ridge = (h - ground_h(x, z, seed)) as f32;
+                    if ridge > 1.5 {
+                        c = mix3(c, [0.44, 0.42, 0.40], (ridge / 22.0).min(1.0));
+                        if ridge > 40.0 { c = mix3(c, [0.82, 0.84, 0.88], ((ridge - 40.0) / 18.0).min(1.0)); }
+                    }
+                }
+                Scenario::River => {
+                    let base = ground_h(x, z, seed);
+                    if is_water(x, z, seed, sc) {
+                        if h > base - 1.5 {
+                            c = [0.50, 0.38, 0.24]; // causeway deck: planks over the water
+                        } else {
+                            let depth = ((base - h) / 9.0).clamp(0.0, 1.0) as f32;
+                            c = mix3([0.30, 0.46, 0.52], [0.10, 0.24, 0.40], depth); // shallows → deep
+                        }
+                    } else if h < base - 0.5 {
+                        c = mix3(c, [0.56, 0.51, 0.36], ((base - h) / 4.0).clamp(0.0, 1.0) as f32); // sandy banks
+                    }
+                }
+                Scenario::Forest => {
+                    // Woods floor darkens where the density mask blocks (the
+                    // carved trails/clearings keep the grass ramp).
+                    let f = is_forest(x, z, seed) as f32;
+                    if f > 0.40 { c = mix3(c, [0.11, 0.19, 0.10], ((f - 0.40) / 0.18).clamp(0.0, 1.0)); }
+                }
+                Scenario::Classic => {}
+            }
             v.push(TVertex { pos: [x as f32, h as f32, z as f32], normal: n.to_array(), color: [c[0], c[1], c[2], 1.0] });
         }
     }
@@ -128,6 +161,38 @@ fn build_terrain(seed: f64) -> (Vec<TVertex>, Vec<u32>) {
         }
     }
     (v, idx)
+}
+
+/// Forest scenario: one static instanced-box tree (trunk + canopy) per blocked
+/// woods cell of the sim's pass grid — carved trails/clearings stay open, so
+/// the walkable min-path network is *visible* as gaps in the canopy.
+const TREE_CAP: usize = 40_000;
+fn build_trees(sim: &Horde) -> Vec<SkinInstance> {
+    if sim.scenario != Scenario::Forest { return Vec::new(); }
+    let n = 150usize; // mirrors the sim's pass-grid resolution
+    let cell = WORLD / n as f64;
+    let mut v = Vec::with_capacity(24_000);
+    for j in 0..n {
+        for i in 0..n {
+            let (x, z) = ((i as f64 + 0.5) * cell, (j as f64 + 0.5) * cell);
+            if sim.passable(x, z) || is_forest(x, z, sim.seed) < 0.46 { continue; }
+            // deterministic per-cell jitter + size (no rng: stable across rebuilds)
+            let hsh = (i.wrapping_mul(73856093) ^ j.wrapping_mul(19349663)) as u32;
+            let jx = ((hsh & 0xff) as f64 / 255.0 - 0.5) * cell * 0.7;
+            let jz = (((hsh >> 8) & 0xff) as f64 / 255.0 - 0.5) * cell * 0.7;
+            let s = 0.8 + ((hsh >> 16) & 0xff) as f32 / 255.0 * 0.6;
+            let (tx, tz) = (x + jx, z + jz);
+            let ty = terrain_h(tx, tz, sim.seed, sim.scenario) as f32;
+            let (tx, tz) = (tx as f32, tz as f32);
+            let trunk = Mat4::from_translation(Vec3::new(tx, ty, tz)) * Mat4::from_scale(Vec3::new(1.6, 7.0 * s, 1.6));
+            v.push(SkinInstance { model: trunk.to_cols_array_2d(), color: [0.34, 0.23, 0.13, 0.0], frame_base: 0, _pad: [0; 3] });
+            let g = 0.28 + ((hsh >> 20) & 0xf) as f32 / 15.0 * 0.10;
+            let canopy = Mat4::from_translation(Vec3::new(tx, ty + 6.5 * s, tz)) * Mat4::from_scale(Vec3::new(6.5 * s, 5.5 * s, 6.5 * s));
+            v.push(SkinInstance { model: canopy.to_cols_array_2d(), color: [0.10, g, 0.10, 0.0], frame_base: 0, _pad: [0; 3] });
+        }
+    }
+    v.truncate(TREE_CAP);
+    v
 }
 
 // ============================================================ gpu types
@@ -341,6 +406,8 @@ struct State {
     inst_buf: wgpu::Buffer,
     box_model: GpuModel,
     box_inst_buf: wgpu::Buffer,
+    tree_inst_buf: wgpu::Buffer, // Forest scenario: static trunk+canopy boxes
+    tree_n: u32,
     castle_model: GpuModel,
     cannon_model: GpuModel,
     cannon_inst_buf: wgpu::Buffer,
@@ -487,6 +554,7 @@ impl State {
         let cannon_model = build_gpu_model(&device, &cam_buf, &skin_layout, &bytes_of("cannon.glb"));
         let box_model = upload_skinned(&device, &cam_buf, &skin_layout, &unit_box());
         let box_inst_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("box-inst"), size: (1024 * std::mem::size_of::<SkinInstance>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let tree_inst_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("tree-inst"), size: (TREE_CAP * std::mem::size_of::<SkinInstance>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         // Billboard instance buffers (48 B each — half a SkinInstance).
         let dormant_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("dormant-inst"), size: (MAX_POP * std::mem::size_of::<BillboardInst>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let proxy_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("proxy-inst"), size: ((MAX_POP + 8192) * std::mem::size_of::<BillboardInst>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
@@ -602,7 +670,7 @@ impl State {
         let pop = std::env::var("HORDE_POP").ok().and_then(|s| s.parse().ok()).unwrap_or(20_000).clamp(2_000, MAX_POP);
         let sim = Horde::new(seed, pop);
 
-        let (tv, ti) = build_terrain(sim.seed);
+        let (tv, ti) = build_terrain(sim.seed, sim.scenario);
         let terrain_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("ter-v"), contents: bytemuck::cast_slice(&tv), usage: wgpu::BufferUsages::VERTEX });
         let terrain_ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("ter-i"), contents: bytemuck::cast_slice(&ti), usage: wgpu::BufferUsages::INDEX });
         let terrain_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("ter-shader"), source: wgpu::ShaderSource::Wgsl(TERRAIN_SHADER.into()) });
@@ -654,7 +722,7 @@ impl State {
         State {
             surface, device, queue, config,
             skin_pipeline, models, inst_buf,
-            box_model, box_inst_buf, castle_model, cannon_model, cannon_inst_buf,
+            box_model, box_inst_buf, tree_inst_buf, tree_n: 0, castle_model, cannon_model, cannon_inst_buf,
             bb_pipeline, bb_bind, bb_geom, idle_models, dormant_buf, dormant_n: 0, dormant_key: (0, 0),
             carpet_eye: Vec3::new(f32::MAX, 0.0, 0.0), carpet_t: -10.0,
             proxy_buf, corpse_buf, corpse_n: 0,
@@ -684,14 +752,34 @@ impl State {
         }
     }
 
-    /// Rebuild the whole run at a new dormant-field size (slider / [ ] keys).
+    /// Rebuild the whole run at a new dormant-field size (slider / [ ] keys) —
+    /// keeping the current scenario and index mode.
     fn set_population(&mut self, pop: usize) {
         let pop = pop.clamp(2_000, MAX_POP);
         if pop == self.pop { return; }
         self.pop = pop;
-        self.sim = Horde::new(self.seed, pop);
+        let (sc, zm) = (self.sim.scenario, self.sim.zmode);
+        self.sim = Horde::with_scenario(self.seed, pop, sc);
+        self.sim.set_zmode(zm);
         // The fresh sim restarts at (run 1, epoch 1) — the same key the old one
         // started with, so the static dormant carpet would never re-upload.
+        self.dormant_key = (u32::MAX, u64::MAX);
+        self.corpse_n = 0;
+    }
+
+    /// The `G` key: cycle the map preset. A new world = new sim (same pop and
+    /// index mode), new terrain mesh, new tree field, carpet invalidated.
+    fn set_scenario(&mut self, sc: Scenario) {
+        let zm = self.sim.zmode;
+        self.sim = Horde::with_scenario(self.seed, self.pop, sc);
+        self.sim.set_zmode(zm);
+        let (tv, ti) = build_terrain(self.sim.seed, sc);
+        self.terrain_vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("ter-v"), contents: bytemuck::cast_slice(&tv), usage: wgpu::BufferUsages::VERTEX });
+        self.terrain_ibuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("ter-i"), contents: bytemuck::cast_slice(&ti), usage: wgpu::BufferUsages::INDEX });
+        self.terrain_nidx = ti.len() as u32;
+        let trees = build_trees(&self.sim);
+        if !trees.is_empty() { self.queue.write_buffer(&self.tree_inst_buf, 0, bytemuck::cast_slice(&trees)); }
+        self.tree_n = trees.len() as u32;
         self.dormant_key = (u32::MAX, u64::MAX);
         self.corpse_n = 0;
     }
@@ -878,7 +966,7 @@ impl State {
         if self.lod {
             use vectorial_hash::Sphere3;
             let near = Sphere3::new(eye.x as f64, eye.y as f64, eye.z as f64, LOD_DIST as f64 + 8.0);
-            for it in self.sim.zindex.cull(&near) {
+            for it in self.sim.zq().cull(&near) {
                 if !it.dormant { continue; }
                 let (x, y, zz) = (it.p.x as f32, it.p.y as f32, it.p.z as f32);
                 if (Vec3::new(x, y, zz) - eye).length_squared() >= LOD_DIST * LOD_DIST { continue; }
@@ -1130,6 +1218,15 @@ impl State {
                 pass.set_index_buffer(bm.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..bm.nidx, 0, 0..box_n);
             }
+            // the forest (static instanced trunk+canopy boxes; one draw call)
+            if self.tree_n > 0 {
+                let bm = &self.box_model;
+                pass.set_bind_group(0, &bm.bind, &[]);
+                pass.set_vertex_buffer(0, bm.vbuf.slice(..));
+                pass.set_vertex_buffer(1, self.tree_inst_buf.slice(..));
+                pass.set_index_buffer(bm.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..bm.nidx, 0, 0..self.tree_n);
+            }
             // tower cannons
             if cannon_n > 0 {
                 let km = &self.cannon_model;
@@ -1376,6 +1473,8 @@ async fn run() {
                         KeyCode::KeyN => st.sim.trigger_wave(), // bring the next wave
                         KeyCode::KeyK => st.frustum_cull = !st.frustum_cull,
                         KeyCode::KeyT => st.sim.tower_threat_mode = !st.sim.tower_threat_mode,
+                        KeyCode::KeyG => { let sc = st.sim.scenario.next(); st.set_scenario(sc); } // cycle the map preset
+                        KeyCode::KeyM => { let zm = st.sim.zmode.next(); st.sim.set_zmode(zm); }   // Tree3 ↔ Morton, live
                         KeyCode::KeyF => {
                             st.free_cam = !st.free_cam;
                             if st.free_cam {
@@ -1431,7 +1530,7 @@ async fn run() {
                     frame += 1;
                     if frame % 15 == 0 {
                         let (d, a) = st.sim.counts();
-                        window.set_title(&format!("vectorial-hash — horde (wgpu) · sleep {d} | awake {a} | kills {} · run {} · {:.0} fps{}", st.sim.kills, st.sim.run, st.fps, if st.paused { " · PAUSED" } else { "" }));
+                        window.set_title(&format!("vectorial-hash — horde (wgpu) · map {} [G] · index {} [M] · sleep {d} | awake {a} | kills {} · run {} · {:.0} fps{}", st.sim.scenario.label(), st.sim.zmode.label(), st.sim.kills, st.sim.run, st.fps, if st.paused { " · PAUSED" } else { "" }));
                     }
                     #[cfg(not(target_arch = "wasm32"))]
                     if let Some(m) = max_frames {
