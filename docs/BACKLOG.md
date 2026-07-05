@@ -53,9 +53,17 @@ autonomously verifiable. User picked **"Todo (A–E)"** + the headline below.
   5. **Tree3 ↔ Morton ↔ 2D live toggle** (`M`, user picked "ambos conmutables").
   6. **Quaternius Ultimate Fantasy RTS** wall/tower/house models to replace the
      procedural boxes (pack vetted in HORDE_DESIGN).
-- **FORMATIONS — researched, build queued**: [FORMATIONS_DESIGN.md](FORMATIONS_DESIGN.md)
-  (regiment slot formations, contact k-NN pairing, **Polyhedron3 flank/rear
-  wedges → morale**, chain routs, charges, banners; KayKit asset picks).
+- **FORMATIONS — BUILT (2026-07-06 night)**: `formations_sim` (graphics-free,
+  11 brute-force-gated tests: k-NN melee pairing, sector flank/rear vs brute
+  angles, the kill-roll curve, charge-corridor raycast, volleys with honest
+  friendly fire, morale/chain routs, kept-index == brute, bit-identical
+  replay) + `formations_wgpu` (GPU-skinned move/attack clips per (faction,
+  kind), horses under cavalry/generals, banner poles+flags with state colour,
+  arrow lines, flattened fallen, HUD bars/sliders; ~7k soldiers ≈ 100 fps).
+  Docs: [FORMATIONS.md](FORMATIONS.md); design [FORMATIONS_DESIGN.md](FORMATIONS_DESIGN.md).
+  Web published + release binary. Remaining polish queued: KayKit banner/
+  weapon props, tactical terrain (hill charge bonus, forest cover), a
+  formations-vs-horde crossover scenario.
 
 **★ PHASE 0 — Multithreading (before the demo).** The `siege` demo is the heavy
 parallel consumer (1k+ units, each doing read queries on the shared index per
