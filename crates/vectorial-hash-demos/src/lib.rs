@@ -24,5 +24,8 @@ pub mod siege_sim;
 /// Shared, graphics-free simulation for the `horde` demo (They Are
 /// Billions-style zombie assault; wgpu renderer) — see `docs/HORDE_DESIGN.md`.
 pub mod horde_sim;
+/// Shared, graphics-free simulation for the `formations` demo (Total War-style
+/// automatic army battle; wgpu renderer) — see `docs/FORMATIONS_DESIGN.md`.
+pub mod formations_sim;
 #[cfg(not(feature = "web-wgpu"))]
 pub mod time;
