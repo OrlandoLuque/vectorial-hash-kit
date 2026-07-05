@@ -17,11 +17,11 @@ Live (WebGPU): <https://orlandoluque.github.io/vectorial-hash-kit/horde_wgpu.htm
 
 - drag: orbit · scroll: zoom · `P`/button: pause · **`N`/WAVE button: summon
   the next wave** (announce at 5 s; press again to land it NOW) · **`G`: map
-  scenario** (OPEN → PASS → RIVER → FOREST) · **`M`: index structure**
-  (TREE3 ↔ MORTON, live) · **`L`: night assault** (torches on the ring) ·
-  `[` `]` + slider: population (2 000 – 100 000) · `T`: tower targeting
-  (nearest ↔ highest-threat) · `K`: frustum cull · `F`: free-fly (WASD/QE) ·
-  thread slider (native).
+  scenario** (OPEN → PASS → RIVER → FOREST → PATCHES) · **`M`: index
+  structure** (TREE3 ↔ MORTON, live) · **`L`: night assault** (torches on the
+  ring) · `[` `]` + slider: population (2 000 – 100 000) · `T`: tower
+  targeting (nearest ↔ highest-threat) · `K`: frustum cull · `F`: free-fly
+  (WASD/QE) · thread slider (native).
 - Contact matters: a marching column **tramples sleepers awake** as it rolls
   over them (walking is silent — aggro spreads via combat noise and touch).
 - Rendering: **impostor billboards** ("photos" of each model: 8 yaws × 3
@@ -119,19 +119,29 @@ that used to ignite the whole map in seconds (per-frame carpet rebuilds,
 contact-wake percolation, walking noise) are fixed; a wave now recruits
 linearly along its path and via wall-combat noise.
 
-## Scenarios (`G`) — the same sim, four worlds
+## Scenarios (`G`) — the same sim, five worlds
 
 **OPEN** is the classic ring-in-a-field. **PASS** raises a rock ridge at
 r≈330 with three gap passes; **RIVER** carves a meandering channel with two
 causeway crossings; **FOREST** is impassable woods with a carved base
 clearing, four winding gate trails, nest clearings and connectors — the
-walkable network is *visible* as gaps in the tree canopy. Impassable terrain
-turns both routing systems into real minimum-path solvers (table above);
-ground units axis-slide along blocked edges, harpies just fly over, wave
-landings resample until they hit passable, *reachable* ground. All of it
-brute-force-gated: flow reaches the CC from 8 bearings per scenario, no
-ground unit ever stands in a blocked cell, Morton culls == Tree culls ==
-brute force.
+walkable network is *visible* as gaps in the tree canopy. **PATCHES** is the
+**They Are Billions** structure (researched): mostly-open ground strewn with
+blob patches of forest / rock / water at theme-weighted densities (three
+independent value-noise masks), where the walkable network is the *residual*
+space between blobs — gorges, small plains, pockets and chokepoints emerge
+from how patches touch, nothing is hand-traced. A connectivity pass (flood
+from the CC, then carve a corridor to each big unreached pocket) gives TAB's
+playability guarantee; small pockets stay as dead-end recovecos on purpose.
+(`HORDE_SCENARIO=PATCHES` boots straight into it.)
+
+Impassable terrain turns both routing systems into real minimum-path solvers
+(table above); ground units axis-slide along blocked edges, harpies just fly
+over, wave landings resample until they hit passable, *reachable* ground.
+All of it brute-force-gated: flow reaches the CC from 8 bearings per
+scenario, no ground unit ever stands in a blocked cell, PATCHES stays >90%
+connected and in a sane open-fraction band across 10 seeds, Morton culls ==
+Tree culls == brute force.
 
 ## The molón round (`L`)
 

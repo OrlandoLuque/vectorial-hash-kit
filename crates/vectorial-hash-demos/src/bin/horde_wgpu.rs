@@ -29,7 +29,7 @@ use winit::{
     window::WindowBuilder,
 };
 
-use vectorial_hash_demos::horde_sim::{ground_h, is_forest, is_water, terrain_h, DKind, Horde, SKind, Scenario, ZClass, BASE_R, WORLD};
+use vectorial_hash_demos::horde_sim::{ground_h, is_forest, is_water, patch_masks, terrain_h, DKind, Horde, SKind, Scenario, ZClass, BASE_R, PATCH_ROCK, PATCH_WATER, WORLD};
 // Generic glb-baking knobs shared with the siege loader.
 use vectorial_hash_demos::siege_sim::{ANIM_FRAMES, MOVE_PREFS};
 
@@ -149,6 +149,17 @@ fn build_terrain(seed: f64, sc: Scenario) -> (Vec<TVertex>, Vec<u32>) {
                     let f = is_forest(x, z, seed) as f32;
                     if f > 0.40 { c = mix3(c, [0.11, 0.19, 0.10], ((f - 0.40) / 0.18).clamp(0.0, 1.0)); }
                 }
+                Scenario::Patches => {
+                    // The TAB-like patch mosaic: water pools blue, rock clumps
+                    // grey (trees are drawn as instances over forest cells).
+                    let (_, r, w) = patch_masks(x, z, seed);
+                    if w >= PATCH_WATER - 0.04 {
+                        let depth = ((w - (PATCH_WATER - 0.04)) / 0.09).clamp(0.0, 1.0) as f32;
+                        c = mix3([0.34, 0.48, 0.54], [0.09, 0.22, 0.38], depth);
+                    } else if r >= PATCH_ROCK - 0.03 {
+                        c = mix3(c, [0.45, 0.44, 0.42], ((r - (PATCH_ROCK - 0.03)) / 0.06).clamp(0.0, 1.0) as f32);
+                    }
+                }
                 Scenario::Classic => {}
             }
             v.push(TVertex { pos: [x as f32, h as f32, z as f32], normal: n.to_array(), color: [c[0], c[1], c[2], 1.0] });
@@ -164,27 +175,44 @@ fn build_terrain(seed: f64, sc: Scenario) -> (Vec<TVertex>, Vec<u32>) {
     (v, idx)
 }
 
-/// Forest scenario: one static instanced-box tree (trunk + canopy) per blocked
-/// woods cell of the sim's pass grid — carved trails/clearings stay open, so
-/// the walkable min-path network is *visible* as gaps in the canopy.
-const TREE_CAP: usize = 40_000;
+/// Static instanced boxes over the blocking terrain — the walkable min-path
+/// network shows as the *gaps* between them. FOREST: a trunk+canopy tree per
+/// blocked woods cell. PATCHES: a tree per forest-patch cell + a grey mesa
+/// block per rock-patch cell (water is just the terrain-colour dip).
+const TREE_CAP: usize = 60_000;
 fn build_trees(sim: &Horde) -> Vec<SkinInstance> {
-    if sim.scenario != Scenario::Forest { return Vec::new(); }
+    if !matches!(sim.scenario, Scenario::Forest | Scenario::Patches) { return Vec::new(); }
     let n = 150usize; // mirrors the sim's pass-grid resolution
     let cell = WORLD / n as f64;
     let mut v = Vec::with_capacity(24_000);
+    let seed = sim.seed;
     for j in 0..n {
         for i in 0..n {
             let (x, z) = ((i as f64 + 0.5) * cell, (j as f64 + 0.5) * cell);
-            if sim.passable(x, z) || is_forest(x, z, sim.seed) < 0.46 { continue; }
+            if sim.passable(x, z) { continue; } // carved trails/clearings stay clear
+            // Which prop this blocked cell wants: forest → tree, rock → mesa.
+            let (is_tree, is_rock) = match sim.scenario {
+                Scenario::Forest => (is_forest(x, z, seed) >= 0.46, false),
+                Scenario::Patches => { let (f, r, w) = patch_masks(x, z, seed); (w < PATCH_WATER && r < PATCH_ROCK && f >= 0.60, r >= PATCH_ROCK && w < PATCH_WATER) }
+                _ => (false, false),
+            };
+            if !is_tree && !is_rock { continue; } // blocked by water → no prop
             // deterministic per-cell jitter + size (no rng: stable across rebuilds)
             let hsh = (i.wrapping_mul(73856093) ^ j.wrapping_mul(19349663)) as u32;
             let jx = ((hsh & 0xff) as f64 / 255.0 - 0.5) * cell * 0.7;
             let jz = (((hsh >> 8) & 0xff) as f64 / 255.0 - 0.5) * cell * 0.7;
             let s = 0.8 + ((hsh >> 16) & 0xff) as f32 / 255.0 * 0.6;
             let (tx, tz) = (x + jx, z + jz);
-            let ty = terrain_h(tx, tz, sim.seed, sim.scenario) as f32;
+            let ty = terrain_h(tx, tz, seed, sim.scenario) as f32;
             let (tx, tz) = (tx as f32, tz as f32);
+            if is_rock {
+                // A blocky grey mesa (TAB's rock clumps) — one box, varied height.
+                let mh = 9.0 + ((hsh >> 12) & 0xf) as f32 * 1.4;
+                let mesa = Mat4::from_translation(Vec3::new(tx, ty, tz)) * Mat4::from_scale(Vec3::new(cell as f32 * 0.85, mh, cell as f32 * 0.85));
+                let g = 0.40 + ((hsh >> 18) & 0x7) as f32 / 7.0 * 0.10;
+                v.push(SkinInstance { model: mesa.to_cols_array_2d(), color: [g, g * 0.97, g * 0.92, 1.0], frame_base: 0, _pad: [0; 3] });
+                continue;
+            }
             let trunk = Mat4::from_translation(Vec3::new(tx, ty, tz)) * Mat4::from_scale(Vec3::new(1.6, 7.0 * s, 1.6));
             v.push(SkinInstance { model: trunk.to_cols_array_2d(), color: [0.34, 0.23, 0.13, 1.0], frame_base: 0, _pad: [0; 3] });
             let g = 0.28 + ((hsh >> 20) & 0xf) as f32 / 15.0 * 0.10;
@@ -690,7 +718,13 @@ impl State {
 
         let seed = std::env::var("HORDE_SEED").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0x40BDE);
         let pop = std::env::var("HORDE_POP").ok().and_then(|s| s.parse().ok()).unwrap_or(20_000).clamp(2_000, MAX_POP);
-        let sim = Horde::new(seed, pop);
+        // Optional start scenario (OPEN/PASS/RIVER/FOREST/PATCHES), else Classic.
+        let start_sc = match std::env::var("HORDE_SCENARIO").ok().as_deref().map(|s| s.to_ascii_uppercase()).as_deref() {
+            Some("PASS") => Scenario::Pass, Some("RIVER") => Scenario::River,
+            Some("FOREST") => Scenario::Forest, Some("PATCHES") => Scenario::Patches,
+            _ => Scenario::Classic,
+        };
+        let sim = Horde::with_scenario(seed, pop, start_sc);
 
         let (tv, ti) = build_terrain(sim.seed, sim.scenario);
         let terrain_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("ter-v"), contents: bytemuck::cast_slice(&tv), usage: wgpu::BufferUsages::VERTEX });
@@ -756,7 +790,7 @@ impl State {
         #[cfg(not(target_arch = "wasm32"))]
         let pool = rayon::ThreadPoolBuilder::new().num_threads(max_threads).build().unwrap();
 
-        State {
+        let mut st = State {
             surface, device, queue, config,
             skin_pipeline, models, inst_buf,
             box_model, box_inst_buf, tree_inst_buf, tree_n: 0, castle_model, cannon_model, cannon_inst_buf,
@@ -780,7 +814,13 @@ impl State {
             yaw: 0.9, pitch: 0.7, dist: 820.0, dragging: false, last_mouse: (0.0, 0.0),
             free_cam: false, cam_pos: glam::Vec3::ZERO, mv: [false; 6],
             skin_instances: Vec::with_capacity(64 * 1024),
-        }
+        };
+        // Forest/Patches start needs its static prop field up front (the `G`
+        // key path builds it in set_scenario; a fresh start bypasses that).
+        let trees = build_trees(&st.sim);
+        if !trees.is_empty() { st.queue.write_buffer(&st.tree_inst_buf, 0, bytemuck::cast_slice(&trees)); }
+        st.tree_n = trees.len() as u32;
+        st
     }
 
     fn resize(&mut self, w: u32, h: u32) {

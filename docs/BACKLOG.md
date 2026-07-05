@@ -42,12 +42,16 @@ autonomously verifiable. User picked **"Todo (A–E)"** + the headline below.
      - **PENDING DISCUSSION (user, next session): their own idea for the
        horde's minimum paths** — tonight's flow-field-over-blocked-cells is
        the baseline to compare against.
-     - **NEW (user, 2026-07-06): research how They Are Billions GENERATES its
-       maps** — determine an algorithm producing TAB-like path networks
-       (distribution, relative widths, nooks/recovecos, clearings) and add it
-       as a scenario option in the demo, IF none of the existing carved
-       scenarios (Pass gaps / River causeways / Forest trails) already reads
-       equivalent. Compare visually first; only then build.
+     - ~~**research how They Are Billions GENERATES its maps**~~ — **DONE**
+       (2026-07-07): researched (TAB = seeded procedural, 6 themes, maps built
+       from weighted blob patches of forest/rock/water as natural barriers;
+       the walkable network is the residual space between blobs — gorges,
+       pockets, chokepoints). None of Pass/River/Forest was equivalent (those
+       are single hand-authored features or the *inverse* solid-woods layout),
+       so added the **PATCHES** scenario: three independent value-noise masks
+       → blob mosaic, a flood-from-CC connectivity pass (corridor to each big
+       unreached pocket, small ones stay dead-end recovecos) for TAB's
+       playability guarantee. `HORDE_SCENARIO=PATCHES`; new brute-force test.
   4. ~~**Molón round**~~ — **DONE** (2026-07-06): `L` night + ≤64 flickering
      torch point-lights in every shader (a fallen tower's light dies with
      it), blood-pool + kill-ring ground decals, trauma camera (rotational,

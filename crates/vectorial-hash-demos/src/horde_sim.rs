@@ -184,10 +184,10 @@ impl NoiseGrid {
 /// horde funnels through the passes / bridges / forest trails. (The user has
 /// an alternative min-path idea for the horde — baseline to compare against.)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Scenario { Classic, Pass, River, Forest }
+pub enum Scenario { Classic, Pass, River, Forest, Patches }
 impl Scenario {
-    pub fn label(self) -> &'static str { match self { Self::Classic => "OPEN", Self::Pass => "PASS", Self::River => "RIVER", Self::Forest => "FOREST" } }
-    pub fn next(self) -> Scenario { match self { Self::Classic => Self::Pass, Self::Pass => Self::River, Self::River => Self::Forest, Self::Forest => Self::Classic } }
+    pub fn label(self) -> &'static str { match self { Self::Classic => "OPEN", Self::Pass => "PASS", Self::River => "RIVER", Self::Forest => "FOREST", Self::Patches => "PATCHES" } }
+    pub fn next(self) -> Scenario { match self { Self::Classic => Self::Pass, Self::Pass => Self::River, Self::River => Self::Forest, Self::Forest => Self::Patches, Self::Patches => Self::Classic } }
 }
 
 /// Scenario-aware terrain height (pure): the Pass raises a ring ridge with
@@ -203,6 +203,13 @@ pub fn terrain_h(x: f64, z: f64, seed: f64, sc: Scenario) -> f64 {
             let a = (z - cz).atan2(x - cx);
             let gap = [0.5f64, 2.6, 4.7].iter().map(|g| { let mut da = (a - g).abs(); if da > std::f64::consts::PI { da = std::f64::consts::TAU - da; } (1.0 - da / 0.22).max(0.0) }).fold(0.0f64, f64::max);
             base + 58.0 * band * band * (1.0 - gap).max(0.0)
+        }
+        Scenario::Patches => {
+            // Water pools dip smoothly (the mask is continuous noise, so the
+            // shore blends); rock clumps bump up a little under their mesas.
+            let (_, r, w) = patch_masks(x, z, seed);
+            base - 3.2 * ((w - (PATCH_WATER - 0.03)) / 0.06).clamp(0.0, 1.0)
+                 + 2.0 * ((r - (PATCH_ROCK - 0.02)) / 0.05).clamp(0.0, 1.0)
         }
         Scenario::River => {
             let zr = cz - 250.0 + 70.0 * (x * 0.008 + seed * 3.0).sin();
@@ -241,6 +248,44 @@ pub fn is_forest(x: f64, z: f64, seed: f64) -> f64 { // 0..1 density
     let (sx, sz) = (fx * fx * (3.0 - 2.0 * fx), fz * fz * (3.0 - 2.0 * fz));
     let (a, b, c, d) = (h(ix, iz, s), h(ix + 1, iz, s), h(ix, iz + 1, s), h(ix + 1, iz + 1, s));
     a + (b - a) * sx + (c - a) * sz + (a - b - c + d) * sx * sz
+}
+
+// ---- the PATCHES scenario (the They Are Billions structure, researched):
+// mostly-open ground + BLOB PATCHES of forest / rock / water at theme-weighted
+// densities, each an independent value-noise mask at its own frequency. The
+// walkable network is the RESIDUAL space between patches — gorges, small
+// plains, pockets and chokepoints emerge from how blobs touch, nothing is
+// hand-traced. (Contrast with FOREST, which is the inverse: solid woods with
+// carved trails.) A connectivity pass then guarantees playability.
+
+/// The three patch masks at (x,z): (forest, rock, water) noise values 0..1.
+/// Frequencies picked so pools are big, woods medium, rock clumps small.
+pub fn patch_masks(x: f64, z: f64, seed: f64) -> (f64, f64, f64) {
+    fn h(ix: i64, iz: i64, s: i64) -> f64 {
+        let mut n = (ix.wrapping_mul(374761393)) ^ (iz.wrapping_mul(668265263)) ^ s.wrapping_mul(1274126177);
+        n = (n ^ (n >> 13)).wrapping_mul(1103515245);
+        ((n ^ (n >> 16)) & 0xffff) as f64 / 65535.0
+    }
+    fn vnoise(x: f64, z: f64, f: f64, s: i64) -> f64 {
+        let (xf, zf) = (x * f, z * f);
+        let (ix, iz) = (xf.floor() as i64, zf.floor() as i64);
+        let (fx, fz) = (xf - xf.floor(), zf - zf.floor());
+        let (sx, sz) = (fx * fx * (3.0 - 2.0 * fx), fz * fz * (3.0 - 2.0 * fz));
+        let (a, b, c, d) = (h(ix, iz, s), h(ix + 1, iz, s), h(ix, iz + 1, s), h(ix + 1, iz + 1, s));
+        a + (b - a) * sx + (c - a) * sz + (a - b - c + d) * sx * sz
+    }
+    let s = (seed * 1e6) as i64;
+    (vnoise(x, z, 0.011, s ^ 0x70A7), vnoise(x, z, 0.019, s ^ 0x50CC), vnoise(x, z, 0.007, s ^ 0x3AB0))
+}
+pub const PATCH_FOREST: f64 = 0.62;
+pub const PATCH_ROCK: f64 = 0.70;
+pub const PATCH_WATER: f64 = 0.71;
+
+/// Patch classification at (x,z): 0 open · 1 forest · 2 rock · 3 water
+/// (water wins over rock wins over forest where blobs overlap).
+pub fn patch_cell(x: f64, z: f64, seed: f64) -> u8 {
+    let (f, r, w) = patch_masks(x, z, seed);
+    if w >= PATCH_WATER { 3 } else if r >= PATCH_ROCK { 2 } else if f >= PATCH_FOREST { 1 } else { 0 }
 }
 
 /// A* over the pass grid — the DEFENDERS' minimum paths (sorties through the
@@ -650,6 +695,7 @@ impl Horde {
                     Scenario::Pass => terrain_h(x, z, fseed, sc) - ground_h(x, z, fseed) < 24.0, // below half-ridge
                     Scenario::River => !is_water(x, z, fseed, sc),
                     Scenario::Forest => is_forest(x, z, fseed) < 0.46,
+                    Scenario::Patches => patch_cell(x, z, fseed) == 0, // walkable = between the blobs
                 };
             }
         }
@@ -681,11 +727,81 @@ impl Horde {
             if sc != Scenario::Forest && !grid[ci] { continue; }
             centers.push((x, z));
         }
+        if matches!(sc, Scenario::Forest | Scenario::Patches) {
+            set_disc(&mut grid, cx, cz, BASE_R + 70.0, true); // the base clearing (the TAB spawn guarantee)
+        }
+        if sc == Scenario::Patches {
+            // Nest clearings, then the CONNECTIVITY pass — TAB's generator
+            // guarantees playable maps; here: flood from the CC, find the
+            // biggest walkable-but-unreached pocket, carve a corridor from its
+            // closest cell to the nearest reached cell, repeat until every
+            // pocket that matters joins the network. Small pockets stay as
+            // dead-end recovecos — that's the TAB look, on purpose.
+            for &(nx, nz) in &centers { set_disc(&mut grid, nx, nz, nr + 6.0, true); }
+            let start = ((cz / pcell) as usize).min(pn - 1) * pn + ((cx / pcell) as usize).min(pn - 1);
+            for _round in 0..48 {
+                // reachable set from the CC (4-neighbour flood)
+                let mut reach = vec![false; pn * pn];
+                let mut q = std::collections::VecDeque::new();
+                if grid[start] { reach[start] = true; q.push_back(start); }
+                while let Some(c) = q.pop_front() {
+                    let (i, j) = (c % pn, c / pn);
+                    for (di, dj) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)] {
+                        let (ni, nj) = (i as i64 + di, j as i64 + dj);
+                        if ni < 0 || nj < 0 || ni >= pn as i64 || nj >= pn as i64 { continue; }
+                        let nc = nj as usize * pn + ni as usize;
+                        if grid[nc] && !reach[nc] { reach[nc] = true; q.push_back(nc); }
+                    }
+                }
+                // distance-to-reached over ALL cells (multi-source BFS through
+                // blobs) — `near` remembers which reached cell is closest.
+                let (mut dist, mut near) = (vec![u32::MAX; pn * pn], vec![u32::MAX; pn * pn]);
+                let mut q2 = std::collections::VecDeque::new();
+                for c in 0..pn * pn { if reach[c] { dist[c] = 0; near[c] = c as u32; q2.push_back(c); } }
+                while let Some(c) = q2.pop_front() {
+                    let (i, j) = (c % pn, c / pn);
+                    for (di, dj) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)] {
+                        let (ni, nj) = (i as i64 + di, j as i64 + dj);
+                        if ni < 0 || nj < 0 || ni >= pn as i64 || nj >= pn as i64 { continue; }
+                        let nc = nj as usize * pn + ni as usize;
+                        if dist[nc] == u32::MAX { dist[nc] = dist[c] + 1; near[nc] = near[c]; q2.push_back(nc); }
+                    }
+                }
+                // biggest unreached pocket + its doorway (cell nearest the network)
+                let mut seen = vec![false; pn * pn];
+                let mut best: Option<(usize, usize)> = None;
+                for c0 in 0..pn * pn {
+                    if !grid[c0] || reach[c0] || seen[c0] { continue; }
+                    let (mut size, mut doorway) = (0usize, c0);
+                    let mut q3 = std::collections::VecDeque::new();
+                    seen[c0] = true; q3.push_back(c0);
+                    while let Some(c) = q3.pop_front() {
+                        size += 1;
+                        if dist[c] < dist[doorway] { doorway = c; }
+                        let (i, j) = (c % pn, c / pn);
+                        for (di, dj) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)] {
+                            let (ni, nj) = (i as i64 + di, j as i64 + dj);
+                            if ni < 0 || nj < 0 || ni >= pn as i64 || nj >= pn as i64 { continue; }
+                            let nc = nj as usize * pn + ni as usize;
+                            if grid[nc] && !reach[nc] && !seen[nc] { seen[nc] = true; q3.push_back(nc); }
+                        }
+                    }
+                    // Link pockets ≥8 cells; below that stays a dead-end recoveco.
+                    if size >= 8 && best.map(|(s, _)| size > s).unwrap_or(true) { best = Some((size, doorway)); }
+                }
+                let Some((_, door)) = best else { break; };
+                let t = near[door] as usize;
+                let (x0, z0) = (((door % pn) as f64 + 0.5) * pcell, ((door / pn) as f64 + 0.5) * pcell);
+                let (x1, z1) = (((t % pn) as f64 + 0.5) * pcell, ((t / pn) as f64 + 0.5) * pcell);
+                let d = ((x1 - x0).powi(2) + (z1 - z0).powi(2)).sqrt().max(1.0);
+                let steps = (d / 6.0) as usize + 1;
+                for k in 0..=steps { let u = k as f64 / steps as f64; set_disc(&mut grid, x0 + (x1 - x0) * u, z0 + (z1 - z0) * u, 9.0, true); }
+            }
+        }
         if sc == Scenario::Forest {
-            // Carve the map: base clearing, a winding trail from each gate to
-            // the map edge, a clearing per nest, and a connector from each
-            // nest to its nearest trail point — guaranteed minimum paths.
-            set_disc(&mut grid, cx, cz, BASE_R + 70.0, true);
+            // Carve the map: base clearing (above), a winding trail from each
+            // gate to the map edge, a clearing per nest, and a connector from
+            // each nest to its nearest trail point — guaranteed minimum paths.
             let mut trail_pts: Vec<(f64, f64)> = Vec::new();
             for q in 0..4 {
                 let a0 = q as f64 * std::f64::consts::FRAC_PI_2;
@@ -1932,7 +2048,7 @@ mod tests {
         // From several bearings on the wave-spawn ring, descending the flow
         // field must reach the base in every impassable scenario — i.e. the
         // Dijkstra actually routes through the pass gaps / causeways / trails.
-        for sc in [Scenario::Pass, Scenario::River, Scenario::Forest] {
+        for sc in [Scenario::Pass, Scenario::River, Scenario::Forest, Scenario::Patches] {
             let h = Horde::with_scenario(11, 3000, sc);
             let (cx, cz) = (WORLD / 2.0, WORLD / 2.0);
             let mut reached = 0;
@@ -1960,10 +2076,48 @@ mod tests {
     }
 
     #[test]
+    fn patches_connectivity_pass_keeps_the_base_reachable_and_open() {
+        // The TAB playability guarantee for the blob-mosaic map: across many
+        // seeds the flow field must reach the CC (the base clearing is carved,
+        // and the connectivity pass links the big pockets), and the walkable
+        // fraction must stay in a sane band — enough open ground to fight in,
+        // but the patches must actually block a real chunk (it's not just OPEN).
+        for seed in [1u64, 2, 5, 9, 13, 21, 42, 99, 128, 777] {
+            let h = Horde::with_scenario(seed, 3000, Scenario::Patches);
+            let (cx, cz) = (WORLD / 2.0, WORLD / 2.0);
+            // the base clearing is open ground the flood fills
+            assert!(h.passable(cx, cz) && h.flow.reachable(cx, cz), "seed {seed}: CC not reachable");
+            // Connectivity is the pass grid's own property (the coarser flow
+            // field can miss thin corridors) — flood-fill the pass grid from
+            // the CC and compare the reached open cells to all open cells.
+            let (pn, pcell, grid) = (h.pass_n, h.pass_cell, &h.pass_grid);
+            let start = ((cz / pcell) as usize).min(pn - 1) * pn + ((cx / pcell) as usize).min(pn - 1);
+            let mut reach = vec![false; pn * pn];
+            let mut q = std::collections::VecDeque::new();
+            if grid[start] { reach[start] = true; q.push_back(start); }
+            while let Some(c) = q.pop_front() {
+                let (i, j) = (c % pn, c / pn);
+                for (di, dj) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)] {
+                    let (ni, nj) = (i as i64 + di, j as i64 + dj);
+                    if ni < 0 || nj < 0 || ni >= pn as i64 || nj >= pn as i64 { continue; }
+                    let nc = nj as usize * pn + ni as usize;
+                    if grid[nc] && !reach[nc] { reach[nc] = true; q.push_back(nc); }
+                }
+            }
+            let open = grid.iter().filter(|&&g| g).count();
+            let reached = reach.iter().filter(|&&r| r).count();
+            let open_frac = open as f64 / (pn * pn) as f64;
+            assert!((0.35..0.92).contains(&open_frac), "seed {seed}: walkable fraction {open_frac:.2} out of band");
+            // Most walkable ground must be one connected network, not islands.
+            assert!(reached as f64 / open as f64 > 0.90, "seed {seed}: only {:.0}% of open ground is connected to the base", 100.0 * reached as f64 / open as f64);
+        }
+    }
+
+    #[test]
     fn scenario_movement_respects_impassable_ground() {
         // 20 s of a landed wave in each carved scenario: no ground unit —
         // zombie or defender — may ever stand in a blocked cell (the slide).
-        for sc in [Scenario::Pass, Scenario::River, Scenario::Forest] {
+        for sc in [Scenario::Pass, Scenario::River, Scenario::Forest, Scenario::Patches] {
             let mut h = Horde::with_scenario(7, 4000, sc);
             h.trigger_wave(); h.trigger_wave(); // announce, then land NOW
             for _ in 0..600 { h.step(1.0 / 30.0); }
