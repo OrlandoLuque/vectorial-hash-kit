@@ -1345,6 +1345,10 @@ impl State {
                 pass.set_bind_group(0, &self.cam_bg, &[]);
                 pass.set_vertex_buffer(0, self.decal_buf.slice(..));
                 pass.draw(0..6, 0..decal_n);
+                // The blocks below (cannons/castle/near-idle) assume the skin
+                // pipeline is still current — restore it or their skin-l bind
+                // groups hit the decal pipeline's cam-l layout (validation panic).
+                pass.set_pipeline(&self.skin_pipeline);
             }
             // tower cannons
             if cannon_n > 0 {
