@@ -458,6 +458,22 @@ pub struct Node3Id(pub u32);
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ItemRef(pub u32);
 
+/// Result of [`Tree3::update_ref_tracked`] — reports whether a moved item stayed
+/// in its leaf, crossed into a different one, or left the world. Useful when a
+/// caller needs to react to an item **changing leaf/cell** (streaming, LOD
+/// tiers, dirty-region tracking, partition-boundary logic).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Crossing {
+    /// The item moved but stayed in the same leaf (leaf id carried along).
+    Stayed(Node3Id),
+    /// The item crossed into a different leaf. Note a leaf is finer than any
+    /// coarse "region" a caller might define, so debounce against a
+    /// leaf→region map if you only care about coarse crossings.
+    Moved { from: Node3Id, to: Node3Id },
+    /// The item left the world; its handle was freed.
+    Left,
+}
+
 /// Where a handle's item currently lives: its leaf node and slot within that
 /// leaf's `items`/`hs` vectors.
 #[derive(Copy, Clone)]
@@ -690,7 +706,7 @@ impl<T: Positioned3> Tree3<T> {
         mutator(&mut self.get_mut(leaf).items[idx]);
         let np = self.get(leaf).items[idx].position();
         if self.get(leaf).bbox.contains(np) { return true; }
-        self.relocate(leaf, idx, np)
+        self.relocate(leaf, idx, np).is_some()
     }
 
     /// O(1) relocation through a stable [`ItemRef`]: no locate walk, no
@@ -703,13 +719,43 @@ impl<T: Positioned3> Tree3<T> {
         mutator(&mut self.get_mut(node).items[slot]);
         let np = self.get(node).items[slot].position();
         if self.get(node).bbox.contains(np) { return true; }
-        self.relocate(node, slot, np)
+        self.relocate(node, slot, np).is_some()
     }
 
+    /// Boundary-crossing variant of [`update_ref`] — reports whether the item
+    /// stayed in its leaf, crossed into a **different leaf** (with both leaf
+    /// ids), or left the world. The hook for reacting to an item **changing
+    /// cell** (re-streaming, LOD tier changes, dirty-region tracking, coarse
+    /// partition logic).
+    ///
+    /// **Caveat:** a *leaf* is finer than any coarse *region* a caller defines
+    /// (a leaf splits at `item_limit` density, so an item can cross many leaves
+    /// in one step). If you only care about coarse crossings, map
+    /// `leaf → region` (a small side table over the tree) and act only when the
+    /// *region* changes — [`Crossing::Moved`] is the cheap exact leaf signal;
+    /// the coarse debounce is yours. Cost is identical to `update_ref` (the
+    /// from/to leaf ids were already computed internally, just not surfaced).
+    pub fn update_ref_tracked<M: FnOnce(&mut T)>(&mut self, r: ItemRef, mutator: M) -> Crossing {
+        let loc = self.locs[r.0 as usize];
+        let (node, slot) = (loc.node, loc.slot as usize);
+        mutator(&mut self.get_mut(node).items[slot]);
+        let np = self.get(node).items[slot].position();
+        if self.get(node).bbox.contains(np) { return Crossing::Stayed(node); }
+        match self.relocate(node, slot, np) {
+            Some(dest) => Crossing::Moved { from: node, to: dest },
+            None => Crossing::Left,
+        }
+    }
+
+    /// The leaf a stable [`ItemRef`] currently lives in (O(1)) — pair with a
+    /// `leaf → coarse-region` side table if you group leaves into larger cells.
+    pub fn ref_leaf(&self, r: ItemRef) -> Node3Id { self.locs[r.0 as usize].node }
+
     /// Shared tail of `update`/`update_ref`: the item at `(leaf, slot)` has
-    /// moved to `np` outside `leaf`. Ascend to the LCA, re-descend, move it;
-    /// drop it (freeing its handle) if it left the root.
-    fn relocate(&mut self, leaf: Node3Id, slot: usize, np: Point3) -> bool {
+    /// moved to `np` outside `leaf`. Ascend to the LCA, re-descend, move it.
+    /// Returns the destination leaf, or `None` if it left the root (dropped +
+    /// merged, handle freed).
+    fn relocate(&mut self, leaf: Node3Id, slot: usize, np: Point3) -> Option<Node3Id> {
         let mut anc = self.get(leaf).parent;
         let lca = loop {
             match anc {
@@ -719,7 +765,7 @@ impl<T: Positioned3> Tree3<T> {
                     let (_, h) = self.swap_remove_h(leaf, slot);
                     self.free_handles.push(h);
                     self.try_merge_up(leaf);
-                    return false;
+                    return None;
                 }
             }
         };
@@ -728,7 +774,7 @@ impl<T: Positioned3> Tree3<T> {
         self.push_h(dest, item, h);
         if self.get(dest).items.len() > self.item_limit { self.divide(dest); }
         self.try_merge_up(leaf);
-        true
+        Some(dest)
     }
 
     fn locate_from(&self, start: Node3Id, p: Point3) -> Node3Id {
@@ -1895,5 +1941,44 @@ mod tests {
         loaded.update_ref(r0, |m| seen = Some(m.id));
         assert_eq!(seen, Some(id0), "ItemRef did not survive the round-trip");
         let _ = p0;
+    }
+
+    #[test]
+    fn update_ref_tracked_reports_leaf_crossings() {
+        // The leaf-crossing signal: a tiny move inside a leaf reports Stayed; a
+        // jump across the tree reports Moved{from,to} with a genuinely different
+        // destination leaf; leaving the world reports Left and frees the handle.
+        // And it must stay consistent with `update_ref`.
+        let world = Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0);
+        let mut x = 0xC0FFEEu64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x >> 11) as f64 / (1u64 << 53) as f64 };
+        let mut tree = Tree3::<P>::new(world, 4);
+        // enough points to force real subdivision (many leaves to cross)
+        let mut handles = Vec::new();
+        for _ in 0..4000 { let p = Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0); handles.push(tree.insert_ref(P(p)).unwrap()); }
+
+        // Leaving the position unchanged keeps the item in its own leaf → Stayed.
+        let r = handles[0];
+        let from0 = tree.ref_leaf(r);
+        let stayed = tree.update_ref_tracked(r, |_it| { /* no move */ });
+        assert_eq!(stayed, Crossing::Stayed(from0), "a no-op move must be Stayed in the same leaf");
+
+        // A teleport across the world almost always lands in a different leaf.
+        let mut moved = 0;
+        for &h in handles.iter().take(500) {
+            let from = tree.ref_leaf(h);
+            let np = Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0);
+            match tree.update_ref_tracked(h, |it| it.0 = np) {
+                Crossing::Moved { from: f, to } => { assert_eq!(f, from, "reported `from` must be the pre-move leaf"); assert_ne!(f, to, "Moved must have distinct leaves"); moved += 1; }
+                Crossing::Stayed(l) => assert_eq!(l, from, "Stayed must keep the same leaf"),
+                Crossing::Left => panic!("in-bounds teleport should not leave the world"),
+            }
+        }
+        assert!(moved > 400, "most cross-world teleports should cross a leaf ({moved}/500)");
+
+        // Leaving the world frees the handle → Left, and matches update_ref=false.
+        let hlast = *handles.last().unwrap();
+        let left = tree.update_ref_tracked(hlast, |it| it.0 = Point3::new(1e6, 1e6, 1e6));
+        assert_eq!(left, Crossing::Left, "out-of-world move must report Left");
     }
 }
