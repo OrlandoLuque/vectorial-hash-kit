@@ -18,6 +18,19 @@ use std::io::{self, Read, Write};
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ONodeId(pub u32);
 
+/// Result of [`Octree3::update_ref_tracked`] — the `Octree3` analogue of
+/// [`crate::Crossing`] (carries `ONodeId` leaves): a moved item stayed in its
+/// leaf, crossed into a different one, or left the world (handle freed).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum OCrossing {
+    /// Moved but stayed in the same leaf.
+    Stayed(ONodeId),
+    /// Crossed into a different leaf (a leaf is finer than a coarse region).
+    Moved { from: ONodeId, to: ONodeId },
+    /// Left the world; the handle was freed.
+    Left,
+}
+
 pub struct ONode<T> {
     pub bbox: Aabb,
     pub parent: Option<ONodeId>,
@@ -227,7 +240,7 @@ impl<T: Positioned3> Octree3<T> {
         mutator(&mut self.get_mut(leaf).items[idx]);
         let np = self.get(leaf).items[idx].position();
         if self.get(leaf).bbox.contains(np) { return true; }
-        self.relocate(leaf, idx, np)
+        self.relocate(leaf, idx, np).is_some()
     }
 
     /// O(1) relocation via a stable [`crate::ItemRef`] — no locate, no scan.
@@ -237,12 +250,13 @@ impl<T: Positioned3> Octree3<T> {
         mutator(&mut self.get_mut(node).items[slot]);
         let np = self.get(node).items[slot].position();
         if self.get(node).bbox.contains(np) { return true; }
-        self.relocate(node, slot, np)
+        self.relocate(node, slot, np).is_some()
     }
 
     /// Shared tail of `update`/`update_ref`: the item at `(leaf, slot)` left its
     /// leaf — ascend to the LCA, re-descend; drop (freeing its handle) if out.
-    fn relocate(&mut self, leaf: ONodeId, slot: usize, np: Point3) -> bool {
+    /// Returns the destination leaf, or `None` if it left the root.
+    fn relocate(&mut self, leaf: ONodeId, slot: usize, np: Point3) -> Option<ONodeId> {
         let mut anc = self.get(leaf).parent;
         let lca = loop {
             match anc {
@@ -252,7 +266,7 @@ impl<T: Positioned3> Octree3<T> {
                     let (_, h) = self.swap_remove_h(leaf, slot);
                     self.free_handles.push(h);
                     self.try_merge_up(leaf);
-                    return false;
+                    return None;
                 }
             }
         };
@@ -261,8 +275,28 @@ impl<T: Positioned3> Octree3<T> {
         self.push_h(dest, item, h);
         if self.get(dest).items.len() > self.item_limit { self.divide(dest); }
         self.try_merge_up(leaf);
-        true
+        Some(dest)
     }
+
+    /// Boundary-crossing variant of [`update_ref`](Self::update_ref): reports
+    /// whether the item stayed in its leaf, crossed into a different one (both
+    /// leaf ids), or left the world. Mirrors [`crate::Crossing`] on `Tree3`, with
+    /// `Octree3`'s `ONodeId` (a leaf is finer than any coarse region — debounce
+    /// against a leaf→region map if you only track coarse crossings).
+    pub fn update_ref_tracked<M: FnOnce(&mut T)>(&mut self, r: ItemRef, mutator: M) -> OCrossing {
+        let loc = self.locs[r.0 as usize];
+        let (node, slot) = (loc.node, loc.slot as usize);
+        mutator(&mut self.get_mut(node).items[slot]);
+        let np = self.get(node).items[slot].position();
+        if self.get(node).bbox.contains(np) { return OCrossing::Stayed(node); }
+        match self.relocate(node, slot, np) {
+            Some(dest) => OCrossing::Moved { from: node, to: dest },
+            None => OCrossing::Left,
+        }
+    }
+
+    /// The leaf a stable [`ItemRef`] currently lives in (O(1)).
+    pub fn ref_leaf(&self, r: ItemRef) -> ONodeId { self.locs[r.0 as usize].node }
 
     fn locate_from(&self, start: ONodeId, p: Point3) -> ONodeId {
         let mut cur = start;
@@ -774,6 +808,38 @@ mod tests {
     #[derive(Clone, Copy)]
     struct P(Point3);
     impl Positioned3 for P { fn position(&self) -> Point3 { self.0 } }
+
+    #[test]
+    fn update_ref_tracked_reports_leaf_crossings() {
+        // Mirror of Tree3's crossing test on the 8-way octree: no-op → Stayed,
+        // cross-world teleport → Moved{from≠to}, out-of-world → Left. Consistent
+        // with update_ref.
+        let world = Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0);
+        let mut x = 0x00C0_FFEEu64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x >> 11) as f64 / (1u64 << 53) as f64 };
+        let mut tree = Octree3::<P>::new(world, 4);
+        let mut handles = Vec::new();
+        for _ in 0..4000 { let p = Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0); handles.push(tree.insert_ref(P(p)).unwrap()); }
+
+        let r = handles[0];
+        let from0 = tree.ref_leaf(r);
+        assert_eq!(tree.update_ref_tracked(r, |_it| {}), OCrossing::Stayed(from0), "a no-op move must be Stayed");
+
+        let mut moved = 0;
+        for &h in handles.iter().take(500) {
+            let from = tree.ref_leaf(h);
+            let np = Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0);
+            match tree.update_ref_tracked(h, |it| it.0 = np) {
+                OCrossing::Moved { from: f, to } => { assert_eq!(f, from, "reported from = pre-move leaf"); assert_ne!(f, to, "Moved must have distinct leaves"); moved += 1; }
+                OCrossing::Stayed(l) => assert_eq!(l, from, "Stayed keeps the leaf"),
+                OCrossing::Left => panic!("in-bounds teleport should not leave"),
+            }
+        }
+        assert!(moved > 400, "most cross-world teleports should cross a leaf ({moved}/500)");
+
+        let hlast = *handles.last().unwrap();
+        assert_eq!(tree.update_ref_tracked(hlast, |it| it.0 = Point3::new(1e6, 1e6, 1e6)), OCrossing::Left, "out-of-world → Left");
+    }
 
     #[test]
     fn octree_raycast_dda_subset_of_capsule_and_first() {
