@@ -216,6 +216,41 @@ impl<T: Positioned> MortonGrid<T> {
         out
     }
 
+    /// **Coarse-tier cull** (the 2D twin of [`MortonGrid3::cull_layered`]): skip
+    /// empty regions of a large / sparse query in O(1) rather than probing every
+    /// fine cell of the bbox. Derives a coarse occupancy set from the live cells
+    /// (a coarse cell = `2^shift` fine cells per axis; its Morton code is the fine
+    /// code with the low `2·shift` bits dropped), then visits only the fine cells
+    /// inside **occupied** coarse blocks. Identical result to [`cull`](Self::cull);
+    /// a win when the query bbox is large and the world has empty regions.
+    pub fn cull_layered<'a, S: Shape>(&'a self, shape: &S) -> Vec<&'a T> {
+        let shift = 2u32;
+        if self.levels <= shift { return self.cull(shape); }
+        let bb = shape.bounding_box();
+        let ix0 = axis_index_n(bb.x, self.world.x, self.cw, self.cells_per_axis);
+        let iy0 = axis_index_n(bb.y, self.world.y, self.ch, self.cells_per_axis);
+        let ix1 = axis_index_n(bb.x_max(), self.world.x, self.cw, self.cells_per_axis);
+        let iy1 = axis_index_n(bb.y_max(), self.world.y, self.ch, self.cells_per_axis);
+        let mut coarse: std::collections::HashSet<u64> = std::collections::HashSet::with_capacity(self.cells.len());
+        for &code in self.cells.keys() { coarse.insert(code >> (2 * shift)); }
+        let mut out = Vec::new();
+        let probe = |ix: u32, iy: u32, out: &mut Vec<&'a T>| {
+            let bucket = match self.cells.get(&morton2(ix, iy)) { Some(b) => b, None => return };
+            let cb = self.cell_box(ix, iy);
+            let state = shape.classify_box(&cb).unwrap_or(if cb.intersects(&bb) { CellState::Maybe } else { CellState::Out });
+            match state { CellState::Out => {}, CellState::In => out.extend(bucket.iter()), CellState::Maybe => collect_matching_items(bucket, shape, &bb, out) }
+        };
+        let (cx0, cx1) = (ix0 >> shift, ix1 >> shift);
+        let (cy0, cy1) = (iy0 >> shift, iy1 >> shift);
+        for cy in cy0..=cy1 { for cx in cx0..=cx1 {
+            if !coarse.contains(&morton2(cx, cy)) { continue; }
+            let (fx0, fx1) = ((cx << shift).max(ix0), ((cx << shift) + (1 << shift) - 1).min(ix1));
+            let (fy0, fy1) = ((cy << shift).max(iy0), ((cy << shift) + (1 << shift) - 1).min(iy1));
+            for iy in fy0..=fy1 { for ix in fx0..=fx1 { probe(ix, iy, &mut out); } }
+        } }
+        out
+    }
+
     /// Batch cull — see [`crate::Tree3::cull_many`].
     pub fn cull_many<'a, S: Shape>(&'a self, shapes: &[S]) -> Vec<Vec<&'a T>> {
         shapes.iter().map(|s| self.cull(s)).collect()
@@ -502,6 +537,29 @@ mod tests {
     fn rng_pts(n: usize, seed: u64) -> Vec<P> {
         let mut x = seed | 1;
         (0..n).map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; let a = (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64; x ^= x << 13; x ^= x >> 7; x ^= x << 17; let b = (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64; P(Point::new(a * 256.0, b * 256.0)) }).collect()
+    }
+
+    #[test]
+    fn morton2_cull_layered_matches_cull_and_brute() {
+        // The 2D coarse-tier cull == plain cull == brute, incl. a sparse world
+        // (clumps in a big void) with a big query where the coarse skip fires.
+        let mut x = 0x2D_1A7EDu64 & 0xFFFF_FFFF;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        let pts: Vec<P> = (0..3000).map(|i| { let (cx, cy) = if i % 2 == 0 { (300.0, 300.0) } else { (1700.0, 1500.0) };
+            P(Point::new(cx + (rng() - 0.5) * 300.0, cy + (rng() - 0.5) * 300.0)) }).collect();
+        let world = Rect::new(0.0, 0.0, 2048.0, 2048.0);
+        for levels in [5u32, 7, 8] {
+            let mut grid = MortonGrid::<P>::new(world, levels);
+            for p in &pts { grid.insert(*p); }
+            for (cx, cy, r) in [(1024.0, 1024.0, 1200.0), (300.0, 300.0, 200.0), (1700.0, 1500.0, 400.0), (1000.0, 1000.0, 2000.0)] {
+                let s = Disc { cx, cy, r };
+                let key = |v: &[&P]| { let mut k: Vec<(u64, u64)> = v.iter().map(|p| (p.0.x.to_bits(), p.0.y.to_bits())).collect(); k.sort(); k };
+                let plain = key(&grid.cull(&s)); let layered = key(&grid.cull_layered(&s));
+                let brute = { let mut b: Vec<(u64, u64)> = pts.iter().filter(|p| { let dx = p.0.x - cx; let dy = p.0.y - cy; dx * dx + dy * dy <= r * r }).map(|p| (p.0.x.to_bits(), p.0.y.to_bits())).collect(); b.sort(); b };
+                assert_eq!(layered, plain, "cull_layered != cull (levels={levels}) disc ({cx},{cy}) r={r}");
+                assert_eq!(layered, brute, "cull_layered != brute (levels={levels}) disc ({cx},{cy}) r={r}");
+            }
+        }
     }
 
     #[test]
