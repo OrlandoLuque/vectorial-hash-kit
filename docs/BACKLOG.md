@@ -4,6 +4,33 @@ Future work queued for review. Nothing here is committed scope — prune,
 reprioritise, or drop freely. Items graduate into the per-crate roadmaps
 (e.g. `crates/vectorial-hash/README.md`) once picked up.
 
+## ★ NEXT DEMO (user, 2026-07-07): a GPU-RESIDENT collision storm
+
+Agreed after the "why don't the sims benefit from GPU LBVH?" discussion. The
+answer: the game sims are branchy-`decide`-bound (GPU-hostile) and pay a per-
+frame CPU↔GPU round-trip; the real GPU win is a sim where **the whole hot loop
+is GPU-resident** — a uniform-rule sim with no round-trip. So:
+
+1. **`gpu_storm` — GPU-resident collision storm** (the vehicle for "how much MORE
+   can we accelerate?"). Whole pipeline in compute shaders: Morton encode → LBVH
+   build → broad-phase pair query → collision resolution → integration, all
+   resident on the GPU, only the framebuffer read back. The **switch compares
+   *whole sim on GPU* vs *on CPU*** (not just the query) + a GPU-load meter. Most
+   visual: 100k–1M particles, collisions flash. Scales to 1M with the GPU-side
+   build (item 3). Native wgpu-direct (no macroquad twin, per the demo policy).
+2. **Influence-field mode** (a toggle on `gpu_storm`, ~90% shared code): thousands
+   of moving emitters, each lighting everything within a radius — a large-scale
+   perception / proximity-glow visual. Cheap add once (1) exists.
+3. **GPU-side LBVH build** (parallel radix sort + Karras in WGSL) — the enabler:
+   erases the per-frame rebuild tax measured in `gpu_spatial_bench`, pushing the
+   moving-broad-phase crossover past 1M. Also unlocks (1) at 1M+.
+
+Companion (measured tonight, separate track): **GPU line-of-sight shader** — the
+`gpu_lbvh_demo` traversal with the leaf test swapped point-in-sphere → segment-
+vs-AABB, over a STATIC occluder BVH (build once, no rebuild → the *clean* GPU
+case). CPU baseline + `Polyhedron3::segment_hit` + `visibility_cull_bench` landed
+2026-07-07 (CPU-parallel holds ~110–216k viewer×target pairs/frame @60 Hz).
+
 ## Overnight queue — round 3 (set 2026-06-26)
 
 The big **ray-cast thread graduated** (DDA leaf-walk 2D + 3D, capsule shapes
