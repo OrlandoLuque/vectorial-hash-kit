@@ -6,9 +6,10 @@
 //! game sims can't reach — no per-frame CPU↔GPU round-trip — so switching the
 //! backend compares *the whole simulation on GPU vs on CPU*, not just a query.
 //!
-//! Keys: `1` CPU grid · `2` GPU-resident · `[` `]` particle count · drag orbit ·
-//! scroll zoom. Title meter: backend · sim ms · FPS · particle count. Particles
-//! are coloured by how many contacts they're in (a collision heat-map).
+//! Keys: `1` CPU grid · `2` GPU-resident · `F` collision ↔ **influence field**
+//! (each particle a moving emitter, coloured by neighbours within a glow radius —
+//! the same grid, a bigger query, no forces) · `[` `]` particle count · drag
+//! orbit · scroll zoom. Title meter: backend · mode · sim ms · FPS · count.
 //!
 //! `cargo run -p vectorial-hash-demos --bin gpu_storm --release`
 #![cfg(not(target_arch = "wasm32"))]
@@ -27,6 +28,7 @@ const CAP: u32 = 16;                 // per-cell bucket capacity
 const DT: f32 = 0.006;               // fixed sim step (stability, not frame-rate coupled)
 const SPRING: f32 = 600.0;
 const DAMP: f32 = 6.0;
+const GLOW_R: f32 = 30.0; // influence-field mode: proximity-glow radius (multi-ring)
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -128,13 +130,14 @@ async fn run() {
     let ts_resolve = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 16, usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
     let ts_read = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 16, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
 
-    let params = |n: usize| Params { n: n as u32, gd: GD, cap: CAP, _p0: 0, world: WORLD, cell: CELL, radius: R, dt: DT, spring: SPRING, damp: DAMP, _p1: 0.0, _p2: 0.0 };
-    queue.write_buffer(&params_b, 0, bytemuck::bytes_of(&params(n)));
+    let params = |n: usize, mode: f32| Params { n: n as u32, gd: GD, cap: CAP, _p0: 0, world: WORLD, cell: CELL, radius: R, dt: DT, spring: SPRING, damp: DAMP, _p1: mode, _p2: GLOW_R };
+    queue.write_buffer(&params_b, 0, bytemuck::bytes_of(&params(n, 0.0)));
     queue.write_buffer(&pos_b, 0, bytemuck::cast_slice(&pos));
     queue.write_buffer(&vel_b, 0, bytemuck::cast_slice(&vel));
 
     let smoke: Option<u64> = std::env::var("GPU_STORM_FRAMES").ok().and_then(|s| s.parse().ok());
     let mut backend = Backend::Gpu;
+    let mut mode = if std::env::var("GPU_STORM_INFLUENCE").is_ok() { 1.0f32 } else { 0.0f32 }; // 0 = collision, 1 = influence field (F toggles)
     let (mut yaw, mut pitch, mut dist) = (0.7f32, 0.4f32, 2600.0f32);
     let (mut drag, mut last_mouse) = (false, (0.0f64, 0.0f64));
     let mut last = Instant::now();
@@ -158,15 +161,17 @@ async fn run() {
                 KeyCode::BracketRight | KeyCode::BracketLeft => {
                     n = if c == KeyCode::BracketRight { (n + 50_000).min(max_n) } else { n.saturating_sub(50_000).max(10_000) };
                     let (p, v) = spawn(n); pos = p; vel = v;
-                    queue.write_buffer(&params_b, 0, bytemuck::bytes_of(&params(n)));
+                    queue.write_buffer(&params_b, 0, bytemuck::bytes_of(&params(n, mode)));
                     queue.write_buffer(&pos_b, 0, bytemuck::cast_slice(&pos)); queue.write_buffer(&vel_b, 0, bytemuck::cast_slice(&vel));
                 }
+                KeyCode::KeyF => mode = if mode > 0.5 { 0.0 } else { 1.0 }, // collision ↔ influence field
                 _ => {}
             },
             WindowEvent::RedrawRequested => {
                 let fdt = { let d = last.elapsed().as_secs_f32().min(0.05); last = Instant::now(); d };
                 fps = if fps == 0.0 { 1.0 / fdt } else { fps * 0.9 + 0.1 / fdt };
                 frame += 1;
+                queue.write_buffer(&params_b, 0, bytemuck::bytes_of(&params(n, mode)));
 
                 let target = Vec3::splat(WORLD * 0.5);
                 let eye = target + Vec3::new(dist * pitch.cos() * yaw.cos(), dist * pitch.sin(), dist * pitch.cos() * yaw.sin());
@@ -188,7 +193,7 @@ async fn run() {
                 } else {
                     // CPU grid DEM (serial) — the same algorithm, on the CPU, for the switch
                     let t = Instant::now();
-                    cpu_step(&mut pos, &mut vel, n, &mut heads, &mut nextp, ncells);
+                    cpu_step(&mut pos, &mut vel, n, &mut heads, &mut nextp, ncells, mode);
                     sim_ms = t.elapsed().as_secs_f32() * 1000.0;
                     let counts: Vec<u32> = pos[..n].iter().map(|p| p[3] as u32).collect();
                     queue.write_buffer(&pos_b, 0, bytemuck::cast_slice(&pos[..n]));
@@ -217,7 +222,7 @@ async fn run() {
                     sim_ms = (t[1].wrapping_sub(t[0])) as f32 * queue.get_timestamp_period() / 1e6;
                 }
 
-                if frame % 8 == 0 { window.set_title(&format!("gpu_storm · {} [1/2] · {} particles [ ] · sim {:.2} ms · {:.0} fps", backend.label(), n, sim_ms, fps)); }
+                if frame % 8 == 0 { window.set_title(&format!("gpu_storm · {} [1/2] · {} [F] · {} particles [ ] · sim {:.2} ms · {:.0} fps", backend.label(), if mode > 0.5 { "influence" } else { "collision" }, n, sim_ms, fps)); }
                 if let Some(mf) = smoke {
                     if frame % (mf / 2).max(1) == 0 { backend = match backend { Backend::Gpu => Backend::Cpu, Backend::Cpu => Backend::Gpu }; }
                     // invariant check: read positions back, assert in-bounds + finite
@@ -252,7 +257,7 @@ fn sync_from_gpu(device: &wgpu::Device, queue: &wgpu::Queue, pos_b: &wgpu::Buffe
 
 /// CPU mirror of the GPU sim: a rebuilt uniform grid + spring-dashpot DEM. `pos[i][3]`
 /// carries the per-particle contact count (for the render colour), matching the GPU.
-fn cpu_step(pos: &mut [[f32; 4]], vel: &mut [[f32; 4]], n: usize, heads: &mut [i32], nextp: &mut [i32], ncells: usize) {
+fn cpu_step(pos: &mut [[f32; 4]], vel: &mut [[f32; 4]], n: usize, heads: &mut [i32], nextp: &mut [i32], ncells: usize, mode: f32) {
     let cell_of = |p: &[f32; 4]| -> usize {
         let gx = ((p[0] / CELL) as i32).clamp(0, GD as i32 - 1);
         let gy = ((p[1] / CELL) as i32).clamp(0, GD as i32 - 1);
@@ -261,13 +266,16 @@ fn cpu_step(pos: &mut [[f32; 4]], vel: &mut [[f32; 4]], n: usize, heads: &mut [i
     };
     for h in heads[..ncells].iter_mut() { *h = -1; }
     for i in 0..n { let c = cell_of(&pos[i]); nextp[i] = heads[c]; heads[c] = i as i32; }
-    let (r, r2) = (R, (2.0 * R) * (2.0 * R));
+    let influence = mode > 0.5;
+    let rad = if influence { GLOW_R } else { 2.0 * R };
+    let ring = if influence { (GLOW_R / CELL).ceil() as i32 } else { 1 };
+    let (r, rad2) = (R, rad * rad);
     for i in 0..n {
         let pi = pos[i]; let vi = vel[i];
         let (gx, gy, gz) = (((pi[0] / CELL) as i32).clamp(0, GD as i32 - 1), ((pi[1] / CELL) as i32).clamp(0, GD as i32 - 1), ((pi[2] / CELL) as i32).clamp(0, GD as i32 - 1));
         let (mut fx, mut fy, mut fz) = (0.0f32, 0.0f32, 0.0f32);
         let mut contacts = 0u32;
-        for dz in -1..=1 { for dy in -1..=1 { for dx in -1..=1 {
+        for dz in -ring..=ring { for dy in -ring..=ring { for dx in -ring..=ring {
             let (cx, cy, cz) = (gx + dx, gy + dy, gz + dz);
             if cx < 0 || cy < 0 || cz < 0 || cx >= GD as i32 || cy >= GD as i32 || cz >= GD as i32 { continue; }
             let c = (cx + cy * GD as i32 + cz * (GD * GD) as i32) as usize;
@@ -275,10 +283,11 @@ fn cpu_step(pos: &mut [[f32; 4]], vel: &mut [[f32; 4]], n: usize, heads: &mut [i
             while j >= 0 { let ju = j as usize; if ju != i {
                 let pj = pos[ju]; let (ox, oy, oz) = (pi[0] - pj[0], pi[1] - pj[1], pi[2] - pj[2]);
                 let d2 = ox * ox + oy * oy + oz * oz;
-                if d2 < r2 && d2 > 1e-8 { let d = d2.sqrt(); let inv = 1.0 / d; let (nx, ny, nz) = (ox * inv, oy * inv, oz * inv);
-                    let overlap = 2.0 * r - d;
-                    let (rvx, rvy, rvz) = (vel[ju][0] - vi[0], vel[ju][1] - vi[1], vel[ju][2] - vi[2]);
-                    fx += SPRING * overlap * nx + DAMP * rvx; fy += SPRING * overlap * ny + DAMP * rvy; fz += SPRING * overlap * nz + DAMP * rvz;
+                if d2 < rad2 && d2 > 1e-8 {
+                    if !influence { let d = d2.sqrt(); let inv = 1.0 / d; let (nx, ny, nz) = (ox * inv, oy * inv, oz * inv);
+                        let overlap = 2.0 * r - d;
+                        if overlap > 0.0 { let (rvx, rvy, rvz) = (vel[ju][0] - vi[0], vel[ju][1] - vi[1], vel[ju][2] - vi[2]);
+                            fx += SPRING * overlap * nx + DAMP * rvx; fy += SPRING * overlap * ny + DAMP * rvy; fz += SPRING * overlap * nz + DAMP * rvz; } }
                     contacts += 1;
                 }
             } j = nextp[ju]; }
@@ -296,7 +305,7 @@ fn unif_vs(b: u32) -> wgpu::BindGroupLayoutEntry { wgpu::BindGroupLayoutEntry { 
 
 // ---- the whole simulation in one WGSL module (4 entry points sharing the layout)
 const SIM: &str = r#"
-struct Params { n: u32, gd: u32, cap: u32, _p0: u32, world: f32, cell: f32, radius: f32, dt: f32, spring: f32, damp: f32, _p1: f32, _p2: f32 };
+struct Params { n: u32, gd: u32, cap: u32, _p0: u32, world: f32, cell: f32, radius: f32, dt: f32, spring: f32, damp: f32, mode: f32, glow_r: f32 };
 @group(0) @binding(0) var<storage, read_write> pos: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read_write> vel: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read_write> acc: array<vec4<f32>>;
@@ -328,12 +337,16 @@ fn build_grid(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn collide(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x; if (i >= P.n) { return; }
     let pi = pos[i].xyz; let vi = vel[i].xyz;
-    let d2r = 2.0 * P.radius;
+    let influence = P.mode > 0.5;
+    // collide mode: contacts within 2r, 3×3×3. influence mode: neighbours within
+    // glow_r (a proximity-glow field), scanning ⌈glow_r/cell⌉ rings, no force.
+    let rad = select(2.0 * P.radius, P.glow_r, influence);
+    let ring = select(1, i32(ceil(P.glow_r / P.cell)), influence);
     let g = clamp(vec3<i32>(pi / P.cell), vec3<i32>(0), vec3<i32>(i32(P.gd) - 1));
-    var f = vec3<f32>(0.0); var contacts = 0u;
-    for (var dz = -1; dz <= 1; dz = dz + 1) {
-    for (var dy = -1; dy <= 1; dy = dy + 1) {
-    for (var dx = -1; dx <= 1; dx = dx + 1) {
+    var f = vec3<f32>(0.0); var cnt = 0u;
+    for (var dz = -ring; dz <= ring; dz = dz + 1) {
+    for (var dy = -ring; dy <= ring; dy = dy + 1) {
+    for (var dx = -ring; dx <= ring; dx = dx + 1) {
         let cc = g + vec3<i32>(dx, dy, dz);
         if (cc.x < 0 || cc.y < 0 || cc.z < 0 || cc.x >= i32(P.gd) || cc.y >= i32(P.gd) || cc.z >= i32(P.gd)) { continue; }
         let c = u32(cc.x + cc.y * i32(P.gd) + cc.z * i32(P.gd) * i32(P.gd));
@@ -342,16 +355,17 @@ fn collide(@builtin(global_invocation_id) gid: vec3<u32>) {
             let j = gitems[c * P.cap + s];
             if (j == i) { continue; }
             let o = pi - pos[j].xyz; let d2 = dot(o, o);
-            if (d2 < d2r * d2r && d2 > 1e-8) {
-                let d = sqrt(d2); let nrm = o / d; let overlap = d2r - d;
-                let rv = vel[j].xyz - vi;
-                f = f + P.spring * overlap * nrm + P.damp * rv;
-                contacts = contacts + 1u;
+            if (d2 < rad * rad && d2 > 1e-8) {
+                if (!influence) {
+                    let d = sqrt(d2); let nrm = o / d; let overlap = 2.0 * P.radius - d;
+                    if (overlap > 0.0) { f = f + P.spring * overlap * nrm + P.damp * (vel[j].xyz - vi); }
+                }
+                cnt = cnt + 1u;
             }
         }
     }}}
-    acc[i] = vec4<f32>(f, 0.0);
-    coll[i] = contacts;
+    acc[i] = select(vec4<f32>(f, 0.0), vec4<f32>(0.0), influence); // influence = drift, no force
+    coll[i] = cnt;
 }
 
 @compute @workgroup_size(64)
