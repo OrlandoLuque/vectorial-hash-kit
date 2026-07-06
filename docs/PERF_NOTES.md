@@ -30,6 +30,52 @@ The two axes still compose, just not as hoped here: the **index** cuts the
 *number* of force evals (N² → k·N — the big win), the **table** would cut the
 *cost* of each (a loss here).
 
+## GPU LBVH broad-phase: measured, showcased — but NOT retrofitted into the sims
+
+The demos issue a lot of spatial queries per frame (the horde's per-active-unit
+separation cull + target k-NN, siege's contact tests). A BVH built from the
+Morton codes we already compute, traversed in a wgpu **compute** shader, runs
+those on the GPU — and the raw kernel is spectacular. `gpu_lbvh_demo` (the live
+three-way switch: CPU `Tree3` ↔ GPU brute ↔ GPU LBVH, 50 k moving points each
+heat-mapped by its neighbour count) on this box (RTX 4080 SUPER):
+
+| backend | query / frame |
+| --- | --- |
+| CPU `Tree3` cull (serial) | 121.8 ms |
+| GPU brute | 2.6 ms (~46×) |
+| **GPU LBVH** | **0.31 ms (~393×)** |
+
+So why don't the game demos use it? Because that 393× is the **query kernel
+only**, and the sims move every frame — which forces the BVH to be **rebuilt**
+every frame, while our keep-index does **not** (`sync_index`/`update_ref` in
+place). The honest per-frame cost is *(rebuild + dispatch)* vs *(keep-index
+maintain + `cull_many_par`)*. `gpu_spatial_bench` (env-parametrised), verdict vs
+the **parallel** keep-index the demos actually run:
+
+| workload | CPU keep (parallel) | GPU LBVH (rebuild+dispatch) | winner |
+| --- | --- | --- | --- |
+| 1 M pts, 10 k queries, r=500 | 62 ms | 80 ms | **CPU 1.30×** |
+| 100 k, 20 k, r=30 (clustered) | 9 ms | 5.4 ms | GPU 1.66× |
+| 100 k, 20 k, r=150 (clustered) | 41 ms | 9 ms | GPU 4.53× |
+
+The **rebuild : query** ratio decides it. The CPU-side LBVH rebuild is *N log N*
+(the sort); the keep-index maintain is *linear* — so past ~a few hundred k the
+rebuild overtakes it and the parallel keep-index wins outright (at 1 M the ~79 ms
+rebuild alone is more than the whole CPU frame). GPU LBVH only pulls ahead when
+per-query work is heavy (fat radius / dense clumps) **and** N is small enough
+that the rebuild stays cheap.
+
+**Verdict for the sims: keep the CPU parallel keep-index** (already in — the
+2026-07-02 keep-vs-rebuild switch + `cull_many_par`). It's the right structure
+for *moving* data at the demos' scale, and their real bottleneck is the per-unit
+**decide** logic (the decision-buckets item), not the cull. GPU LBVH lives in
+its own **`gpu_lbvh_demo`** showcase and is the right tool for **static /
+rebuild-anyway** loads; a **GPU-side build** (parallel radix sort + Karras) would
+move the crossover past 1 M and is the route if queries ever go wholesale to the
+GPU. Reproduce: `cargo run -p vectorial-hash-demos --bin gpu_lbvh_demo --release`
+and `… --example gpu_spatial_bench --release --features parallel` (with `GPU_N=…
+GPU_M=… GPU_R=… GPU_CLUSTER=1`).
+
 ## Voxel vs smooth terrain: why `V` changes the FPS
 
 Pressing `V` (voxel ↔ smooth heightfield) noticeably moves the frame rate — e.g.

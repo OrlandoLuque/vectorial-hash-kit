@@ -84,6 +84,20 @@ autonomously verifiable. User picked **"Todo (A–E)"** + the headline below.
      key + ALL button (`wake_all`) rouse every sleeper at once. Measured:
      **100k ALL active = ~79 fps rendered** (RTX 4080 SUPER, no vsync) — the
      honest worst-case ceiling. `HORDE_WAKE_ALL=1` boots straight into it.
+  9. ~~**GPU LBVH broad-phase — support + a switchable demo + measure the
+     sims**~~ — **DONE** (2026-07-07): `gpu_lbvh_demo` (a live three-way switch
+     CPU `Tree3` ↔ GPU brute ↔ **GPU LBVH** compute traversal, N moving points
+     heat-mapped by neighbour count, GPU-timer meter in the title, `1/2/3`
+     keys + `[ ]` point count) and a parametrised `gpu_spatial_bench`
+     (GPU_N/M/R/CLUSTER + the per-frame **rebuild-vs-keep** verdict). Raw query
+     kernel is ~393× the serial CPU cull, **but** — measured — for *moving* data
+     the per-frame BVH rebuild eats it: vs the **parallel keep-index** the sims
+     already run, GPU LBVH wins 1.66–4.5× at ≤100k yet **loses 1.30× at 1M**
+     (the *N log N* rebuild overtakes the linear keep-maintain). **Verdict: sims
+     keep the CPU parallel keep-index** (right for moving data; their bottleneck
+     is `decide`, not the cull); GPU LBVH is for static / rebuild-anyway loads,
+     and a GPU-side build would move the crossover past 1M. Full write-up:
+     `PERF_NOTES.md` § "GPU LBVH broad-phase". RustRover config added.
 - **FORMATIONS — BUILT (2026-07-06 night)**: `formations_sim` (graphics-free,
   11 brute-force-gated tests: k-NN melee pairing, sector flank/rear vs brute
   angles, the kill-roll curve, charge-corridor raycast, volleys with honest
