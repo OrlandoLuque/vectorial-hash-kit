@@ -39,6 +39,7 @@ pub mod tree3;
 pub mod octree3;
 pub mod morton3;
 pub mod morton;
+pub mod advisor;
 
 pub use geom::{Point, Rect};
 pub use template::{CellState, PlacedTemplate, TemplateGrid};
@@ -50,3 +51,4 @@ pub use tree3::{Aabb, Crossing, ItemRef, Node3, Node3Id, Point3, Polyhedron3, Po
 pub use octree3::{ONode, ONodeId, Octree3};
 pub use morton3::MortonGrid3;
 pub use morton::MortonGrid;
+pub use advisor::{SpatialProfile, StructureHint};

@@ -32,9 +32,11 @@ criterion = { workspace = true }
 # Property-based fuzzing (tests/proptest_structures.rs): randomized op sequences
 # vs a brute-force model, with shrinking. Dev-only.
 proptest = "1"
-# On-disk embedded B-tree KV (pure Rust). Dev-only — used ONLY by the
-# examples/cold_store_redb.rs cold-index prototype, never by the shipped crate.
+# On-disk embedded KV engines (pure Rust). Dev-only — used ONLY by the
+# cold-index example prototypes (redb = COW B-tree; fjall = LSM), to compare
+# the read-optimized vs write-optimized engine. Never in the shipped crate.
 redb = "2"
+fjall = "2"
 
 [[bench]]
 name = "spatial"
