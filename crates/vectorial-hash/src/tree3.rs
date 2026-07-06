@@ -244,6 +244,34 @@ impl Polyhedron3 {
         self.raster = Some(VoxelRaster::for_shape(&probe));
         self
     }
+
+    /// **Line-of-sight / occlusion test.** The parameter `t ∈ [0, 1]` at which
+    /// the segment `a`→`b` **first enters** this convex solid, or `None` if the
+    /// segment never touches it. Liang–Barsky clipping against the half-spaces
+    /// `n·p ≤ d` (each plane bounds the valid `t` interval; convex ⇒ one run).
+    ///
+    /// Use it as a hard occlusion test: a viewer at `a` sees a target at `b`
+    /// **unless** some occluder returns `Some(t)` with `t < 1` — the solid blocks
+    /// the line before the target is reached. (`Segment3`/`raycast` is the *thick*
+    /// capsule that finds items *near* a ray; this is the exact segment↔solid
+    /// surface hit the doc-comment there points to.)
+    pub fn segment_hit(&self, a: Point3, b: Point3) -> Option<f64> {
+        let (dx, dy, dz) = (b.x - a.x, b.y - a.y, b.z - a.z);
+        let (mut t0, mut t1) = (0.0_f64, 1.0_f64); // inside-interval, clamped to the segment
+        for &(nx, ny, nz, d) in &self.planes {
+            let den = nx * dx + ny * dy + nz * dz;      // n·(b−a)
+            let num = d - (nx * a.x + ny * a.y + nz * a.z); // constraint: t·den ≤ num
+            if den.abs() < 1e-12 {
+                if num < 0.0 { return None; } // parallel to this face and outside it
+            } else {
+                let t = num / den;
+                if den > 0.0 { if t < t1 { t1 = t; } } // upper bound
+                else if t > t0 { t0 = t; }             // lower bound
+                if t0 > t1 { return None; }            // interval collapsed → misses the solid
+            }
+        }
+        if t0 <= t1 { Some(t0) } else { None }
+    }
 }
 
 impl Shape3 for Polyhedron3 {
@@ -1613,6 +1641,48 @@ mod tests {
         let mut got: Vec<(u64, u64, u64)> = tree.cull(&poly).iter().map(|p| (p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits())).collect();
         want.sort(); got.sort();
         assert_eq!(want, got, "frustum-from-box cull != box contains");
+    }
+
+    #[test]
+    fn segment_hit_matches_box_slab_reference() {
+        // segment_hit on a general convex polytope must agree with an INDEPENDENT
+        // analytic slab (ray-box) clip when the polytope IS an axis-aligned box.
+        // Both are exact (no sampling) → deterministic entry-t agreement.
+        let (lo, hi) = (Point3::new(0.0, 0.0, 0.0), Point3::new(10.0, 8.0, 12.0));
+        let corners = [
+            Point3::new(lo.x, lo.y, lo.z), Point3::new(hi.x, lo.y, lo.z), Point3::new(hi.x, hi.y, lo.z), Point3::new(lo.x, hi.y, lo.z),
+            Point3::new(lo.x, lo.y, hi.z), Point3::new(hi.x, lo.y, hi.z), Point3::new(hi.x, hi.y, hi.z), Point3::new(lo.x, hi.y, hi.z),
+        ];
+        let poly = Polyhedron3::from_corners(corners);
+        // reference: standard slab clip of the segment a→b against [lo,hi].
+        let slab = |a: Point3, b: Point3| -> Option<f64> {
+            let d = [b.x - a.x, b.y - a.y, b.z - a.z];
+            let ac = [a.x, a.y, a.z]; let l = [lo.x, lo.y, lo.z]; let h = [hi.x, hi.y, hi.z];
+            let (mut t0, mut t1) = (0.0_f64, 1.0_f64);
+            for i in 0..3 {
+                if d[i].abs() < 1e-12 { if ac[i] < l[i] || ac[i] > h[i] { return None; } }
+                else {
+                    let (mut tn, mut tf) = ((l[i] - ac[i]) / d[i], (h[i] - ac[i]) / d[i]);
+                    if tn > tf { std::mem::swap(&mut tn, &mut tf); }
+                    t0 = t0.max(tn); t1 = t1.min(tf);
+                    if t0 > t1 { return None; }
+                }
+            }
+            Some(t0)
+        };
+        let mut x = 0xF00D_CAFEu64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        let mut hits = 0;
+        for _ in 0..20_000 {
+            let a = Point3::new(rng() * 20.0 - 5.0, rng() * 18.0 - 5.0, rng() * 22.0 - 5.0);
+            let b = Point3::new(rng() * 20.0 - 5.0, rng() * 18.0 - 5.0, rng() * 22.0 - 5.0);
+            match (poly.segment_hit(a, b), slab(a, b)) {
+                (None, None) => {}
+                (Some(t), Some(tr)) => { assert!((t - tr).abs() < 1e-6, "entry t {t} != slab {tr}"); hits += 1; }
+                (g, r) => panic!("segment_hit {g:?} disagrees with slab {r:?} for {a:?}->{b:?}"),
+            }
+        }
+        assert!(hits > 1000, "test should exercise many real occlusions (got {hits})");
     }
 
     #[test]
