@@ -60,6 +60,21 @@ don't leave anything doable for tomorrow. Ordered (autonomously-verifiable first
 12. **Held (user)**: crates.io publish · template not-found diagnostics rethink ·
     threading tutorial — leave for the user unless everything else is done.
 
+**LANDED so far (2026-07-07 night, all pushed, CI green):**
+- ~~**(1) `gpu_storm` milestone 1**~~ — GPU-resident collision storm: clear→build
+  grid→collide (DEM)→integrate, four compute passes, pos/vel resident; CPU/GPU
+  switch + meter; smoke-tested (0 out-of-bounds/NaN). **GPU sim ~0.33 ms vs CPU
+  grid ~16.4 ms at 150k (~50×)**. RustRover config added. *Remaining: influence-
+  field mode + web publish + the GPU-side build (item 3) to push it to 1M.*
+- ~~**(5) Morton multi-level**~~ — `MortonGrid3::cull_layered` (coarse occupancy
+  skip, Z-order prefix = hierarchy), brute-gated (== cull == brute on a
+  clumps-in-a-void world). Non-invasive (separate method, no build-cost hit).
+- ~~**(6) 3D dilation**~~ — `Polyhedron3::inflated(r)` (Minkowski-flavoured face
+  offset), brute-gated vs exact L2 box distance. + `segment_hit` line-of-sight
+  (occlusion) + `visibility_cull_bench` landed earlier tonight.
+- ~~**(8) README sync**~~ — seven structures, 3D, raycast, knn, ItemRef, shapes,
+  advisor. *(Performance guide still to write.)*
+
 ## Overnight queue — round 3 (set 2026-06-26)
 
 The big **ray-cast thread graduated** (DDA leaf-walk 2D + 3D, capsule shapes
