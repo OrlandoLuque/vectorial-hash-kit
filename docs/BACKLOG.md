@@ -72,8 +72,21 @@ don't leave anything doable for tomorrow. Ordered (autonomously-verifiable first
 - ~~**(6) 3D dilation**~~ — `Polyhedron3::inflated(r)` (Minkowski-flavoured face
   offset), brute-gated vs exact L2 box distance. + `segment_hit` line-of-sight
   (occlusion) + `visibility_cull_bench` landed earlier tonight.
-- ~~**(8) README sync**~~ — seven structures, 3D, raycast, knn, ItemRef, shapes,
-  advisor. *(Performance guide still to write.)*
+- ~~**(1b) `gpu_storm` influence-field mode**~~ — `F` toggles collision ↔ a
+  proximity-glow/perception field (bigger radius, multi-ring, no forces); CPU
+  path honours it too. GPU ~3.35 ms vs CPU ~128 ms at 150k (~38×). *Remaining:
+  web publish + the GPU-side build (item 3) for 1M.*
+- ~~**(6b) Octree3 boundary-crossing event**~~ — `update_ref_tracked`/`OCrossing`
+  + `ref_leaf` (parity with Tree3's `Crossing`), brute-gated.
+- ~~**(8) README sync + `docs/PERFORMANCE.md`**~~ — seven structures / raycast /
+  knn / ItemRef / shapes / advisor; the practical speed guide (build flags,
+  keep-index, threads, analytic-vs-raster, GPU) is written + cross-linked.
+- Sanity: full lib suite (102 tests) + parallel clippy gate green after all of it.
+
+**Still open this round:** GPU-side LBVH build (radix+Karras) · GPU line-of-sight
+shader · `gpu_storm` web publish · nudge-free 3D walk (Samet, §A.2) · 3-projection
+vs narrowphase (§Index) · demos §9 (leaf-depth viz, 2D k-NN/LoS, Morton toggle) ·
+siege/horde §10 (Quaternius models, wgpu web shim, bridges) · `[eyes]` items §11.
 
 ## Overnight queue — round 3 (set 2026-06-26)
 
