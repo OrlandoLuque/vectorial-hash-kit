@@ -189,8 +189,10 @@ proptest! {
             let s = Sphere3::new(cx, cy, cz, rr).with_raster();
             let mut want: Vec<(u64, u64, u64)> = live.iter().filter(|p| { let (dx, dy, dz) = (p.x - cx, p.y - cy, p.z - cz); dx * dx + dy * dy + dz * dz <= rr * rr }).map(|p| (p.x.to_bits(), p.y.to_bits(), p.z.to_bits())).collect();
             let mut got: Vec<(u64, u64, u64)> = g.cull(&s).iter().map(|m| (m.p.x.to_bits(), m.p.y.to_bits(), m.p.z.to_bits())).collect();
-            want.sort(); got.sort();
-            prop_assert_eq!(want, got, "morton3 cull != brute ({},{},{}) r={}", cx, cy, cz, rr);
+            let mut lay: Vec<(u64, u64, u64)> = g.cull_layered(&s).iter().map(|m| (m.p.x.to_bits(), m.p.y.to_bits(), m.p.z.to_bits())).collect();
+            want.sort(); got.sort(); lay.sort();
+            prop_assert_eq!(&want, &got, "morton3 cull != brute ({},{},{}) r={}", cx, cy, cz, rr);
+            prop_assert_eq!(&got, &lay, "morton3 cull_layered != cull ({},{},{}) r={}", cx, cy, cz, rr);
         }
         for qp in [Point3::new(120.0, 120.0, 120.0), Point3::new(30.0, 200.0, 60.0)] {
             for k in KS {
@@ -213,8 +215,10 @@ proptest! {
             let s = Disc { cx, cy, r: rr };
             let mut want: Vec<(u64, u64)> = live.iter().filter(|p| { let (dx, dy) = (p.x - cx, p.y - cy); dx * dx + dy * dy <= rr * rr }).map(|p| (p.x.to_bits(), p.y.to_bits())).collect();
             let mut got: Vec<(u64, u64)> = g.cull(&s).iter().map(|m| (m.p.x.to_bits(), m.p.y.to_bits())).collect();
-            want.sort(); got.sort();
-            prop_assert_eq!(want, got, "morton2 cull != brute ({},{}) r={}", cx, cy, rr);
+            let mut lay: Vec<(u64, u64)> = g.cull_layered(&s).iter().map(|m| (m.p.x.to_bits(), m.p.y.to_bits())).collect();
+            want.sort(); got.sort(); lay.sort();
+            prop_assert_eq!(&want, &got, "morton2 cull != brute ({},{}) r={}", cx, cy, rr);
+            prop_assert_eq!(&got, &lay, "morton2 cull_layered != cull ({},{}) r={}", cx, cy, rr);
         }
         for qp in [Point::new(120.0, 120.0), Point::new(30.0, 200.0)] {
             for k in KS {
