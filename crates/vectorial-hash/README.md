@@ -7,8 +7,10 @@ Part of the [`vectorial-hash-kit`](https://github.com/OrlandoLuque/vectorial-has
 **New here?** Seven structures (2D + 3D) answer the same queries — see
 [`docs/CHOOSING.md`](../../docs/CHOOSING.md) for a one-glance flowchart on which
 to pick, [`docs/THREE_D.md`](../../docs/THREE_D.md) for the quantitative decision
-map, [`docs/RAYCAST.md`](../../docs/RAYCAST.md) for the ray-cast surface, and
-[`docs/PARALLEL.md`](../../docs/PARALLEL.md) for when threads pay.
+map, [`docs/RAYCAST.md`](../../docs/RAYCAST.md) for the ray-cast surface,
+[`docs/PARALLEL.md`](../../docs/PARALLEL.md) for when threads pay, and
+[`docs/PERFORMANCE.md`](../../docs/PERFORMANCE.md) for how to make the chosen
+structure fast (build flags, keep-index, threads, GPU).
 
 ## Status
 
