@@ -289,6 +289,51 @@ impl<T: Positioned3> MortonGrid3<T> {
         out
     }
 
+    /// **Coarse-tier cull** — the multi-level linear-octree query: skip whole
+    /// empty regions of a large / sparse query in O(1) instead of probing every
+    /// fine cell of the bounding box. It derives a coarse occupancy set from the
+    /// live cells (a coarse cell = `2^shift` fine cells per axis; its Morton code
+    /// is just the fine code with the low `3·shift` bits dropped — the Z-order
+    /// prefix *is* the hierarchy), then visits only the fine cells inside
+    /// **occupied** coarse blocks. Result is identical to [`cull`](Self::cull).
+    ///
+    /// Win profile (mirrors the on-disk layered study): a big query over sparse
+    /// space skips the void cheaply; for a dense or small query plain `cull` is
+    /// faster (no coarse pass), so reach for this only when the bbox is large and
+    /// the world has empty regions.
+    pub fn cull_layered<'a, S: Shape3>(&'a self, shape: &S) -> Vec<&'a T> {
+        let shift = 2u32; // coarse cell = 4×4×4 = 64 fine cells
+        if self.levels <= shift { return self.cull(shape); }
+        let bb = shape.bounding_box();
+        let ix0 = self.axis_index(bb.x, self.world.x, self.cw); let ix1 = self.axis_index(bb.x_max(), self.world.x, self.cw);
+        let iy0 = self.axis_index(bb.y, self.world.y, self.ch); let iy1 = self.axis_index(bb.y_max(), self.world.y, self.ch);
+        let iz0 = self.axis_index(bb.z, self.world.z, self.cd); let iz1 = self.axis_index(bb.z_max(), self.world.z, self.cd);
+        // coarse occupancy from the live fine codes (once)
+        let mut coarse: std::collections::HashSet<u64> = std::collections::HashSet::with_capacity(self.cells.len());
+        for &code in self.cells.keys() { coarse.insert(code >> (3 * shift)); }
+        let raster = shape.voxel_raster();
+        let mut out = Vec::new();
+        let probe = |ix: u32, iy: u32, iz: u32, out: &mut Vec<&'a T>| {
+            let bucket = match self.cells.get(&morton3(ix, iy, iz)) { Some(b) => b, None => return };
+            match shape.classify_aabb(&self.cell_box(ix, iy, iz)) {
+                CellState::Out => {}
+                CellState::In => out.extend(bucket.iter()),
+                CellState::Maybe => { for it in bucket { let p = it.position(); match raster.map(|g| g.cell_at_world(p)) { Some(CellState::In) => out.push(it), Some(CellState::Out) => {}, _ => if shape.contains_point(p) { out.push(it); } } } }
+            }
+        };
+        let (cx0, cx1) = (ix0 >> shift, ix1 >> shift);
+        let (cy0, cy1) = (iy0 >> shift, iy1 >> shift);
+        let (cz0, cz1) = (iz0 >> shift, iz1 >> shift);
+        for cz in cz0..=cz1 { for cy in cy0..=cy1 { for cx in cx0..=cx1 {
+            if !coarse.contains(&morton3(cx, cy, cz)) { continue; } // whole coarse block empty → skip 2^(3·shift) fine cells
+            let (fx0, fx1) = ((cx << shift).max(ix0), (((cx << shift) + (1 << shift) - 1)).min(ix1));
+            let (fy0, fy1) = ((cy << shift).max(iy0), (((cy << shift) + (1 << shift) - 1)).min(iy1));
+            let (fz0, fz1) = ((cz << shift).max(iz0), (((cz << shift) + (1 << shift) - 1)).min(iz1));
+            for iz in fz0..=fz1 { for iy in fy0..=fy1 { for ix in fx0..=fx1 { probe(ix, iy, iz, &mut out); } } }
+        } } }
+        out
+    }
+
     /// Batch cull — see [`crate::Tree3::cull_many`].
     pub fn cull_many<'a, S: Shape3>(&'a self, shapes: &[S]) -> Vec<Vec<&'a T>> {
         shapes.iter().map(|s| self.cull(s)).collect()
@@ -706,6 +751,31 @@ mod tests {
                     .map(|p| (p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits())).collect();
                 want.sort(); got.sort();
                 assert_eq!(want, got, "morton cull != brute (levels={levels}) for sphere ({cx},{cy},{cz}) r={r}");
+            }
+        }
+    }
+
+    #[test]
+    fn morton_cull_layered_matches_cull_and_brute() {
+        // The coarse-tier cull must return exactly what plain cull (and brute)
+        // does — including a SPARSE world with a big query (where the coarse skip
+        // actually fires: most coarse blocks over the void are empty).
+        let mut x = 0xC0A45E_11u64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        // two dense clumps in a big world → lots of empty coarse space
+        let pts: Vec<P> = (0..3000).map(|i| { let (cx, cy, cz) = if i % 2 == 0 { (200.0, 200.0, 200.0) } else { (1500.0, 1500.0, 1500.0) };
+            P(Point3::new(cx + (rng() - 0.5) * 200.0, cy + (rng() - 0.5) * 200.0, cz + (rng() - 0.5) * 200.0)) }).collect();
+        let world = Aabb::new(0.0, 0.0, 0.0, 2048.0, 2048.0, 2048.0);
+        for levels in [5u32, 7, 8] {
+            let mut grid = MortonGrid3::<P>::new(world, levels);
+            for p in &pts { grid.insert(*p); }
+            for (cx, cy, cz, r) in [(1024.0, 1024.0, 1024.0, 1200.0), (200.0, 200.0, 200.0, 150.0), (1500.0, 1500.0, 1500.0, 400.0), (1000.0, 1000.0, 1000.0, 2000.0)] {
+                let s = Sphere3::new(cx, cy, cz, r); // analytic (no raster: a 4000³ voxel raster would be 64 GB)
+                let key = |v: &[&P]| { let mut k: Vec<(u64, u64, u64)> = v.iter().map(|p| (p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits())).collect(); k.sort(); k };
+                let plain = key(&grid.cull(&s)); let layered = key(&grid.cull_layered(&s));
+                let brute = { let mut b: Vec<(u64, u64, u64)> = pts.iter().filter(|p| { let dx = p.0.x - cx; let dy = p.0.y - cy; let dz = p.0.z - cz; dx * dx + dy * dy + dz * dz <= r * r }).map(|p| (p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits())).collect(); b.sort(); b };
+                assert_eq!(layered, plain, "cull_layered != cull (levels={levels}) sphere ({cx},{cy},{cz}) r={r}");
+                assert_eq!(layered, brute, "cull_layered != brute (levels={levels}) sphere ({cx},{cy},{cz}) r={r}");
             }
         }
     }
