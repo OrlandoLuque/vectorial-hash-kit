@@ -137,6 +137,30 @@ workload Morton wins maintain (flat re-bucket beats the trees' predicate-scan
 `update`), the trees win cull in the deep/dense corner — see `docs/THREE_D.md`
 § "Synthesis".
 
+### Demo 6 — GPU (wgpu compute): broad-phase + a resident collision storm
+
+Native-only (winit + wgpu compute; wasm-gated out). These show where the GPU
+wins — and, honestly measured, where it doesn't (`docs/PERF_NOTES.md`).
+
+```bash
+cargo run -p vectorial-hash-demos --bin gpu_lbvh_demo --release   # switchable broad-phase
+cargo run -p vectorial-hash-demos --bin gpu_storm     --release   # GPU-resident sim
+cargo run -p vectorial-hash-demos --example gpu_spatial_bench --release --features parallel
+```
+
+- **`gpu_lbvh_demo`** — the *same* neighbour-count query, three backends you flip
+  live (`1` CPU `Tree3` · `2` GPU brute · `3` **GPU LBVH**, a BVH built from the
+  Morton codes the kit computes, traversed in a compute shader), coloured by a
+  density heat-map, GPU-time meter in the title. Identical picture, ~393× spread
+  on the query kernel (50k pts: CPU 122 ms → GPU LBVH 0.31 ms).
+- **`gpu_storm`** — a **GPU-resident** collision storm: the *whole* hot loop
+  (grid build → contacts → integrate) lives on the GPU, no per-frame round-trip.
+  Switch the whole sim CPU↔GPU (`1`/`2`), `F` toggles collision ↔ an influence
+  field. ~50× the CPU sim at 150k. The answer to "how much more than the query
+  can we accelerate?" — everything but the branchy `decide` a game sim needs.
+- **`gpu_spatial_bench`** — the headless measurement behind both, with the honest
+  per-frame *rebuild-vs-keep* verdict for moving data (`GPU_N/M/R/CLUSTER` env).
+
 ## Try the demos
 
 Three ways, easiest first:
