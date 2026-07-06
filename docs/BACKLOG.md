@@ -81,12 +81,32 @@ don't leave anything doable for tomorrow. Ordered (autonomously-verifiable first
 - ~~**(8) README sync + `docs/PERFORMANCE.md`**~~ — seven structures / raycast /
   knn / ItemRef / shapes / advisor; the practical speed guide (build flags,
   keep-index, threads, analytic-vs-raster, GPU) is written + cross-linked.
-- Sanity: full lib suite (102 tests) + parallel clippy gate green after all of it.
+- ~~**(5b) Morton multi-level 2D**~~ — `MortonGrid::cull_layered` (the 2D twin;
+  2D+3D coverage complete), brute-gated + fuzzed. `layered_cull_bench` **measures**
+  it: 1.2× (≈uniform) → 42.5× (sparse 3%) on a big query over clumps-in-a-void.
+- ~~**(8b) docs**~~ — demos README gains the GPU section (gpu_lbvh_demo /
+  gpu_storm / gpu_spatial_bench). Proptest campaign fuzzes `cull_layered == cull`.
+- Sanity: full lib suite (104 tests) + parallel clippy gate + all-targets build
+  green after the whole night.
 
-**Still open this round:** GPU-side LBVH build (radix+Karras) · GPU line-of-sight
-shader · `gpu_storm` web publish · nudge-free 3D walk (Samet, §A.2) · 3-projection
-vs narrowphase (§Index) · demos §9 (leaf-depth viz, 2D k-NN/LoS, Morton toggle) ·
-siege/horde §10 (Quaternius models, wgpu web shim, bridges) · `[eyes]` items §11.
+**Night total: 15 commits, all pushed, CI green.** Library: `segment_hit` (LoS),
+`inflated` (3D dilation), `cull_layered` (2D+3D multi-level), Octree3 crossing
+event, README/PERFORMANCE docs. Demos: `gpu_storm` (collision + influence,
+switch, meter). Benches: `visibility_cull_bench`, `layered_cull_bench`, the
+parametrised `gpu_spatial_bench`.
+
+**Still open — WHY each waits (not blind-doable well tonight):**
+- **GPU-side LBVH build** (radix sort + Karras, WGSL) — a focused session; a blind
+  GPU radix sort is high-risk to get right + verify. Highest-value next item
+  (unlocks `gpu_storm` at 1M + the moving broad-phase crossover).
+- **`gpu_storm` / `siege_wgpu` web publish** — needs the `requestDevice` limit
+  shim + a *browser* to verify; can't confirm WebGPU-compute works headless.
+- **nudge-free 3D walk** (Samet, §A.2) — the "subset of capsule" test can't catch
+  a subtle under-collection, so this one needs careful non-blind verification.
+- **Demos §9 + `[eyes]` §11** (leaf-depth viz, 2D k-NN/LoS demo, balance,
+  classic-Reynolds) — **need the user's eyes** to judge.
+- **3-projection vs narrowphase** (§Index) · **siege/horde §10** (Quaternius
+  models, bridges) — straightforward, just not reached tonight.
 
 ## Overnight queue — round 3 (set 2026-06-26)
 
