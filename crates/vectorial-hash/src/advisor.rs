@@ -25,10 +25,15 @@ pub enum StructureHint {
     CoarserOrRebuild,
 }
 
-/// Crossover where a linear scan stops beating an index. From the `formations`
-/// demo + micro-benchmarks: brute force wins into the low hundreds (contiguous +
-/// SIMD), the tree pulls ahead above this. Heuristic — tune per element size.
-pub const BRUTE_FORCE_MAX: usize = 256;
+/// Crossover where a linear scan stops beating an index — **workload-dependent**,
+/// so this is a conservative default. Measured (`threshold_bench`, query-only,
+/// pre-built index): brute wins up to ~1000 points and the tree takes over
+/// around ~1500 (the tree's descent + result-alloc is ~100 ns fixed; a scan is
+/// ~1 ns/point). When you also pay the index BUILD (few queries per rebuild, as
+/// in the `formations` regiment level) the crossover drops to the low hundreds.
+/// So: query-heavy → raise toward ~1000; build-heavy/query-light → lower. 512 is
+/// a middle default; tune per workload (the profiler's `query_per_move` helps).
+pub const BRUTE_FORCE_MAX: usize = 512;
 
 /// Relocation rate above which the keep-index's per-move leaf-exit cost starts to
 /// dominate → prefer a coarser/looser structure or a rebuild. From
