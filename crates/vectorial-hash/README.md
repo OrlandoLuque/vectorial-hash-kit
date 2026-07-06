@@ -4,14 +4,27 @@ Core index and hash algorithms for vectorial spaces, designed with modern CPU ar
 
 Part of the [`vectorial-hash-kit`](https://github.com/OrlandoLuque/vectorial-hash-kit) workspace.
 
-**New here?** Six structures answer the same queries — see
+**New here?** Seven structures (2D + 3D) answer the same queries — see
 [`docs/CHOOSING.md`](../../docs/CHOOSING.md) for a one-glance flowchart on which
 to pick, [`docs/THREE_D.md`](../../docs/THREE_D.md) for the quantitative decision
-map, and [`docs/PARALLEL.md`](../../docs/PARALLEL.md) for when threads pay.
+map, [`docs/RAYCAST.md`](../../docs/RAYCAST.md) for the ray-cast surface, and
+[`docs/PARALLEL.md`](../../docs/PARALLEL.md) for when threads pay.
 
 ## Status
 
-Runtime tree, template-driven culling, the dynamic `remove` / `update` operations (with the paper's merge-up rule), and the templates-crate adapter are wired up. `Tree::visit_leaves` exposes the live regions (used by the visual demo) and `TemplateGrid::translated` re-anchors a precomputed template at any world position. 3D support is next.
+Mature. **Seven structures** share one arena layout and query surface: `Tree`
+(2D binary), `QuadTree` (2D 4-way), `IntegerTree` (2D, `i32` / power-of-two),
+`Tree3` (3D binary), `Octree3` (3D 8-way), plus the pointer-free Z-order grids
+`MortonGrid` (2D) and `MortonGrid3` (3D). Each supports template-driven `cull`,
+dynamic `insert`/`remove`/`update` (merge-up rule), an **O(1) stable `ItemRef`**
+relocation handle (`insert_ref`/`update_ref`/`remove_ref`), **k-NN**, **ray-cast**
+(thick capsule + DDA leaf-walk, `raycast`/`raycast_dda`/`raycast_first`), and
+dependency-free `serialize`/`deserialize` of the built index. Query volumes: 2D
+`Shape` (`Circle`, boxes, polygons) and 3D `Shape3` (`Sphere3`, `Polyhedron3`
+convex half-spaces incl. `from_corners` frustum + `segment_hit` line-of-sight,
+`Segment3` capsule). Parallel batch cull (`cull_many_par`), parallel `bulk_load`,
+and a self-tuning structure [`advisor`] round it out. `Tree::visit_leaves`
+exposes the live regions (used by the visual demos).
 
 ## What it does
 
@@ -36,6 +49,19 @@ Leaf items can additionally be answered by a 1×1 raster (`Shape::point_template
 | `tree` | `Tree<T>`, `Node<T>`, `NodeId`, `Positioned` | Arena-backed binary-split tree (`insert`, `remove`, `update`, `locate`, `cull`, `visit_leaves`). `Tree::with_limits` sets a separate merge-up threshold (`merge_limit <= item_limit`) for split/merge hysteresis. |
 | `culling` | `Shape`, `Tree::cull`, `Tree::cull_walk`, `WalkNeighbors` | Query items inside a shape, with optional template short-circuit; `cull_walk` traverses by flood fill over leaf neighbours instead of descending. |
 | `quadtree` | `QuadTree<T>`, `QNode<T>`, `QNodeId` | Reference 4-way structure with the tree's full dynamic contract (`insert`, `remove`, `update`, 4-way merge rule, `cull` through the same template machinery) for head-to-head comparisons. |
+| `itree` | `IntegerTree<T>` | 2D binary tree on `i32` coordinates with a power-of-two root extent (bit-shift `locate`); converts IRect↔Rect at the `Shape` boundary so all the float template machinery works unchanged. |
+| `morton` | `MortonGrid<T>` | 2D pointer-free Z-order (linear-quadtree) hash grid: quantise → interleave bits → bucket by code. Fastest index on uniform data; `raycast` too. |
+| `tree3` | `Tree3<T>`, `Node3`, `Node3Id`, `Positioned3`, `Point3`, `Aabb` | 3D binary-split tree. `insert`/`remove`/`update`(LCA)/`cull`/`knn`/`raycast`(+DDA)/`serialize` + the `ItemRef` handle path (`insert_ref`/`update_ref`/`update_ref_tracked`→`Crossing`/`remove_ref`), `bulk_load`(+`_par`). |
+| `tree3` (shapes) | `Shape3`, `Sphere3`, `Polyhedron3`, `Segment3`, `VoxelRaster` | 3D query volumes. `Polyhedron3` = convex half-spaces (`from_corners` builds a frustum; `segment_hit` is the exact line-of-sight/occlusion test); `Segment3` = capsule behind `raycast`. |
+| `octree3` | `Octree3<T>`, `ONode`, `ONodeId` | 3D 8-way (2×2×2) split — the 3D `QuadTree`. Same dynamic contract + `knn` + DDA `raycast` + `bulk_load`. |
+| `morton3` | `MortonGrid3<T>` | 3D Z-order linear octree: fastest on uniform data, cheapest build, `knn` (ring shell) + `raycast`, `extend_par` bulk build. |
+| `advisor` | `SpatialProfile`, `StructureHint` | Self-tuning structure selection: track a region's relocation rate + query:move ratio (EMA); `recommend()` returns `BruteForce`/`KeepIndexTree`/`CoarserOrRebuild` from measured crossovers. |
+
+Beyond `cull`, every structure answers **`knn`** (k-nearest, best-first with bbox
+pruning), **`raycast`** (thick capsule + a front-to-back DDA leaf-walk with
+`raycast_first` early-exit — see [`docs/RAYCAST.md`](../../docs/RAYCAST.md)), and
+carries a stable **`ItemRef`** so a moving item relocates in O(1) (no locate walk,
+no predicate scan) — the highest-leverage win for per-frame relocation workloads.
 
 ## Features
 
