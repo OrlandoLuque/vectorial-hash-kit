@@ -272,6 +272,21 @@ impl Polyhedron3 {
         }
         if t0 <= t1 { Some(t0) } else { None }
     }
+
+    /// **Dilation** (Minkowski-flavoured): the convex solid grown outward by `r`.
+    /// Each face half-space is pushed out by `r` (`n·p ≤ d` → `n·p ≤ d + r‖n‖`,
+    /// so a normal of any scale moves its face by geometric distance `r`) and the
+    /// bbox grows by `r`. The 3D analogue of the 2D `inflated_convex`: cull with
+    /// `inflated(r)` to find every agent whose **centre** is within `r` of the
+    /// figure — keep items as points, inflate the *query* (agent-body radius,
+    /// `disk(r1) ⊕ disk(r2) = disk(r1+r2)`, vision-radius grows, …). Conservative
+    /// at sharp corners (a superset of the exact `r`-neighbourhood → no false
+    /// negatives in a cull); filter in narrowphase for exactness.
+    pub fn inflated(&self, r: f64) -> Polyhedron3 {
+        let planes = self.planes.iter().map(|&(nx, ny, nz, d)| { let m = (nx * nx + ny * ny + nz * nz).sqrt(); (nx, ny, nz, d + r * m) }).collect();
+        let b = self.bbox;
+        Polyhedron3 { planes, bbox: Aabb::new(b.x - r, b.y - r, b.z - r, b.w + 2.0 * r, b.h + 2.0 * r, b.d + 2.0 * r), raster: None }
+    }
 }
 
 impl Shape3 for Polyhedron3 {
@@ -1683,6 +1698,36 @@ mod tests {
             }
         }
         assert!(hits > 1000, "test should exercise many real occlusions (got {hits})");
+    }
+
+    #[test]
+    fn inflated_is_superset_of_r_neighbourhood() {
+        // Polyhedron3::inflated(r) must contain every point within r of the solid
+        // (no false negatives) and stay tight (⊆ the L∞-r shell ⊆ r√3). Reference:
+        // exact L2 distance from a point to an axis-aligned box.
+        let (lo, hi) = (Point3::new(20.0, 10.0, 30.0), Point3::new(60.0, 50.0, 70.0));
+        let corners = [
+            Point3::new(lo.x, lo.y, lo.z), Point3::new(hi.x, lo.y, lo.z), Point3::new(hi.x, hi.y, lo.z), Point3::new(lo.x, hi.y, lo.z),
+            Point3::new(lo.x, lo.y, hi.z), Point3::new(hi.x, lo.y, hi.z), Point3::new(hi.x, hi.y, hi.z), Point3::new(lo.x, hi.y, hi.z),
+        ];
+        let poly = Polyhedron3::from_corners(corners);
+        let r = 8.0;
+        let inf = poly.inflated(r);
+        let box_dist = |p: Point3| -> f64 { let (cx, cy, cz) = (p.x.clamp(lo.x, hi.x), p.y.clamp(lo.y, hi.y), p.z.clamp(lo.z, hi.z)); ((p.x - cx).powi(2) + (p.y - cy).powi(2) + (p.z - cz).powi(2)).sqrt() };
+        let mut x = 0xD1_1A7EDu64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        let mut near = 0;
+        for _ in 0..80_000 {
+            let p = Point3::new(rng() * 100.0 - 5.0, rng() * 90.0 - 5.0, rng() * 110.0 - 5.0);
+            let d = box_dist(p);
+            let cont = inf.contains_point(p);
+            if d <= r - 1e-6 { assert!(cont, "false negative: dist {d} ≤ r {r} but not in inflated"); near += 1; }
+            if cont { assert!(d <= r * 3f64.sqrt() + 1e-6, "too loose: in inflated but dist {d} > r√3"); }
+        }
+        // r=0 is the identity (same in/out as the original) on a sample
+        let z = poly.inflated(0.0);
+        for _ in 0..5_000 { let p = Point3::new(rng() * 100.0 - 5.0, rng() * 90.0 - 5.0, rng() * 110.0 - 5.0); assert_eq!(poly.contains_point(p), z.contains_point(p)); }
+        assert!(near > 2000, "should exercise many within-r points (got {near})");
     }
 
     #[test]
