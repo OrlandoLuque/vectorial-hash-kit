@@ -13,7 +13,7 @@
 //! ```
 
 use std::time::Instant;
-use vectorial_hash::{Aabb, Point3, Positioned3, Sphere3, Tree3};
+use vectorial_hash::{Aabb, ItemRef, Point3, Positioned3, Sphere3, Tree3};
 
 const WORLD: f64 = 10_000.0;
 
@@ -130,21 +130,40 @@ fn main() {
     pollster::block_on(run());
 }
 
-async fn run() {
-    let n = 1_000_000usize;
-    let m = 10_000usize;
-    let radius = 500.0f32;
-    println!("GPU spatial-query bench (milestone 1a: brute cull) | {n} points | {m} queries | r={radius}\n");
+fn env_usize(k: &str, d: usize) -> usize { std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d) }
+fn env_f32(k: &str, d: f32) -> f32 { std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d) }
 
-    // ---- data
+async fn run() {
+    // Parametrised so the same rig can measure a broad-phase workload (big world,
+    // fat bubbles, few queries) AND a game-demo workload (N points each doing a
+    // small-radius neighbour cull — separation/interest). Env: GPU_N, GPU_M,
+    // GPU_R, GPU_CLUSTER=1 (clump the points like a battle front).
+    let n = env_usize("GPU_N", 1_000_000);
+    let m = env_usize("GPU_M", 10_000);
+    let radius = env_f32("GPU_R", 500.0);
+    let cluster = std::env::var("GPU_CLUSTER").is_ok();
+    println!("GPU spatial-query bench | {n} points | {m} queries | r={radius}{}\n", if cluster { " | clustered" } else { "" });
+
+    // ---- data. Uniform, or (cluster) a handful of dense blobs = a battle front.
     let mut r = Rng(42);
-    let pts: Vec<P> = (0..n).map(|_| P(Point3::new(r.unit() * WORLD, r.unit() * WORLD, r.unit() * WORLD))).collect();
+    let pts: Vec<P> = if cluster {
+        let blobs: Vec<(f64, f64, f64)> = (0..24).map(|_| (r.unit() * WORLD, r.unit() * WORLD, r.unit() * WORLD)).collect();
+        (0..n).map(|_| { let (cx, cy, cz) = blobs[(r.next() as usize) % blobs.len()]; let s = WORLD * 0.03; let hi = WORLD - 1.0;
+            P(Point3::new((cx + (r.unit() - 0.5) * s).clamp(0.0, hi), (cy + (r.unit() - 0.5) * s).clamp(0.0, hi), (cz + (r.unit() - 0.5) * s).clamp(0.0, hi))) }).collect()
+    } else {
+        (0..n).map(|_| P(Point3::new(r.unit() * WORLD, r.unit() * WORLD, r.unit() * WORLD))).collect()
+    };
+    // queries = a sample of the points themselves when m<=n (the demo case: every
+    // active unit culls its own neighbourhood), else random centres.
     let mut rq = Rng(99);
-    let qcenters: Vec<(f64, f64, f64)> = (0..m).map(|_| (rq.unit() * WORLD, rq.unit() * WORLD, rq.unit() * WORLD)).collect();
+    let qcenters: Vec<(f64, f64, f64)> = (0..m).map(|i| if m <= n { let p = pts[i * (n / m.max(1))].0; (p.x, p.y, p.z) } else { (rq.unit() * WORLD, rq.unit() * WORLD, rq.unit() * WORLD) }).collect();
 
     // build the LBVH (also gives points in Morton-sorted order); both GPU passes
-    // use the sorted points (brute is order-independent, the LBVH leaf indexes it)
+    // use the sorted points (brute is order-independent, the LBVH leaf indexes it).
+    // Time the build too — for a MOVING cloud this is a per-frame rebuild cost.
+    let t_build = Instant::now();
     let (nodes_packed, pbuf, root) = build_lbvh(&pts);
+    let lbvh_build_ms = { let mut b = t_build.elapsed().as_secs_f64(); for _ in 0..4 { let t = Instant::now(); let _ = build_lbvh(&pts); b = b.min(t.elapsed().as_secs_f64()); } b * 1e3 };
     let qbuf: Vec<[f32; 4]> = qcenters.iter().map(|&(x, y, z)| [x as f32, y as f32, z as f32, radius]).collect();
 
     // ---- wgpu headless device
@@ -271,6 +290,24 @@ async fn run() {
     let best = |reps: usize, mut f: Box<dyn FnMut() -> usize>| -> (f64, usize) { let h = f(); let mut b = f64::MAX; for _ in 0..reps { let t = Instant::now(); f(); b = b.min(t.elapsed().as_secs_f64()); } (b, h) };
     let (cpu_brute, hb) = best(3, Box::new(|| { let mut h = 0; for s in &spheres { for p in &pts { if (p.0.x - s_c(s).0).powi(2) + (p.0.y - s_c(s).1).powi(2) + (p.0.z - s_c(s).2).powi(2) <= (radius as f64).powi(2) { h += 1; } } } h }));
     let (cpu_tree, _) = best(5, Box::new(|| { let mut h = 0; for s in &spheres { h += tree.cull(s).len(); } h }));
+    // The demos batch their culls over rayon (cull_many_par) — the honest CPU
+    // baseline for a demo, not the serial loop. Feature-gated (rayon not in wasm).
+    #[cfg(feature = "parallel")]
+    let cpu_tree_par = { let mut b = f64::MAX; for _ in 0..5 { let t = Instant::now(); let r = tree.cull_many_par(&spheres); std::hint::black_box(&r); b = b.min(t.elapsed().as_secs_f64()); } b };
+    #[cfg(not(feature = "parallel"))]
+    let cpu_tree_par: f64 = f64::NAN;
+
+    // ---- CPU keep-index maintenance: one frame of movement = update_ref every
+    // point (the moving-demo per-frame cost the GPU LBVH must beat, since a moving
+    // cloud forces the BVH to be *rebuilt* every frame). Small perturbation so
+    // most points stay in their leaf (the O(1) path), a few relocate.
+    let mut ktree: Tree3<P> = Tree3::new(Aabb::new(0.0, 0.0, 0.0, WORLD, WORLD, WORLD), 8);
+    let handles: Vec<ItemRef> = pts.iter().map(|p| ktree.insert_ref(*p).unwrap()).collect();
+    let mut rm = Rng(7);
+    let hi = WORLD - 1.0; // stay strictly inside the half-open world so no handle is freed
+    let keep_maint_ms = { let mut b = f64::MAX; for _ in 0..5 { let t = Instant::now();
+        for (i, h) in handles.iter().enumerate() { let p = pts[i].0; let np = Point3::new((p.x + (rm.unit() - 0.5) * 4.0).clamp(0.0, hi), (p.y + (rm.unit() - 0.5) * 4.0).clamp(0.0, hi), (p.z + (rm.unit() - 0.5) * 4.0).clamp(0.0, hi)); ktree.update_ref(*h, |s| s.0 = np); }
+        b = b.min(t.elapsed().as_secs_f64()); } b * 1e3 };
 
     // verify — GPU is f32, CPU brute is f64, so a few points exactly on the
     // sphere boundary classify differently. Allow a tiny tolerance (that IS the
@@ -287,9 +324,38 @@ async fn run() {
     if let Some(ms) = lbvh_ts_ms { println!("{:>26} | {:>12.3}   | {:>14.1}", "GPU LBVH (timestamp)", ms, ms * 1e6 / m as f64); }
     println!("{:>26} | {:>12.2}   | {:>14.1}", "CPU brute (serial)", cpu_brute * 1e3, cpu_brute / m as f64 * 1e9);
     println!("{:>26} | {:>12.2}   | {:>14.1}", "CPU Tree3 (serial cull)", cpu_tree * 1e3, cpu_tree / m as f64 * 1e9);
+    if cpu_tree_par.is_finite() { println!("{:>26} | {:>12.2}   | {:>14.1}", "CPU Tree3 (cull_many_par)", cpu_tree_par * 1e3, cpu_tree_par / m as f64 * 1e9); }
     let ptests = (n as f64 * m as f64) / wall / 1e9;
     println!("\nGPU brute did {n}×{m} = {:.1}e9 point-tests in {:.2} ms → {ptests:.1} G point-tests/s.", n as f64 * m as f64 / 1e9, wall * 1e3);
     println!("LBVH vs brute on GPU: {:.2}× ({} hits, matches). Pruning cuts the point-tests but\nadds divergent traversal + random node fetches; whether it beats brute-force on\nthe GPU depends on density (bubble size) — measure both, pick per workload.", wall / lbvh_wall, lbvh_total);
+
+    // ---- the per-frame verdict for a MOVING cloud (game demos). The GPU LBVH
+    // query is only part of the cost: a moving cloud forces a full rebuild+upload
+    // each frame. The CPU keep-index does NOT rebuild — update_ref in place. So
+    // the honest per-frame comparison is (rebuild + query) vs (maintain + query).
+    let gpu_frame = lbvh_build_ms + lbvh_wall * 1e3;   // CPU rebuild + GPU dispatch (wall)
+    let cpu_frame = keep_maint_ms + cpu_tree * 1e3;    // keep-index maintain + serial cull
+    let cpu_par_frame = keep_maint_ms + cpu_tree_par * 1e3; // keep-index maintain + parallel cull
+    println!("\n── per-frame for a MOVING cloud (N points move every frame) ──");
+    println!("{:>34} | {:>10}", "phase", "ms");
+    println!("{:>34} | {:>10.2}", "CPU keep-index maintain (update_ref)", keep_maint_ms);
+    println!("{:>34} | {:>10.2}", "CPU Tree3 cull (serial, m queries)", cpu_tree * 1e3);
+    println!("{:>34} | {:>10.2}  ⇐ CPU keep-index frame (serial)", "= maintain + cull", cpu_frame);
+    if cpu_tree_par.is_finite() {
+        println!("{:>34} | {:>10.2}", "CPU Tree3 cull_many_par (16 thr)", cpu_tree_par * 1e3);
+        println!("{:>34} | {:>10.2}  ⇐ CPU keep-index frame (parallel)", "= maintain + par cull", cpu_par_frame);
+    }
+    println!("{:>34} | {:>10.2}", "CPU LBVH rebuild (sort+build)", lbvh_build_ms);
+    println!("{:>34} | {:>10.2}", "GPU LBVH dispatch (wall)", lbvh_wall * 1e3);
+    println!("{:>34} | {:>10.2}  ⇐ GPU LBVH frame (rebuild+dispatch)", "= rebuild + dispatch", gpu_frame);
+    // The demo's real CPU baseline is the parallel frame when available.
+    let cpu_ref = if cpu_tree_par.is_finite() { cpu_par_frame } else { cpu_frame };
+    let label = if cpu_tree_par.is_finite() { "CPU keep-index (parallel)" } else { "CPU keep-index (serial)" };
+    println!("\nverdict (vs {label}): {}", if gpu_frame < cpu_ref {
+        format!("GPU LBVH wins the frame ({:.2}x) — the query load justifies the per-frame rebuild.", cpu_ref / gpu_frame)
+    } else {
+        format!("{label} wins the frame ({:.2}x) — the rebuild costs more than the offload saves;\n         the query is too cheap (small radius / few queries / parallelised) to pay for a\n         per-frame BVH. GPU LBVH is for query-dominated / rebuild-anyway (static) loads.", gpu_frame / cpu_ref)
+    });
 }
 
 fn s_c(s: &Sphere3) -> (f64, f64, f64) { use vectorial_hash::Shape3; let b = s.bounding_box(); (b.x + b.w / 2.0, b.y + b.h / 2.0, b.z + b.d / 2.0) }
