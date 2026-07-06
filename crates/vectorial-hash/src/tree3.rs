@@ -1714,7 +1714,7 @@ mod tests {
         let r = 8.0;
         let inf = poly.inflated(r);
         let box_dist = |p: Point3| -> f64 { let (cx, cy, cz) = (p.x.clamp(lo.x, hi.x), p.y.clamp(lo.y, hi.y), p.z.clamp(lo.z, hi.z)); ((p.x - cx).powi(2) + (p.y - cy).powi(2) + (p.z - cz).powi(2)).sqrt() };
-        let mut x = 0xD1_1A7EDu64;
+        let mut x = 0x0D11_A7EDu64;
         let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
         let mut near = 0;
         for _ in 0..80_000 {

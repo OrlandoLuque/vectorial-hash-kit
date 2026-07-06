@@ -326,9 +326,9 @@ impl<T: Positioned3> MortonGrid3<T> {
         let (cz0, cz1) = (iz0 >> shift, iz1 >> shift);
         for cz in cz0..=cz1 { for cy in cy0..=cy1 { for cx in cx0..=cx1 {
             if !coarse.contains(&morton3(cx, cy, cz)) { continue; } // whole coarse block empty → skip 2^(3·shift) fine cells
-            let (fx0, fx1) = ((cx << shift).max(ix0), (((cx << shift) + (1 << shift) - 1)).min(ix1));
-            let (fy0, fy1) = ((cy << shift).max(iy0), (((cy << shift) + (1 << shift) - 1)).min(iy1));
-            let (fz0, fz1) = ((cz << shift).max(iz0), (((cz << shift) + (1 << shift) - 1)).min(iz1));
+            let (fx0, fx1) = ((cx << shift).max(ix0), ((cx << shift) + (1 << shift) - 1).min(ix1));
+            let (fy0, fy1) = ((cy << shift).max(iy0), ((cy << shift) + (1 << shift) - 1).min(iy1));
+            let (fz0, fz1) = ((cz << shift).max(iz0), ((cz << shift) + (1 << shift) - 1).min(iz1));
             for iz in fz0..=fz1 { for iy in fy0..=fy1 { for ix in fx0..=fx1 { probe(ix, iy, iz, &mut out); } } }
         } } }
         out
@@ -760,7 +760,7 @@ mod tests {
         // The coarse-tier cull must return exactly what plain cull (and brute)
         // does — including a SPARSE world with a big query (where the coarse skip
         // actually fires: most coarse blocks over the void are empty).
-        let mut x = 0xC0A45E_11u64;
+        let mut x = 0xC0A4_5E11u64;
         let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
         // two dense clumps in a big world → lots of empty coarse space
         let pts: Vec<P> = (0..3000).map(|i| { let (cx, cy, cz) = if i % 2 == 0 { (200.0, 200.0, 200.0) } else { (1500.0, 1500.0, 1500.0) };
