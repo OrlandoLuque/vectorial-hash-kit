@@ -31,6 +31,35 @@ vs-AABB, over a STATIC occluder BVH (build once, no rebuild → the *clean* GPU
 case). CPU baseline + `Polyhedron3::segment_hit` + `visibility_cull_bench` landed
 2026-07-07 (CPU-parallel holds ~110–216k viewer×target pairs/frame @60 Hz).
 
+## ★ OVERNIGHT — round 4 (user, 2026-07-07): "do it all, as much as possible"
+
+Autonomous night. Full mandate: complete as much as possible, commit + doc each,
+don't leave anything doable for tomorrow. Ordered (autonomously-verifiable first;
+`[eyes]` = wants a human glance, lower priority). Safety-net suspend armed 02:00.
+
+1. **`gpu_storm`** — GPU-resident collision storm (see NEXT DEMO §1) + **§2
+   influence-field mode** + RustRover config + web publish.
+2. **GPU-side LBVH build** (radix sort + Karras, WGSL) — enables (1) at 1M; folds
+   into `gpu_spatial_bench` (re-measure the moving crossover with a GPU build).
+3. **GPU line-of-sight shader** — the clean static-occluder offload (companion above).
+4. **Nudge-free 3D walk** (Samet ascend-to-LCA) — raycast §A.2; removes the
+   `locate`+epsilon nudge on `Tree3`/`Octree3` DDA. Brute-gated (⊆ exact capsule).
+5. **Morton multi-level linear octree** (§C.8) — coarse occupancy levels so a
+   big-radius cull skips empty blocks (2D + 3D). Brute-gated.
+6. **3D dilation (Minkowski)** — agent body radius for 3D (the 2D
+   `inflated_convex`/`within_dilation` analogue).
+7. **Full 3-projection vs expensive narrowphase** (Index/algorithms) — the
+   `THREE_D.md` open item: many-faced `Polyhedron3`, find where tight broadphase pays.
+8. **Docs**: sync the lib README (raycast, MortonGrid 2D, `Circle`, `segment_hit`,
+   the seven structures) + a performance guide (`target-cpu=native`, SIMD, threads).
+9. **Demos**: colour-by-leaf-depth tree viz; 2D k-NN / line-of-sight demo; add
+   `MortonGrid` (2D) to the `critters` toggle; batch sight-lines/effects to meshes.
+10. **Siege/horde**: Quaternius RTS wall/tower/house models (horde #6, pack on
+    disk); `siege_wgpu` web `requestDevice` shim; bridge decks + path-to-bridge AI.
+11. `[eyes]` classic-Reynolds boids flag · balance pass · web touch controls + HUD.
+12. **Held (user)**: crates.io publish · template not-found diagnostics rethink ·
+    threading tutorial — leave for the user unless everything else is done.
+
 ## Overnight queue — round 3 (set 2026-06-26)
 
 The big **ray-cast thread graduated** (DDA leaf-walk 2D + 3D, capsule shapes
