@@ -130,9 +130,10 @@ async fn run() {
     let make_depth = |device: &wgpu::Device, w: u32, h: u32| device.create_texture(&wgpu::TextureDescriptor { label: Some("depth"), size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Depth32Float, usage: wgpu::TextureUsages::RENDER_ATTACHMENT, view_formats: &[] }).create_view(&Default::default());
     let mut depth_view = make_depth(&device, config.width, config.height);
 
-    let qset = has_ts.then(|| device.create_query_set(&wgpu::QuerySetDescriptor { label: None, ty: wgpu::QueryType::Timestamp, count: 2 }));
-    let ts_resolve = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 16, usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
-    let ts_read = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 16, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+    // 8 timestamps = 4 timed spans: grid(0,1) collide(2,3) integrate(4,5) render(6,7)
+    let qset = has_ts.then(|| device.create_query_set(&wgpu::QuerySetDescriptor { label: None, ty: wgpu::QueryType::Timestamp, count: 8 }));
+    let ts_resolve = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 64, usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+    let ts_read = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 64, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
 
     let params = |n: usize, mode: f32| Params { n: n as u32, gd: GD, cap: CAP, _p0: 0, world: WORLD, cell: CELL, radius: R, dt: DT, spring: SPRING, damp: DAMP, _p1: mode, _p2: GLOW_R };
     queue.write_buffer(&params_b, 0, bytemuck::bytes_of(&params(n, 0.0)));
@@ -147,6 +148,7 @@ async fn run() {
     let mut last = Instant::now();
     let mut fps = 0.0f32;
     let mut sim_ms = 0.0f32;
+    let (mut grid_ms, mut coll_ms, mut integ_ms, mut render_ms) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
     let mut frame = 0u64;
     // scratch for the CPU backend
     let mut heads: Vec<i32> = vec![-1; ncells];
@@ -185,15 +187,16 @@ async fn run() {
 
                 let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
                 if backend == Backend::Gpu {
-                    let ts = qset.as_ref().map(|qs| wgpu::ComputePassTimestampWrites { query_set: qs, beginning_of_pass_write_index: Some(0), end_of_pass_write_index: Some(1) });
-                    let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: ts });
-                    cp.set_bind_group(0, &cbg, &[]);
-                    cp.set_pipeline(&clear_pipe); cp.dispatch_workgroups((ncells as u32).div_ceil(64), 1, 1);
-                    cp.set_pipeline(&build_pipe); cp.dispatch_workgroups((n as u32).div_ceil(64), 1, 1);
-                    cp.set_pipeline(&collide_pipe); cp.dispatch_workgroups((n as u32).div_ceil(64), 1, 1);
-                    cp.set_pipeline(&integ_pipe); cp.dispatch_workgroups((n as u32).div_ceil(64), 1, 1);
-                    drop(cp);
-                    if let Some(qs) = &qset { enc.resolve_query_set(qs, 0..2, &ts_resolve, 0); enc.copy_buffer_to_buffer(&ts_resolve, 0, &ts_read, 0, 16); }
+                    // three timed compute passes so each GPU load is visible separately
+                    let span = |a: u32, b: u32| qset.as_ref().map(|qs| wgpu::ComputePassTimestampWrites { query_set: qs, beginning_of_pass_write_index: Some(a), end_of_pass_write_index: Some(b) });
+                    { let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("grid"), timestamp_writes: span(0, 1) });
+                      cp.set_bind_group(0, &cbg, &[]);
+                      cp.set_pipeline(&clear_pipe); cp.dispatch_workgroups((ncells as u32).div_ceil(64), 1, 1);
+                      cp.set_pipeline(&build_pipe); cp.dispatch_workgroups((n as u32).div_ceil(64), 1, 1); }
+                    { let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("collide"), timestamp_writes: span(2, 3) });
+                      cp.set_bind_group(0, &cbg, &[]); cp.set_pipeline(&collide_pipe); cp.dispatch_workgroups((n as u32).div_ceil(64), 1, 1); }
+                    { let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("integrate"), timestamp_writes: span(4, 5) });
+                      cp.set_bind_group(0, &cbg, &[]); cp.set_pipeline(&integ_pipe); cp.dispatch_workgroups((n as u32).div_ceil(64), 1, 1); }
                 } else {
                     // CPU grid DEM (serial) — the same algorithm, on the CPU, for the switch
                     let t = Instant::now();
@@ -207,26 +210,41 @@ async fn run() {
                 let frame_tex = match surface.get_current_texture() { Ok(f) => f, Err(_) => { surface.configure(&device, &config); return; } };
                 let view_tex = frame_tex.texture.create_view(&Default::default());
                 {
-                    let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor { label: None, color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view_tex, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.03, g: 0.03, b: 0.05, a: 1.0 }), store: wgpu::StoreOp::Store } })], depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &depth_view, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }), timestamp_writes: None, occlusion_query_set: None });
+                    let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor { label: None, color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view_tex, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.03, g: 0.03, b: 0.05, a: 1.0 }), store: wgpu::StoreOp::Store } })], depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &depth_view, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }), timestamp_writes: qset.as_ref().map(|qs| wgpu::RenderPassTimestampWrites { query_set: qs, beginning_of_pass_write_index: Some(6), end_of_pass_write_index: Some(7) }), occlusion_query_set: None });
                     rp.set_pipeline(&render_pipe);
                     rp.set_bind_group(0, &cam_bg, &[]);
                     rp.set_vertex_buffer(0, pos_b.slice(..));
                     rp.set_vertex_buffer(1, coll_b.slice(..));
                     rp.draw(0..6, 0..n as u32);
                 }
+                if let Some(qs) = &qset { enc.resolve_query_set(qs, 0..8, &ts_resolve, 0); enc.copy_buffer_to_buffer(&ts_resolve, 0, &ts_read, 0, 64); }
                 queue.submit(Some(enc.finish()));
                 frame_tex.present();
 
-                if backend == Backend::Gpu && qset.is_some() {
+                if qset.is_some() {
                     device.poll(wgpu::Maintain::Wait);
                     ts_read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
                     device.poll(wgpu::Maintain::Wait);
                     let t: Vec<u64> = bytemuck::cast_slice(&ts_read.slice(..).get_mapped_range()).to_vec();
                     ts_read.unmap();
-                    sim_ms = (t[1].wrapping_sub(t[0])) as f32 * queue.get_timestamp_period() / 1e6;
+                    let p = queue.get_timestamp_period();
+                    let ms = |a: usize, b: usize| (t[b].wrapping_sub(t[a])) as f32 * p / 1e6;
+                    render_ms = ms(6, 7);
+                    if backend == Backend::Gpu { grid_ms = ms(0, 1); coll_ms = ms(2, 3); integ_ms = ms(4, 5); sim_ms = grid_ms + coll_ms + integ_ms; }
+                    else { grid_ms = 0.0; coll_ms = 0.0; integ_ms = 0.0; }
                 }
 
-                if frame % 8 == 0 { window.set_title(&format!("gpu_storm · {} [1/2] · {} [F] · {} particles [ ] · sim {:.2} ms · {:.0} fps", backend.label(), if mode > 0.5 { "influence" } else { "collision" }, n, sim_ms, fps)); }
+                if frame % 8 == 0 {
+                    let mode_s = if mode > 0.5 { "influence" } else { "collision" };
+                    let gpu_ms = sim_ms + render_ms;                 // total GPU work / frame
+                    let load = gpu_ms / (1000.0 / 60.0) * 100.0;     // % of a 60 fps budget
+                    let title = if backend == Backend::Gpu {
+                        format!("gpu_storm · GPU-resident [1/2] · {mode_s} [F] · {n} pts [ ] · GPU: grid {grid_ms:.2}+coll {coll_ms:.2}+integ {integ_ms:.2}+render {render_ms:.2} = {gpu_ms:.2}ms ({load:.0}% of 60fps) · {fps:.0} fps")
+                    } else {
+                        format!("gpu_storm · CPU grid [1/2] · {mode_s} [F] · {n} pts [ ] · CPU sim {sim_ms:.1}ms + GPU render {render_ms:.2}ms ({load:.0}% of 60fps) · {fps:.0} fps")
+                    };
+                    window.set_title(&title);
+                }
                 if let Some(mf) = smoke {
                     if frame % (mf / 2).max(1) == 0 { backend = match backend { Backend::Gpu => Backend::Cpu, Backend::Cpu => Backend::Gpu }; }
                     // invariant check: read positions back, assert in-bounds + finite
@@ -234,7 +252,7 @@ async fn run() {
                         sync_from_gpu(&device, &queue, &pos_b, &vel_b, &readback, n, &mut pos, &mut vel);
                         let bad = pos[..n].iter().filter(|p| !(p[0].is_finite() && p[1].is_finite() && p[2].is_finite()) || p[0] < -1.0 || p[0] > WORLD + 1.0 || p[1] < -1.0 || p[1] > WORLD + 1.0 || p[2] < -1.0 || p[2] > WORLD + 1.0).count();
                         let contacts: u64 = pos[..n].iter().map(|p| p[3] as u64).sum();
-                        println!("frame {frame} · {} · sim {:.2} ms · {:.0} fps · {n} pts · out-of-bounds/NaN {bad} · contacts {contacts}", backend.label(), sim_ms, fps);
+                        println!("frame {frame} · {} · GPU grid {grid_ms:.2}+coll {coll_ms:.2}+integ {integ_ms:.2}+render {render_ms:.2} = {:.2}ms · {:.0} fps · {n} pts · oob/NaN {bad} · contacts {contacts}", backend.label(), sim_ms + render_ms, fps);
                         assert!(bad == 0, "particles left the box or went NaN ({bad})");
                     }
                     if frame >= mf { elwt.exit(); }
