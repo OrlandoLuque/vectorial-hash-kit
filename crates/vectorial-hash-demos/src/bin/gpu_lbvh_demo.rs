@@ -135,9 +135,10 @@ async fn run() {
         depth_stencil: None, multisample: Default::default(), multiview: None,
     });
 
-    let qset = has_ts.then(|| device.create_query_set(&wgpu::QuerySetDescriptor { label: None, ty: wgpu::QueryType::Timestamp, count: 2 }));
-    let ts_resolve = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 16, usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
-    let ts_read = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 16, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+    // 4 timestamps: query span (0,1) + render span (2,3) → separate GPU loads
+    let qset = has_ts.then(|| device.create_query_set(&wgpu::QuerySetDescriptor { label: None, ty: wgpu::QueryType::Timestamp, count: 4 }));
+    let ts_resolve = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 32, usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+    let ts_read = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 32, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
 
     // CPU Tree3 keep-index
     let mut tree = Tree3::new(Aabb::new(0.0, 0.0, 0.0, WORLD as f64, WORLD as f64, WORLD as f64), 16);
@@ -151,6 +152,7 @@ async fn run() {
     let mut last = Instant::now();
     let mut fps = 0.0f32;
     let mut query_ms = 0.0f32;
+    let mut render_ms = 0.0f32;
     let mut frame = 0u64;
 
     let _ = event_loop.run(move |event, elwt| match event {
@@ -209,7 +211,6 @@ async fn run() {
                     cp.set_bind_group(0, &comp_bg, &[]);
                     cp.dispatch_workgroups((n as u32).div_ceil(64), 1, 1);
                     drop(cp);
-                    if let Some(qs) = &qset { enc.resolve_query_set(qs, 0..2, &ts_resolve, 0); enc.copy_buffer_to_buffer(&ts_resolve, 0, &ts_read, 0, 16); }
                 } else {
                     // CPU Tree3: count neighbours per point, upload
                     let counts: Vec<u32> = (0..n).map(|i| { let p = pos[i]; (tree.cull(&Sphere3::new(p[0] as f64, p[1] as f64, p[2] as f64, RADIUS as f64)).len() as u32).saturating_sub(1) }).collect();
@@ -221,29 +222,31 @@ async fn run() {
                 let frame_tex = match surface.get_current_texture() { Ok(f) => f, Err(_) => { surface.configure(&device, &config); return; } };
                 let view_tex = frame_tex.texture.create_view(&Default::default());
                 {
-                    let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor { label: None, color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view_tex, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.04, g: 0.05, b: 0.07, a: 1.0 }), store: wgpu::StoreOp::Store } })], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None });
+                    let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor { label: None, color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view_tex, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.04, g: 0.05, b: 0.07, a: 1.0 }), store: wgpu::StoreOp::Store } })], depth_stencil_attachment: None, timestamp_writes: qset.as_ref().map(|qs| wgpu::RenderPassTimestampWrites { query_set: qs, beginning_of_pass_write_index: Some(2), end_of_pass_write_index: Some(3) }), occlusion_query_set: None });
                     rp.set_pipeline(&render_pipe);
                     rp.set_bind_group(0, &cam_bg, &[]);
                     rp.set_vertex_buffer(0, points_b.slice(..));
                     rp.set_vertex_buffer(1, counts_b.slice(..));
                     rp.draw(0..6, 0..n as u32);
                 }
+                if let Some(qs) = &qset { enc.resolve_query_set(qs, 0..4, &ts_resolve, 0); enc.copy_buffer_to_buffer(&ts_resolve, 0, &ts_read, 0, 32); }
                 queue.submit(Some(enc.finish()));
                 frame_tex.present();
 
-                if use_gpu {
+                if qset.is_some() {
                     device.poll(wgpu::Maintain::Wait);
-                    if qset.is_some() {
-                        ts_read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-                        device.poll(wgpu::Maintain::Wait);
-                        let t: Vec<u64> = bytemuck::cast_slice(&ts_read.slice(..).get_mapped_range()).to_vec();
-                        ts_read.unmap();
-                        query_ms = (t[1].wrapping_sub(t[0])) as f32 * queue.get_timestamp_period() / 1e6;
-                    }
+                    ts_read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+                    device.poll(wgpu::Maintain::Wait);
+                    let t: Vec<u64> = bytemuck::cast_slice(&ts_read.slice(..).get_mapped_range()).to_vec();
+                    ts_read.unmap();
+                    let p = queue.get_timestamp_period();
+                    render_ms = (t[3].wrapping_sub(t[2])) as f32 * p / 1e6;
+                    if use_gpu { query_ms = (t[1].wrapping_sub(t[0])) as f32 * p / 1e6; }
                 }
 
                 if frame % 8 == 0 {
-                    window.set_title(&format!("gpu_lbvh_demo · {} [1/2/3] · {} pts [ ] · query {:.2} ms · {:.0} fps", backend.label(), n, query_ms, fps));
+                    let load = (query_ms + render_ms) / (1000.0 / 60.0) * 100.0; // % of a 60 fps budget
+                    window.set_title(&format!("gpu_lbvh_demo · {} [1/2/3] · {n} pts [ ] · query {query_ms:.2} + render {render_ms:.2} = {:.2}ms ({load:.0}% of 60fps) · {fps:.0} fps", backend.label(), query_ms + render_ms));
                 }
                 if let Some(mf) = max_frames {
                     if frame % (mf / 3).max(1) == 0 { backend = match backend { Backend::GpuLbvh => Backend::GpuBrute, Backend::GpuBrute => Backend::CpuTree, Backend::CpuTree => Backend::GpuLbvh }; }
