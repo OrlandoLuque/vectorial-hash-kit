@@ -692,6 +692,9 @@ async fn run() {
     {
         use winit::platform::web::WindowExtWebSys;
         let canvas = window.canvas().expect("canvas");
+        // Give the canvas a CSS size — without it winit's backing buffer has no
+        // displayed size and the page stays black (siege/horde do the same).
+        let _ = canvas.set_attribute("style", "width:100vw;height:100vh;display:block");
         web_sys::window().and_then(|w| w.document())
             .and_then(|d| d.get_element_by_id("wgpu-canvas").or_else(|| d.body().map(|b| b.into())))
             .map(|c| c.append_child(&canvas.into()).ok())
@@ -706,6 +709,7 @@ async fn run() {
     let mut fps_acc: (f64, u64) = (0.0, 0);
     let mut frame: u64 = 0;
     event_loop.run(move |event, elwt| {
+        elwt.set_control_flow(winit::event_loop::ControlFlow::Poll); // drive continuous frames (needed on web)
         match event {
             Event::WindowEvent { event, .. } => match event {
                 WindowEvent::CloseRequested => elwt.exit(),
