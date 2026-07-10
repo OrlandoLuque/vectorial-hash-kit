@@ -72,6 +72,22 @@ struct Cam { vp: [[f32; 4]; 4] }
 enum Backend { CpuTree, GpuBrute, GpuLbvh }
 impl Backend { fn label(self) -> &'static str { match self { Backend::CpuTree => "CPU Tree3", Backend::GpuBrute => "GPU brute", Backend::GpuLbvh => "GPU LBVH" } } }
 
+// --- 2D screen-space overlay (query/render GPU-load bars) ---
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct UiVertex { pos: [f32; 2], color: [f32; 4] }
+fn push_quad(v: &mut Vec<UiVertex>, px: f32, py: f32, w: f32, h: f32, color: [f32; 4], sw: f32, sh: f32) {
+    let (x0, x1) = (px / sw * 2.0 - 1.0, (px + w) / sw * 2.0 - 1.0);
+    let (y0, y1) = (1.0 - py / sh * 2.0, 1.0 - (py + h) / sh * 2.0);
+    let q = |x, y| UiVertex { pos: [x, y], color };
+    v.extend_from_slice(&[q(x0, y0), q(x1, y0), q(x1, y1), q(x0, y0), q(x1, y1), q(x0, y1)]);
+}
+const UI_SHADER: &str = r#"
+struct VOut { @builtin(position) clip: vec4<f32>, @location(0) color: vec4<f32> };
+@vertex fn vs(@location(0) p: vec2<f32>, @location(1) color: vec4<f32>) -> VOut { var o: VOut; o.clip = vec4<f32>(p, 0.0, 1.0); o.color = color; return o; }
+@fragment fn fs(in: VOut) -> @location(0) vec4<f32> { return in.color; }
+"#;
+
 struct P(Point3);
 impl Positioned3 for P { fn position(&self) -> Point3 { self.0 } }
 
@@ -150,6 +166,18 @@ async fn run() {
         primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
         depth_stencil: None, multisample: Default::default(), multiview: None,
     });
+
+    // 2D overlay pipeline (NDC quads, no camera, no depth) for the GPU-load bars.
+    let ui_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(UI_SHADER.into()) });
+    let ui_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[], push_constant_ranges: &[] });
+    let ui_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("ui"), layout: Some(&ui_pl),
+        vertex: wgpu::VertexState { module: &ui_mod, entry_point: "vs", compilation_options: Default::default(), buffers: &[wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<UiVertex>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x4] }] },
+        fragment: Some(wgpu::FragmentState { module: &ui_mod, entry_point: "fs", compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
+        primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+        depth_stencil: None, multisample: Default::default(), multiview: None,
+    });
+    let ui_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("ui"), size: (128 * std::mem::size_of::<UiVertex>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
 
     // 4 timestamps: query span (0,1) + render span (2,3) → separate GPU loads
     let qset = has_ts.then(|| device.create_query_set(&wgpu::QuerySetDescriptor { label: None, ty: wgpu::QueryType::Timestamp, count: 4 }));
@@ -235,6 +263,21 @@ async fn run() {
                 }
 
                 // ---- render
+                // ---- on-screen GPU-load bars (query + render, scaled to a 60 fps budget)
+                let (sw, sh) = (config.width as f32, config.height as f32);
+                let scale = 300.0 / (1000.0 / 60.0); // px per ms
+                let qcol = match backend { Backend::CpuTree => [0.9, 0.3, 0.3, 0.95], Backend::GpuBrute => [1.0, 0.55, 0.2, 0.95], Backend::GpuLbvh => [0.35, 0.9, 0.45, 0.95] };
+                let mut ui: Vec<UiVertex> = Vec::new();
+                push_quad(&mut ui, 12.0, 12.0, 324.0, 44.0, [0.0, 0.0, 0.0, 0.45], sw, sh);
+                for (i, (color, ms)) in [(qcol, query_ms), ([0.7, 0.45, 0.95, 0.95], render_ms)].iter().enumerate() {
+                    let y = 18.0 + i as f32 * 17.0;
+                    push_quad(&mut ui, 18.0, y, 300.0, 13.0, [0.16, 0.16, 0.22, 0.7], sw, sh);
+                    push_quad(&mut ui, 18.0, y, (ms * scale).clamp(0.0, 316.0), 13.0, *color, sw, sh);
+                }
+                push_quad(&mut ui, 18.0 + 300.0 - 1.0, 16.0, 2.0, 38.0, [1.0, 1.0, 1.0, 0.55], sw, sh); // 60 fps tick
+                queue.write_buffer(&ui_buf, 0, bytemuck::cast_slice(&ui));
+                let ui_count = ui.len() as u32;
+
                 let frame_tex = match surface.get_current_texture() { Ok(f) => f, Err(_) => { surface.configure(&device, &config); return; } };
                 let view_tex = frame_tex.texture.create_view(&Default::default());
                 {
@@ -244,6 +287,7 @@ async fn run() {
                     rp.set_vertex_buffer(0, points_b.slice(..));
                     rp.set_vertex_buffer(1, counts_b.slice(..));
                     rp.draw(0..6, 0..n as u32);
+                    rp.set_pipeline(&ui_pipeline); rp.set_vertex_buffer(0, ui_buf.slice(..)); rp.draw(0..ui_count, 0..1);
                 }
                 if let Some(qs) = &qset { enc.resolve_query_set(qs, 0..4, &ts_resolve, 0); enc.copy_buffer_to_buffer(&ts_resolve, 0, &ts_read, 0, 32); }
                 queue.submit(Some(enc.finish()));
