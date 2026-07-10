@@ -289,8 +289,8 @@ fn cpu_step(pos: &mut [[f32; 4]], vel: &mut [[f32; 4]], n: usize, heads: &mut [i
     for h in heads[..ncells].iter_mut() { *h = -1; }
     for i in 0..n { let c = cell_of(&pos[i]); nextp[i] = heads[c]; heads[c] = i as i32; }
     let influence = mode > 0.5;
-    let rad = if influence { GLOW_R } else { 2.0 * R };
-    let ring = if influence { (GLOW_R / CELL).ceil() as i32 } else { 1 };
+    let rad = if influence { GLOW_R } else { 2.6 * R }; // colour = density within rad; force uses 2R overlap
+    let ring = (rad / CELL).ceil() as i32;
     let (r, rad2) = (R, rad * rad);
     for i in 0..n {
         let pi = pos[i]; let vi = vel[i];
@@ -360,10 +360,11 @@ fn collide(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x; if (i >= P.n) { return; }
     let pi = pos[i].xyz; let vi = vel[i].xyz;
     let influence = P.mode > 0.5;
-    // collide mode: contacts within 2r, 3×3×3. influence mode: neighbours within
-    // glow_r (a proximity-glow field), scanning ⌈glow_r/cell⌉ rings, no force.
-    let rad = select(2.0 * P.radius, P.glow_r, influence);
-    let ring = select(1, i32(ceil(P.glow_r / P.cell)), influence);
+    // Colour by LOCAL DENSITY — neighbours within a colour radius — so collision
+    // mode isn't stuck blue (hard contacts are sparse); the FORCE still uses only
+    // real overlaps (< 2r, guarded below). Influence uses the glow radius.
+    let rad = select(2.6 * P.radius, P.glow_r, influence);
+    let ring = i32(ceil(rad / P.cell));
     let g = clamp(vec3<i32>(pi / P.cell), vec3<i32>(0), vec3<i32>(i32(P.gd) - 1));
     var f = vec3<f32>(0.0); var cnt = 0u;
     for (var dz = -ring; dz <= ring; dz = dz + 1) {
