@@ -43,6 +43,23 @@ safety net). Ordered — verifiable/high-value first, `[eyes]` last:
   filaments light up (not stuck blue); on-screen per-phase GPU-load bars
   (grid/collide/integrate/render, scaled to a 60 fps budget). Same bars on
   `gpu_lbvh_demo` (query+render). Native builds re-verified after the web port.
+- ~~**(3) GPU line-of-sight**~~ — `gpu_visibility_bench`: segment-vs-AABB LBVH
+  traversal over STATIC occluders, verified == CPU `segment_hit` (Δ 0), ~1380× the
+  serial CPU with a one-time 1 ms build (the *clean* GPU offload). Documented in
+  PERF_NOTES + the local occlusion notes.
+- ~~**(7) GPU-side build — attempted, honest negative**~~ — `gpu_sort_bench`: a GPU
+  bitonic sort of Morton codes (verified == CPU sort). But naive bitonic is
+  **slower** than the CPU sort (log² work + dispatch-per-pass). **The GPU-side LBVH
+  build needs a RADIX sort** (or a workgroup-shared-memory bitonic) — a focused
+  session, not a blind attempt. Blocker identified.
+
+**New asks (user, 2026-07-11 — queued):**
+- **(9) Demo screenshots → a more visual index.** Launch each demo, wait ~20 s,
+  capture, use the images as thumbnails in `docs/index.html`. *Blocker: no CLI
+  screenshot on Windows + PowerShell deny-listed → the clean path is an offscreen
+  "render 1 frame to PNG" mode in the wgpu demos (needs an image-encode dep).*
+- **(10) Research more optimisation strategies (with/without GPU)** — internet
+  search; run via the `deep-research` skill → a cited report (research repo).
 
 ## ★ NEXT DEMO (user, 2026-07-07): a GPU-RESIDENT collision storm
 
