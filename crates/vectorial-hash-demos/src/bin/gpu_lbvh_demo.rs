@@ -9,10 +9,14 @@
 //! drag orbit · scroll zoom. Meter (title): backend · query ms · FPS.
 //!
 //! `cargo run -p vectorial-hash-demos --bin gpu_lbvh_demo --release`
-#![cfg(not(target_arch = "wasm32"))]
+#![cfg(any(not(target_arch = "wasm32"), feature = "web-wgpu"))]
+#![cfg_attr(target_arch = "wasm32", no_main)]
 
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use winit::{event::*, event_loop::EventLoop, keyboard::{KeyCode, PhysicalKey}, window::WindowBuilder};
@@ -74,11 +78,23 @@ impl Positioned3 for P { fn position(&self) -> Point3 { self.0 } }
 struct Rng(u64);
 impl Rng { fn next(&mut self) -> u64 { let mut x = self.0; x ^= x << 13; x ^= x >> 7; x ^= x << 17; self.0 = x; x } fn unit(&mut self) -> f32 { (self.next() >> 40) as f32 / (1u32 << 24) as f32 } }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() { pollster::block_on(run()); }
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen(start)]
+pub fn start() { console_error_panic_hook::set_once(); wasm_bindgen_futures::spawn_local(run()); }
 
 async fn run() {
     let event_loop = EventLoop::new().unwrap();
     let window = Arc::new(WindowBuilder::new().with_title("gpu_lbvh_demo").with_inner_size(winit::dpi::LogicalSize::new(1400, 900)).build(&event_loop).unwrap());
+    #[cfg(target_arch = "wasm32")]
+    {
+        use winit::platform::web::WindowExtWebSys;
+        let canvas = window.canvas().expect("canvas");
+        let _ = canvas.set_attribute("style", "width:100vw;height:100vh;display:block");
+        web_sys::window().and_then(|w| w.document()).and_then(|d| d.body()).expect("body").append_child(&canvas.into()).expect("append canvas");
+    }
 
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
     let surface = instance.create_surface(window.clone()).unwrap();
@@ -257,7 +273,7 @@ async fn run() {
             }
             _ => {}
         },
-        Event::AboutToWait => window.request_redraw(),
+        Event::AboutToWait => { elwt.set_control_flow(winit::event_loop::ControlFlow::Poll); window.request_redraw(); }
         _ => {}
     });
 }
