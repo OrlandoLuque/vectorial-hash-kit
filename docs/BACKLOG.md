@@ -33,6 +33,17 @@ safety net). Ordered — verifiable/high-value first, `[eyes]` last:
 8. `[eyes]` (leave for the user): colour-by-leaf-depth viz · 2D k-NN/LoS demo ·
    Quaternius RTS wall models · classic-Reynolds boids · balance · web touch+HUD.
 
+**LANDED (2026-07-11 night, all pushed, CI green):**
+- ~~**(1) Web publish**~~ — `gpu_lbvh_demo` + `gpu_storm` now build for wasm32
+  (web-wgpu), wasm-bindgen'd to `docs/gpu/` with HTML shells (requestDevice shim)
+  + index cards. Web gotcha solved (canvas CSS size + `Poll`); gpu_storm uses a
+  smaller grid on web (96³) to fit WebGPU's 128 MiB buffer limit. `[eyes: confirm
+  in a WebGPU browser.]`
+- ~~**(2) gpu_storm colour + bars**~~ — colour by local density (2.6r) so collision
+  filaments light up (not stuck blue); on-screen per-phase GPU-load bars
+  (grid/collide/integrate/render, scaled to a 60 fps budget). Same bars on
+  `gpu_lbvh_demo` (query+render). Native builds re-verified after the web port.
+
 ## ★ NEXT DEMO (user, 2026-07-07): a GPU-RESIDENT collision storm
 
 Agreed after the "why don't the sims benefit from GPU LBVH?" discussion. The
