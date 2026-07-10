@@ -76,6 +76,26 @@ GPU. Reproduce: `cargo run -p vectorial-hash-demos --bin gpu_lbvh_demo --release
 and `… --example gpu_spatial_bench --release --features parallel` (with `GPU_N=…
 GPU_M=… GPU_R=… GPU_CLUSTER=1`).
 
+### The CLEAN GPU case: line-of-sight over STATIC occluders
+
+The rebuild tax above only bites *moving* data. **Occluders (walls, cover) are
+static** → their BVH is built once, so the GPU LoS pass gets the full kernel win
+with no per-frame rebuild. `gpu_visibility_bench` — M viewer→target segments
+traversed against an occluder LBVH in a compute shader (segment-vs-AABB slab),
+**verified exactly against the CPU `segment_hit`** (Δ 0 blocked segments). 20k
+occluders × 50k segments:
+
+| stage | ms | per segment |
+| --- | --- | --- |
+| LBVH build (once) | 1.0 | — |
+| GPU LoS dispatch | **0.225** | 5 ns |
+| CPU LoS (serial) | 310.6 | 6.2 µs |
+
+**~1 380×** — and the 1.0 ms build is one-time. This is the offload to actually
+reach for: static geometry, query-dominated, no rebuild. (A subtlety the cross-
+check caught: the CPU reference cull needs a capsule radius of `H·√3`, the box
+circumradius, or it misses boxes the segment clips at a corner.)
+
 ## Voxel vs smooth terrain: why `V` changes the FPS
 
 Pressing `V` (voxel ↔ smooth heightfield) noticeably moves the frame rate — e.g.

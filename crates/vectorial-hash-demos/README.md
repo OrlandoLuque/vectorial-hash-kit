@@ -160,6 +160,12 @@ cargo run -p vectorial-hash-demos --example gpu_spatial_bench --release --featur
   can we accelerate?" — everything but the branchy `decide` a game sim needs.
 - **`gpu_spatial_bench`** — the headless measurement behind both, with the honest
   per-frame *rebuild-vs-keep* verdict for moving data (`GPU_N/M/R/CLUSTER` env).
+- **`gpu_visibility_bench`** — GPU **line-of-sight** over static occluders (the
+  *clean* GPU case: build once, no rebuild). Segment-vs-AABB traversal in a compute
+  shader, verified exactly against the CPU `segment_hit`; ~1380× the serial CPU LoS.
+
+`gpu_lbvh_demo` and `gpu_storm` are also **published to the web** (WebGPU) — see the
+[live demo index](https://orlandoluque.github.io/vectorial-hash-kit/).
 
 ## Try the demos
 
