@@ -10,7 +10,9 @@ to pick, [`docs/THREE_D.md`](../../docs/THREE_D.md) for the quantitative decisio
 map, [`docs/RAYCAST.md`](../../docs/RAYCAST.md) for the ray-cast surface,
 [`docs/PARALLEL.md`](../../docs/PARALLEL.md) for when threads pay, and
 [`docs/PERFORMANCE.md`](../../docs/PERFORMANCE.md) for how to make the chosen
-structure fast (build flags, keep-index, threads, GPU).
+structure fast (build flags, keep-index, threads, GPU), and
+[`docs/GPU.md`](../../docs/GPU.md) for the GPU-compute strand (demos, benches, and
+the measured verdict on when the GPU wins vs a parallel CPU path).
 
 ## Status
 
