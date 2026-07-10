@@ -75,6 +75,20 @@
       friendly fire, and flank/rear contact (sector classify) bleeds morale until an army
       <b>chain-routs</b>. Needs a <b>WebGPU</b> browser.</span>
     </a>
+    <a class="card" href="gpu_lbvh_demo.html">
+      <span class="tag">wgpu · WebGPU</span>
+      <h2>GPU broad-phase →</h2>
+      <span class="d">The <i>same</i> neighbour-count query, three backends you flip live —
+      CPU <b>Tree3</b> · GPU brute · <b>GPU LBVH</b> (a BVH from Morton codes, traversed in a
+      compute shader). Identical picture, wildly different cost. Needs a <b>WebGPU</b> browser.</span>
+    </a>
+    <a class="card" href="gpu_storm.html">
+      <span class="tag">wgpu · WebGPU</span>
+      <h2>GPU storm →</h2>
+      <span class="d">A <b>GPU-resident</b> collision storm — the whole hot loop (grid → contacts → integrate)
+      on the GPU, no CPU round-trip. Switch the <i>whole</i> sim CPU↔GPU; <b>F</b> for an influence field.
+      Coloured by local density. Needs a <b>WebGPU</b> browser.</span>
+    </a>
   </div>
   <p class="note">Click the canvas to give it keyboard focus. The first load fetches ~1&nbsp;MB of
   WebAssembly. Needs a WebGL2-capable browser. On a phone, tap <b>⤢</b> (top-right) to hide the
