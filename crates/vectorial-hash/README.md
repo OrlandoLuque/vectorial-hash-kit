@@ -121,6 +121,30 @@ Run the long campaign with
 `cargo test -p vectorial-hash-templates --release --test exhaustive_culling -- --ignored`
 (add `--features neighbors` for the ropes strategy).
 
+## Honest limitations (measured)
+
+This kit reports negative results too — the conclusions come from benchmarks, not
+intuition. In short:
+
+- **No single structure wins.** The binary tree is rarely the outright best: the
+  8-way `Octree3` culls ~14–19% faster, and the pointer-free `MortonGrid3` wins on
+  uniform data and on rebuild-per-frame. Choose per workload — see
+  [`docs/THREE_D.md`](../../docs/THREE_D.md), or let the `advisor` pick from
+  measured local rates.
+- **Templates and the 1×1×1 raster are conditional.** For cheap analytic shapes
+  (spheres, circles) a direct test beats a lookup — a memory load can't outrun one
+  distance compare (the memory wall). The template/raster path pays only for an
+  *expensive* `contains_point` (a many-faced/non-analytic figure; crossover ~24–48
+  faces of a `Polyhedron3`). Don't raster a sphere.
+- **The keep-index (`ItemRef`) is the real lever — and a well-known pattern.** The
+  arena + stable-handle relocation isn't novel (slot maps / ECS storage / in-place
+  broad-phase updates are standard); the useful finding is that it *dominates*
+  moving-point maintenance here (5–11×).
+- **Some precomputation measured slower than recompute** — a boids force table and
+  a moving-data GPU offload both lost to the simple path (the memory wall again);
+  see [`docs/PERF_NOTES.md`](../../docs/PERF_NOTES.md). The full self-critique lives
+  in the research study's `LESSONS_LEARNED`.
+
 ## Roadmap
 
 Ordered roughly by impact. The first block was harvested from the original design notes (the unpublished draft of the publication) and is the next round of work.
