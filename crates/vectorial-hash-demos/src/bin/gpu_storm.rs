@@ -12,15 +12,24 @@
 //! orbit · scroll zoom. Title meter: backend · mode · sim ms · FPS · count.
 //!
 //! `cargo run -p vectorial-hash-demos --bin gpu_storm --release`
-#![cfg(not(target_arch = "wasm32"))]
+#![cfg(any(not(target_arch = "wasm32"), feature = "web-wgpu"))]
+#![cfg_attr(target_arch = "wasm32", no_main)]
 
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use winit::{event::*, event_loop::EventLoop, keyboard::{KeyCode, PhysicalKey}, window::WindowBuilder};
 
 const WORLD: f32 = 1600.0;
+// Web: a smaller grid keeps the bucket buffer under WebGPU's 128 MiB
+// maxStorageBufferBindingSize (128³×16×4 = 134 MB > limit; 96³ = 56 MB).
+#[cfg(target_arch = "wasm32")]
+const GD: u32 = 96;
+#[cfg(not(target_arch = "wasm32"))]
 const GD: u32 = 128;                 // grid dimension per axis
 const CELL: f32 = WORLD / GD as f32; // 12.5
 const R: f32 = 6.0;                  // particle radius (< CELL/2 so 3×3×3 suffices)
@@ -56,11 +65,23 @@ fn spawn(n: usize) -> (Vec<[f32; 4]>, Vec<[f32; 4]>) {
     (pos, vel)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() { pollster::block_on(run()); }
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen(start)]
+pub fn start() { console_error_panic_hook::set_once(); wasm_bindgen_futures::spawn_local(run()); }
 
 async fn run() {
     let event_loop = EventLoop::new().unwrap();
     let window = Arc::new(WindowBuilder::new().with_title("gpu_storm").with_inner_size(winit::dpi::LogicalSize::new(1400, 900)).build(&event_loop).unwrap());
+    #[cfg(target_arch = "wasm32")]
+    {
+        use winit::platform::web::WindowExtWebSys;
+        let canvas = window.canvas().expect("canvas");
+        let _ = canvas.set_attribute("style", "width:100vw;height:100vh;display:block");
+        web_sys::window().and_then(|w| w.document()).and_then(|d| d.body()).expect("body").append_child(&canvas.into()).expect("append canvas");
+    }
 
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
     let surface = instance.create_surface(window.clone()).unwrap();
@@ -261,7 +282,7 @@ async fn run() {
             }
             _ => {}
         },
-        Event::AboutToWait => window.request_redraw(),
+        Event::AboutToWait => { elwt.set_control_flow(winit::event_loop::ControlFlow::Poll); window.request_redraw(); }
         _ => {}
     });
 }

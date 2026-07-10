@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>gpu_storm (wgpu) — vectorial-hash</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #0e0e12; color: #cdd2dc;
+      font-family: system-ui, -apple-system, sans-serif; overflow: hidden; }
+    #msg { position: fixed; inset: 0; z-index: 10; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; text-align: center; padding: 2rem; gap: .5rem; }
+    #msg a { color: #7ab8ff; }
+    #msg .small { color: #8b93a3; font-size: .85rem; max-width: 34rem; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <div id="msg">
+    <div>Loading <b>gpu_storm</b>…</div>
+    <div class="small">A <b>GPU-resident</b> collision storm — the whole hot loop (build a spatial grid → resolve contacts
+      → integrate) lives on the GPU, no per-frame CPU↔GPU round-trip. Particles are coloured by local density, so the
+      force-chains light up. Switch the <i>whole</i> simulation CPU↔GPU and watch the meter.
+      <b>1</b> CPU grid · <b>2</b> GPU-resident · <b>F</b> collision ↔ influence field · <b>[ ]</b> count · drag orbit · scroll zoom.</div>
+  </div>
+  <script type="module">
+    const msg = document.getElementById('msg');
+    if (!navigator.gpu) {
+      msg.innerHTML = '<div>This demo needs <b>WebGPU</b>.</div>' +
+        '<div class="small">Open it in a recent <b>Chrome</b> or <b>Edge</b> (or Firefox Nightly with WebGPU enabled). ' +
+        'The whole simulation runs in compute shaders over storage buffers with atomics, which WebGL2 can’t do — no fallback. ' +
+        'The other demos on the <a href="./index.html">index</a> run anywhere.</div>';
+    } else {
+      const _requestDevice = GPUAdapter.prototype.requestDevice;
+      GPUAdapter.prototype.requestDevice = function (desc) {
+        if (desc && desc.requiredLimits) {
+          for (const key of Object.keys(desc.requiredLimits)) {
+            if (!(key in this.limits)) delete desc.requiredLimits[key];
+          }
+        }
+        return _requestDevice.call(this, desc);
+      };
+      import('./gpu/gpu_storm.js')
+        .then(m => m.default())
+        .then(() => { setTimeout(() => msg.remove(), 1500); })
+        .catch(e => { msg.innerHTML = '<div>Failed to start.</div><div class="small">' + e + '</div>'; console.error(e); });
+    }
+  </script>
+</body>
+</html>
