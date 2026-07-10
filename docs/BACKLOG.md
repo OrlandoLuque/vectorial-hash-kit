@@ -4,6 +4,35 @@ Future work queued for review. Nothing here is committed scope — prune,
 reprioritise, or drop freely. Items graduate into the per-crate roadmaps
 (e.g. `crates/vectorial-hash/README.md`) once picked up.
 
+## ⚠️ MORNING REMINDER (user asked, 2026-07-11)
+
+**Test the battle fix in the browser** — `formations_wgpu` was black on web
+(canvas had no CSS size + no `ControlFlow::Poll`); fixed + republished
+(`docs/formations/`). Hard-refresh (`Ctrl+Shift+R`) the Pages site / local serve
+and confirm pirates-vs-undead renders. *(And remove the `ClaudeNightSuspend`
+scheduled task if it's still around.)*
+
+## ★ OVERNIGHT — round 5 (user, 2026-07-11): autonomous, safety-net 02:00
+
+Full autonomous mandate again (commit + doc per task; suspend when done or at the
+safety net). Ordered — verifiable/high-value first, `[eyes]` last:
+
+1. **Publish `gpu_storm` + `gpu_lbvh_demo` to the web** — now cheap: the web
+   gotcha is known (canvas CSS size + `Poll`, just fixed for formations) + the
+   `build-wgpu-web.sh` pattern. Add a `requestDevice` limit shim if Chrome balks.
+2. **`gpu_storm` polish**: colour by **local density** (smooth — collision mode
+   is stuck blue because hard contacts are sparse) + **on-screen GPU meter bars**
+   (a UI-quad overlay, not just the title).
+3. **GPU line-of-sight shader** — the clean static-occluder offload (CPU measured;
+   `gpu_lbvh_demo` traversal with the leaf test sphere→segment).
+4. **Full 3-projection vs expensive narrowphase** (THREE_D open item) — measure.
+5. **Nudge-free 3D walk** (Samet) — careful (the subset test can't catch under-collection).
+6. **Demos**: `MortonGrid` (2D) in the `critters` toggle; batch sight-lines to meshes.
+7. **GPU-side LBVH build** (radix+Karras) — attempt only if the rest is done and
+   time remains; a blind radix sort is the risky one.
+8. `[eyes]` (leave for the user): colour-by-leaf-depth viz · 2D k-NN/LoS demo ·
+   Quaternius RTS wall models · classic-Reynolds boids · balance · web touch+HUD.
+
 ## ★ NEXT DEMO (user, 2026-07-07): a GPU-RESIDENT collision storm
 
 Agreed after the "why don't the sims benefit from GPU LBVH?" discussion. The
