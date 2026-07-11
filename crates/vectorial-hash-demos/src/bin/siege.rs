@@ -280,7 +280,7 @@ async fn main() {
         .unwrap_or_else(|| (macroquad::miniquad::date::now() * 1000.0) as u64);
     set_map_seed((seed % 100_000) as f64 * 0.01);
     let mut rng = Rng::new(seed | 1);
-    let mut per_faction = PER_FACTION; // live army size per side (population slider)
+    let mut per_faction = default_per_faction(); // live army size per side (population slider; $SIEGE_POP boot override)
     let mut cur_pop = per_faction;
     let mut pop_drag = false;
     let mut units = spawn_army(&mut rng, per_faction);
@@ -633,7 +633,7 @@ async fn main() {
         );
         if paused { draw_text("PAUSED", screen_width() * 0.5 - 50.0, 40.0, 36.0, YELLOW); }
 
-        if let Some(p) = std::env::var_os("SHOT") { if frame_no >= 120 && screen_width() > 200.0 { let _ = get_screen_data().export_png(&p.to_string_lossy()); std::process::exit(0); } }
+        if let Some(p) = std::env::var_os("SHOT") { if get_time() > 10.0 && screen_width() > 200.0 { let _ = get_screen_data().export_png(&p.to_string_lossy()); std::process::exit(0); } }
         next_frame().await;
         frame_no += 1;
         if let Some(m) = max_frames { if frame_no >= m { break; } }

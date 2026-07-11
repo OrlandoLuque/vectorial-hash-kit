@@ -42,6 +42,12 @@ fn reynolds_blend() -> f64 {
 pub const WORLD: f64 = 800.0; // battlefield is WORLD × WORLD in the ground plane
 pub const SKY: f64 = 260.0; // index height — heights reach ~150, the dragon flies
 pub const PER_FACTION: usize = 500; // units each side spawns with (tunable live)
+/// Initial army size **per side** — override with `$SIEGE_POP` (clamped to the
+/// slider / `[ ]` ceiling of 10000). Lets the demos boot straight into a packed
+/// field instead of the 500-a-side default. Mirrors formations' `$FORM_POP`.
+pub fn default_per_faction() -> usize {
+    std::env::var("SIEGE_POP").ok().and_then(|s| s.parse().ok()).unwrap_or(PER_FACTION).clamp(20, 10_000)
+}
 pub const ATK_ANIM_LEN: f32 = 0.45; // attack-clip / lunge play window (seconds)
 pub const LAVA_DPS: f64 = 45.0; // damage per second to a ground unit standing in lava
 pub const WATER_LEVEL: f64 = 6.0; // terrain below this is water (units wade slowly)

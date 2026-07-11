@@ -42,7 +42,7 @@ use vectorial_hash_demos::siege_sim::model_for;
 #[cfg(target_arch = "wasm32")]
 use vectorial_hash_demos::siege_sim::SIEGE_MODEL_FILES;
 use vectorial_hash_demos::siege_sim::{
-    apply, decide, default_body_radius, faction_tint, forest_trees, ground_height, model_file, set_map_seed,
+    apply, decide, default_body_radius, default_per_faction, faction_tint, forest_trees, ground_height, model_file, set_map_seed,
     spawn_army, sync_index, terrain_height, terrain_surface, volcano_step, Craters, Faction, Fx, FxKind, IUnit,
     Kind, ProjKind, Projectile, Puff, Rng, SepTables, Unit, Volcano, ANIM_FRAMES, MOVE_PREFS,
     PER_FACTION, SKY, WORLD,
@@ -611,7 +611,7 @@ impl State {
         let seed = std::env::var("SIEGE_SEED").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0x51E6E);
         set_map_seed((seed % 100_000) as f64 * 0.01);
         let mut rng = Rng::new(seed | 1);
-        let pop = PER_FACTION;
+        let pop = default_per_faction();
         let units = spawn_army(&mut rng, pop);
         let index = Tree3::<IUnit>::new(Aabb::new(0.0, 0.0, 0.0, WORLD, SKY, WORLD), 8);
         // Live rayon pool for the parallel decide pass (the thread slider). Native
