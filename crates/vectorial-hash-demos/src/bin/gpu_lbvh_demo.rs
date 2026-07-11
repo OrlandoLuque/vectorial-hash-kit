@@ -306,7 +306,7 @@ async fn run() {
                     if use_gpu { query_ms = (t[1].wrapping_sub(t[0])) as f32 * p / 1e6; }
                 }
 
-                if frame % 8 == 0 {
+                if frame % 8 == 0 && std::env::var_os("SHOT").is_none() {
                     let load = (query_ms + render_ms) / (1000.0 / 60.0) * 100.0; // % of a 60 fps budget
                     window.set_title(&format!("gpu_lbvh_demo · {} [1/2/3] · {n} pts [ ] · query {query_ms:.2} + render {render_ms:.2} = {:.2}ms ({load:.0}% of 60fps) · {fps:.0} fps", backend.label(), query_ms + render_ms));
                 }

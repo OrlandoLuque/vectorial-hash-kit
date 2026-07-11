@@ -1796,8 +1796,11 @@ async fn run() {
                     st.update_and_render();
                     frame += 1;
                     if frame % 15 == 0 {
+                        if std::env::var_os("SHOT").is_some() { window.set_title("vhshot"); }
+                        else {
                         let (d, a) = st.sim.counts();
                         window.set_title(&format!("vectorial-hash — horde (wgpu) · map {} [G] · index {} [M] · goal {} [O]{} · sleep {d} | awake {a} | kills {} · run {} · {:.0} fps{}", st.sim.scenario.label(), st.sim.zmode.label(), if st.sim.flow_multi() { "BUILDINGS" } else { "CC" }, if st.night { " · NIGHT [L]" } else { "" }, st.sim.kills, st.sim.run, st.fps, if st.paused { " · PAUSED" } else { "" }));
+                        }
                     }
                     #[cfg(not(target_arch = "wasm32"))]
                     if let Some(m) = max_frames {

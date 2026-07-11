@@ -12,10 +12,14 @@
          background: radial-gradient(1200px 600px at 50% -10%, #18203a, #0a0c14 60%); color:#dfe6f2; padding:2rem; }
   h1 { font-size: clamp(1.6rem, 4vw, 2.6rem); margin:0 0 .5rem; letter-spacing:-.02em; }
   p.sub { margin:0 0 2rem; color:#8a96ad; max-width:44rem; text-align:center; line-height:1.55; }
-  .cards { display:flex; gap:1.2rem; flex-wrap:wrap; justify-content:center; }
-  a.card { text-decoration:none; color:inherit; width:19rem; border:1px solid #2a3550; border-radius:14px; padding:1.4rem 1.5rem;
+  .cards { display:flex; gap:1.2rem; flex-wrap:wrap; justify-content:center; max-width:66rem; }
+  a.card { text-decoration:none; color:inherit; width:19rem; border:1px solid #2a3550; border-radius:14px; overflow:hidden;
            background:linear-gradient(180deg,#141a2c,#10131f); transition:transform .12s ease, border-color .12s ease; }
   a.card:hover { transform:translateY(-3px); border-color:#4a6cff; }
+  a.card:hover .thumb { filter:brightness(1.08); }
+  img.thumb { width:100%; aspect-ratio:16/10; object-fit:cover; display:block; background:#0a0c14;
+              border-bottom:1px solid #2a3550; transition:filter .12s ease; }
+  .body { padding:1.2rem 1.4rem 1.4rem; }
   a.card h2 { margin:.3rem 0 .5rem; font-size:1.25rem; }
   a.card span.d { color:#8a96ad; font-size:.92rem; line-height:1.5; display:block; }
   .tag { display:inline-block; font-size:.7rem; letter-spacing:.08em; text-transform:uppercase; color:#7fa0ff;
@@ -33,61 +37,85 @@
   via WebAssembly.</p>
   <div class="cards">
     <a class="card" href="2d.html">
+      <img class="thumb" src="shots/critters.jpg" alt="2D critters on a flat map, index leaf regions recoloured" loading="lazy">
+      <div class="body">
       <span class="tag">2D</span>
       <h2>2D critters →</h2>
       <span class="d">Predators &amp; prey on a flat map. A live tuning panel and performance graphs;
       the index's leaf regions recolour as cells subdivide and merge.</span>
+      </div>
     </a>
     <a class="card" href="3d.html">
+      <img class="thumb" src="shots/critters3d.jpg" alt="3D cube world of instanced critters with the index wireframe" loading="lazy">
+      <div class="body">
       <span class="tag">3D</span>
       <h2>3D critters →</h2>
       <span class="d">A cube world with GPU-instanced rendering. Press <b>M</b> to switch the index live
       (binary tree / octree / Morton grid / projection — all O(1)-relocated via stable handles).</span>
+      </div>
     </a>
     <a class="card" href="siege.html">
+      <img class="thumb" src="shots/siege.jpg" alt="Procedural voxel battlefield with a volcano and two clashing armies" loading="lazy">
+      <div class="body">
       <span class="tag">3D</span>
       <h2>Siege →</h2>
       <span class="d">A procedural medieval battlefield: two castles sally their armies and clash.
       Every unit's brain is a spatial query — k-NN targeting, raycast line-of-fire, sphere-cull
       AoE, smoke that blocks shots. Eight troop types, one query each. (Native runs the AI
       across all cores via a live thread slider; the web build is single-threaded.)</span>
+      </div>
     </a>
     <a class="card" href="siege_wgpu.html">
+      <img class="thumb" src="shots/siege_wgpu.jpg" alt="The same battle rendered on wgpu with GPU skeletal skinning" loading="lazy">
+      <div class="body">
       <span class="tag">wgpu · WebGPU</span>
       <h2>Siege (wgpu) →</h2>
       <span class="d">The same battle on a modern GPU stack — real <b>GPU skeletal skinning</b> of
       the whole army (the thing macroquad's WebGL1 can't). Shares the exact simulation with the
       macroquad siege. Needs a <b>WebGPU</b> browser (recent Chrome / Edge).</span>
+      </div>
     </a>
     <a class="card" href="horde_wgpu.html">
+      <img class="thumb" src="shots/horde_wgpu.jpg" alt="A walled colony ringed by scattered clusters of dormant zombies" loading="lazy">
+      <div class="body">
       <span class="tag">wgpu · WebGPU</span>
       <h2>Horde →</h2>
       <span class="d">A <i>They Are Billions</i>-style assault: a fortified colony vs tens of thousands
       of <b>dormant</b> zombies. Noise events wake them in cascading sphere-culls, towers auto-target
       (k-NN), breaches reroute the flood, one fallen house detonates the infection chain — and the
       sleeping horde costs <b>~nothing</b> to keep indexed. Needs a <b>WebGPU</b> browser.</span>
+      </div>
     </a>
     <a class="card" href="formations_wgpu.html">
+      <img class="thumb" src="shots/formations_wgpu.jpg" alt="Two armies drawn up in ordered regiments facing off across a field" loading="lazy">
+      <div class="body">
       <span class="tag">wgpu · WebGPU</span>
       <h2>Formations →</h2>
       <span class="d">A <i>Total War</i>-style automatic battle: regiments wheel and hold lines,
       cavalry charges arm over a <b>raycast</b> corridor, archer volleys land k-NN(1) with honest
       friendly fire, and flank/rear contact (sector classify) bleeds morale until an army
       <b>chain-routs</b>. Needs a <b>WebGPU</b> browser.</span>
+      </div>
     </a>
     <a class="card" href="gpu_lbvh_demo.html">
+      <img class="thumb" src="shots/gpu_lbvh_demo.jpg" alt="A point cloud coloured by neighbour density, GPU LBVH broad-phase" loading="lazy">
+      <div class="body">
       <span class="tag">wgpu · WebGPU</span>
       <h2>GPU broad-phase →</h2>
       <span class="d">The <i>same</i> neighbour-count query, three backends you flip live —
       CPU <b>Tree3</b> · GPU brute · <b>GPU LBVH</b> (a BVH from Morton codes, traversed in a
       compute shader). Identical picture, wildly different cost. Needs a <b>WebGPU</b> browser.</span>
+      </div>
     </a>
     <a class="card" href="gpu_storm.html">
+      <img class="thumb" src="shots/gpu_storm.jpg" alt="A GPU-resident collision storm of particles coloured by density" loading="lazy">
+      <div class="body">
       <span class="tag">wgpu · WebGPU</span>
       <h2>GPU storm →</h2>
       <span class="d">A <b>GPU-resident</b> collision storm — the whole hot loop (grid → contacts → integrate)
       on the GPU, no CPU round-trip. Switch the <i>whole</i> sim CPU↔GPU; <b>F</b> for an influence field.
       Coloured by local density. Needs a <b>WebGPU</b> browser.</span>
+      </div>
     </a>
   </div>
   <p class="note">Click the canvas to give it keyboard focus. The first load fetches ~1&nbsp;MB of

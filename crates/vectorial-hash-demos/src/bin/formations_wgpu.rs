@@ -789,11 +789,14 @@ async fn run() {
                     st.update_and_render();
                     frame += 1;
                     if frame % 15 == 0 {
+                        if std::env::var_os("SHOT").is_some() { window.set_title("vhshot"); }
+                        else {
                         let (r, b) = st.sim.counts();
                         let (sr, sb) = st.sim.standing();
                         window.set_title(&format!(
                             "vectorial-hash — formations (wgpu) · red {r} ({sr} regs) | blue {b} ({sb} regs) · kills {}:{} · run {} · {:.0} fps{}",
                             st.sim.kills[0], st.sim.kills[1], st.sim.run, st.fps, if st.paused { " · PAUSED" } else { "" }));
+                        }
                     }
                     #[cfg(not(target_arch = "wasm32"))]
                     if let Some(m) = max_frames {

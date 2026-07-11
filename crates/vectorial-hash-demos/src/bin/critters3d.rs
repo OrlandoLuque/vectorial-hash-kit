@@ -1607,6 +1607,7 @@ async fn main() {
                 break;
             }
         }
+        if let Some(p) = std::env::var_os("SHOT") { if frame >= 120 { let _ = get_screen_data().export_png(&p.to_string_lossy()); std::process::exit(0); } }
         next_frame().await;
     }
 }

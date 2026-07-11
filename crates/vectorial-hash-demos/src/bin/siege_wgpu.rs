@@ -1283,7 +1283,8 @@ async fn run() {
                         st.update_and_render();
                         frame += 1;
                         if frame % 15 == 0 {
-                            window.set_title(&format!("vectorial-hash — siege (wgpu) · Red {} | Blue {} · {:.0} fps{}", st.red, st.blue, st.fps, if st.paused { " · PAUSED" } else { "" }));
+                            if std::env::var_os("SHOT").is_some() { window.set_title("vhshot"); }
+                            else { window.set_title(&format!("vectorial-hash — siege (wgpu) · Red {} | Blue {} · {:.0} fps{}", st.red, st.blue, st.fps, if st.paused { " · PAUSED" } else { "" })); }
                         }
                         if let Some(m) = max_frames { if frame >= m { elwt.exit(); } }
                     }

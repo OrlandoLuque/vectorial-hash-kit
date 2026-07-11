@@ -633,6 +633,7 @@ async fn main() {
         );
         if paused { draw_text("PAUSED", screen_width() * 0.5 - 50.0, 40.0, 36.0, YELLOW); }
 
+        if let Some(p) = std::env::var_os("SHOT") { if frame_no >= 120 && screen_width() > 200.0 { let _ = get_screen_data().export_png(&p.to_string_lossy()); std::process::exit(0); } }
         next_frame().await;
         frame_no += 1;
         if let Some(m) = max_frames { if frame_no >= m { break; } }

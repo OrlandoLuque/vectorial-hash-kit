@@ -312,7 +312,7 @@ async fn run() {
                     else { grid_ms = 0.0; coll_ms = 0.0; integ_ms = 0.0; }
                 }
 
-                if frame % 8 == 0 {
+                if frame % 8 == 0 && std::env::var_os("SHOT").is_none() {
                     let mode_s = if mode > 0.5 { "influence" } else { "collision" };
                     let gpu_ms = sim_ms + render_ms;                 // total GPU work / frame
                     let load = gpu_ms / (1000.0 / 60.0) * 100.0;     // % of a 60 fps budget
