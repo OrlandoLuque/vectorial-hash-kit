@@ -58,8 +58,18 @@ safety net). Ordered — verifiable/high-value first, `[eyes]` last:
   capture, use the images as thumbnails in `docs/index.html`. *Blocker: no CLI
   screenshot on Windows + PowerShell deny-listed → the clean path is an offscreen
   "render 1 frame to PNG" mode in the wgpu demos (needs an image-encode dep).*
-- **(10) Research more optimisation strategies (with/without GPU)** — internet
-  search; run via the `deep-research` skill → a cited report (research repo).
+- ~~**(10) Research more optimisation strategies**~~ — **DONE** via `deep-research`
+  (23 sources, 25 claims verified, 17 confirmed) → `docs/OPTIMIZATION_RESEARCH.md`.
+  Headline: the kit is near-SOTA; concrete next steps = **Onesweep GPU radix sort**
+  (unblocks the GPU-side build; keep 32-bit Morton), **cache-oblivious arena
+  layout** (algorithm-free, high upside), **compressed wide-BVH nodes**,
+  **refit+rotations** if a persistent dynamic BVH is added. Our LBVH + keep-index
+  choices *validated* by the literature. *(The run hit the monthly spend limit
+  mid-verification — a few CPU/SIMD claims left unconfirmed; noted in the doc.)*
+- **(9) Demo screenshots** — still queued (eyes + offscreen-render-to-PNG mechanism).
+
+**Night ended on the monthly SPEND LIMIT** (the safety-net suspend's raison d'être).
+13 commits, all pushed, CI green. Suspended.
 
 ## ★ NEXT DEMO (user, 2026-07-07): a GPU-RESIDENT collision storm
 
