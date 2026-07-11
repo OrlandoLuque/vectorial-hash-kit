@@ -214,7 +214,10 @@ async fn run() {
             WindowEvent::CursorMoved { position, .. } => { let (dx, dy) = (position.x - last_mouse.0, position.y - last_mouse.1); last_mouse = (position.x, position.y); if drag { yaw += dx as f32 * 0.005; pitch = (pitch + dy as f32 * 0.004).clamp(-1.5, 1.5); } }
             WindowEvent::MouseWheel { delta, .. } => { let d = match delta { MouseScrollDelta::LineDelta(_, y) => y * 200.0, MouseScrollDelta::PixelDelta(p) => p.y as f32 }; dist = (dist - d).clamp(300.0, 7000.0); }
             WindowEvent::KeyboardInput { event: KeyEvent { physical_key: PhysicalKey::Code(c), state: ElementState::Pressed, .. }, .. } => match c {
-                KeyCode::Digit1 => { backend = Backend::Cpu; sync_from_gpu(&device, &queue, &pos_b, &vel_b, &readback, n, &mut pos, &mut vel); }
+                // CPU backend needs a synchronous GPU readback (sync_from_gpu),
+                // which can't work on web — and the wasm CPU sim would be far too
+                // slow at 150k anyway. Native only; on web `1` stays on the GPU.
+                KeyCode::Digit1 if cfg!(not(target_arch = "wasm32")) => { backend = Backend::Cpu; sync_from_gpu(&device, &queue, &pos_b, &vel_b, &readback, n, &mut pos, &mut vel); }
                 KeyCode::Digit2 => { backend = Backend::Gpu; queue.write_buffer(&pos_b, 0, bytemuck::cast_slice(&pos[..n])); queue.write_buffer(&vel_b, 0, bytemuck::cast_slice(&vel[..n])); }
                 KeyCode::BracketRight | KeyCode::BracketLeft => {
                     n = if c == KeyCode::BracketRight { (n + 50_000).min(max_n) } else { n.saturating_sub(50_000).max(10_000) };
@@ -293,7 +296,10 @@ async fn run() {
                 queue.submit(Some(enc.finish()));
                 frame_tex.present();
 
-                if qset.is_some() {
+                // native only: on WebGPU device.poll(Wait) doesn't block, so a
+                // synchronous map_async→get_mapped_range readback throws. Skip it
+                // on web (the timestamp meter reads 0 there — timestamps are gated).
+                if qset.is_some() && cfg!(not(target_arch = "wasm32")) {
                     device.poll(wgpu::Maintain::Wait);
                     ts_read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
                     device.poll(wgpu::Maintain::Wait);

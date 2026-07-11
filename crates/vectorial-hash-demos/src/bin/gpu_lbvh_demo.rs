@@ -293,7 +293,9 @@ async fn run() {
                 queue.submit(Some(enc.finish()));
                 frame_tex.present();
 
-                if qset.is_some() {
+                // native only: on WebGPU device.poll(Wait) doesn't block, so a
+                // synchronous map_async→get_mapped_range readback throws (skip on web).
+                if qset.is_some() && cfg!(not(target_arch = "wasm32")) {
                     device.poll(wgpu::Maintain::Wait);
                     ts_read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
                     device.poll(wgpu::Maintain::Wait);
