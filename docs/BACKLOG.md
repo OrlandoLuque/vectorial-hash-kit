@@ -85,13 +85,14 @@ safety net). Ordered — verifiable/high-value first, `[eyes]` last:
 4. **Full 3-projection vs expensive narrowphase** (THREE_D open item) — measure.
 5. **Nudge-free 3D walk** (Samet) — careful (the subset test can't catch under-collection).
 6. **Demos**: `MortonGrid` (2D) in the `critters` toggle; batch sight-lines to meshes.
-7. **GPU-side LBVH build** (radix+Karras) — the **radix half is DONE**
+7. **GPU-side LBVH build** (radix+Karras) — the **radix half is DONE + winning**
    (`examples/gpu_radix_bench`, 2026-07-17): a stable all-GPU 4-bit LSD radix of
-   Morton codes, verified == CPU, at **parity** with `sort_unstable` (262k 1.01× ·
-   4M 1.09×) and decisively past the old bitonic (which was ~2× *slower*).
-   Remaining: **Onesweep** decoupled-lookback scan (the single-workgroup scan is
-   the bottleneck) → then **Karras split + AABB refit** on top for the full
-   GPU-resident build. See OPTIMIZATION_RESEARCH.md §"Implemented + measured".
+   Morton codes, verified == CPU, **~2× faster** than `sort_unstable` (262k 2.37× ·
+   1M 1.77× · 4M 1.97×) after parallelising the scan 16-way (one thread/digit) —
+   the first serial-scan version was only at parity. Decisively past the old
+   bitonic (which was ~2× *slower*). Remaining: **Karras split + AABB refit** on
+   top for the full GPU-resident build (+ an Onesweep multi-workgroup scan for
+   even larger N). See OPTIMIZATION_RESEARCH.md §"Implemented + measured".
 8. `[eyes]` (leave for the user): colour-by-leaf-depth viz · 2D k-NN/LoS demo ·
    Quaternius RTS wall models · classic-Reynolds boids · balance · web touch+HUD.
 

@@ -31,8 +31,10 @@ const SHADER: &str = r#"
 
 const RADIX: u32 = 16u;
 
-var<workgroup> lhist: array<atomic<u32>, 16>;
-var<workgroup> ldig:  array<u32, 256>;
+var<workgroup> lhist:  array<atomic<u32>, 16>;
+var<workgroup> ldig:   array<u32, 256>;
+var<workgroup> wtotal: array<u32, 16>;
+var<workgroup> wbase:  array<u32, 16>;
 
 // 1) per-tile histogram of the current 4-bit digit.
 @compute @workgroup_size(256)
@@ -49,25 +51,28 @@ fn histogram(@builtin(global_invocation_id) gid: vec3<u32>,
 }
 
 // 2) exclusive scan over the (tile × digit) histogram → each tile's write base
-//    per digit. One workgroup, one thread — the counts are tiny (num_tiles×16).
-@compute @workgroup_size(1)
-fn scan() {
+//    per digit. One workgroup, 16 threads (one per digit) — the per-digit tile
+//    scans run in parallel instead of one thread walking tiles×16 serially.
+@compute @workgroup_size(16)
+fn scan(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let d = lid.x;           // this thread owns digit d
     let nt = p.z;
-    var total: array<u32, 16>;
-    for (var d = 0u; d < RADIX; d = d + 1u) { total[d] = 0u; }
-    for (var t = 0u; t < nt; t = t + 1u) {
-        for (var d = 0u; d < RADIX; d = d + 1u) { total[d] = total[d] + tile_hist[t * RADIX + d]; }
+    // phase 1: total count of digit d across all tiles.
+    var tot = 0u;
+    for (var t = 0u; t < nt; t = t + 1u) { tot = tot + tile_hist[t * RADIX + d]; }
+    wtotal[d] = tot;
+    workgroupBarrier();
+    // phase 2: digit_base[d] = Σ_{d'<d} total[d']  (thread 0 scans the 16 totals).
+    if (d == 0u) {
+        var acc = 0u;
+        for (var k = 0u; k < RADIX; k = k + 1u) { wbase[k] = acc; acc = acc + wtotal[k]; }
     }
-    // digit_base[d] = Σ_{d'<d} total[d']   (buckets laid out in digit order)
-    var run: array<u32, 16>;
-    var acc = 0u;
-    for (var d = 0u; d < RADIX; d = d + 1u) { run[d] = acc; acc = acc + total[d]; }
-    // per-tile exclusive prefix within each digit, offset by digit_base.
+    workgroupBarrier();
+    // phase 3: per-tile exclusive prefix within digit d, offset by digit_base.
+    var run = wbase[d];
     for (var t = 0u; t < nt; t = t + 1u) {
-        for (var d = 0u; d < RADIX; d = d + 1u) {
-            tile_off[t * RADIX + d] = run[d];
-            run[d] = run[d] + tile_hist[t * RADIX + d];
-        }
+        tile_off[t * RADIX + d] = run;
+        run = run + tile_hist[t * RADIX + d];
     }
 }
 
@@ -175,5 +180,5 @@ async fn run() {
     println!("{:>22} | {:>10.2}", "CPU sort_unstable", cpu_ms);
     let verdict = if gpu_ms < cpu_ms { format!("FASTER ({:.2}×)", cpu_ms / gpu_ms) } else { format!("slower ({:.2}×)", gpu_ms / cpu_ms) };
     println!("\nResult: the GPU radix is verified-correct and {verdict} than the CPU sort at this size.");
-    println!("(Stable 4-bit LSD, all-GPU: 3 kernels/pass, ping-pong, no CPU in the loop. The single-workgroup\nscan is the naive part — a tree/decoupled-lookback scan would lift the ceiling further. This unblocks\nthe on-GPU LBVH build: sort Morton codes here, then Karras split + AABB refit on top.)");
+    println!("(Stable 4-bit LSD, all-GPU: 3 kernels/pass, ping-pong, no CPU in the loop. The scan is 16-way\nparallel — one thread per digit — which is what put it clear of the CPU; a multi-workgroup\ndecoupled-lookback (Onesweep) scan would scale it further. This unblocks the on-GPU LBVH build:\nsort Morton codes here, then Karras split + AABB refit on top.)");
 }

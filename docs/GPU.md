@@ -33,7 +33,7 @@ cargo run -p vectorial-hash-demos --bin gpu_storm     --release
 | `gpu_spatial_bench` | GPU brute / GPU LBVH / CPU, + the per-frame **rebuild-vs-keep** verdict for *moving* data | kernel ~100–400×; but moving data → **parallel CPU keep-index wins at 1 M** |
 | `gpu_visibility_bench` | GPU **line-of-sight** over STATIC occluders (segment-vs-AABB LBVH traversal), verified == CPU `segment_hit` (Δ 0) | **~1380×** the serial CPU; 1 ms one-time build — the *clean* GPU case |
 | `gpu_sort_bench` | GPU **bitonic sort** of Morton codes, verified == CPU sort | **slower** than the CPU sort (log² work + dispatch/pass) — the honest negative that motivated the radix |
-| `gpu_radix_bench` | GPU **stable 4-bit LSD radix sort** of Morton codes, verified == CPU sort | **at parity** with `sort_unstable` (262k 1.01× · 4M 1.09×) — correct+stable, past the bitonic; the sort primitive for the GPU-side build |
+| `gpu_radix_bench` | GPU **stable 4-bit LSD radix sort** of Morton codes, verified == CPU sort | **~2× faster** than `sort_unstable` (262k **2.37×** · 1M 1.77× · 4M 1.97×) — correct+stable, past the bitonic; the sort primitive for the GPU-side build |
 
 ```bash
 cargo run -p vectorial-hash-demos --example gpu_spatial_bench   --release --features parallel   # GPU_N/M/R/CLUSTER
@@ -68,12 +68,12 @@ headline is the kernel only. The honest rule:
 The one thing that would push the *moving* broad-phase crossover past 1 M is a
 GPU-side build (build the BVH on the GPU each frame instead of the CPU). The
 **sort half is now done**: `gpu_radix_bench` is a stable all-GPU 4-bit LSD radix,
-verified == CPU and **at parity** with `sort_unstable` (vs the bitonic's ~2×
-loss). Remaining for the full build: an **Onesweep** decoupled-lookback scan (the
-single-workgroup exclusive scan is the current radix bottleneck), then a GPU
-**Karras** hierarchy + **AABB refit** on top — with the sort GPU-resident, the
-whole build avoids the readback. Until that lands, GPU is for the static /
-resident / query-dominated cases above.
+verified == CPU and **~2× faster** than `sort_unstable` (262k 2.37×) — past both
+the bitonic's ~2× *loss* and the CPU. Remaining for the full build: a GPU
+**Karras** hierarchy + **AABB refit** on top of the sorted codes (and, for even
+larger N, an **Onesweep** multi-workgroup scan beyond the current 16-way one) —
+with the sort GPU-resident, the whole build avoids the readback. Until that
+lands, GPU is for the static / resident / query-dominated cases above.
 
 ## Design notes
 
