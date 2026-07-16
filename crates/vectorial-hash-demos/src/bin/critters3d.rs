@@ -516,13 +516,18 @@ fn draw_graph(x: f32, y: f32, w: f32, h: f32, label: &str, data: &[f32], color: 
 
 /// One frame's drawable state — recorded into the history ring so a past frame
 /// can be redrawn without re-simulating. Holds exactly the render inputs:
-/// the critter instances, the effect instances, and the index's leaf boxes.
+/// the critter instances, the effect instances, the index's leaf boxes, and the
+/// observe-mode overlay (vision sphere + the sight-lines to what its cull saw) so
+/// the culling visualisation stays put while you scrub the replay.
 #[derive(Clone, Default)]
 struct Frame {
     instances: Vec<Instance>,
     sphere_fx: Vec<EffectInstance>,
     drop_fx: Vec<EffectInstance>,
     boxes: Vec<(Vec3, Vec3)>,
+    observer: Vec3,     // vision-sphere centre at capture
+    vision_r: f32,      // vision-cull radius at capture
+    lit_pos: Vec<Vec3>, // positions of the critters this frame's cull saw (sight-line ends)
 }
 
 /// Draw a `Frame`'s world: the cube, the leaf boxes (if shown), the instanced
@@ -1326,7 +1331,7 @@ async fn main() {
 
         // --- build this frame's drawable state (critters + effects + boxes) ---
         let t_prep = Instant::now();
-        let mut cur = Frame { boxes, ..Default::default() };
+        let mut cur = Frame { boxes, observer, vision_r, ..Default::default() };
         if render_mode.geom().is_some() {
             for (i, c) in critters.iter().enumerate() {
                 let (col, rad) = match sim_mode {
@@ -1336,6 +1341,7 @@ async fn main() {
                     }
                 };
                 cur.instances.push(Instance::new(c.pos, rad, [col.r, col.g, col.b, col.a]));
+                if sim_mode == SimMode::Observe && lit[i] { cur.lit_pos.push(c.pos); }
             }
         }
         if render_mode != RenderMode::None && sim_mode == SimMode::Combat {
@@ -1380,12 +1386,14 @@ async fn main() {
         };
         draw_world_visuals(&mut renderer, render_mode.geom(), view_frame, mvp, cam_right, cam_up, show_boxes, world, observer);
 
-        // observe-only live extras (vision sphere + sight-lines) — not recorded.
-        if scrub == 0 && sim_mode == SimMode::Observe && render_mode != RenderMode::None {
-            draw_sphere_wires(observer, vision_r, None, Color::new(1.0, 0.9, 0.3, 0.5));
-            draw_sphere(observer, 3.0, None, WHITE);
-            for (i, c) in critters.iter().enumerate() {
-                if lit[i] { draw_line_3d(c.pos, observer, Color::new(1.0, 0.85, 0.3, 0.25)); }
+        // Observe-mode overlay (vision sphere + sight-lines), drawn from the
+        // recorded frame so it stays put while scrubbing the replay — it used to
+        // be gated to the live view, so rewinding blanked the yellow grid.
+        if sim_mode == SimMode::Observe && render_mode != RenderMode::None {
+            draw_sphere_wires(view_frame.observer, view_frame.vision_r, None, Color::new(1.0, 0.9, 0.3, 0.5));
+            draw_sphere(view_frame.observer, 3.0, None, WHITE);
+            for p in &view_frame.lit_pos {
+                draw_line_3d(*p, view_frame.observer, Color::new(1.0, 0.85, 0.3, 0.25));
             }
         }
 
