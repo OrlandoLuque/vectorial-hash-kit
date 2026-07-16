@@ -46,6 +46,19 @@ compare** — then set the winner as the default (env still overrides).
   the measured deltas, don't guess. **Native vs web differ** (no threads/rayon on
   web; WebGL1 vs wgpu) → pick the best mode *per target*, not one global default.
 
+**Measured so far (2026-07-17 night):**
+- **horde decide rate** → 15 Hz→7.5 Hz default, **+22 %** at 53k active (item 1 above).
+- **critters3d index** → the headless decision map (`--sweep`) says `binR`
+  (Tree3 + `ItemRef`) wins **maintain 15/16** configs and cull 9/16 (Morton only
+  wins cull in sparse 1024³ worlds). The demo already boots Binary3 + ItemRef →
+  **current default validated, no change.** And at 10k pop the index is ~0.1–0.3
+  ms of a 16 ms frame → the demo is **render-bound**; its FPS lever is the render
+  path (already instanced = default), not the index.
+- **Remaining to measure:** siege voxel vs smooth terrain FPS (PERF_NOTES has a
+  first number); horde frustum-cull (`K`) default on/off; siege/formations thread
+  default (already all-cores). Most defaults already look optimal — the honest
+  outcome so far is "validated", with decide-buckets the one real win.
+
 ## ★ OVERNIGHT — round 5 (user, 2026-07-11): autonomous, safety-net 02:00
 
 Full autonomous mandate again (commit + doc per task; suspend when done or at the
