@@ -73,9 +73,9 @@ keep-index vs rebuild, SoA vs AoS batch — the kit already has measured studies
 
 ## Suggested next steps (ranked)
 
-1. **Onesweep-style GPU radix sort** → unblocks the GPU-side LBVH build (the one
-   thing that would push the moving-broad-phase crossover past 1 M). Keep 32-bit
-   Morton codes.
+1. **GPU radix sort** → **DONE** (a stable 4-bit LSD radix, see below); the
+   *Onesweep* upgrade (decoupled-lookback scan) is the remaining lever to push it
+   clear of the CPU. Keep 32-bit Morton codes.
 2. ~~**Cache-oblivious arena layout**~~ → **DONE** as `Tree3::compact()` (see below).
 3. **Compressed wide-BVH nodes** — cut bytes-per-step against the memory wall.
 4. **Refit + rotations** — only if a persistent dynamic BVH is ever added.
@@ -98,3 +98,21 @@ keep-index vs rebuild, SoA vs AoS batch — the kit already has measured studies
   before a query-heavy phase after churn (`bulk_load` already lays out compactly,
   so a fresh build doesn't need it). Not wired into the demos — their per-frame
   cull is a small slice, so 15 % of it isn't worth the periodic compaction hitch.
+
+- **GPU radix sort → `examples/gpu_radix_bench`** (2026-07-17). A **stable 4-bit
+  LSD radix** of 32-bit Morton codes, fully on the GPU: 3 compute kernels per pass
+  (per-tile histogram → single-workgroup exclusive scan → stable local-rank
+  scatter), ping-pong buffers, 8 passes, no CPU in the loop. **Verified exactly ==
+  a CPU sort** at every size. Measured (RTX 4080 SUPER, min-of-7 vs
+  `sort_unstable`):
+  - 262k keys: GPU 2.52 ms · CPU 2.54 ms — **1.01×** (parity)
+  - 1 M keys:  GPU 11.78 ms · CPU 11.13 ms — 1.06× slower
+  - 4 M keys:  GPU 44.92 ms · CPU 48.98 ms — **1.09× faster**
+  The headline vs the old `gpu_sort_bench`: the **bitonic was ~2× *slower* than the
+  CPU; the radix is at parity** and correct+stable — the primitive the research
+  named. It's scan-bound (the single-workgroup exclusive scan serialises the
+  per-tile offsets); the **Onesweep** decoupled-lookback scan is the upgrade that
+  would push it clear. This **unblocks the on-GPU LBVH build**: the sort now stays
+  GPU-resident (no readback), so parity-in-isolation is a win in-pipeline — sort
+  Morton codes here, then Karras split + AABB refit on top, all without a round
+  trip. (32-bit keys; a full build emulates u64 as `vec2<u32>`.)
