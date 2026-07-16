@@ -76,8 +76,25 @@ keep-index vs rebuild, SoA vs AoS batch — the kit already has measured studies
 1. **Onesweep-style GPU radix sort** → unblocks the GPU-side LBVH build (the one
    thing that would push the moving-broad-phase crossover past 1 M). Keep 32-bit
    Morton codes.
-2. **Cache-oblivious arena layout** for the trees — cheap, algorithm-free, high upside.
+2. ~~**Cache-oblivious arena layout**~~ → **DONE** as `Tree3::compact()` (see below).
 3. **Compressed wide-BVH nodes** — cut bytes-per-step against the memory wall.
 4. **Refit + rotations** — only if a persistent dynamic BVH is ever added.
 5. Verify the **AVX-512 broad-phase** lead with our own bench before investing
    (the spend limit cut its verification short).
+
+## Implemented + measured (from this list)
+
+- **Cache-oblivious arena layout → `Tree3::compact()`** (2026-07-17). A one-pass
+  DFS pre-order reorder of the node arena (a node lands adjacent to its first
+  child, so a root→leaf descent walks mostly-contiguous memory) that also
+  reclaims freed slots. Pure layout — brute-force-gated identical cull/knn/handle
+  results (`compact_preserves_queries_and_handles`). **Measured on a churned
+  keep-index tree** (`examples/compact_bench`, 300 frames of `update_ref`
+  relocations that scramble the arena):
+  - N=100k: cull **3.66 → 3.13 µs/query = 1.17×** (36k nodes, 1.8 ms to compact).
+  - N=200k: cull **5.50 → 4.74 µs/query = 1.16×** (72k nodes, 3.2 ms to compact).
+  Honest read: a steady **~1.16× cull win**, not the literature's 26–300 % (that
+  was pathological / other structures). One pass, amortises over many frames; best
+  before a query-heavy phase after churn (`bulk_load` already lays out compactly,
+  so a fresh build doesn't need it). Not wired into the demos — their per-frame
+  cull is a small slice, so 15 % of it isn't worth the periodic compaction hitch.

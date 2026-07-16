@@ -630,6 +630,51 @@ impl<T: Positioned3> Tree3<T> {
     pub fn node_count(&self) -> usize { self.nodes.len() }
     pub fn live_node_count(&self) -> usize { self.nodes.len() - self.free.len() }
 
+    /// Reorder the node arena into DFS pre-order and drop freed slots — a pure
+    /// **cache-locality** pass (van-Emde-Boas-flavoured: a node lands adjacent to
+    /// its first child, so a root→leaf descent walks mostly-contiguous memory).
+    /// The tree shape, items, bboxes, handles and *every query result* are
+    /// unchanged; only the `nodes` Vec order and the internal `Node3Id`s move.
+    ///
+    /// Why: after a long churny run the split/merge slots land wherever the free
+    /// list points, so insertion-order nodes drift into a scramble and descents
+    /// thrash cache. `compact()` restores locality (and reclaims freed slots).
+    /// O(live nodes), one pass. Invalidates any raw `Node3Id` you cached — but
+    /// **not** `ItemRef` handles, which are remapped. See `docs/PERF_NOTES.md`.
+    pub fn compact(&mut self) {
+        let n = self.nodes.len();
+        let mut old2new = vec![u32::MAX; n];
+        let mut order: Vec<Node3Id> = Vec::with_capacity(self.live_node_count());
+        // DFS pre-order from the root: emit a node, then recurse its children —
+        // push right before left so the left child pops first and lands right
+        // after its parent (the contiguous descent spine).
+        let mut stack = vec![self.root];
+        while let Some(id) = stack.pop() {
+            old2new[id.0 as usize] = order.len() as u32;
+            order.push(id);
+            if let Some([a, b]) = self.get(id).children { stack.push(b); stack.push(a); }
+        }
+        let remap = |id: Node3Id| Node3Id(old2new[id.0 as usize]);
+        let mut new_nodes: Vec<Node3<T>> = Vec::with_capacity(order.len());
+        for &old in &order {
+            let bbox = self.nodes[old.0 as usize].bbox;
+            let mut node = std::mem::replace(&mut self.nodes[old.0 as usize],
+                Node3 { bbox, parent: None, children: None, items: Vec::new(), hs: Vec::new() });
+            node.parent = node.parent.map(remap);
+            node.children = node.children.map(|[a, b]| [remap(a), remap(b)]);
+            new_nodes.push(node);
+        }
+        // Remap the handle table (live handles always point at a reachable node;
+        // stale free-handle locs may not, so guard on the sentinel).
+        for loc in self.locs.iter_mut() {
+            let nn = old2new[loc.node.0 as usize];
+            if nn != u32::MAX { loc.node = Node3Id(nn); }
+        }
+        self.root = remap(self.root);
+        self.nodes = new_nodes;
+        self.free.clear();
+    }
+
     pub fn insert(&mut self, item: T) -> bool {
         self.insert_ref(item).is_some()
     }
@@ -1474,6 +1519,65 @@ mod tests {
             assert_eq!(want, got, "cull != brute for sphere ({cx},{cy},{cz}) r={r}");
         }
         let _ = brute(&pts, &Sphere3::new(0.0,0.0,0.0,10.0));
+    }
+
+    #[test]
+    fn compact_preserves_queries_and_handles() {
+        // compact() is a pure layout pass. After churn (inserts + relocations +
+        // removes leave the arena scrambled with free slots), reordering must
+        // change NO cull/knn result, must reclaim the free slots, and every live
+        // ItemRef must still resolve to its own item.
+        let mut x = 0x0BAD_C0DEu64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x >> 11) as f64 / (1u64 << 53) as f64 };
+        let world = Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0);
+        let mut tree = Tree3::<P>::new(world, 8);
+        let mut refs: Vec<Option<ItemRef>> = Vec::new();
+        let mut expected: Vec<Option<Point3>> = Vec::new();
+        for _ in 0..3000 {
+            let p = Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0);
+            refs.push(tree.insert_ref(P(p)));
+            expected.push(Some(p));
+        }
+        // Churn: relocate every 3rd (scatters split slots), remove every 5th.
+        for i in 0..3000 {
+            if i % 3 == 0 { if let Some(r) = refs[i] {
+                let np = Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0);
+                tree.update_ref(r, |q| q.0 = np); expected[i] = Some(np);
+            } }
+            if i % 5 == 0 { if let Some(r) = refs[i].take() { tree.remove_ref(r); expected[i] = None; } }
+        }
+        assert!(tree.node_count() > tree.live_node_count(), "churn should leave free slots to reclaim");
+
+        let spheres = [(128.0,128.0,128.0,40.0),(40.0,40.0,40.0,60.0),(250.0,250.0,250.0,30.0),(0.0,0.0,0.0,100.0)];
+        let snap_cull = |t: &Tree3<P>| -> Vec<Vec<(u64,u64,u64)>> {
+            spheres.iter().map(|&(cx,cy,cz,r)| {
+                let s = Sphere3::new(cx,cy,cz,r).with_raster();
+                let mut v: Vec<(u64,u64,u64)> = t.cull(&s).iter().map(|p| (p.0.x.to_bits(), p.0.y.to_bits(), p.0.z.to_bits())).collect();
+                v.sort(); v
+            }).collect()
+        };
+        let queries = [Point3::new(50.0,60.0,70.0), Point3::new(200.0,200.0,10.0), Point3::new(128.0,128.0,128.0)];
+        let snap_knn = |t: &Tree3<P>| -> Vec<Vec<u64>> {
+            queries.iter().map(|&q| { let mut d: Vec<u64> = t.knn(q, 12).iter().map(|(dist,_)| dist.to_bits()).collect(); d.sort(); d }).collect()
+        };
+        let cull_before = snap_cull(&tree);
+        let knn_before = snap_knn(&tree);
+
+        tree.compact();
+
+        assert_eq!(tree.node_count(), tree.live_node_count(), "compact must reclaim every free slot");
+        assert_eq!(cull_before, snap_cull(&tree), "compact changed a cull result");
+        assert_eq!(knn_before, snap_knn(&tree), "compact changed a knn result");
+        // Every live handle still resolves to exactly its own (possibly relocated) item.
+        for i in 0..3000 {
+            if let Some(r) = refs[i] {
+                let got = tree.remove_ref(r).expect("live handle must resolve after compact").0;
+                let want = expected[i].expect("live handle should have an expected position");
+                assert_eq!((got.x.to_bits(), got.y.to_bits(), got.z.to_bits()),
+                           (want.x.to_bits(), want.y.to_bits(), want.z.to_bits()),
+                           "handle {i} resolved to the wrong item after compact");
+            }
+        }
     }
 
     #[test]
