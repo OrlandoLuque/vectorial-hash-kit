@@ -646,6 +646,43 @@ impl<T: Positioned> Tree<T> {
     /// Currently-reachable nodes (arena capacity minus free-list slots).
     pub fn live_node_count(&self) -> usize { self.nodes.len() - self.free.len() }
 
+    /// Reorder the node arena into DFS pre-order and drop freed slots — the
+    /// [`Tree3::compact`](crate::Tree3::compact) cache-locality pass for the 2D
+    /// binary tree. Pure layout: shape, items, bboxes, `ItemRef` handles and
+    /// every query result are unchanged; only the internal `NodeId`s move
+    /// (handles remapped, raw `NodeId`s not). Under the `neighbors` feature the
+    /// leaf ropes are regenerated (their `NodeId`s moved). O(live nodes).
+    pub fn compact(&mut self) {
+        let mut old2new = vec![u32::MAX; self.nodes.len()];
+        let mut order: Vec<NodeId> = Vec::with_capacity(self.live_node_count());
+        let mut stack = vec![self.root];
+        while let Some(id) = stack.pop() {
+            old2new[id.0 as usize] = order.len() as u32;
+            order.push(id);
+            if let Some([a, b]) = self.get(id).children { stack.push(b); stack.push(a); }
+        }
+        let remap = |id: NodeId| NodeId(old2new[id.0 as usize]);
+        let mut new_nodes: Vec<Node<T>> = Vec::with_capacity(order.len());
+        for &old in &order {
+            let bbox = self.nodes[old.0 as usize].bbox;
+            let mut node = std::mem::replace(&mut self.nodes[old.0 as usize], Node::new_leaf(bbox, None));
+            node.parent = node.parent.map(remap);
+            node.children = node.children.map(|[a, b]| [remap(a), remap(b)]);
+            new_nodes.push(node);
+        }
+        for loc in self.locs.iter_mut() {
+            let nn = old2new[loc.node.0 as usize];
+            if nn != u32::MAX { loc.node = NodeId(nn); }
+        }
+        self.root = remap(self.root);
+        self.nodes = new_nodes;
+        self.free.clear();
+        // Ropes carry stale NodeIds after the reorder — regenerate from scratch
+        // (same routine bulk_load uses). No-op when the feature is compiled out.
+        #[cfg(feature = "neighbors")]
+        self.rebuild_ropes();
+    }
+
     /// Visit every live leaf reachable from the root, in depth-first order.
     ///
     /// Orphaned nodes left behind by `remove`/`update` merges are not visited.
@@ -1310,6 +1347,57 @@ mod tests {
     impl crate::Shape for Disc {
         fn bounding_box(&self) -> Rect { Rect::new(self.cx - self.r, self.cy - self.r, 2.0 * self.r, 2.0 * self.r) }
         fn contains_point(&self, p: Point) -> bool { let (dx, dy) = (p.x - self.cx, p.y - self.cy); dx * dx + dy * dy <= self.r * self.r }
+    }
+
+    #[test]
+    fn compact_preserves_queries_and_handles() {
+        // 2D Tree twin of the Tree3 compact test: churn scrambles the arena, then
+        // compact() must change no cull/knn result, reclaim free slots, and keep
+        // every live handle resolving to its own item. Under `--features
+        // neighbors` it also exercises the rope rebuild (cull/knn stay identical).
+        let mut x = 0x2D0C_0DE7u64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x >> 11) as f64 / (1u64 << 53) as f64 };
+        let mut tree = Tree::<Pt>::new(Rect::new(0.0, 0.0, 256.0, 256.0), 8);
+        let mut refs: Vec<Option<ItemRef>> = Vec::new();
+        let mut expected: Vec<Option<Point>> = Vec::new();
+        for _ in 0..3000 {
+            let p = Point::new(rng() * 256.0, rng() * 256.0);
+            refs.push(tree.insert_ref(Pt(p)));
+            expected.push(Some(p));
+        }
+        for i in 0..3000 {
+            if i % 3 == 0 { if let Some(r) = refs[i] {
+                let np = Point::new(rng() * 256.0, rng() * 256.0);
+                tree.update_ref(r, |q| q.0 = np); expected[i] = Some(np);
+            } }
+            if i % 5 == 0 { if let Some(r) = refs[i].take() { tree.remove_ref(r); expected[i] = None; } }
+        }
+        assert!(tree.node_count() > tree.live_node_count(), "churn should leave free slots to reclaim");
+        let discs = [(128.0,128.0,40.0),(40.0,40.0,60.0),(250.0,250.0,30.0),(0.0,0.0,100.0)];
+        let snap_cull = |t: &Tree<Pt>| -> Vec<Vec<(u64,u64)>> {
+            discs.iter().map(|&(cx,cy,r)| {
+                let mut v: Vec<(u64,u64)> = t.cull(&Disc{cx,cy,r}).iter().map(|p| (p.0.x.to_bits(), p.0.y.to_bits())).collect();
+                v.sort(); v
+            }).collect()
+        };
+        let queries = [Point::new(50.0,60.0), Point::new(200.0,10.0), Point::new(128.0,128.0)];
+        let snap_knn = |t: &Tree<Pt>| -> Vec<Vec<u64>> {
+            queries.iter().map(|&q| { let mut d: Vec<u64> = t.knn(q, 12).iter().map(|(dist,_)| dist.to_bits()).collect(); d.sort(); d }).collect()
+        };
+        let cull_before = snap_cull(&tree);
+        let knn_before = snap_knn(&tree);
+        tree.compact();
+        assert_eq!(tree.node_count(), tree.live_node_count(), "compact must reclaim every free slot");
+        assert_eq!(cull_before, snap_cull(&tree), "compact changed a cull result");
+        assert_eq!(knn_before, snap_knn(&tree), "compact changed a knn result");
+        for i in 0..3000 {
+            if let Some(r) = refs[i] {
+                let got = tree.remove_ref(r).expect("live handle must resolve after compact").0;
+                let want = expected[i].unwrap();
+                assert_eq!((got.x.to_bits(), got.y.to_bits()), (want.x.to_bits(), want.y.to_bits()),
+                           "handle {i} resolved to the wrong item after compact");
+            }
+        }
     }
 
     #[test]

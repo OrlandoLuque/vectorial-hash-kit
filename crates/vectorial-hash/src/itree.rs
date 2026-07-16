@@ -207,6 +207,39 @@ impl<T: IPositioned> IntegerTree<T> {
     pub fn node_count(&self) -> usize { self.nodes.len() }
     pub fn live_node_count(&self) -> usize { self.nodes.len() - self.free.len() }
 
+    /// Reorder the node arena into DFS pre-order and drop freed slots — the
+    /// [`Tree3::compact`](crate::Tree3::compact) cache-locality pass for the
+    /// integer 2D tree. Pure layout: shape, items, bboxes, `ItemRef` handles and
+    /// every query result are unchanged; only the internal `INodeId`s move
+    /// (handles remapped, raw `INodeId`s not). O(live nodes), one pass.
+    pub fn compact(&mut self) {
+        let mut old2new = vec![u32::MAX; self.nodes.len()];
+        let mut order: Vec<INodeId> = Vec::with_capacity(self.live_node_count());
+        let mut stack = vec![self.root];
+        while let Some(id) = stack.pop() {
+            old2new[id.0 as usize] = order.len() as u32;
+            order.push(id);
+            if let Some([a, b]) = self.get(id).children { stack.push(b); stack.push(a); }
+        }
+        let remap = |id: INodeId| INodeId(old2new[id.0 as usize]);
+        let mut new_nodes: Vec<INode<T>> = Vec::with_capacity(order.len());
+        for &old in &order {
+            let bbox = self.nodes[old.0 as usize].bbox;
+            let mut node = std::mem::replace(&mut self.nodes[old.0 as usize],
+                INode { bbox, parent: None, children: None, items: Vec::new(), hs: Vec::new() });
+            node.parent = node.parent.map(remap);
+            node.children = node.children.map(|[a, b]| [remap(a), remap(b)]);
+            new_nodes.push(node);
+        }
+        for loc in self.locs.iter_mut() {
+            let nn = old2new[loc.node.0 as usize];
+            if nn != u32::MAX { loc.node = INodeId(nn); }
+        }
+        self.root = remap(self.root);
+        self.nodes = new_nodes;
+        self.free.clear();
+    }
+
     pub fn item_count(&self) -> usize {
         let mut n = 0;
         self.visit_leaves(|_, leaf| n += leaf.items.len());
@@ -677,6 +710,56 @@ mod tests {
     impl Shape for Disc {
         fn bounding_box(&self) -> Rect { Rect::new(self.cx - self.r, self.cy - self.r, 2.0 * self.r, 2.0 * self.r) }
         fn contains_point(&self, p: Point) -> bool { let (dx, dy) = (p.x - self.cx, p.y - self.cy); dx * dx + dy * dy <= self.r * self.r }
+    }
+
+    #[test]
+    fn compact_preserves_queries_and_handles() {
+        // IntegerTree twin of the Tree3 compact test: churn scrambles the arena,
+        // then compact() must change no cull/knn result, reclaim free slots, and
+        // keep every live handle resolving to its own item.
+        let mut x = 0x1D7C_0DE9u64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x >> 11) as f64 / (1u64 << 53) as f64 };
+        let ri = |r: &mut dyn FnMut() -> f64| (r() * 256.0) as i32;
+        let mut tree = IntegerTree::<IP>::new(IRect::new(0, 0, 256, 256), 8);
+        let mut refs: Vec<Option<ItemRef>> = Vec::new();
+        let mut expected: Vec<Option<IPoint>> = Vec::new();
+        for _ in 0..3000 {
+            let p = IPoint::new(ri(&mut rng), ri(&mut rng));
+            refs.push(tree.insert_ref(IP(p)));
+            expected.push(Some(p));
+        }
+        for i in 0..3000 {
+            if i % 3 == 0 { if let Some(r) = refs[i] {
+                let np = IPoint::new(ri(&mut rng), ri(&mut rng));
+                tree.update_ref(r, |q| q.0 = np); expected[i] = Some(np);
+            } }
+            if i % 5 == 0 { if let Some(r) = refs[i].take() { tree.remove_ref(r); expected[i] = None; } }
+        }
+        assert!(tree.node_count() > tree.live_node_count(), "churn should leave free slots to reclaim");
+        let discs = [(128.0,128.0,40.0),(40.0,40.0,60.0),(250.0,250.0,30.0),(0.0,0.0,100.0)];
+        let snap_cull = |t: &IntegerTree<IP>| -> Vec<Vec<(i32,i32)>> {
+            discs.iter().map(|&(cx,cy,r)| {
+                let mut v: Vec<(i32,i32)> = t.cull(&Disc{cx,cy,r}).iter().map(|p| (p.0.x, p.0.y)).collect();
+                v.sort(); v
+            }).collect()
+        };
+        let queries = [IPoint::new(50,60), IPoint::new(200,10), IPoint::new(128,128)];
+        let snap_knn = |t: &IntegerTree<IP>| -> Vec<Vec<u64>> {
+            queries.iter().map(|&q| { let mut d: Vec<u64> = t.knn(q, 12).iter().map(|(dist,_)| dist.to_bits()).collect(); d.sort(); d }).collect()
+        };
+        let cull_before = snap_cull(&tree);
+        let knn_before = snap_knn(&tree);
+        tree.compact();
+        assert_eq!(tree.node_count(), tree.live_node_count(), "compact must reclaim every free slot");
+        assert_eq!(cull_before, snap_cull(&tree), "compact changed a cull result");
+        assert_eq!(knn_before, snap_knn(&tree), "compact changed a knn result");
+        for i in 0..3000 {
+            if let Some(r) = refs[i] {
+                let got = tree.remove_ref(r).expect("live handle must resolve after compact").0;
+                let want = expected[i].unwrap();
+                assert_eq!((got.x, got.y), (want.x, want.y), "handle {i} resolved to the wrong item after compact");
+            }
+        }
     }
 
     #[test]
