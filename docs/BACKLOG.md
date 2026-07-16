@@ -12,6 +12,40 @@ reprioritise, or drop freely. Items graduate into the per-crate roadmaps
 and confirm pirates-vs-undead renders. *(And remove the `ClaudeNightSuspend`
 scheduled task if it's still around.)*
 
+## ★ 2026-07-11 (morning, with the user) — landed + new ask
+
+**Landed this session (all pushed, CI green):**
+- ~~gpu_storm / gpu_lbvh_demo **web crash**~~ — WebGPU `poll(Wait)` doesn't block →
+  the synchronous timestamp readback threw every frame; gated to native.
+- ~~**Demo screenshots → visual index**~~ (was §9) — `SHOT` capture mode in every
+  demo (macroquad self-export via `get_screen_data`; wgpu title-freeze + `ffmpeg
+  gdigrab`), 8 JPEG thumbnails wired into `docs/index.html`. Plus `$SIEGE_POP`
+  boot override → recaptured siege/formations at max population.
+- ~~horde_wgpu **web crash**~~ — impostor `bb-shader` had an integral vertex output
+  without `@interpolate(flat)` (Tint-strict; naga tolerated it).
+- ~~3D critters **replay overlay**~~ — the vision-cull sphere/sight-lines are now
+  recorded into the history `Frame`, so they survive replay scrubbing.
+
+### ★ NEW ASK (user, 2026-07-11): auto-boot every demo in its highest-FPS mode
+
+With everything now measured (keep-index vs rebuild, voxel vs smooth terrain,
+impostors vs skinned LOD, boids maths vs table, Tree3 vs Morton, thread counts,
+frustum cull `K`, and — once done — decision-buckets), **pick the fastest default
+boot configuration for each demo** and make that the out-of-the-box mode. Method:
+**launch each demo for ~X seconds per candidate mode, print/collect the FPS, and
+compare** — then set the winner as the default (env still overrides).
+- Reuse the existing smoke/telemetry hooks that already print fps: `SIEGE_MAX_
+  FRAMES`, `HORDE_MAX_FRAMES` (prints fps/slp/act per ~second), `CRITTERS3D_MAX_
+  FRAMES`, plus the offscreen benches (`siege_cpu_bench`, `horde_bench`). Extend
+  where a knob isn't yet togglable by env.
+- Candidate axes per demo: index (Tree3 / Octree3 / Morton / projection), terrain
+  (voxel/smooth), LOD/impostor distance, thread count (native), decision-bucket
+  rate (horde), frustum cull on/off, population.
+- Deliverable: a short FPS-comparison table (per demo, per mode) + the chosen
+  defaults committed, noted in the relevant demo docs. Keep it honest — report
+  the measured deltas, don't guess. **Native vs web differ** (no threads/rayon on
+  web; WebGL1 vs wgpu) → pick the best mode *per target*, not one global default.
+
 ## ★ OVERNIGHT — round 5 (user, 2026-07-11): autonomous, safety-net 02:00
 
 Full autonomous mandate again (commit + doc per task; suspend when done or at the
