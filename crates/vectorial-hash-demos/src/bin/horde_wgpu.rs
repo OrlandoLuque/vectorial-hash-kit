@@ -1596,7 +1596,7 @@ struct Camera { vp: mat4x4<f32>, light: vec4<f32>, eye_time: vec4<f32>, night_to
 @group(0) @binding(0) var<uniform> cam: Camera;
 @group(0) @binding(1) var atlas: texture_2d_array<f32>;
 @group(0) @binding(2) var samp: sampler;
-struct VOut { @builtin(position) clip: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) tint: vec4<f32>, @location(2) layer: u32, @location(3) uv2: vec2<f32>, @location(4) bandmix: f32, @location(5) wpos: vec3<f32> };
+struct VOut { @builtin(position) clip: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) tint: vec4<f32>, @location(2) @interpolate(flat) layer: u32, @location(3) uv2: vec2<f32>, @location(4) bandmix: f32, @location(5) wpos: vec3<f32> };
 const TAU: f32 = 6.2831853;
 fn torch_light(wp: vec3<f32>) -> vec3<f32> {
     var acc = vec3<f32>(0.0);
