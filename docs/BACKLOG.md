@@ -232,11 +232,14 @@ autonomously verifiable. User picked **"Todo (A–E)"** + the headline below.
   fixed by closing 3 feedback loops (carpet rebuilds, contact percolation,
   walking noise). Shipped doc: [HORDE.md](HORDE.md).
   **HORDE queue (priority order):**
-  1. ~~**Decision buckets 4–8 Hz**~~ — **DONE** (2026-07-06): far-from-walls
-     actives re-decide at 15 Hz (staggered; cached vel walks between), full
-     rate inside BASE_R+60. With the dynamics fixes (silent walking killed the
-     per-frame wake-cull storm): 100k pop mass assault 100 ms → **4.9 ms with
-     62k active (205 fps ceiling)**.
+  1. ~~**Decision buckets 4–8 Hz**~~ — **DONE + tuned to the 4–8 Hz target**
+     (2026-07-17): far-from-walls actives re-decide every `decide_n` frames
+     (staggered by id; cached vel walks between), full rate inside BASE_R+60.
+     Was 15 Hz (`4`); swept `$HORDE_DECIDE_N` on the 100k mass assault (~53k
+     active): 15 Hz 5.41 ms (185 fps) → **7.5 Hz (`8`, new default) 4.44 ms
+     (225 fps, +22 %)** → 4 Hz 4.09 ms (244 fps, +32 %). Chose 8 — banks most of
+     the win with coherent steering; 8→15 buys only +8 % for coarser paths.
+     Table in [HORDE.md](HORDE.md#decision-buckets).
   2. Impostor **elevation-band blending** — only if the band switch is visible
      when flying the camera up/down (user to confirm).
   3. **Scenario presets** (mountain pass / river crossing / forest paths) —

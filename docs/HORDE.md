@@ -122,6 +122,26 @@ that used to ignite the whole map in seconds (per-frame carpet rebuilds,
 contact-wake percolation, walking noise) are fixed; a wave now recruits
 linearly along its path and via wall-combat noise.
 
+### Decision buckets (measured, `$HORDE_DECIDE_N`)
+
+A zombie away from the walls doesn't need a fresh plan every frame — it coasts on
+its **cached velocity** between decisions while movement/heard/swings still run at
+full rate (and near-wall combat is never bucketed). Staggering the re-decide by id
+turns the decide pass into an every-`N`-frames cost. Sweeping `N` on the 100k mass
+assault (~53k active, 16 threads):
+
+```
+  N   rate     ms/step   fps    Δ vs 15 Hz
+  4   15 Hz     5.41     185     — (old default)
+  8   7.5 Hz    4.44     225     +22 %
+ 15   4 Hz      4.09     244     +32 %
+```
+
+**Default is now `N=8` (7.5 Hz)** — it banks most of the win (+22 %) with steering
+still visually coherent; 8→15 buys only +8 % more for coarser paths (the decide
+pass is already a shrinking slice — movement, the separation cull, `apply` and the
+index sync all run every frame). `$HORDE_DECIDE_N` overrides it live.
+
 ## Scenarios (`G`) — the same sim, five worlds
 
 **OPEN** is the classic ring-in-a-field. **PASS** raises a rock ridge at

@@ -527,6 +527,13 @@ fn via_gate(gates: &[(f64, f64)], from: Point3, tx: f64, tz: f64) -> (f64, f64) 
 
 // ----------------------------------------------------------------------- sim
 
+/// Default decision-bucket period (frames between re-decides for a zombie away
+/// from the walls). 8 = 7.5 Hz @60fps — chosen from the `horde_bench` sweep:
+/// dropping from the old 15 Hz (`4`) roughly halves the decide pass with no
+/// visible change to the march (steering stays coherent, combat is unbucketed).
+/// Override with `$HORDE_DECIDE_N`.
+pub const DECIDE_N_DEFAULT: u64 = 8;
+
 pub struct Horde {
     pub units: Vec<Zombie>,
     pub structures: Vec<Structure>,
@@ -564,6 +571,12 @@ pub struct Horde {
     pub now: f64,
     /// Frame counter — staggers the decision buckets.
     frame: u64,
+    /// Decision-bucket period: a zombie away from the walls re-decides every
+    /// `decide_n` frames (staggered by id), coasting on its cached velocity in
+    /// between. 4=15 Hz@60fps · 8=7.5 Hz · 15=4 Hz. Env `$HORDE_DECIDE_N`.
+    /// Larger = cheaper decide pass, staler steering — movement/heard/swings and
+    /// near-wall (combat) units always run at full rate regardless.
+    decide_n: u64,
     pub seed: f64,
     /// Woken-this-frame counter (for HUD/telemetry).
     pub woken_last: usize,
@@ -872,7 +885,9 @@ impl Horde {
             tower_threat_mode: false, cc_id,
             wave_k: 0, wave_spawn_t: 50.0, wave_dir: 0.0, wave_announced: false,
             game_over: None, run: 1, kills: 0,
-            rng, now: 0.0, frame: 0, seed: fseed, woken_last: 0, dormant_epoch: 1,
+            rng, now: 0.0, frame: 0,
+            decide_n: std::env::var("HORDE_DECIDE_N").ok().and_then(|s| s.parse().ok()).filter(|&n| n >= 1).unwrap_or(DECIDE_N_DEFAULT),
+            seed: fseed, woken_last: 0, dormant_epoch: 1,
             base_pop: pop, base_seed: seed,
             defenders: Vec::new(), threat: [0.0; SECTORS], weapons_free: false, cmd_t: 0.0, breach: None,
             gates: Vec::new(),
@@ -1202,6 +1217,7 @@ impl Horde {
             let (sindex, structures, flow) = (&self.sindex, &self.structures, &self.flow);
             let defenders = &self.defenders;
             let frame = self.frame;
+            let decide_n = self.decide_n;
             let (units, cx, cz) = (&mut self.units, WORLD / 2.0, WORLD / 2.0);
             let decide_one = |i: usize, z: &mut Zombie| {
                 if !z.alive() { return; }
@@ -1223,7 +1239,7 @@ impl Horde {
                 {
                     let (dx0, dz0) = (z.p.x - cx, z.p.z - cz);
                     let near_combat = (dx0 * dx0 + dz0 * dz0).sqrt() < BASE_R + 60.0;
-                    if !near_combat && (frame + i as u64) % 4 != 0 { return; } // keep cached vel
+                    if !near_combat && (frame + i as u64) % decide_n != 0 { return; } // keep cached vel
                 }
                 // Target acquisition near the base: nearest LIVE structure in
                 // reach (k-NN on the static index; venom's 36-wu standoff spit
