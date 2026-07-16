@@ -54,10 +54,20 @@ compare** — then set the winner as the default (env still overrides).
   **current default validated, no change.** And at 10k pop the index is ~0.1–0.3
   ms of a 16 ms frame → the demo is **render-bound**; its FPS lever is the render
   path (already instanced = default), not the index.
-- **Remaining to measure:** siege voxel vs smooth terrain FPS (PERF_NOTES has a
-  first number); horde frustum-cull (`K`) default on/off; siege/formations thread
-  default (already all-cores). Most defaults already look optimal — the honest
-  outcome so far is "validated", with decide-buckets the one real win.
+- **siege** → its defaults are *intentional*, not accidental: **voxel terrain**
+  is the requested headline look (smooth is cheaper geometry but the user asked
+  for voxel — an aesthetic default, not an FPS one; PERF_NOTES §"Voxel vs
+  smooth" has the delta), the **thread slider boots at all-cores** (fastest), and
+  the index is the **keep-index Tree3** (validated fastest, same as critters3d).
+  Nothing to flip.
+- **conclusion:** across the demos the boot defaults are already at/near optimal
+  — the one concrete win was **horde decide-buckets** (done, +22 %). Honest
+  outcome of the "auto-boot fastest mode" ask: *measured, mostly validated.*
+  (Remaining low-value knobs: horde frustum-cull `K` default — a quality/latency
+  call, left as a toggle.) **DONE enough to close.**
+
+Note: **`Tree::bulk_load` / `bulk_load_par` already exist** (2D) with tests — the
+old "2D Tree bulk-load (3D done)" backlog line was stale.
 
 ## ★ OVERNIGHT — round 5 (user, 2026-07-11): autonomous, safety-net 02:00
 
