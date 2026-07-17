@@ -56,11 +56,16 @@ headline is the kernel only. The honest rule:
 - **✅ Whole-loop GPU-resident → GPU.** When positions/velocities never leave the
   GPU (a particle/DEM/flocking sim of one uniform rule), everything — grid, query,
   forces, integration — is on-GPU with no round-trip. `gpu_storm` = ~50× the CPU.
-- **❌ Moving data, one query slice offloaded → CPU keep-index.** A moving cloud
-  forces the BVH to be **rebuilt every frame**; that rebuild (an *N log N* sort)
-  overtakes the linear keep-index maintain, and at 1 M the parallel CPU keep-index
-  **beats** GPU LBVH per frame (measured 1.30×). The lever for moving data is the
-  `ItemRef` keep-index + `cull_many_par`, not the GPU.
+- **◑ Moving data → it depends on the moving FRACTION** (now that the GPU-side
+  build is real — `gpu_lbvh_build_bench`, ~9 ms/frame at 1 M, all GPU-resident).
+  - **Most of the cloud moves → GPU rebuild.** All-moving, per frame: GPU rebuild
+    vs the CPU keep-index's *best case* (serial `update_ref` over all, ~no
+    relocations): **262k 1.7 vs 8.4 ms · 1 M 9.3 vs 80 ms · 4 M 35 vs 517 ms** —
+    a serial maintain-*all* pass loses to the parallel build (5–15×). (Before the
+    radix, the GPU-side build didn't exist — the bitonic sort lost to the CPU.)
+  - **Only a fraction moves → CPU keep-index.** Its real edge is *skipping* the
+    items that didn't move (the horde demo's dormant carpet keeps for ~nothing);
+    `ItemRef` + the moved-only sync + `cull_many_par` is still the lever there.
 - **❌ The game sims stay on the CPU.** Their dominant cost is the *branchy*
   per-agent `decide` (FSM, targeting, morale) — warp-divergent, GPU-hostile — not
   the spatial query. See `PERF_NOTES.md`.

@@ -20,9 +20,15 @@
 //! cargo run -p vectorial-hash-demos --example gpu_lbvh_build_bench --release   # LBVH_N
 //! ```
 use std::time::Instant;
+use vectorial_hash::{Aabb, ItemRef, Point3, Positioned3, Tree3};
 
 struct Rng(u64);
 impl Rng { fn next(&mut self) -> u32 { let mut x = self.0; x ^= x << 13; x ^= x >> 7; x ^= x << 17; self.0 = x; (x >> 16) as u32 } }
+
+// The CPU rival: a Tree3 over the same points, for the keep-index (update_ref) vs
+// full-rebuild (bulk_load) per-frame comparison against the GPU build.
+struct QP(Point3);
+impl Positioned3 for QP { fn position(&self) -> Point3 { self.0 } }
 
 const TILE: usize = 256;
 
@@ -394,7 +400,46 @@ async fn run() {
     let mut ms = f64::MAX;
     for _ in 0..7 { let t = Instant::now(); build(); ms = ms.min(t.elapsed().as_secs_f64() * 1e3); }
 
-    println!("\nverified: full GPU-resident LBVH build ({n} points) — sort payload intact + BVH\ntraversal == brute force over 16 random spheres ✓");
-    println!("  Morton + key-value radix + Karras + refit: {ms:.2} ms/build (min of 7) — {:.0} Mpts/s", n as f64 / (ms / 1e3) / 1e6);
-    println!("\n(The whole LBVH build is GPU-resident — points → Morton → stable key-value radix →\nKarras hierarchy → atomic bottom-up AABB refit, no CPU round-trip. This is the piece that\nlets a MOVING broad-phase rebuild on the GPU each frame instead of the CPU; the rebuild-vs-\nkeep-index crossover is measured in gpu_spatial_bench / PARALLEL.md.)");
+    // ---- CPU rivals on the SAME points: keep-index maintain vs full rebuild ----
+    let world = Aabb::new(0.0, 0.0, 0.0, 1024.0, 1024.0, 1024.0);
+    let items: Vec<QP> = pts.iter().map(|p| QP(Point3::new(p[0] as f64, p[1] as f64, p[2] as f64))).collect();
+    // keep-index: update_ref every item each frame. Use a TINY jitter (±0.25) so
+    // almost nothing crosses a leaf — this is the keep-index's *best case* (a
+    // near-pure serial O(1)-per-item pass, no relocations), the fairest floor to
+    // compare a parallel GPU full-rebuild against. Real motion only grows it
+    // (relocations pile on); env LBVH_JITTER overrides the amplitude.
+    let jit: f64 = std::env::var("LBVH_JITTER").ok().and_then(|s| s.parse().ok()).unwrap_or(0.25);
+    let mut tree = Tree3::<QP>::bulk_load(world, 8, items.iter().map(|q| QP(q.0)).collect());
+    let refs: Vec<ItemRef> = (0..n as u32).map(ItemRef).collect(); // bulk_load: handle i == item i
+    let mut jr = Rng(0x9E37_79B9);
+    let mut keep_ms = f64::MAX;
+    for _ in 0..5 {
+        let t = Instant::now();
+        for &rf in &refs {
+            let (dx, dy, dz) = (((jr.next() & 1) as f64 - 0.5) * 2.0 * jit, ((jr.next() & 1) as f64 - 0.5) * 2.0 * jit, ((jr.next() & 1) as f64 - 0.5) * 2.0 * jit);
+            tree.update_ref(rf, |q| q.0 = Point3::new((q.0.x + dx).clamp(1.0, 1023.0), (q.0.y + dy).clamp(1.0, 1023.0), (q.0.z + dz).clamp(1.0, 1023.0)));
+        }
+        keep_ms = keep_ms.min(t.elapsed().as_secs_f64() * 1e3);
+    }
+    // full CPU rebuild each frame (the parallel build is the fair rebuild rival).
+    let mut rebuild_ms = f64::MAX;
+    for _ in 0..5 {
+        let src: Vec<QP> = items.iter().map(|q| QP(q.0)).collect();
+        let t = Instant::now();
+        #[cfg(feature = "parallel")] let tr = Tree3::<QP>::bulk_load_par(world, 8, src);
+        #[cfg(not(feature = "parallel"))] let tr = Tree3::<QP>::bulk_load(world, 8, src);
+        std::hint::black_box(&tr);
+        rebuild_ms = rebuild_ms.min(t.elapsed().as_secs_f64() * 1e3);
+    }
+    let rebuild_kind = if cfg!(feature = "parallel") { "bulk_load_par" } else { "bulk_load, serial" };
+
+    println!("\nverified: full GPU-resident LBVH build ({n} points) — sort payload intact + BVH\ntraversal == brute force over 16 random spheres ✓\n");
+    println!("moving-data broad-phase — per-frame cost ({n} points, min timing):");
+    println!("  GPU rebuild  (Morton+radix+Karras+refit) : {ms:>8.2} ms   ({:.0} Mpts/s, GPU-resident)", n as f64 / (ms / 1e3) / 1e6);
+    println!("  CPU keep     (update_ref all, serial, jit {jit}) : {keep_ms:>8.2} ms   (keep's best case; real motion only grows it)", );
+    println!("  CPU rebuild  ({rebuild_kind:<17})     : {rebuild_ms:>8.2} ms", );
+    let vs_keep = if ms < keep_ms { format!("the GPU rebuild BEATS the CPU keep-index {:.2}×", keep_ms / ms) } else { format!("the CPU keep-index still wins {:.2}×", ms / keep_ms) };
+    let vs_reb  = if ms < rebuild_ms { format!("and beats the CPU rebuild {:.2}×", rebuild_ms / ms) } else { format!("while the CPU {rebuild_kind} rebuild is {:.2}× faster", ms / rebuild_ms) };
+    println!("\n→ At {n} moving points, {vs_keep}, {vs_reb}.");
+    println!("(Honest crossover: this moves ALL {n} points every frame — the WORST case for the\nkeep-index, whose real edge is SKIPPING the items that didn't move (the horde demo's dormant\ncarpet costs ~nothing to keep). So the rule is by *moving fraction*, not just N:\n  · ~100% moving  → the parallel GPU rebuild wins (a serial maintain-all pass > a parallel build);\n  · small fraction → CPU keep wins by skipping the rest (the demos' thesis, still true).\nTonight's unblock: the GPU build is finally an option at all — ~9 ms/frame at 1M, GPU-resident —\nwhere before the sort (bitonic) lost to the CPU and there was no contest.)");
 }
