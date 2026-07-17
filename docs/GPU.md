@@ -34,12 +34,14 @@ cargo run -p vectorial-hash-demos --bin gpu_storm     --release
 | `gpu_visibility_bench` | GPU **line-of-sight** over STATIC occluders (segment-vs-AABB LBVH traversal), verified == CPU `segment_hit` (Δ 0) | **~1380×** the serial CPU; 1 ms one-time build — the *clean* GPU case |
 | `gpu_sort_bench` | GPU **bitonic sort** of Morton codes, verified == CPU sort | **slower** than the CPU sort (log² work + dispatch/pass) — the honest negative that motivated the radix |
 | `gpu_radix_bench` | GPU **stable 4-bit LSD radix sort** of Morton codes, verified == CPU sort | **~2× faster** than `sort_unstable` (262k **2.37×** · 1M 1.77× · 4M 1.97×) — correct+stable, past the bitonic; the sort primitive for the GPU-side build |
+| `gpu_lbvh_build_bench` | the **whole LBVH built on the GPU** — Morton → radix → Karras → refit — verified by traversal-vs-brute | **1 M-point BVH in ~8 ms/frame** (262k 1.69 · 4M 36.3), all GPU-resident — the on-GPU per-frame rebuild |
 
 ```bash
-cargo run -p vectorial-hash-demos --example gpu_spatial_bench   --release --features parallel   # GPU_N/M/R/CLUSTER
-cargo run -p vectorial-hash-demos --example gpu_visibility_bench --release                        # VIS_OCC/VIS_SEG
-cargo run -p vectorial-hash-demos --example gpu_sort_bench       --release                        # SORT_N (bitonic)
-cargo run -p vectorial-hash-demos --example gpu_radix_bench      --release                        # SORT_N (radix)
+cargo run -p vectorial-hash-demos --example gpu_spatial_bench    --release --features parallel   # GPU_N/M/R/CLUSTER
+cargo run -p vectorial-hash-demos --example gpu_visibility_bench  --release                        # VIS_OCC/VIS_SEG
+cargo run -p vectorial-hash-demos --example gpu_sort_bench        --release                        # SORT_N (bitonic)
+cargo run -p vectorial-hash-demos --example gpu_radix_bench       --release                        # SORT_N (radix)
+cargo run -p vectorial-hash-demos --example gpu_lbvh_build_bench  --release                        # LBVH_N (full build)
 ```
 
 ## The verdict — when the GPU wins (measured, not assumed)
@@ -63,17 +65,26 @@ headline is the kernel only. The honest rule:
   per-agent `decide` (FSM, targeting, morale) — warp-divergent, GPU-hostile — not
   the spatial query. See `PERF_NOTES.md`.
 
-## The GPU-side LBVH build (open)
+## The GPU-side LBVH build — DONE (measured)
 
-The one thing that would push the *moving* broad-phase crossover past 1 M is a
-GPU-side build (build the BVH on the GPU each frame instead of the CPU). The
-**sort half is now done**: `gpu_radix_bench` is a stable all-GPU 4-bit LSD radix,
-verified == CPU and **~2× faster** than `sort_unstable` (262k 2.37×) — past both
-the bitonic's ~2× *loss* and the CPU. Remaining for the full build: a GPU
-**Karras** hierarchy + **AABB refit** on top of the sorted codes (and, for even
-larger N, an **Onesweep** multi-workgroup scan beyond the current 16-way one) —
-with the sort GPU-resident, the whole build avoids the readback. Until that
-lands, GPU is for the static / resident / query-dominated cases above.
+The one thing that would push the *moving* broad-phase crossover past 1 M: build
+the BVH on the GPU each frame instead of the CPU. **`gpu_lbvh_build_bench` does the
+whole build GPU-resident** — Morton → stable key-value radix → Karras hierarchy →
+atomic bottom-up AABB refit, no CPU round-trip — and **verifies it** by traversing
+the GPU-built tree on the CPU vs brute force (a pass ⇒ hierarchy *and* AABBs
+correct). Measured (RTX 4080 SUPER, min-of-7, whole build per frame):
+
+| points | build/frame | throughput |
+| --- | --- | --- |
+| 262 k | **1.69 ms** | 155 Mpts/s |
+| 1 M | **8.39 ms** | 125 Mpts/s |
+| 4 M | **36.3 ms** | 116 Mpts/s |
+
+So a 1 M-point BVH **rebuilds on the GPU in ~8 ms/frame**, verified correct. This
+is what lets a *moving* broad-phase rebuild on the GPU each frame rather than lean
+on the CPU keep-index — the rebuild-vs-keep crossover itself is in
+`gpu_spatial_bench` / PARALLEL.md. Further headroom: an **Onesweep** multi-workgroup
+scan (beyond the current 16-way one) and a compressed wide-node layout.
 
 ## Design notes
 

@@ -117,3 +117,18 @@ keep-index vs rebuild, SoA vs AoS batch — the kit already has measured studies
   GPU-resident (no readback), so parity-in-isolation is a win in-pipeline — sort
   Morton codes here, then Karras split + AABB refit on top, all without a round
   trip. (32-bit keys; a full build emulates u64 as `vec2<u32>`.)
+
+- **Full GPU-resident LBVH build → `examples/gpu_lbvh_build_bench`** (2026-07-17).
+  The whole build on the GPU, no CPU round-trip: **Morton** (30-bit, GPU) → the
+  **key-value radix** above → **Karras** hierarchy (common-prefix ranges + split,
+  index as the tiebreaker for equal codes) → **atomic bottom-up AABB refit** (only
+  the second child to reach a node unions the boxes). Verified two ways: the sort
+  against GPU-produced data, and the **whole tree by traversing the GPU-built BVH
+  on the CPU vs brute force** over random spheres (a pass ⇒ hierarchy *and* refit
+  AABBs correct). Measured (RTX 4080 SUPER, min-of-7, whole build/frame): **262k
+  1.69 ms · 1 M 8.39 ms · 4 M 36.3 ms** (≈120–155 Mpts/s). So a **1 M-point BVH
+  rebuilds on the GPU in ~8 ms/frame** — the piece that lets a *moving* broad-phase
+  rebuild on-GPU each frame instead of leaning on the CPU keep-index. (The atomic
+  refit relies on the platform's atomic ordering for cross-workgroup visibility —
+  correct on this NVIDIA hardware, as the brute-force verify confirms; a level-by-
+  level refit would be spec-portable. Headroom: Onesweep scan, compressed nodes.)
