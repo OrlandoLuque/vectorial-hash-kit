@@ -261,6 +261,22 @@ fanning the partition over threads (plateaus ~1.58× at 4+ threads — the seria
 flatten tail + allocator contention cap it). Handle `i` addresses `items[i]`, so
 `ItemRef` survives a bulk build.
 
+**The GPU-side rebuild — and an adaptive keep↔GPU switch (measured 2026-07-17).**
+"keep beats rebuild" holds *when a small fraction moves per frame* — the demos'
+regime, where `keep` skips the unmoved. Push to a **mostly-moving** cloud and it
+flips: a serial `update_ref` over *all* N loses to a parallel from-scratch build.
+And that build can now be the **GPU** — `gpu_lbvh_build_bench` builds a whole LBVH
+(Morton→radix→Karras→refit) **GPU-resident in ~8 ms/frame at 1 M**, verified by
+traversal-vs-brute. Since keep skips the unmoved, keep-cost ≈ linear in the moving
+fraction while the GPU rebuild is flat, so they cross at **f\* ≈ 16 % (262k) /
+12–14 % (1 M)** moving (and f\* *drops* with N). An **adaptive** policy — keep below
+f\*, GPU rebuild above, with a **hysteresis** dead-band to stop thrashing at the
+boundary — beats *both* pure strategies on a varying load (1 M wave: adaptive 1020
+ms vs pure-GPU 1099 vs pure-keep 5227) and roughly halves the mode switches when
+the load hovers at f\* (110→64). Numbers + the GPU-vs-CPU verdict: [GPU.md](GPU.md).
+So the full rule: **sparse motion → CPU keep · mostly-moving huge clouds → GPU
+rebuild · varying → adaptive with hysteresis.**
+
 ## Why not parallelise relocation / the Morton build too?
 
 - **Relocation (`update_ref`):** a single item's move is an ascend-to-LCA +

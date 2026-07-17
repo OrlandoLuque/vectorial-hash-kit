@@ -78,6 +78,11 @@ headline is the kernel only. The honest rule:
 - **❌ The game sims stay on the CPU.** Their dominant cost is the *branchy*
   per-agent `decide` (FSM, targeting, morale) — warp-divergent, GPU-hostile — not
   the spatial query. See `PERF_NOTES.md`.
+- **❌ Uniform-density collision → a grid, not a BVH.** `gpu_storm`'s hash grid is
+  O(1)-per-cell and already the right broad-phase for a uniform storm; an LBVH buys
+  nothing there. A BVH's edge is **non-uniform** density or **culling by shape**
+  (ray / frustum / sphere), not uniform pair-finding — so we did *not* retrofit the
+  new GPU LBVH build into `gpu_storm` (it would be a fancier tool for a worse fit).
 
 ## The GPU-side LBVH build — DONE (measured)
 
