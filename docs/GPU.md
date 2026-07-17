@@ -20,10 +20,19 @@ see the [live index](https://orlandoluque.github.io/vectorial-hash-kit/).
   GPU, no per-frame CPU↔GPU round-trip. Switch the whole sim CPU↔GPU; `F` toggles
   collision ↔ an influence field; coloured by local density; per-phase GPU-load
   bars. ~**50×** the CPU sim at 150k particles.
+- **`adaptive_broadphase`** *(native only)* — the moving-data **maintenance
+  crossover**, live. A slider (`,` `.`) sets what **fraction** of the cloud moves;
+  every frame it measures BOTH the **CPU keep-index** (`update_ref` only the movers)
+  and a full **GPU LBVH rebuild** (Morton→radix→Karras→refit) and draws them as two
+  bars. Keep is ~linear in the fraction (it skips the unmoved), the GPU rebuild is
+  flat, so the bars **cross** at f\* — and the **ADAPTIVE** controller switches
+  keep↔GPU with a **hysteresis** dead-band (`A` auto · `1`/`2` force a mode). The
+  live face of `examples/gpu_lbvh_build_bench`.
 
 ```bash
-cargo run -p vectorial-hash-demos --bin gpu_lbvh_demo --release
-cargo run -p vectorial-hash-demos --bin gpu_storm     --release
+cargo run -p vectorial-hash-demos --bin gpu_lbvh_demo       --release
+cargo run -p vectorial-hash-demos --bin gpu_storm           --release
+cargo run -p vectorial-hash-demos --bin adaptive_broadphase --release   # ADAPT_N
 ```
 
 ## The benches (headless, measured)
