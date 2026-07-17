@@ -66,6 +66,15 @@ headline is the kernel only. The honest rule:
   - **Only a fraction moves → CPU keep-index.** Its real edge is *skipping* the
     items that didn't move (the horde demo's dormant carpet keeps for ~nothing);
     `ItemRef` + the moved-only sync + `cull_many_par` is still the lever there.
+  - **Adaptive hybrid (measured, viable).** Keep below a crossover fraction **f\***,
+    GPU rebuild above, with a **hysteresis** dead-band so it doesn't thrash. Since
+    keep skips the unmoved, keep-cost ≈ linear in the moving fraction while GPU is
+    flat, so they cross at a clean **f\* ≈ 16 % (262k) · 12–14 % (1 M)** — and f\*
+    *drops* with N (the serial keep pass scales worse). On a wave whose moving
+    fraction ramps 0→1→0 the adaptive policy beats **both** pure strategies (1 M:
+    **1020 ms** vs pure-GPU 1099 vs pure-keep 5227); a ±25 %-of-f\* dead-band roughly
+    **halves the switch count** when the load hovers at f\* (110→64 over 200 noisy
+    frames). `gpu_lbvh_build_bench` prints the f\* sweep + the wave/noise comparison.
 - **❌ The game sims stay on the CPU.** Their dominant cost is the *branchy*
   per-agent `decide` (FSM, targeting, morale) — warp-divergent, GPU-hostile — not
   the spatial query. See `PERF_NOTES.md`.

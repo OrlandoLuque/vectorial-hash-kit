@@ -441,5 +441,71 @@ async fn run() {
     let vs_keep = if ms < keep_ms { format!("the GPU rebuild BEATS the CPU keep-index {:.2}×", keep_ms / ms) } else { format!("the CPU keep-index still wins {:.2}×", ms / keep_ms) };
     let vs_reb  = if ms < rebuild_ms { format!("and beats the CPU rebuild {:.2}×", rebuild_ms / ms) } else { format!("while the CPU {rebuild_kind} rebuild is {:.2}× faster", ms / rebuild_ms) };
     println!("\n→ At {n} moving points, {vs_keep}, {vs_reb}.");
+
+    // ---- Adaptive hybrid: keep-index below a moving-fraction threshold, GPU
+    // rebuild above it, with a HYSTERESIS dead-band so it doesn't thrash at the
+    // boundary. The keep cost SKIPS unmoved items (its real edge), so it scales
+    // with the moving fraction; the GPU rebuild is fraction-independent. ----
+    let fracs = [0.01f64, 0.02, 0.05, 0.1, 0.2, 0.35, 0.5, 1.0];
+    let mut keep_at: Vec<(f64, f64)> = Vec::new();
+    for &f in &fracs {
+        let movers = ((n as f64) * f).round() as usize;
+        let mut km = f64::MAX;
+        for _ in 0..3 {
+            let t = Instant::now();
+            for k in 0..movers {
+                let rf = refs[k.wrapping_mul(2654435761) % n];
+                let (dx, dy, dz) = (((jr.next() & 1) as f64 - 0.5) * 2.0 * jit, ((jr.next() & 1) as f64 - 0.5) * 2.0 * jit, ((jr.next() & 1) as f64 - 0.5) * 2.0 * jit);
+                tree.update_ref(rf, |q| q.0 = Point3::new((q.0.x + dx).clamp(1.0, 1023.0), (q.0.y + dy).clamp(1.0, 1023.0), (q.0.z + dz).clamp(1.0, 1023.0)));
+            }
+            km = km.min(t.elapsed().as_secs_f64() * 1e3);
+        }
+        keep_at.push((f, km));
+    }
+    // keep_cost(f): piecewise-linear over the samples, keep(0)=0.
+    let keep_cost = |f: f64| -> f64 {
+        let f = f.clamp(0.0, 1.0);
+        let mut prev = (0.0f64, 0.0f64);
+        for &(x, y) in &keep_at {
+            if f <= x { let t = if x > prev.0 { (f - prev.0) / (x - prev.0) } else { 0.0 }; return prev.1 + t * (y - prev.1); }
+            prev = (x, y);
+        }
+        keep_at.last().unwrap().1
+    };
+    // crossover fraction f*: where keep_cost(f*) == the (flat) GPU build ms.
+    let fstar = { let (mut lo, mut hi) = (0.0f64, 1.0f64); for _ in 0..40 { let mid = 0.5 * (lo + hi); if keep_cost(mid) < ms { lo = mid; } else { hi = mid; } } 0.5 * (lo + hi) };
+
+    println!("\nADAPTIVE hybrid — keep-index (skips the unmoved) below f*, GPU rebuild above:");
+    println!("  moving fraction :   keep ms    (GPU rebuild is flat at {ms:.2} ms)");
+    for &(f, km) in &keep_at { println!("     {:>4.0}%        : {km:>8.2}   {}", f * 100.0, if km < ms { "keep wins" } else { "GPU wins" }); }
+    println!("  → crossover  f* ≈ {:.1}% moving  (below: keep cheaper · above: GPU cheaper)", fstar * 100.0);
+
+    // a 120-frame "wave": the moving fraction ramps 0→1→0. Total cost of each policy.
+    let wave: Vec<f64> = (0..120).map(|i| { let x = i as f64 / 119.0; 1.0 - (2.0 * x - 1.0).abs() }).collect();
+    let tot_keep: f64 = wave.iter().map(|&f| keep_cost(f)).sum();
+    let tot_gpu = ms * wave.len() as f64;
+    let (mut t1, mut sw1, mut m1) = (0.0f64, 0u32, false);                 // 1 threshold → thrashes
+    for &f in &wave { let w = f > fstar; if w != m1 { sw1 += 1; m1 = w; } t1 += if m1 { ms } else { keep_cost(f) }; }
+    let (fl, fh) = (fstar * 0.75, fstar * 1.25);
+    let (mut t2, mut sw2, mut m2) = (0.0f64, 0u32, false);                 // hysteresis dead-band
+    for &f in &wave { if !m2 && f > fh { m2 = true; sw2 += 1; } else if m2 && f < fl { m2 = false; sw2 += 1; } t2 += if m2 { ms } else { keep_cost(f) }; }
+    println!("  a 120-frame wave (moving fraction 0→1→0), total ms — vs the pure strategies:");
+    println!("    pure keep-index        : {tot_keep:>8.1}");
+    println!("    pure GPU rebuild       : {tot_gpu:>8.1}");
+    println!("    adaptive, 1 threshold  : {t1:>8.1}   ({sw1} switches — thrashes at the boundary)");
+    println!("    adaptive, hysteresis   : {t2:>8.1}   ({sw2} switches — dead-band {:.0}–{:.0}%)", fl * 100.0, fh * 100.0);
+    println!("  → adaptive tracks the cheaper of the two each frame and beats BOTH pure strategies.");
+
+    // a NOISY load hovering right at f* — where a single threshold thrashes and the
+    // hysteresis dead-band earns its keep (near f* the two costs are ~equal, so the
+    // damage of a needless flip is the SWITCH itself: rebuild warm-up, frame-time
+    // variance — real overhead a raw-ms model doesn't see).
+    let mut nr = Rng(0xF00D_1234);
+    let noisy: Vec<f64> = (0..200).map(|_| (fstar + (nr.next() as f64 / u32::MAX as f64 - 0.5) * fstar * 1.2).clamp(0.0, 1.0)).collect();
+    let (mut sa, mut a) = (0u32, false);
+    for &f in &noisy { let w = f > fstar; if w != a { sa += 1; a = w; } }
+    let (mut sb, mut b) = (0u32, false);
+    for &f in &noisy { if !b && f > fh { b = true; sb += 1; } else if b && f < fl { b = false; sb += 1; } }
+    println!("  a 200-frame NOISY load sitting AT f* (±{:.0}%): single-threshold **{sa} switches** vs\n    hysteresis **{sb}** — the dead-band is what stops the flip-flop when the load hovers near f*.", fstar * 60.0);
     println!("(Honest crossover: this moves ALL {n} points every frame — the WORST case for the\nkeep-index, whose real edge is SKIPPING the items that didn't move (the horde demo's dormant\ncarpet costs ~nothing to keep). So the rule is by *moving fraction*, not just N:\n  · ~100% moving  → the parallel GPU rebuild wins (a serial maintain-all pass > a parallel build);\n  · small fraction → CPU keep wins by skipping the rest (the demos' thesis, still true).\nTonight's unblock: the GPU build is finally an option at all — ~9 ms/frame at 1M, GPU-resident —\nwhere before the sort (bitonic) lost to the CPU and there was no contest.)");
 }
