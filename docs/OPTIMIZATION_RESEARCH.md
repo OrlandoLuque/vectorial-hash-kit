@@ -76,9 +76,11 @@ keep-index vs rebuild, SoA vs AoS batch — the kit already has measured studies
 
 ## Suggested next steps (ranked)
 
-1. **GPU radix sort** → **DONE** (a stable 4-bit LSD radix, see below); the
-   *Onesweep* upgrade (decoupled-lookback scan) is the remaining lever to push it
-   clear of the CPU. Keep 32-bit Morton codes.
+1. **GPU radix sort** → **DONE** (a stable LSD radix, see below): hierarchical scan
+   **+ an 8-bit/4-pass width** (vs 4-bit/8-pass) now runs it at **8–17× the CPU** at
+   scale. A *true* single-pass **Onesweep** (decoupled-lookback) is blocked by
+   WebGPU's lack of an inter-workgroup forward-progress guarantee (it can deadlock) —
+   8-bit/4-pass is the portable step in that direction. Keep 32-bit Morton codes.
 2. ~~**Cache-oblivious arena layout**~~ → **DONE** as `Tree3::compact()` (see below).
 3. ~~**Compressed wide-BVH nodes**~~ → **DONE + measured** as
    `examples/compressed_bvh_bench` (see below). *Correction (2026-07-18): an
@@ -180,6 +182,14 @@ keep-index vs rebuild, SoA vs AoS batch — the kit already has measured studies
   GPU-resident (no readback), so parity-in-isolation is a win in-pipeline — sort
   Morton codes here, then Karras split + AABB refit on top, all without a round
   trip. (32-bit keys; a full build emulates u64 as `vec2<u32>`.)
+  **Update (2026-07-18): + an 8-bit/4-pass width.** Sorting 8 bits at a time (4
+  passes) instead of 4 bits (8 passes) halves the global histogram+scatter
+  round-trips (at the cost of a 256- vs 16-bucket histogram/scan per pass) — measured
+  **1.6–1.8× faster** than 4-bit/8-pass (262k 1.70→0.93 · 1 M 2.20→1.30 · 4 M
+  4.35→2.79 ms), so the radix is now **8–17× the CPU** (1 M **8.1×**, 4 M **16.8×**).
+  A *true* single-pass **Onesweep** (decoupled-lookback) would go further but needs an
+  inter-workgroup forward-progress guarantee WebGPU/WGSL doesn't give (it can
+  deadlock) — 8-bit/4-pass is the portable ceiling. Both widths verified == CPU.
 
 - **Full GPU-resident LBVH build → `examples/gpu_lbvh_build_bench`** (2026-07-17).
   The whole build on the GPU, no CPU round-trip: **Morton** (30-bit, GPU) → the

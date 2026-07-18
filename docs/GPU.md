@@ -42,7 +42,7 @@ cargo run -p vectorial-hash-demos --bin adaptive_broadphase --release   # ADAPT_
 | `gpu_spatial_bench` | GPU brute / GPU LBVH / CPU, + the per-frame **rebuild-vs-keep** verdict for *moving* data | kernel ~100–400×; moving data → **fraction-dependent**: keep wins sparse motion, GPU rebuild wins dense (f\* ≈ 30 %→2.8 % as N grows) |
 | `gpu_visibility_bench` | GPU **line-of-sight** over STATIC occluders (segment-vs-AABB LBVH traversal), verified == CPU `segment_hit` (Δ 0) | **~1380×** the serial CPU; 1 ms one-time build — the *clean* GPU case |
 | `gpu_sort_bench` | GPU **bitonic sort** of Morton codes, verified == CPU sort | **slower** than the CPU sort (log² work + dispatch/pass) — the honest negative that motivated the radix |
-| `gpu_radix_bench` | GPU **stable 4-bit LSD radix sort** of Morton codes (hierarchical scan), verified == CPU sort | **5–11× faster** than `sort_unstable` at scale (262k 1.52× · 1M **5.0×** · 4M **10.9×**) — correct+stable, past the bitonic; the sort primitive for the GPU-side build |
+| `gpu_radix_bench` | GPU **stable LSD radix sort** of Morton codes (hierarchical scan), **4-bit×8 vs 8-bit×4** widths, verified == CPU sort | 8-bit/4-pass is **1.6–1.8× faster** than 4-bit/8-pass → **8–17× faster** than `sort_unstable` at scale (262k 2.8× · 1M **8.1×** · 4M **16.8×**) — fewer global passes, the portable Onesweep step |
 | `gpu_lbvh_build_bench` | the **whole LBVH built on the GPU** — Morton → radix → Karras → refit — verified by traversal-vs-brute | **1 M-point BVH in ~4.4 ms/frame** (262k 2.28 · 4M 13.0), all GPU-resident — the on-GPU per-frame rebuild |
 
 ```bash
@@ -115,14 +115,19 @@ So a 1 M-point BVH **rebuilds on the GPU in ~4.4 ms/frame**, verified correct
 N pays a little for the extra scan passes). This
 is what lets a *moving* broad-phase rebuild on the GPU each frame rather than lean
 on the CPU keep-index — the rebuild-vs-keep crossover itself is in
-`gpu_spatial_bench` / PARALLEL.md. Further headroom: a single-pass **Onesweep** scan
-(the current scan is already **hierarchical** — reduce/scan/add — which took 1 M
-8.4 → 4.4 ms) and a **wide (8-ary) compressed node**. On the last: quantised **u16**
-nodes are measured **1.6× smaller and exact** (round the box outward + test the
-exact leaf point — `vectorial-hash/examples/compressed_bvh_bench`), but for the
-binary layout that is a **footprint** win (fit more BVH under WebGPU's
-`maxStorageBufferBindingSize`), *not* a cull-latency win — the latency win needs the
-**wide** node (one cache line per node, SIMD box tests), not quantisation alone.
+`gpu_spatial_bench` / PARALLEL.md. Further headroom: the sort is already
+**hierarchical** (reduce/scan/add; 1 M 8.4 → 4.4 ms build) and now runs an **8-bit /
+4-pass** width that beats the 4-bit/8-pass **1.6–1.8×** (fewer global passes — the
+portable step toward Onesweep, whose true single-pass decoupled-lookback needs
+inter-workgroup forward-progress WebGPU doesn't guarantee). *Follow-on:* propagate
+the 8-bit width into the build's key-value radix (`gpu_lbvh_build_bench`) to shave
+its sort stage. On the **node layout** (both measured on the CPU, but they govern
+the GPU buffer too): quantised **u16** boxes are **1.6× smaller and exact** (round
+outward + test the exact leaf point — `compressed_bvh_bench`) but only a *footprint*
+win for the binary tree; going **wide (8-ary)** with an SoA/SIMD 8-box test is the
+real **~2× cull** win (`wide_bvh_bench`), and it *also* shrinks the arena ~5× (points
+batch into leaves) — `wide8-u16` is the best footprint-and-speed point. That wide SoA
+node is the layout to reach for if a static BVH graduates into the kit.
 
 ## Design notes
 
