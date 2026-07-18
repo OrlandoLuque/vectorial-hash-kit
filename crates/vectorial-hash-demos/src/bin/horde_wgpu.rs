@@ -60,12 +60,15 @@ const BUILDING_FILES: [&str; 5] = ["wall.glb", "gate.glb", "tower.glb", "house.g
 /// values matched to the old box heights — **eyeball + tune** (Quaternius props are
 /// Y-up, ~1-unit, origin at the base).
 fn building_tweak(k: SKind) -> (f32, f32, f32) {
+    // yaw = +90° (counterclockwise) — the Quaternius props face 90° off from the box
+    // orientation (user feedback 2026-07-19). CommandCenter (castle) is drawn separately.
+    let ccw = std::f32::consts::FRAC_PI_2;
     match k {
-        SKind::Wall => (7.0, 0.0, 0.0),
-        SKind::Gate => (7.0, 0.0, 0.0),
-        SKind::Tower => (9.0, 0.0, 0.0),
-        SKind::House => (7.0, 0.0, 0.0),
-        SKind::Storehouse => (8.0, 0.0, 0.0),
+        SKind::Wall => (7.0, ccw, 0.0),
+        SKind::Gate => (7.0, ccw, 0.0),
+        SKind::Tower => (9.0, ccw, 0.0),
+        SKind::House => (7.0, ccw, 0.0),
+        SKind::Storehouse => (8.0, ccw, 0.0),
         SKind::CommandCenter => (40.0, 0.0, 0.0),
     }
 }
