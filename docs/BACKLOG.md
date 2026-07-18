@@ -811,9 +811,16 @@ Everything else in this file is **future** — left to triage later.
   the decision map shows both trees lose *maintain* to Morton. The live demo's
   `M` toggle keeps a persistent octree too. See `THREE_D.md` § "Dynamic octree
   vs binary".
-- **Full 3-projection vs expensive narrowphase** — `THREE_D.md`'s open item:
-  run the projection methods (not just 1-proj) against a many-faced
-  `Polyhedron3` to find where the tight broadphase finally pays for itself.
+- ~~**Full 3-projection vs expensive narrowphase**~~ — **MEASURED** (2026-07-19,
+  `examples/broadphase_tightness_bench`): tested whether a tight broadphase pays as
+  the narrowphase gets expensive (a `faceted_ball` `Polyhedron3`, N faces = N
+  dot-products/point). **Honest negative:** culling by the tight *volume*
+  (`cull(&poly)`) LOSES to a cheap 6-plane box broadphase + N-plane narrowphase at
+  every face count (1.0×→1.6×, gap widens with N) — the tight prune runs the N-plane
+  `classify_box` at *every node* and nodes ≫ candidates, so the per-node cost
+  dominates the candidate savings. Validates the kit's cheap-broadphase +
+  exact-narrowphase design (and the `VoxelRaster` short-circuit for the narrowphase).
+  THREE_D.md § "Does a tight broadphase pay…".
 - ~~**Morton / Z-order keys (linear octree)**~~ — **done.** `MortonGrid3`
   (pointer-free Z-order hash grid) added + churn-free brute-force test, wired
   into `tree3d_bench` as the fourth structure. Fastest index on uniform data

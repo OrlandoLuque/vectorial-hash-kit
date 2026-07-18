@@ -96,9 +96,46 @@ set every time.
    - Want maximum speed and can afford the 3D structure (analytic shape, or
      the N³ template for general shapes) → **true 3D tree** (14–16×).
    - Expensive exact 3D test (complex polyhedron, where the narrowphase
-     cost is what hurts) → **3-projection**'s tight 1.12× broadphase finally
-     pays, because it minimises the number of exact tests. Not our case
-     here, but the regime where it wins.
+     cost is what hurts) → the intuition was that a **tight** broadphase would
+     finally pay by minimising the number of exact tests. **Measured (2026-07-19,
+     `examples/broadphase_tightness_bench`) — it does NOT, for a tight *volume*
+     cull.** See below.
+
+### Does a tight broadphase pay when the narrowphase is expensive? (measured — no)
+
+The open question above, tested directly: query = a convex `Polyhedron3`
+(`faceted_ball`, N faces) whose point test costs one dot-product **per face** — so N
+*is* the narrowphase cost. Two exact ways to get the points inside it, both
+brute-force-verified: **TIGHT** = `tree.cull(&poly)` (the tree prunes each node by
+the poly's N half-spaces via `classify_box`, tests survivors by the N-plane
+`contains`); **BOX+NP** = `tree.cull(&box6)` by the poly's 6-face bounding box (cheap
+prune, over-collects ~82 %) then an exact N-plane narrowphase on the candidates.
+Measured (200k points, 120 queries, RTX-class box, ns/query):
+
+| faces | TIGHT poly-cull | BOX6 + narrowphase | winner |
+| --- | --- | --- | --- |
+| 8 | 90 230 | 89 738 | BOX+NP 1.01× |
+| 32 | 171 600 | 126 047 | BOX+NP 1.36× |
+| 64 | 251 750 | 178 091 | BOX+NP 1.41× |
+| 128 | 414 328 | 263 191 | BOX+NP 1.57× |
+| 256 | 942 982 | 718 300 | BOX+NP 1.31× |
+
+**BOX+NP wins at every face count, and the gap *widens* with N** — the opposite of
+the intuition. The reason is structural: culling by the tight volume runs the N-plane
+`classify_box` **at every visited node**, and a query visits **far more nodes than it
+keeps candidates** (~6 k candidates vs a whole descent of nodes). So the tight cull
+pays N-per-node while only saving the narrowphase on the ~45 % surplus the box
+over-collects — and node count dominates. The cheap 6-plane box prune + an exact
+narrowphase on the few survivors is simply less total plane-arithmetic. Lesson: for a
+convex query with an expensive point test, **broadphase with a cheap bound and pay
+the exact test on the candidates** — don't push the expensive test into the node
+prune. (The `VoxelRaster` short-circuit — a 1×1×1 O(1) lookup replacing the N-plane
+`contains` — is the further accelerator for that narrowphase, exactly as the
+`Polyhedron3` doc-comment notes; it attacks the surviving-candidate cost, not the
+node prune.) The author's *2D 3-projection* broadphase is a different point on the
+tightness spectrum (cheap 2D shadows, no per-node N-plane cost) — its 1.12× edge in
+the earlier table stands; what does *not* pay is buying tightness with a per-node
+N-plane volume test.
 
 ## 1-projection refinements: z-reject, raster, quadtree (2026-06-23)
 
