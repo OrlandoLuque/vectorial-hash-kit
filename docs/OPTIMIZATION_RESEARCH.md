@@ -121,9 +121,15 @@ keep-index vs rebuild, SoA vs AoS batch — the kit already has measured studies
   nodes): 1 M drops 64 → 13 MB (f32) / 9.4 MB (u16). Quantising the wide node to u16
   costs a little vs wide-f32 (the same dequantise offset as the binary case) yet
   stays ~2× over binary **and** ~1.4× smaller than wide-f32 — so **wide8-u16 is the
-  best footprint-and-speed point**. This is the layout to reach for if a static /
-  query-heavy BVH ever graduates into the kit (the GPU LBVH build is the natural
-  producer). Follow-on: the same SoA-wide idea on `Tree3`/`Octree3` arenas.
+  best footprint-and-speed point**.
+  **BUT — reference-checked (2026-07-19): the 2× is over a *strawman*.** The bench now
+  also culls the SAME cloud with the kit's **shipping `Tree3` / `Octree3`**: wide8-u16
+  is only **~1.0× vs Tree3** (200k 1.03× · 1 M **0.99×** — Tree3 is *faster*) and
+  **~1.05× vs Octree3**. The kit's arena descent is already near the wide node; the 2×
+  was purely over a naive pointer-BVH baseline. **Verdict: a static wide BVH is NOT
+  worth promoting** — the win evaporates against the real cull. The 8-ary SoA layout's
+  home stays the **GPU LBVH** (where the alternative is a naive kernel, not a tuned
+  arena). This retires the "graduate a wide BVH into the kit" follow-on.
 
 - **Compressed / quantized BVH nodes → `examples/compressed_bvh_bench`**
   (2026-07-18). A binary BVH over N points stored two ways with the **same

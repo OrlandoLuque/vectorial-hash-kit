@@ -19,8 +19,14 @@
 // an iterator rewrite defeats the whole point of the bench.
 #![allow(clippy::needless_range_loop)]
 use std::time::Instant;
+use vectorial_hash::{Aabb, Octree3, Point3, Positioned3, Sphere3, Tree3};
 
 const LEAF: usize = 8; // a leaf holds up to this many points (tested exactly)
+
+// A point item for the reference cull on the kit's shipping Tree3 / Octree3.
+#[derive(Clone, Copy)]
+struct LP(Point3);
+impl Positioned3 for LP { fn position(&self) -> Point3 { self.0 } }
 
 struct Rng(u64);
 impl Rng { fn next(&mut self) -> u32 { let mut x = self.0; x ^= x << 13; x ^= x >> 7; x ^= x << 17; self.0 = x; (x >> 16) as u32 } fn unit(&mut self) -> f32 { (self.next() & 0xffffff) as f32 / (1u32 << 24) as f32 } }
@@ -203,16 +209,38 @@ fn main() {
     let (twf, nwf) = bench(&cull_wf);
     let (twq, nwq) = bench(&cull_wq);
 
+    // ---- reference: the kit's shipping Tree3 / Octree3 cull on the SAME cloud ----
+    // (this is the number that decides whether promoting a static wide BVH is worth it)
+    let bounds = Aabb::new(0.0, 0.0, 0.0, w as f64, w as f64, w as f64);
+    let lpts: Vec<LP> = pts.iter().map(|p| LP(Point3::new(p[0] as f64, p[1] as f64, p[2] as f64))).collect();
+    let mut t3 = Tree3::<LP>::new(bounds, 12);
+    let mut o3 = Octree3::<LP>::new(bounds, 12);
+    for p in &lpts { t3.insert(*p); o3.insert(*p); }
+    let spheres3: Vec<Sphere3> = spheres.iter().map(|&(c, r)| Sphere3::new(c[0] as f64, c[1] as f64, c[2] as f64, r as f64)).collect();
+    let time_lib = |run: &dyn Fn() -> usize| -> f64 { let mut best = f64::MAX; for _ in 0..8 { let t = Instant::now(); let a = run(); std::hint::black_box(a); best = best.min(t.elapsed().as_secs_f64()); } best * 1e6 / spheres.len() as f64 };
+    let t3_us = time_lib(&|| { let mut a = 0usize; for s in &spheres3 { a += t3.cull(s).len(); } a });
+    let o3_us = time_lib(&|| { let mut a = 0usize; for s in &spheres3 { a += o3.cull(s).len(); } a });
+    // sanity: same total hit count as the wide cull (f32/f64 ε aside)
+    let wide_total: usize = { let mut a = 0usize; for &(c, r) in &spheres { let mut v = 0u64; a += cull_wf(c, r, &mut v).len(); } a };
+    let t3_total: usize = spheres3.iter().map(|s| t3.cull(s).len()).sum();
+    // f32 (wide) vs f64 (kit) boundary rounding ⇒ a few points near a sphere edge
+    // differ; a 0.2 % relative tolerance catches a real structural bug but not ε.
+    let tol = (wide_total / 500).max(16) as i64;
+    assert!((wide_total as i64 - t3_total as i64).abs() <= tol, "wide vs Tree3 hit-count mismatch {wide_total} vs {t3_total} (tol {tol})");
+
     let bin_bytes = bin.len() * std::mem::size_of::<Bin>();
     let wf_bytes = wide.len() * std::mem::size_of::<Wide>() + leaf_pts.len() * 4;
     let wq_bytes = wideq.len() * std::mem::size_of::<WideQ>() + leaf_pts.len() * 4;
     println!("wide-BVH (8-ary, SoA/SIMD), {n} points  (LEAF={LEAF})\n");
     println!("verified: binary == wide-f32 == wide-u16 == brute force (exact leaf test) ✓\n");
-    println!("            | node B | arena MB | nodes/query | cull µs/query | vs binary");
-    println!("  bin-f32   | {:>6} | {:>7.1} | {:>11.0} | {:>13.3} | 1.00×", std::mem::size_of::<Bin>(), bin_bytes as f64 / 1e6, nb, tb);
-    println!("  wide8-f32 | {:>6} | {:>7.1} | {:>11.0} | {:>13.3} | {}", std::mem::size_of::<Wide>(), wf_bytes as f64 / 1e6, nwf, twf, speed(tb, twf));
-    println!("  wide8-u16 | {:>6} | {:>7.1} | {:>11.0} | {:>13.3} | {}", std::mem::size_of::<WideQ>(), wq_bytes as f64 / 1e6, nwq, twq, speed(tb, twq));
-    println!("\nreading: the wide node visits ~{:.0}× fewer nodes than the binary tree (8:1 fan-out,\nshallow) and tests its 8 child boxes in one vectorisable sweep. Whether that beats the\nbinary pointer-chase — and whether u16 helps or the dequantise offsets it — is above.\n(For the AVX path build with RUSTFLAGS=-Ctarget-cpu=native.)", nb / nwf.max(1.0));
+    println!("               | node B | arena MB | nodes/query | cull µs/query | vs binary");
+    println!("  bin-f32      | {:>6} | {:>7.1} | {:>11.0} | {:>13.3} | 1.00×", std::mem::size_of::<Bin>(), bin_bytes as f64 / 1e6, nb, tb);
+    println!("  wide8-f32    | {:>6} | {:>7.1} | {:>11.0} | {:>13.3} | {}", std::mem::size_of::<Wide>(), wf_bytes as f64 / 1e6, nwf, twf, speed(tb, twf));
+    println!("  wide8-u16    | {:>6} | {:>7.1} | {:>11.0} | {:>13.3} | {}", std::mem::size_of::<WideQ>(), wq_bytes as f64 / 1e6, nwq, twq, speed(tb, twq));
+    println!("  Tree3  (kit) |    —   |    —    |      —      | {:>13.3} | {}", t3_us, speed(tb, t3_us));
+    println!("  Octree3(kit) |    —   |    —    |      —      | {:>13.3} | {}", o3_us, speed(tb, o3_us));
+    println!("\nreading: the wide node visits ~{:.0}× fewer nodes than the binary tree (8:1 fan-out) and\ntests its 8 child boxes in one vectorisable sweep — ~2× the NAIVE binary BVH. But vs the\nkit's SHIPPING cull it is only {} than Tree3 and {} than Octree3: the kit's cull is\nALREADY near the wide node (it descends a tuned arena, not a naive pointer-BVH). So the\nhonest verdict — a static wide BVH is NOT worth promoting: ~2× is over a strawman, ~1.0×\nover the real thing. The 8-ary SoA layout's real home stays the GPU LBVH.\n(AVX path: RUSTFLAGS=-Ctarget-cpu=native.)",
+        nb / nwf.max(1.0), speed(t3_us, twq), speed(o3_us, twq));
 }
 
 fn speed(base: f64, x: f64) -> String { if x < base { format!("{:.2}× FASTER", base / x) } else { format!("{:.2}× slower", x / base) } }

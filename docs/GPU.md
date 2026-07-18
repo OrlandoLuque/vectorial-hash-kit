@@ -126,9 +126,11 @@ portable ceiling). On the **node layout** (both measured on the CPU, but they go
 the GPU buffer too): quantised **u16** boxes are **1.6× smaller and exact** (round
 outward + test the exact leaf point — `compressed_bvh_bench`) but only a *footprint*
 win for the binary tree; going **wide (8-ary)** with an SoA/SIMD 8-box test is the
-real **~2× cull** win (`wide_bvh_bench`), and it *also* shrinks the arena ~5× (points
-batch into leaves) — `wide8-u16` is the best footprint-and-speed point. That wide SoA
-node is the layout to reach for if a static BVH graduates into the kit.
+real **~2× cull** win *over a naive binary BVH* (`wide_bvh_bench`), shrinking the arena
+~5×. **But reference-checked against the kit's shipping `Tree3`/`Octree3` cull it is
+only ~1.0×** (Tree3 is even a hair faster at 1 M) — the kit's tuned arena already sits
+at the wide node, so a static wide BVH is **not worth promoting**; the SoA-wide layout
+stays a **GPU-side** win (where the alternative is a naive kernel).
 
 ## Design notes
 
