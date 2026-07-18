@@ -56,7 +56,10 @@ literature — and the literature names the exact next steps.
 
 - **Compressed / quantized wide-BVH nodes** — **35–60 % of the uncompressed
   footprint**, cutting bytes touched per traversal step (the memory wall we keep
-  hitting). *Confirmed 3-0.* → a candidate node layout for `Tree3`/`Octree3`/LBVH.
+  hitting). *Confirmed 3-0.* → **built + measured** (`compressed_bvh_bench`): u16
+  nodes are **1.6× smaller and EXACT** (round outward + exact leaf test), but the
+  cull-speed win needs a *wide* node — the binary layout's footprint drop doesn't
+  move latency. See "Implemented + measured".
 - **Cache-oblivious tree layout** (van-Emde-Boas-style) — **26 %–300 % typical, up
   to ~2600 % peak** speedup, **zero algorithm change** — purely reorder nodes in the
   arena for locality. *Confirmed 3-0.* → cheap, high-upside for the arena trees.
@@ -77,16 +80,42 @@ keep-index vs rebuild, SoA vs AoS batch — the kit already has measured studies
    *Onesweep* upgrade (decoupled-lookback scan) is the remaining lever to push it
    clear of the CPU. Keep 32-bit Morton codes.
 2. ~~**Cache-oblivious arena layout**~~ → **DONE** as `Tree3::compact()` (see below).
-3. **Compressed wide-BVH nodes** — cut bytes-per-step against the memory wall.
-   *Caveat (2026-07-18): quantised AABBs make queries **conservative** (they
-   over-collect), which breaks the kit's exact-brute-force-matched contract — it'd
-   need an explicit **approximate-query mode** (a design decision + new API), not a
-   drop-in perf tweak. Real, but a deliberate feature, not a rush job. Deferred.*
+3. ~~**Compressed wide-BVH nodes**~~ → **DONE + measured** as
+   `examples/compressed_bvh_bench` (see below). *Correction (2026-07-18): an
+   earlier note here claimed quantised AABBs "break exactness" — **that was wrong**.
+   Round the box outward (min↓/max↑) and test the **exact point at the leaf**, and
+   the answer is **identical to brute force** (conservative internal boxes only ever
+   cost a few extra node visits, never a wrong result). Measured: **1.6× smaller
+   nodes, exact, 0 % over-visit** at u16 — but a **footprint** win, not a cull-speed
+   win for the binary layout (the dequant arithmetic offsets the smaller-node cache
+   win; a wide/8-ary node is where the literature's speed win actually lives).*
 4. **Refit + rotations** — only if a persistent dynamic BVH is ever added.
 5. Verify the **AVX-512 broad-phase** lead with our own bench before investing
    (the spend limit cut its verification short).
 
 ## Implemented + measured (from this list)
+
+- **Compressed / quantized BVH nodes → `examples/compressed_bvh_bench`**
+  (2026-07-18). A binary BVH over N points stored two ways with the **same
+  topology**: full f32 boxes (**32 B/node**) vs each box **quantised to u16 relative
+  to the root** — min rounded **down**, max rounded **up**, so the dequantised box is
+  a *superset* (**20 B/node**). The leaves test the **exact** point, so the quantised
+  cull is **bit-for-bit == brute force** (verified over random spheres at every
+  size). Measured (RTX-class box, min-of-8, clumpy 3D cloud):
+  - **1.6× smaller nodes** (32→20 B; e.g. 1 M pts: **64 → 40 MB** arena) at
+    **zero accuracy cost** and, at u16 resolution, **0 % extra node visits** (the
+    ~0.016-unit outward rounding is far below the clump scale, so conservative boxes
+    match the exact ones for traversal).
+  - **Cull latency: a wash** — 200k **18.4 → 18.6 µs** (1.01× slower), 1 M **206.6 →
+    204.4 µs** (1.01× faster), 4 M **778 → 847 µs** (1.09× slower). The per-node
+    dequantise (a float mul-add × 3 axes) offsets the smaller-node cache win; this
+    binary traversal is **pointer-/branch-bound, not bandwidth-bound**.
+  - **Honest verdict:** compression here is a **footprint** lever (fit ~1.6× more
+    BVH in cache/VRAM — matters for the GPU build's `maxStorageBufferBindingSize`
+    and huge static worlds), **not** a cull-speed lever — *and it corrects the
+    earlier "breaks exactness" worry: it does not*. The literature's *speed* win
+    comes from **wide (8-ary) compressed nodes** (one cache line = one node, SIMD box
+    tests), which is the real next step if latency (not footprint) is the goal.
 
 - **Cache-oblivious arena layout → `Tree3::compact()`** (2026-07-17). A one-pass
   DFS pre-order reorder of the node arena (a node lands adjacent to its first
