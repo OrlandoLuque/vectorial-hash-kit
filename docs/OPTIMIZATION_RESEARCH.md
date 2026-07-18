@@ -78,6 +78,10 @@ keep-index vs rebuild, SoA vs AoS batch — the kit already has measured studies
    clear of the CPU. Keep 32-bit Morton codes.
 2. ~~**Cache-oblivious arena layout**~~ → **DONE** as `Tree3::compact()` (see below).
 3. **Compressed wide-BVH nodes** — cut bytes-per-step against the memory wall.
+   *Caveat (2026-07-18): quantised AABBs make queries **conservative** (they
+   over-collect), which breaks the kit's exact-brute-force-matched contract — it'd
+   need an explicit **approximate-query mode** (a design decision + new API), not a
+   drop-in perf tweak. Real, but a deliberate feature, not a rush job. Deferred.*
 4. **Refit + rotations** — only if a persistent dynamic BVH is ever added.
 5. Verify the **AVX-512 broad-phase** lead with our own bench before investing
    (the spend limit cut its verification short).

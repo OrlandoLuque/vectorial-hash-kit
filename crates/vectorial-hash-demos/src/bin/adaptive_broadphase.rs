@@ -14,8 +14,9 @@
 //! visible (the query is a separate axis — see docs/GPU.md).
 //!
 //! Keys: `S` auto-sweep the fraction (on by default, so the cross plays itself) ·
-//! `,` `.` moving fraction · `A` adaptive vs a forced mode (`1` keep · `2` GPU) ·
-//! drag orbit · scroll zoom. `ADAPT_N` sets the count.
+//! `D` colour points by their leaf depth in the tree (deep = dense = warm — watch
+//! it subdivide where the cloud clumps) · `,` `.` moving fraction · `A` adaptive vs
+//! a forced mode (`1` keep · `2` GPU) · drag orbit · scroll zoom. `ADAPT_N` counts.
 //!
 //! `cargo run -p vectorial-hash-demos --bin adaptive_broadphase --release`
 #![cfg(not(target_arch = "wasm32"))]
@@ -36,7 +37,7 @@ impl Rng { fn next(&mut self) -> u64 { let mut x = self.0; x ^= x << 13; x ^= x 
 struct P(Point3);
 impl Positioned3 for P { fn position(&self) -> Point3 { self.0 } }
 
-#[repr(C)] #[derive(Clone, Copy, Pod, Zeroable)] struct Cam { vp: [[f32; 4]; 4] }
+#[repr(C)] #[derive(Clone, Copy, Pod, Zeroable)] struct Cam { vp: [[f32; 4]; 4], mode: u32, maxd: f32, _pad: [u32; 2] }
 #[repr(C)] #[derive(Clone, Copy, Pod, Zeroable)] struct UiVertex { pos: [f32; 2], color: [f32; 4] }
 
 fn push_quad(v: &mut Vec<UiVertex>, px: f32, py: f32, w: f32, h: f32, color: [f32; 4], sw: f32, sh: f32) {
@@ -179,16 +180,19 @@ fn refit(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 const RENDER: &str = r#"
-struct Cam { vp: mat4x4<f32> };
+struct Cam { vp: mat4x4<f32>, mode: u32, maxd: f32 };
 @group(0) @binding(0) var<uniform> cam: Cam;
 struct VOut { @builtin(position) clip: vec4<f32>, @location(0) col: vec3<f32> };
+fn heat(t: f32) -> vec3<f32> { let x = clamp(t, 0.0, 1.0); return clamp(vec3<f32>(1.5 - abs(4.0*x - 3.0), 1.5 - abs(4.0*x - 2.0), 1.5 - abs(4.0*x - 1.0)), vec3<f32>(0.0), vec3<f32>(1.0)); }
 @vertex
-fn vs(@builtin(vertex_index) vi: u32, @location(0) pos: vec4<f32>, @location(1) mover: u32) -> VOut {
+fn vs(@builtin(vertex_index) vi: u32, @location(0) pos: vec4<f32>, @location(1) val: u32) -> VOut {
+    // mode 0: val = mover flag (0/1). mode 1: val = the point's leaf DEPTH in the tree.
     var corners = array<vec2<f32>, 6>(vec2(-1.0,-1.0), vec2(1.0,-1.0), vec2(1.0,1.0), vec2(-1.0,-1.0), vec2(1.0,1.0), vec2(-1.0,1.0));
     var o: VOut; let clip = cam.vp * vec4<f32>(pos.xyz, 1.0);
-    let sz = select(2.2, 4.0, mover == 1u);
+    let sz = select(2.6, 4.0, cam.mode == 0u && val == 1u);
     o.clip = vec4<f32>(clip.xy + corners[vi] * sz * clip.w / 700.0, clip.z, clip.w);
-    o.col = select(vec3<f32>(0.22, 0.30, 0.55), vec3<f32>(0.35, 0.95, 1.0), mover == 1u);
+    if (cam.mode == 1u) { o.col = heat(f32(val) / max(cam.maxd, 1.0)); }
+    else { o.col = select(vec3<f32>(0.22, 0.30, 0.55), vec3<f32>(0.35, 0.95, 1.0), val == 1u); }
     return o;
 }
 @fragment fn fs(in: VOut) -> @location(0) vec4<f32> { return vec4<f32>(in.col, 0.9); }
@@ -307,6 +311,7 @@ async fn run() {
     let mut moving_frac = 0.30f32;
     let mut sweep = true;       // auto-oscillate the fraction 0→1→0 so the cross is self-evident
     let mut sweep_t = 0.0f32;
+    let mut color_depth = false; // D: colour points by their leaf depth in the tree
     let mut forced: Option<Mode> = None; // None = adaptive
     let mut mode = Mode::Keep;
     let mut switches = 0u32;
@@ -328,6 +333,7 @@ async fn run() {
                 KeyCode::Comma => { sweep = false; moving_frac = (moving_frac - 0.02).max(0.0); }
                 KeyCode::Period => { sweep = false; moving_frac = (moving_frac + 0.02).min(1.0); }
                 KeyCode::KeyS => sweep = !sweep,
+                KeyCode::KeyD => color_depth = !color_depth,
                 KeyCode::KeyA => forced = None,
                 KeyCode::Digit1 => forced = Some(Mode::Keep),
                 KeyCode::Digit2 => forced = Some(Mode::Gpu),
@@ -389,11 +395,22 @@ async fn run() {
                 };
                 if want as u8 != mode as u8 { switches += 1; mode = want; }
 
+                // colour value per point: the mover flag (0/1), or in DEPTH mode the
+                // point's leaf depth in the keep-index tree (deep = dense = warm) —
+                // you watch the tree adapt: it subdivides where the cloud clumps.
+                let mut maxd = 1.0f32;
+                if color_depth {
+                    for i in 0..n {
+                        let (mut d, mut nd) = (0u32, tree.ref_leaf(handles[i]));
+                        while let Some(par) = tree.get(nd).parent { nd = par; d += 1; }
+                        flags_cpu[i] = d; maxd = maxd.max(d as f32);
+                    }
+                }
                 // camera + render uploads
                 let target = Vec3::splat(WORLD * 0.5);
                 let eye = target + Vec3::new(dist * pitch.cos() * yaw.cos(), dist * pitch.sin(), dist * pitch.cos() * yaw.sin());
                 let vp = Mat4::perspective_rh(45f32.to_radians(), config.width as f32 / config.height as f32, 1.0, 20000.0) * Mat4::look_at_rh(eye, target, Vec3::Y);
-                queue.write_buffer(&cam_b, 0, bytemuck::cast_slice(&[Cam { vp: vp.to_cols_array_2d() }]));
+                queue.write_buffer(&cam_b, 0, bytemuck::cast_slice(&[Cam { vp: vp.to_cols_array_2d(), mode: color_depth as u32, maxd, _pad: [0, 0] }]));
                 queue.write_buffer(&render_pos_b, 0, bytemuck::cast_slice(&pos));
                 queue.write_buffer(&render_flag_b, 0, bytemuck::cast_slice(&flags_cpu));
 
@@ -417,7 +434,7 @@ async fn run() {
                 row(&mut ui, 54.0, "GPU REBUILD", gpu_ms, [0.4, 0.92, 0.55, 0.95], mode == Mode::Gpu);
                 let mode_txt = match forced { None => if mode == Mode::Keep { "ADAPTIVE - KEEP" } else { "ADAPTIVE - GPU" }, Some(Mode::Keep) => "FORCED KEEP", Some(Mode::Gpu) => "FORCED GPU" };
                 push_text(&mut ui, 18.0, 78.0, 2.0, [0.5, 0.9, 1.0, 0.95], &format!("MOVING {:.0} PCT {}   MODE {mode_txt}   SWITCHES {switches}", moving_frac * 100.0, if sweep { "SWEEP" } else { "" }), sw, sh);
-                push_text(&mut ui, 18.0, 96.0, 1.8, gray, "S AUTO-SWEEP   . MORE   COMMA LESS   A AUTO   1 KEEP   2 GPU", sw, sh);
+                push_text(&mut ui, 18.0, 96.0, 1.8, gray, "S SWEEP   D DEPTH COLOUR   . MORE   COMMA LESS   A AUTO   1 KEEP   2 GPU", sw, sh);
                 push_text(&mut ui, 18.0, 112.0, 1.8, gray, "WHITE BAR MARKS THE PICK. BARS CROSS AT F STAR. DRAG ORBIT SCROLL ZOOM", sw, sh);
                 queue.write_buffer(&ui_buf, 0, bytemuck::cast_slice(&ui));
                 let ui_count = (ui.len() as u32).min(40000);
