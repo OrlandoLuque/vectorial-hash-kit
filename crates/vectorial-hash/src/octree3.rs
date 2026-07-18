@@ -1047,6 +1047,59 @@ mod tests {
     }
 
     #[test]
+    fn octree_raycast_dda_lca_fuzz_across_configs() {
+        // Broadens the 8-way completeness gate (deterministic seed): varied
+        // item_limits + uniform / clustered clouds + many random rays, stressing the
+        // octant-bit-flip neighbour across deep, uneven subdivision.
+        let mut x = 0x0C7A_5A3Eu64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        let w = 256.0;
+        let world = Aabb::new(0.0, 0.0, 0.0, w, w, w);
+        for &il in &[2usize, 5, 10] {
+            for clustered in [false, true] {
+                let pts: Vec<P> = (0..5000).map(|_| {
+                    if clustered {
+                        let cx = (rng() * 6.0) as i64 as f64 * 40.0 + 20.0;
+                        let cy = (rng() * 5.0) as i64 as f64 * 45.0 + 20.0;
+                        P(Point3::new((cx + (rng() - 0.5) * 30.0).clamp(0.0, w), (cy + (rng() - 0.5) * 30.0).clamp(0.0, w), rng() * w))
+                    } else {
+                        P(Point3::new(rng() * w, rng() * w, rng() * w))
+                    }
+                }).collect();
+                let mut tree = Octree3::<P>::new(world, il);
+                for p in &pts { tree.insert(*p); }
+                for _ in 0..30 {
+                    let o = Point3::new(rng() * w * 1.4 - w * 0.2, rng() * w * 1.4 - w * 0.2, rng() * w * 1.4 - w * 0.2);
+                    let d = Point3::new(rng() - 0.5, rng() - 0.5, rng() - 0.5);
+                    let m = (d.x * d.x + d.y * d.y + d.z * d.z).sqrt();
+                    if m < 1e-3 { continue; }
+                    let (ux, uy, uz) = (d.x / m, d.y / m, d.z / m);
+                    let mt = 800.0;
+                    let mut leaf = match tree.raycast_start_leaf(o, ux, uy, uz, mt) { Some(l) => l, None => continue };
+                    let mut visited: Vec<ONodeId> = vec![leaf];
+                    let mut guard = 0usize;
+                    loop {
+                        guard += 1;
+                        if guard > tree.nodes.len() * 3 + 32 { break; }
+                        match tree.ray_step_lca(leaf, o, ux, uy, uz, mt) {
+                            Some((_, n)) => { leaf = n; if !visited.contains(&n) { visited.push(n); } }
+                            None => break,
+                        }
+                    }
+                    let steps = 1600;
+                    for i in 0..=steps {
+                        let t = mt * i as f64 / steps as f64;
+                        let p = Point3::new(o.x + ux * t, o.y + uy * t, o.z + uz * t);
+                        if world.contains(p) {
+                            assert!(visited.contains(&tree.locate(p)), "LCA 8-way fuzz skipped a crossed leaf (il={il}, clustered={clustered})");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn octree_raycast_thick_matches_brute() {
         // The thick capsule raycast must equal brute force, sorted by t.
         let mut x = 0x0C7B_CA57u64;
