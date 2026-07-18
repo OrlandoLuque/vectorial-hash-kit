@@ -121,8 +121,15 @@ on the CPU keep-index — the rebuild-vs-keep crossover itself is in
 `gpu_spatial_bench` / PARALLEL.md. Further headroom: the sort is **hierarchical**
 (reduce/scan/add) **+ 8-bit/4-pass** in both the standalone `gpu_radix_bench`
 (1.6–1.8× the 4-bit width, 8–17× the CPU) and now the build; a *true* single-pass
-Onesweep needs inter-workgroup forward-progress WebGPU doesn't guarantee (the
-portable ceiling). On the **node layout** (both measured on the CPU, but they govern
+**Onesweep** (decoupled-lookback) is the remaining lever — **and now measured to be
+un-implementable in portable WGSL** (`gpu_onesweep_scan_bench`): the look-back needs a
+**device-scope** acquire/release between one spinning thread and other workgroups, but
+WGSL's only ordering primitive, `storageBarrier()`, is **workgroup-scope and
+uniform-only** (no device fence). On native NVIDIA the scan returns a **wrong** prefix
+(a tile reads a predecessor's flag before its aggregate is visible) with **no**
+spin-timeout — so it's a *memory-ordering* wall, not a forward-progress one, and the
+hierarchical + 8-bit/4-pass radix is the honest portable ceiling. On the **node
+layout** (both measured on the CPU, but they govern
 the GPU buffer too): quantised **u16** boxes are **1.6× smaller and exact** (round
 outward + test the exact leaf point — `compressed_bvh_bench`) but only a *footprint*
 win for the binary tree; going **wide (8-ary)** with an SoA/SIMD 8-box test is the

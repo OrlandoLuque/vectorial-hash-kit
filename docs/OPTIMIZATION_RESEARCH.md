@@ -78,9 +78,12 @@ keep-index vs rebuild, SoA vs AoS batch — the kit already has measured studies
 
 1. **GPU radix sort** → **DONE** (a stable LSD radix, see below): hierarchical scan
    **+ an 8-bit/4-pass width** (vs 4-bit/8-pass) now runs it at **8–17× the CPU** at
-   scale. A *true* single-pass **Onesweep** (decoupled-lookback) is blocked by
-   WebGPU's lack of an inter-workgroup forward-progress guarantee (it can deadlock) —
-   8-bit/4-pass is the portable step in that direction. Keep 32-bit Morton codes.
+   scale. A *true* single-pass **Onesweep** (decoupled-lookback) was **attempted +
+   measured un-implementable in portable WGSL** (`gpu_onesweep_scan_bench`): WGSL has
+   no **device-scope** memory fence (`storageBarrier()` is workgroup-scope + uniform),
+   so the cross-workgroup look-back reads stale predecessor data (wrong result on
+   native NVIDIA, no spin-timeout ⇒ a *memory-ordering* wall, not forward-progress).
+   **8-bit/4-pass is the honest portable ceiling.** Keep 32-bit Morton codes.
 2. ~~**Cache-oblivious arena layout**~~ → **DONE** as `Tree3::compact()` (see below).
 3. ~~**Compressed wide-BVH nodes**~~ → **DONE + measured** as
    `examples/compressed_bvh_bench` (see below). *Correction (2026-07-18): an
