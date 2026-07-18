@@ -42,7 +42,7 @@ cargo run -p vectorial-hash-demos --bin adaptive_broadphase --release   # ADAPT_
 | `gpu_spatial_bench` | GPU brute / GPU LBVH / CPU, + the per-frame **rebuild-vs-keep** verdict for *moving* data | kernel ~100–400×; moving data → **fraction-dependent**: keep wins sparse motion, GPU rebuild wins dense (f\* ≈ 30 %→2.8 % as N grows) |
 | `gpu_visibility_bench` | GPU **line-of-sight** over STATIC occluders (segment-vs-AABB LBVH traversal), verified == CPU `segment_hit` (Δ 0) | **~1380×** the serial CPU; 1 ms one-time build — the *clean* GPU case |
 | `gpu_sort_bench` | GPU **bitonic sort** of Morton codes, verified == CPU sort | **slower** than the CPU sort (log² work + dispatch/pass) — the honest negative that motivated the radix |
-| `gpu_radix_bench` | GPU **stable LSD radix sort** of Morton codes (hierarchical scan), **4-bit×8 vs 8-bit×4** widths, verified == CPU sort | 8-bit/4-pass is **1.6–1.8× faster** than 4-bit/8-pass → **8–17× faster** than `sort_unstable` at scale (262k 2.8× · 1M **8.1×** · 4M **16.8×**) — fewer global passes, the portable Onesweep step |
+| `gpu_radix_bench` | GPU **stable LSD radix sort** of Morton codes (hierarchical scan), **4-bit×8 vs 8-bit×4** widths, verified == CPU sort | 8-bit/4-pass is **1.3–1.8× faster** than 4-bit/8-pass → **8–23× faster** than `sort_unstable` (1M **8.1×** · 4M 16.8× · **8M peak 22.6×** · 16M 17.2×) — fewer global passes, the portable Onesweep step |
 | `gpu_lbvh_build_bench` | the **whole LBVH built on the GPU** — Morton → radix → Karras → refit — verified by traversal-vs-brute | **1 M-point BVH in ~4.4 ms/frame** (262k 2.28 · 4M 13.0), all GPU-resident — the on-GPU per-frame rebuild |
 
 ```bash
