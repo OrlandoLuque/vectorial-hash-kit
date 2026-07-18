@@ -45,6 +45,40 @@ fn push_quad(v: &mut Vec<UiVertex>, px: f32, py: f32, w: f32, h: f32, color: [f3
     v.extend_from_slice(&[q(x0, y0), q(x1, y0), q(x1, y1), q(x0, y0), q(x1, y1), q(x0, y1)]);
 }
 
+// A 3x5 bitmap font (shared with the siege/horde HUDs — wgpu has no text).
+fn glyph(c: char) -> [&'static str; 5] {
+    match c {
+        '0' => ["111","101","101","101","111"], '1' => ["010","110","010","010","111"],
+        '2' => ["111","001","111","100","111"], '3' => ["111","001","111","001","111"],
+        '4' => ["101","101","111","001","001"], '5' => ["111","100","111","001","111"],
+        '6' => ["111","100","111","101","111"], '7' => ["111","001","010","010","010"],
+        '8' => ["111","101","111","101","111"], '9' => ["111","101","111","001","111"],
+        'A' => ["111","101","111","101","101"], 'B' => ["110","101","110","101","110"],
+        'C' => ["111","100","100","100","111"], 'D' => ["110","101","101","101","110"],
+        'E' => ["111","100","110","100","111"], 'F' => ["111","100","110","100","100"],
+        'G' => ["111","100","101","101","111"], 'H' => ["101","101","111","101","101"],
+        'I' => ["111","010","010","010","111"], 'K' => ["101","101","110","101","101"],
+        'L' => ["100","100","100","100","111"], 'M' => ["101","111","111","101","101"],
+        'N' => ["101","111","111","111","101"], 'O' => ["111","101","101","101","111"],
+        'P' => ["111","101","111","100","100"], 'R' => ["111","101","110","101","101"],
+        'S' => ["111","100","111","001","111"], 'T' => ["111","010","010","010","010"],
+        'U' => ["101","101","101","101","111"], 'V' => ["101","101","101","101","010"],
+        'W' => ["101","101","101","111","101"], 'Y' => ["101","101","010","010","010"],
+        ':' => ["000","010","000","010","000"], '-' => ["000","000","111","000","000"],
+        '.' => ["000","000","000","000","010"], _ => ["000","000","000","000","000"],
+    }
+}
+#[allow(clippy::too_many_arguments)]
+fn push_text(v: &mut Vec<UiVertex>, x: f32, y: f32, px: f32, color: [f32; 4], text: &str, sw: f32, sh: f32) {
+    let mut cx = x;
+    for c in text.chars() {
+        for (row, bits) in glyph(c.to_ascii_uppercase()).iter().enumerate() {
+            for (col, ch) in bits.char_indices() { if ch == '1' { push_quad(v, cx + col as f32 * px, y + row as f32 * px, px, px, color, sw, sh); } }
+        }
+        cx += 4.0 * px;
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Mode { Keep, Gpu }
 
@@ -212,7 +246,7 @@ async fn run() {
     let render_pos_b = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (n * 16) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
     let render_flag_b = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (n * 4) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
     let cam_b = ub(std::mem::size_of::<Cam>() as u64);
-    let ui_buf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (256 * std::mem::size_of::<UiVertex>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+    let ui_buf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (40000 * std::mem::size_of::<UiVertex>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
 
     // ---- pipelines ----
     let ent = |b, ty| wgpu::BindGroupLayoutEntry { binding: b, visibility: wgpu::ShaderStages::COMPUTE, ty, count: None };
@@ -358,20 +392,30 @@ async fn run() {
                 queue.write_buffer(&render_pos_b, 0, bytemuck::cast_slice(&pos));
                 queue.write_buffer(&render_flag_b, 0, bytemuck::cast_slice(&flags_cpu));
 
-                // HUD bars: keep vs GPU-rebuild cost, the picked one bright.
+                // HUD: two labelled index-maintenance cost bars + a legend, so it
+                // reads without knowing the demo (bitmap font — wgpu has no text).
                 let (sw, sh) = (config.width as f32, config.height as f32);
-                let scale = 320.0 / 20.0; // px per ms (0..20 ms full scale)
+                let scale = 210.0 / 20.0; // px per ms (bar full scale ~20 ms)
+                let white = [0.92, 0.94, 1.0, 0.95];
+                let gray = [0.6, 0.64, 0.75, 0.9];
                 let mut ui: Vec<UiVertex> = Vec::new();
-                push_quad(&mut ui, 12.0, 12.0, 344.0, 58.0, [0.0, 0.0, 0.0, 0.5], sw, sh);
-                let bar = |ui: &mut Vec<UiVertex>, y: f32, ms: f32, col: [f32; 4], picked: bool| {
-                    push_quad(ui, 18.0, y, 320.0, 18.0, [0.16, 0.16, 0.22, 0.7], sw, sh);
-                    push_quad(ui, 18.0, y, (ms * scale).clamp(0.0, 320.0), 18.0, col, sw, sh);
-                    if picked { push_quad(ui, 14.0, y - 2.0, 3.0, 22.0, [1.0, 1.0, 1.0, 0.9], sw, sh); }
+                push_quad(&mut ui, 12.0, 10.0, 470.0, 122.0, [0.0, 0.0, 0.0, 0.55], sw, sh);
+                push_text(&mut ui, 18.0, 15.0, 2.2, white, "MOVING-DATA BROAD-PHASE: KEEP-INDEX VS GPU REBUILD", sw, sh);
+                let row = |ui: &mut Vec<UiVertex>, y: f32, label: &str, ms: f32, col: [f32; 4], picked: bool| {
+                    push_text(ui, 18.0, y + 2.0, 2.0, col, label, sw, sh);
+                    push_quad(ui, 150.0, y, 210.0, 15.0, [0.16, 0.16, 0.22, 0.75], sw, sh);
+                    push_quad(ui, 150.0, y, (ms * scale).clamp(0.0, 210.0), 15.0, col, sw, sh);
+                    push_text(ui, 368.0, y + 2.0, 2.0, white, &format!("{ms:.2} MS"), sw, sh);
+                    if picked { push_quad(ui, 143.0, y - 1.0, 4.0, 17.0, white, sw, sh); }
                 };
-                bar(&mut ui, 18.0, keep_ms, [0.9, 0.35, 0.35, 0.95], mode == Mode::Keep);
-                bar(&mut ui, 44.0, gpu_ms, [0.35, 0.9, 0.5, 0.95], mode == Mode::Gpu);
+                row(&mut ui, 34.0, "CPU KEEP", keep_ms, [0.95, 0.42, 0.42, 0.95], mode == Mode::Keep);
+                row(&mut ui, 54.0, "GPU REBUILD", gpu_ms, [0.4, 0.92, 0.55, 0.95], mode == Mode::Gpu);
+                let mode_txt = match forced { None => if mode == Mode::Keep { "ADAPTIVE - KEEP" } else { "ADAPTIVE - GPU" }, Some(Mode::Keep) => "FORCED KEEP", Some(Mode::Gpu) => "FORCED GPU" };
+                push_text(&mut ui, 18.0, 78.0, 2.0, [0.5, 0.9, 1.0, 0.95], &format!("MOVING {:.0} PCT   MODE {mode_txt}   SWITCHES {switches}", moving_frac * 100.0), sw, sh);
+                push_text(&mut ui, 18.0, 96.0, 1.8, gray, "MORE MOVING . KEY   LESS COMMA KEY   A AUTO   1 KEEP   2 GPU", sw, sh);
+                push_text(&mut ui, 18.0, 112.0, 1.8, gray, "WHITE BAR MARKS THE PICK. BARS CROSS AT F STAR. DRAG ORBIT SCROLL ZOOM", sw, sh);
                 queue.write_buffer(&ui_buf, 0, bytemuck::cast_slice(&ui));
-                let ui_count = ui.len() as u32;
+                let ui_count = (ui.len() as u32).min(40000);
 
                 let frame_tex = match surface.get_current_texture() { Ok(f) => f, Err(_) => { surface.configure(&device, &config); return; } };
                 let view_tex = frame_tex.texture.create_view(&Default::default());
@@ -388,8 +432,10 @@ async fn run() {
                 queue.submit(Some(enc.finish()));
                 frame_tex.present();
 
-                let policy = match forced { None => format!("ADAPTIVE → {}", if mode == Mode::Keep { "keep" } else { "GPU" }), Some(Mode::Keep) => "forced keep".into(), Some(Mode::Gpu) => "forced GPU".into() };
-                window.set_title(&format!("adaptive_broadphase · {policy} [A/1/2] · moving {:.0}% [,.] · keep {keep_ms:.2}ms (red) vs GPU-rebuild {gpu_ms:.2}ms (green) · sw {switches} · {n} pts · {fps:.0} fps", moving_frac * 100.0));
+                if std::env::var_os("SHOT").is_some() { window.set_title("vhshot"); } else {
+                    let policy = match forced { None => format!("ADAPTIVE → {}", if mode == Mode::Keep { "keep" } else { "GPU" }), Some(Mode::Keep) => "forced keep".into(), Some(Mode::Gpu) => "forced GPU".into() };
+                    window.set_title(&format!("adaptive_broadphase · {policy} [A/1/2] · moving {:.0}% [,.] · keep {keep_ms:.2}ms (red) vs GPU-rebuild {gpu_ms:.2}ms (green) · sw {switches} · {n} pts · {fps:.0} fps", moving_frac * 100.0));
+                }
                 window.request_redraw();
             }
             _ => {}
