@@ -39,11 +39,11 @@ cargo run -p vectorial-hash-demos --bin adaptive_broadphase --release   # ADAPT_
 
 | bench | what | headline |
 | --- | --- | --- |
-| `gpu_spatial_bench` | GPU brute / GPU LBVH / CPU, + the per-frame **rebuild-vs-keep** verdict for *moving* data | kernel ~100–400×; but moving data → **parallel CPU keep-index wins at 1 M** |
+| `gpu_spatial_bench` | GPU brute / GPU LBVH / CPU, + the per-frame **rebuild-vs-keep** verdict for *moving* data | kernel ~100–400×; moving data → **fraction-dependent**: keep wins sparse motion, GPU rebuild wins dense (f\* ≈ 30 %→2.8 % as N grows) |
 | `gpu_visibility_bench` | GPU **line-of-sight** over STATIC occluders (segment-vs-AABB LBVH traversal), verified == CPU `segment_hit` (Δ 0) | **~1380×** the serial CPU; 1 ms one-time build — the *clean* GPU case |
 | `gpu_sort_bench` | GPU **bitonic sort** of Morton codes, verified == CPU sort | **slower** than the CPU sort (log² work + dispatch/pass) — the honest negative that motivated the radix |
 | `gpu_radix_bench` | GPU **stable 4-bit LSD radix sort** of Morton codes (hierarchical scan), verified == CPU sort | **5–11× faster** than `sort_unstable` at scale (262k 1.52× · 1M **5.0×** · 4M **10.9×**) — correct+stable, past the bitonic; the sort primitive for the GPU-side build |
-| `gpu_lbvh_build_bench` | the **whole LBVH built on the GPU** — Morton → radix → Karras → refit — verified by traversal-vs-brute | **1 M-point BVH in ~8 ms/frame** (262k 1.69 · 4M 36.3), all GPU-resident — the on-GPU per-frame rebuild |
+| `gpu_lbvh_build_bench` | the **whole LBVH built on the GPU** — Morton → radix → Karras → refit — verified by traversal-vs-brute | **1 M-point BVH in ~4.4 ms/frame** (262k 2.28 · 4M 13.0), all GPU-resident — the on-GPU per-frame rebuild |
 
 ```bash
 cargo run -p vectorial-hash-demos --example gpu_spatial_bench    --release --features parallel   # GPU_N/M/R/CLUSTER
@@ -66,25 +66,26 @@ headline is the kernel only. The honest rule:
   GPU (a particle/DEM/flocking sim of one uniform rule), everything — grid, query,
   forces, integration — is on-GPU with no round-trip. `gpu_storm` = ~50× the CPU.
 - **◑ Moving data → it depends on the moving FRACTION** (now that the GPU-side
-  build is real — `gpu_lbvh_build_bench`, ~9 ms/frame at 1 M, all GPU-resident).
+  build is real — `gpu_lbvh_build_bench`, ~4.4 ms/frame at 1 M, all GPU-resident).
   - **Most of the cloud moves → GPU rebuild.** All-moving, per frame: GPU rebuild
     vs the CPU keep-index's *best case* (serial `update_ref` over all, ~no
-    relocations): **262k 2.3 vs 5.9 ms · 1 M 4.4 vs 62 ms** — a serial maintain-*all*
-    pass loses to the parallel build (2.6× at 262k, **14× at 1 M** now the scan is
-    hierarchical). (Before the radix, the GPU-side build didn't exist — the bitonic
-    sort lost to the CPU.)
+    relocations): **262k 2.3 vs 5.7 ms · 1 M 4.4 vs 48.6 ms · 4 M 13 vs 452 ms** — a
+    serial maintain-*all* pass loses to the parallel build (2.5× at 262k, **11× at
+    1 M**, 35× at 4 M now the scan is hierarchical). (Before the radix, the GPU-side
+    build didn't exist — the bitonic sort lost to the CPU.)
   - **Only a fraction moves → CPU keep-index.** Its real edge is *skipping* the
     items that didn't move (the horde demo's dormant carpet keeps for ~nothing);
     `ItemRef` + the moved-only sync + `cull_many_par` is still the lever there.
   - **Adaptive hybrid (measured, viable).** Keep below a crossover fraction **f\***,
     GPU rebuild above, with a **hysteresis** dead-band so it doesn't thrash. Since
     keep skips the unmoved, keep-cost ≈ linear in the moving fraction while GPU is
-    flat, so they cross at a clean **f\* ≈ 30 % (262k) · 7 % (1 M)** — and f\*
-    *drops* with N (the serial keep pass scales worse). On a wave whose moving
-    fraction ramps 0→1→0 the adaptive policy beats **both** pure strategies (1 M:
-    **1020 ms** vs pure-GPU 1099 vs pure-keep 5227); a ±25 %-of-f\* dead-band roughly
-    **halves the switch count** when the load hovers at f\* (110→64 over 200 noisy
-    frames). `gpu_lbvh_build_bench` prints the f\* sweep + the wave/noise comparison.
+    flat, so they cross at a clean **f\* ≈ 30 % (262k) · 7.6 % (1 M) · 2.8 % (4 M)** —
+    and f\* *drops sharply* with N (the serial keep pass scales worse). On a wave
+    whose moving fraction ramps 0→1→0 the adaptive policy beats **both** pure
+    strategies (1 M: **504 ms** vs pure-GPU 527 vs pure-keep 4163); a ±25 %-of-f\*
+    dead-band roughly **halves the switch count** when the load hovers at f\* (110→64
+    over 200 noisy frames). `gpu_lbvh_build_bench` prints the f\* sweep + the
+    wave/noise comparison.
 - **❌ The game sims stay on the CPU.** Their dominant cost is the *branchy*
   per-agent `decide` (FSM, targeting, morale) — warp-divergent, GPU-hostile — not
   the spatial query. See `PERF_NOTES.md`.
@@ -105,16 +106,23 @@ correct). Measured (RTX 4080 SUPER, min-of-7, whole build per frame):
 
 | points | build/frame | throughput |
 | --- | --- | --- |
-| 262 k | 2.29 ms | 115 Mpts/s |
-| 1 M | **4.36 ms** | 241 Mpts/s |
+| 262 k | 2.28 ms | 115 Mpts/s |
+| 1 M | **4.40 ms** | 239 Mpts/s |
+| 4 M | 12.98 ms | 308 Mpts/s |
 
 So a 1 M-point BVH **rebuilds on the GPU in ~4.4 ms/frame**, verified correct
 (down from 8.4 ms once the radix scan went hierarchical — see the sort row; small
 N pays a little for the extra scan passes). This
 is what lets a *moving* broad-phase rebuild on the GPU each frame rather than lean
 on the CPU keep-index — the rebuild-vs-keep crossover itself is in
-`gpu_spatial_bench` / PARALLEL.md. Further headroom: an **Onesweep** multi-workgroup
-scan (beyond the current 16-way one) and a compressed wide-node layout.
+`gpu_spatial_bench` / PARALLEL.md. Further headroom: a single-pass **Onesweep** scan
+(the current scan is already **hierarchical** — reduce/scan/add — which took 1 M
+8.4 → 4.4 ms) and a **wide (8-ary) compressed node**. On the last: quantised **u16**
+nodes are measured **1.6× smaller and exact** (round the box outward + test the
+exact leaf point — `vectorial-hash/examples/compressed_bvh_bench`), but for the
+binary layout that is a **footprint** win (fit more BVH under WebGPU's
+`maxStorageBufferBindingSize`), *not* a cull-latency win — the latency win needs the
+**wide** node (one cache line per node, SIMD box tests), not quantisation alone.
 
 ## Design notes
 
