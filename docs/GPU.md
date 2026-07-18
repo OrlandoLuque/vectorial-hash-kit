@@ -104,24 +104,25 @@ atomic bottom-up AABB refit, no CPU round-trip — and **verifies it** by traver
 the GPU-built tree on the CPU vs brute force (a pass ⇒ hierarchy *and* AABBs
 correct). Measured (RTX 4080 SUPER, min-of-7, whole build per frame):
 
-| points | build/frame | throughput |
+| points | build/frame (4-bit → 8-bit sort) | throughput |
 | --- | --- | --- |
-| 262 k | 2.28 ms | 115 Mpts/s |
-| 1 M | **4.40 ms** | 239 Mpts/s |
-| 4 M | 12.98 ms | 308 Mpts/s |
+| 262 k | 2.28 → **1.58 ms** | 166 Mpts/s |
+| 1 M | 4.40 → **3.7 ms** | 273 Mpts/s |
+| 4 M | 12.98 → ~14 ms (flat) | 283 Mpts/s |
 
-So a 1 M-point BVH **rebuilds on the GPU in ~4.4 ms/frame**, verified correct
-(down from 8.4 ms once the radix scan went hierarchical — see the sort row; small
-N pays a little for the extra scan passes). This
+So a 1 M-point BVH **rebuilds on the GPU in ~3.7 ms/frame**, verified correct — down
+from 8.4 ms (hierarchical scan) then 4.4 ms (see the sort row), now the build's own
+key-value radix runs the **8-bit / 4-pass** width. The width helps where the *sort*
+is a big slice of the build (262 k **1.4×**, 1 M **1.2×**); at 4 M the sort is a
+smaller fraction (Karras + refit dominate) and the 256-bucket scan overhead makes it
+a **wash** — an honest, size-dependent win. This
 is what lets a *moving* broad-phase rebuild on the GPU each frame rather than lean
 on the CPU keep-index — the rebuild-vs-keep crossover itself is in
-`gpu_spatial_bench` / PARALLEL.md. Further headroom: the sort is already
-**hierarchical** (reduce/scan/add; 1 M 8.4 → 4.4 ms build) and now runs an **8-bit /
-4-pass** width that beats the 4-bit/8-pass **1.6–1.8×** (fewer global passes — the
-portable step toward Onesweep, whose true single-pass decoupled-lookback needs
-inter-workgroup forward-progress WebGPU doesn't guarantee). *Follow-on:* propagate
-the 8-bit width into the build's key-value radix (`gpu_lbvh_build_bench`) to shave
-its sort stage. On the **node layout** (both measured on the CPU, but they govern
+`gpu_spatial_bench` / PARALLEL.md. Further headroom: the sort is **hierarchical**
+(reduce/scan/add) **+ 8-bit/4-pass** in both the standalone `gpu_radix_bench`
+(1.6–1.8× the 4-bit width, 8–17× the CPU) and now the build; a *true* single-pass
+Onesweep needs inter-workgroup forward-progress WebGPU doesn't guarantee (the
+portable ceiling). On the **node layout** (both measured on the CPU, but they govern
 the GPU buffer too): quantised **u16** boxes are **1.6× smaller and exact** (round
 outward + test the exact leaf point — `compressed_bvh_bench`) but only a *footprint*
 win for the binary tree; going **wide (8-ary)** with an SoA/SIMD 8-box test is the

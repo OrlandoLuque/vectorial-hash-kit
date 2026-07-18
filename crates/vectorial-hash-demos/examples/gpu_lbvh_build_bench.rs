@@ -73,12 +73,12 @@ const RADIX_SRC: &str = r#"
 @group(0) @binding(7) var<storage, read_write> block_tot: array<u32>;
 @group(0) @binding(8) var<storage, read_write> block_off: array<u32>;
 
-const RADIX: u32 = 16u;
+const RADIX: u32 = 256u; // 8-bit digit → 4 passes (half the global round-trips of 4-bit×8)
 const BLOCK: u32 = 512u; // tiles per scan block (hierarchical scan)
-var<workgroup> lhist:  array<atomic<u32>, 16>;
+var<workgroup> lhist:  array<atomic<u32>, 256>;
 var<workgroup> ldig:   array<u32, 256>;
-var<workgroup> wtotal: array<u32, 16>;
-var<workgroup> wbase:  array<u32, 16>;
+var<workgroup> wtotal: array<u32, 256>;
+var<workgroup> wbase:  array<u32, 256>;
 
 @compute @workgroup_size(256)
 fn histogram(@builtin(global_invocation_id) gid: vec3<u32>,
@@ -88,13 +88,13 @@ fn histogram(@builtin(global_invocation_id) gid: vec3<u32>,
     if (li < RADIX) { atomicStore(&lhist[li], 0u); }
     workgroupBarrier();
     let i = gid.x;
-    if (i < p.x) { atomicAdd(&lhist[(src_k[i] >> p.y) & 0xFu], 1u); }
+    if (i < p.x) { atomicAdd(&lhist[(src_k[i] >> p.y) & 0xFFu], 1u); }
     workgroupBarrier();
     if (li < RADIX) { tile_hist[wid.x * RADIX + li] = atomicLoad(&lhist[li]); }
 }
 
 // hierarchical scan: reduce (per block of tiles) → top (scan blocks) → add.
-@compute @workgroup_size(16)
+@compute @workgroup_size(256)
 fn scan_reduce(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
     let d = lid.x; let nt = p.z; let b = wid.x;
     let lo = b * BLOCK; let hi = min(lo + BLOCK, nt);
@@ -102,7 +102,7 @@ fn scan_reduce(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_
     for (var t = lo; t < hi; t = t + 1u) { tile_off[t * RADIX + d] = run; run = run + tile_hist[t * RADIX + d]; }
     block_tot[b * RADIX + d] = run;
 }
-@compute @workgroup_size(16)
+@compute @workgroup_size(256)
 fn scan_top(@builtin(local_invocation_id) lid: vec3<u32>) {
     let d = lid.x; let nb = p.w;
     var tot = 0u;
@@ -114,7 +114,7 @@ fn scan_top(@builtin(local_invocation_id) lid: vec3<u32>) {
     var run = wbase[d];
     for (var b = 0u; b < nb; b = b + 1u) { block_off[b * RADIX + d] = run; run = run + block_tot[b * RADIX + d]; }
 }
-@compute @workgroup_size(16)
+@compute @workgroup_size(256)
 fn scan_add(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
     let d = lid.x; let nt = p.z; let b = wid.x;
     let base = block_off[b * RADIX + d];
@@ -129,8 +129,8 @@ fn scatter(@builtin(global_invocation_id) gid: vec3<u32>,
     let li = lid.x;
     let i = gid.x;
     var key = 0xFFFFFFFFu;
-    var d = 0xFu;
-    if (i < p.x) { key = src_k[i]; d = (key >> p.y) & 0xFu; }
+    var d = 0xFFu;
+    if (i < p.x) { key = src_k[i]; d = (key >> p.y) & 0xFFu; }
     ldig[li] = d;
     workgroupBarrier();
     if (i < p.x) {
@@ -262,11 +262,11 @@ async fn run() {
     let (code_a, code_b) = (sbuf((n2 * 4) as u64), sbuf((n2 * 4) as u64));
     let (val_a, val_b)   = (sbuf((n2 * 4) as u64), sbuf((n2 * 4) as u64));
     let code_orig = sbuf((n2 * 4) as u64); // un-sorted codes, kept for the verify
-    let hist_b = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (num_tiles * 16 * 4) as u64, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
-    let off_b  = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (num_tiles * 16 * 4) as u64, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
+    let hist_b = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (num_tiles * 256 * 4) as u64, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
+    let off_b  = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (num_tiles * 256 * 4) as u64, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
     let num_blocks = num_tiles.div_ceil(512);
-    let block_tot_b = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (num_blocks * 16 * 4) as u64, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
-    let block_off_b = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (num_blocks * 16 * 4) as u64, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
+    let block_tot_b = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (num_blocks * 256 * 4) as u64, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
+    let block_off_b = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (num_blocks * 256 * 4) as u64, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
     let mp_b = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
     let rp_b = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
     let rd = |sz: u64| device.create_buffer(&wgpu::BufferDescriptor { label: None, size: sz, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
@@ -321,7 +321,7 @@ async fn run() {
     let kpipe = |ep: &str| device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&k_pl), module: &k_mod, entry_point: ep, compilation_options: Default::default() });
     let (karras_p, leaf_p, refit_p) = (kpipe("karras"), kpipe("leaf_init"), kpipe("refit"));
     let k_bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &k_bgl, entries: &[
-        wgpu::BindGroupEntry { binding: 0, resource: code_a.as_entire_binding() },   // sorted codes (8 passes even → in code_a)
+        wgpu::BindGroupEntry { binding: 0, resource: code_a.as_entire_binding() },   // sorted codes (4 passes even → in code_a)
         wgpu::BindGroupEntry { binding: 1, resource: val_a.as_entire_binding() },    // sorted point indices
         wgpu::BindGroupEntry { binding: 2, resource: pts_b.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 3, resource: children_b.as_entire_binding() },
@@ -342,10 +342,10 @@ async fn run() {
         { let mut c = enc.begin_compute_pass(&Default::default()); c.set_bind_group(0, &m_bg, &[]); c.set_pipeline(&m_pipe); c.dispatch_workgroups((n as u32).div_ceil(256), 1, 1); }
         enc.copy_buffer_to_buffer(&code_a, 0, &code_orig, 0, (n2 * 4) as u64); // snapshot before the sort
         queue.submit(Some(enc.finish()));
-        // key-value radix, 8 passes ping-pong (final in code_a/val_a).
-        for pass in 0..8u32 {
+        // key-value radix, 8-bit digit → 4 passes ping-pong (final in code_a/val_a).
+        for pass in 0..4u32 {
             let g = if pass % 2 == 0 { &bg_ab } else { &bg_ba };
-            queue.write_buffer(&rp_b, 0, bytemuck::cast_slice(&[n2 as u32, pass * 4, num_tiles as u32, num_blocks as u32]));
+            queue.write_buffer(&rp_b, 0, bytemuck::cast_slice(&[n2 as u32, pass * 8, num_tiles as u32, num_blocks as u32]));
             let nb = num_blocks as u32;
             let mut enc = device.create_command_encoder(&Default::default());
             { let mut c = enc.begin_compute_pass(&Default::default()); c.set_bind_group(0, g, &[]); c.set_pipeline(&hist_p); c.dispatch_workgroups(wg, 1, 1); }
