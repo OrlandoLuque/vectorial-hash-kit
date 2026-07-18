@@ -42,7 +42,7 @@ cargo run -p vectorial-hash-demos --bin adaptive_broadphase --release   # ADAPT_
 | `gpu_spatial_bench` | GPU brute / GPU LBVH / CPU, + the per-frame **rebuild-vs-keep** verdict for *moving* data | kernel ~100–400×; but moving data → **parallel CPU keep-index wins at 1 M** |
 | `gpu_visibility_bench` | GPU **line-of-sight** over STATIC occluders (segment-vs-AABB LBVH traversal), verified == CPU `segment_hit` (Δ 0) | **~1380×** the serial CPU; 1 ms one-time build — the *clean* GPU case |
 | `gpu_sort_bench` | GPU **bitonic sort** of Morton codes, verified == CPU sort | **slower** than the CPU sort (log² work + dispatch/pass) — the honest negative that motivated the radix |
-| `gpu_radix_bench` | GPU **stable 4-bit LSD radix sort** of Morton codes, verified == CPU sort | **~2× faster** than `sort_unstable` (262k **2.37×** · 1M 1.77× · 4M 1.97×) — correct+stable, past the bitonic; the sort primitive for the GPU-side build |
+| `gpu_radix_bench` | GPU **stable 4-bit LSD radix sort** of Morton codes (hierarchical scan), verified == CPU sort | **5–11× faster** than `sort_unstable` at scale (262k 1.52× · 1M **5.0×** · 4M **10.9×**) — correct+stable, past the bitonic; the sort primitive for the GPU-side build |
 | `gpu_lbvh_build_bench` | the **whole LBVH built on the GPU** — Morton → radix → Karras → refit — verified by traversal-vs-brute | **1 M-point BVH in ~8 ms/frame** (262k 1.69 · 4M 36.3), all GPU-resident — the on-GPU per-frame rebuild |
 
 ```bash

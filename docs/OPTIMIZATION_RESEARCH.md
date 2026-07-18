@@ -105,15 +105,17 @@ keep-index vs rebuild, SoA vs AoS batch — the kit already has measured studies
   scatter), ping-pong buffers, 8 passes, no CPU in the loop. **Verified exactly ==
   a CPU sort** at every size. Measured (RTX 4080 SUPER, min-of-7 vs
   `sort_unstable`):
-  - 262k keys: GPU 1.09 ms · CPU 2.58 ms — **2.37× faster**
-  - 1 M keys:  GPU 6.31 ms · CPU 11.16 ms — **1.77× faster**
-  - 4 M keys:  GPU 24.51 ms · CPU 48.38 ms — **1.97× faster**
+  - 262k keys: GPU 1.69 ms · CPU 2.56 ms — **1.52× faster**
+  - 1 M keys:  GPU 2.25 ms · CPU 11.29 ms — **5.01× faster**
+  - 4 M keys:  GPU 4.46 ms · CPU 48.74 ms — **10.93× faster**
   The headline vs the old `gpu_sort_bench`: the **bitonic was ~2× *slower* than the
-  CPU; the radix is ~2× *faster*** and correct+stable — the primitive the research
-  named. The lever that put it clear was a **16-way-parallel scan** (one thread per
-  digit; the first single-workgroup-*serial* scan was only at parity — 1.0×). A
-  multi-workgroup **Onesweep** decoupled-lookback scan would scale it further
-  still. This **unblocks the on-GPU LBVH build**: the sort now stays
+  CPU; the radix is 5–11× *faster*** at scale and correct+stable — the primitive the
+  research named. Two scan iterations got it there: a 16-way (one-thread-per-digit)
+  scan lifted the first single-workgroup-*serial* version off parity, then a
+  **hierarchical multi-workgroup scan** (reduce per block of tiles → scan the blocks
+  → add) removed the real bottleneck at scale — **1 M went 6.3→2.3 ms, 4 M 24.5→4.5
+  ms** (small N pays a little for the extra passes; the Onesweep the research named).
+  This **unblocks the on-GPU LBVH build**: the sort now stays
   GPU-resident (no readback), so parity-in-isolation is a win in-pipeline — sort
   Morton codes here, then Karras split + AABB refit on top, all without a round
   trip. (32-bit keys; a full build emulates u64 as `vec2<u32>`.)
