@@ -1,7 +1,8 @@
-//! Cache-locality bench for [`Tree3::compact`]: does DFS-reordering the node
-//! arena speed up culls on a tree whose node order has been *scrambled* by a
-//! long keep-index run (per-frame `update_ref` relocations → splits/merges land
-//! in scattered free slots)?
+//! Cache-locality bench for [`Tree3::compact`] **and [`Octree3::compact`]**: does
+//! DFS-reordering the node arena speed up culls on a tree whose node order has been
+//! *scrambled* by a long keep-index run (per-frame `update_ref` relocations →
+//! splits/merges land in scattered free slots)? Measured on both the binary tree
+//! and the 8-way octree (same churn, same query set).
 //!
 //! ```bash
 //! cargo run -p vectorial-hash --example compact_bench --release
@@ -12,7 +13,7 @@
 //! memory order of the nodes differs.
 
 use std::time::Instant;
-use vectorial_hash::{Aabb, ItemRef, Point3, Positioned3, Sphere3, Tree3};
+use vectorial_hash::{Aabb, ItemRef, Octree3, Point3, Positioned3, Sphere3, Tree3};
 
 #[derive(Clone, Copy)]
 struct P(Point3);
@@ -66,7 +67,29 @@ fn main() {
     let compact_us = t0.elapsed().as_secs_f64() * 1e6;
     let compacted = bench(&tree);
 
-    println!("Tree3::compact locality bench | N={n} items | {frames} churn frames | 3000 random culls (min of 10)");
-    println!("  arena nodes: {nc0} ({lc0} live) → {} after compact ({:.0} µs to compact, one pass)", tree.node_count(), compact_us);
-    println!("  cull:  scrambled {scrambled:.3} µs/query   compacted {compacted:.3} µs/query   speedup {:.2}×", scrambled / compacted);
+    // --- Octree3: the same churn + compact question on the 8-way tree ---
+    let mut otree = Octree3::<P>::new(world, 8);
+    let mut orefs: Vec<ItemRef> = Vec::with_capacity(n);
+    for _ in 0..n { let p = Point3::new(rng() * w, rng() * w, rng() * w); orefs.push(otree.insert_ref(P(p)).unwrap()); }
+    for _ in 0..frames {
+        for &r in &orefs {
+            let (dx, dy, dz) = ((rng() - 0.5) * 24.0, (rng() - 0.5) * 24.0, (rng() - 0.5) * 24.0);
+            otree.update_ref(r, |q| q.0 = Point3::new((q.0.x + dx).clamp(1.0, w - 1.0), (q.0.y + dy).clamp(1.0, w - 1.0), (q.0.z + dz).clamp(1.0, w - 1.0)));
+        }
+    }
+    let obench = |t: &Octree3<P>| -> f64 {
+        let mut best = f64::MAX;
+        for _ in 0..10 { let s = Instant::now(); let mut acc = 0usize; for q in &queries { acc += t.cull(q).len(); } std::hint::black_box(acc); best = best.min(s.elapsed().as_secs_f64()); }
+        best * 1e6 / queries.len() as f64
+    };
+    let oscrambled = obench(&otree);
+    let (onc0, olc0) = (otree.node_count(), otree.live_node_count());
+    let ot0 = Instant::now();
+    otree.compact();
+    let ocompact_us = ot0.elapsed().as_secs_f64() * 1e6;
+    let ocompacted = obench(&otree);
+
+    println!("compact() locality bench | N={n} items | {frames} churn frames | 3000 random culls (min of 10)\n");
+    println!("  Tree3   arena {nc0} ({lc0} live) → {} | compact {:.0} µs | cull {scrambled:.3} → {compacted:.3} µs/query | {:.2}×", tree.node_count(), compact_us, scrambled / compacted);
+    println!("  Octree3 arena {onc0} ({olc0} live) → {} | compact {ocompact_us:.0} µs | cull {oscrambled:.3} → {ocompacted:.3} µs/query | {:.2}×", otree.node_count(), oscrambled / ocompacted);
 }

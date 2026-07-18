@@ -167,6 +167,11 @@ keep-index vs rebuild, SoA vs AoS batch — the kit already has measured studies
   before a query-heavy phase after churn (`bulk_load` already lays out compactly,
   so a fresh build doesn't need it). Not wired into the demos — their per-frame
   cull is a small slice, so 15 % of it isn't worth the periodic compaction hitch.
+  **Octree3 too (2026-07-19), and it barely helps there — only ~1.04×** (200k:
+  5.03 → 4.82 µs) vs Tree3's 1.17 % at the same N. The 8-way tree is **shallower**
+  (fewer levels to walk, so less pointer-chasing to reorder) and its cull already
+  touches ~8× fewer nodes, so arena locality has less to fix. `compact()` is a
+  **binary-`Tree3` lever**, marginal on the octree.
 
 - **GPU radix sort → `examples/gpu_radix_bench`** (2026-07-17). A **stable 4-bit
   LSD radix** of 32-bit Morton codes, fully on the GPU: 3 compute kernels per pass
