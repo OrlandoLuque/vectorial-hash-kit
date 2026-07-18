@@ -300,16 +300,21 @@ autonomously verifiable. User picked **"Todo (A–E)"** + the headline below.
      axis: one wake blast touched 270k cells). Morton==Tree==brute gated.
      (The 2D leg of "ambos conmutables" would need a projection layer —
      queued behind the TAB-map research.)
-  6. **Quaternius Ultimate Fantasy RTS** wall/tower/house models to replace
-     the procedural boxes. **PACK NOW ON DISK** (user downloaded it):
-     `assets/siege/Ultimate Fantasy RTS-glb.zip` — glb files ready. Wiring
-     job (next): pick `Stone Wall.glb`, `Stone Wall Towers.glb`/`Stone
-     Tower.glb`, `Castle Gate.glb`, `Castle.glb`/`Castle Fortress.glb` (CC),
-     `House*.glb`, `Storage House.glb`, `Barracks.glb`; unzip into
-     `assets/siege/models/`, map onto `SKind` in `horde_wgpu` replacing the
-     instanced boxes (mind per-model yaw/scale like `model_tweak`; check clip
-     names — these are static props, no rig). The web build fetches from
-     `docs/models/`, so add them there + rebuild the wasm too.
+  6. ~~**Quaternius Ultimate Fantasy RTS** wall/tower/house models~~ — **WIRED
+     (first pass, 2026-07-18) — needs the user's eyes for scale/orientation.**
+     Extracted `Stone Wall`→`wall.glb`, `Castle Gate`→`gate.glb`, `Stone
+     Tower`→`tower.glb`, `House`→`house.glb`, `Storage House`→`storehouse.glb`
+     into `assets/siege/models/` (native `include_bytes`) **and** `docs/models/`
+     (web fetch). `horde_wgpu` loads one static `GpuModel` per `SKind`
+     (`BUILDING_FILES`, via `build_gpu_model` like the castle) and draws them in
+     **per-kind instance ranges** from a shared buffer (replacing the boxes;
+     CommandCenter still the castle, porter bundles still boxes). HP damage tints
+     the model toward alarm-red (`tint.a = dmg`), rubble sinks + darkens; tower
+     cannon rides on top. First-pass scales in **`building_tweak(SKind) ->
+     (scale, yaw, y)`** — trivial to tune. Compiles + runs (no panic, 58 fps).
+     **PENDING (needs eyes): tune `building_tweak` scale/yaw/y per model, then
+     rebuild + republish the horde wasm.** (wasm NOT yet rebuilt — a blind visual
+     publish would risk shipping wrong scales.)
   7. ~~**Multi-goal flow field**~~ — **DONE** (2026-07-07): the user's
      multi-source idea. `O` toggle seeds 0 at every live building, one flood
      (multi-source Dijkstra); re-routes to survivors as buildings fall

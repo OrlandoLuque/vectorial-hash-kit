@@ -51,6 +51,24 @@ const UNIT_FILES: [&str; 10] = [
     "henry.glb",          // Crew
     "witch.glb",          // Porter
 ];
+/// Quaternius "Ultimate Fantasy RTS" (CC0) building props, in `SKind` order
+/// (Wall, Gate, Tower, House, Storehouse) — replace the instanced boxes.
+/// CommandCenter keeps the castle model. Static props (no rig) load fine through
+/// `build_gpu_model` exactly like the castle/cannon.
+const BUILDING_FILES: [&str; 5] = ["wall.glb", "gate.glb", "tower.glb", "house.glb", "storehouse.glb"];
+/// Per-building placement tweak: `(uniform scale, extra yaw, y offset)`. First-pass
+/// values matched to the old box heights — **eyeball + tune** (Quaternius props are
+/// Y-up, ~1-unit, origin at the base).
+fn building_tweak(k: SKind) -> (f32, f32, f32) {
+    match k {
+        SKind::Wall => (7.0, 0.0, 0.0),
+        SKind::Gate => (7.0, 0.0, 0.0),
+        SKind::Tower => (9.0, 0.0, 0.0),
+        SKind::House => (7.0, 0.0, 0.0),
+        SKind::Storehouse => (8.0, 0.0, 0.0),
+        SKind::CommandCenter => (40.0, 0.0, 0.0),
+    }
+}
 fn zmodel(c: ZClass) -> usize { c.index() } // 0..5 in UNIT_FILES order
 fn dmodel(k: DKind) -> usize { match k { DKind::Ranger => 5, DKind::Soldier => 6, DKind::Sniper => 7, DKind::Crew => 8, DKind::Porter => 9 } }
 fn zscale(c: ZClass) -> f32 { match c { ZClass::Chubby => 9.0, ZClass::Harpy => 5.0, _ => 7.0 } }
@@ -447,6 +465,8 @@ struct State {
     inst_buf: wgpu::Buffer,
     box_model: GpuModel,
     box_inst_buf: wgpu::Buffer,
+    building_models: Vec<GpuModel>,
+    building_inst_buf: wgpu::Buffer,
     tree_inst_buf: wgpu::Buffer, // Forest scenario: static trunk+canopy boxes
     tree_n: u32,
     // ---- the molón round: night+torches, blood/kill-ring decals, trauma cam
@@ -574,7 +594,7 @@ impl State {
         #[cfg(target_arch = "wasm32")]
         let table: std::collections::HashMap<&'static str, Vec<u8>> = {
             let mut m = std::collections::HashMap::new();
-            for name in UNIT_FILES.iter().copied().chain(["castle.glb", "cannon.glb"]) {
+            for name in UNIT_FILES.iter().copied().chain(["castle.glb", "cannon.glb"]).chain(BUILDING_FILES) {
                 m.insert(name, fetch_bytes(&format!("models/{name}")).await);
             }
             m
@@ -594,6 +614,11 @@ impl State {
                 "witch.glb" => include_bytes!("../../assets/siege/models/witch.glb").to_vec(),
                 "castle.glb" => include_bytes!("../../assets/siege/models/castle.glb").to_vec(),
                 "cannon.glb" => include_bytes!("../../assets/siege/models/cannon.glb").to_vec(),
+                "wall.glb" => include_bytes!("../../assets/siege/models/wall.glb").to_vec(),
+                "gate.glb" => include_bytes!("../../assets/siege/models/gate.glb").to_vec(),
+                "tower.glb" => include_bytes!("../../assets/siege/models/tower.glb").to_vec(),
+                "house.glb" => include_bytes!("../../assets/siege/models/house.glb").to_vec(),
+                "storehouse.glb" => include_bytes!("../../assets/siege/models/storehouse.glb").to_vec(),
                 _ => unreachable!("unknown horde model {name}"),
             }
         };
@@ -605,6 +630,10 @@ impl State {
         let cannon_model = build_gpu_model(&device, &cam_buf, &skin_layout, &bytes_of("cannon.glb"));
         let box_model = upload_skinned(&device, &cam_buf, &skin_layout, &unit_box());
         let box_inst_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("box-inst"), size: (1024 * std::mem::size_of::<SkinInstance>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        // RTS building props (static glTF), one GpuModel per SKind + a shared
+        // instance buffer drawn in per-kind ranges (like the skinned units).
+        let building_models: Vec<GpuModel> = BUILDING_FILES.iter().map(|f| build_gpu_model(&device, &cam_buf, &skin_layout, &bytes_of(f))).collect();
+        let building_inst_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("building-inst"), size: (1024 * std::mem::size_of::<SkinInstance>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let tree_inst_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("tree-inst"), size: (TREE_CAP * std::mem::size_of::<SkinInstance>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         // Billboard instance buffers (48 B each — half a SkinInstance).
         let dormant_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("dormant-inst"), size: (MAX_POP * std::mem::size_of::<BillboardInst>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
@@ -794,7 +823,7 @@ impl State {
         let mut st = State {
             surface, device, queue, config,
             skin_pipeline, models, inst_buf,
-            box_model, box_inst_buf, tree_inst_buf, tree_n: 0, castle_model, cannon_model, cannon_inst_buf,
+            box_model, box_inst_buf, building_models, building_inst_buf, tree_inst_buf, tree_n: 0, castle_model, cannon_model, cannon_inst_buf,
             night: false, trauma: 0.0, decal_pipeline, decal_buf, decals: Vec::new(),
             decal_seen_corpses: 0, last_breach: -1.0, last_wave_k: 0, was_over: false,
             bb_pipeline, bb_bind, bb_geom, idle_models, dormant_buf, dormant_n: 0, dormant_key: (0, 0),
@@ -1149,41 +1178,39 @@ impl State {
         if self.skin_instances.len() > cap { self.skin_instances.truncate(cap); }
         self.queue.write_buffer(&self.inst_buf, 0, bytemuck::cast_slice(&self.skin_instances));
 
-        // Structures → box instances (walls tinted by HP; rubble = flat slab).
+        // Structures → RTS building models (Quaternius CC0), grouped per SKind into
+        // a shared instance buffer drawn in per-kind ranges below. box_inst now only
+        // carries the porter bundles; the CommandCenter stays the castle model.
         let mut box_inst: Vec<SkinInstance> = Vec::new();
         let mut cannon_inst: Vec<SkinInstance> = Vec::new();
+        let mut building_inst: Vec<SkinInstance> = Vec::new();
+        let mut building_ranges = [(0u32, 0u32); 5];
         let (ccx, ccz) = (WORLD as f32 * 0.5, WORLD as f32 * 0.5);
-        for s in &self.sim.structures {
-            let (x, y, zz) = (s.p.x as f32, s.p.y as f32, s.p.z as f32);
-            let frac = (s.hp / s.kind.max_hp()).clamp(0.0, 1.0) as f32;
-            let ang = (zz - ccz).atan2(x - ccx);
-            let (sx, sy, sz, mut col) = match s.kind {
-                SKind::Wall => (8.4, 13.0, 4.5, [0.58, 0.58, 0.62]),
-                SKind::Gate => (10.0, 10.0, 6.0, [0.48, 0.36, 0.24]),
-                SKind::Tower => (11.0, 22.0, 11.0, [0.52, 0.52, 0.58]),
-                SKind::House => (12.0, 9.0, 12.0, [0.72, 0.60, 0.44]),
-                SKind::Storehouse => (15.0, 10.0, 15.0, [0.55, 0.42, 0.30]),
-                SKind::CommandCenter => (0.0, 0.0, 0.0, [0.0, 0.0, 0.0]), // castle model below
-            };
-            if s.kind == SKind::CommandCenter { continue; }
-            let destroyed = s.hp <= 0.0;
-            // Damage must READ from orbit: lerp hard toward glowing red-brown
-            // as HP drops (full = clean stone, half = clearly wounded, near
-            // death = alarm red); rubble is a charred low slab.
-            let dmg = 1.0 - frac;
-            let wound = [0.85, 0.16, 0.10];
-            col = [col[0] + (wound[0] - col[0]) * dmg, col[1] + (wound[1] - col[1]) * dmg, col[2] + (wound[2] - col[2]) * dmg];
-            if destroyed { col = [0.16, 0.13, 0.11]; }
-            let h = if destroyed { sy * 0.14 } else { sy * (0.35 + 0.65 * frac) };
-            let m = Mat4::from_translation(Vec3::new(x, y, zz)) * Mat4::from_rotation_y(-ang) * Mat4::from_scale(Vec3::new(sx, h, sz));
-            // tint.a = 1.0: the box's vertices are white, the instance colour IS
-            // the colour (a=0 meant "keep vertex white" — the HP red never showed).
-            box_inst.push(SkinInstance { model: m.to_cols_array_2d(), color: [col[0], col[1], col[2], 1.0], frame_base: 0, _pad: [0; 3] });
-            if s.kind == SKind::Tower && !destroyed {
-                let cm = Mat4::from_translation(Vec3::new(x, y + h, zz)) * Mat4::from_rotation_y(-ang + std::f32::consts::FRAC_PI_2) * Mat4::from_scale(Vec3::splat(7.0));
-                cannon_inst.push(SkinInstance { model: cm.to_cols_array_2d(), color: [0.2, 0.2, 0.22, 0.25], frame_base: 0, _pad: [0; 3] });
+        let wound = [0.85, 0.16, 0.10];
+        for (bi, kind) in [SKind::Wall, SKind::Gate, SKind::Tower, SKind::House, SKind::Storehouse].into_iter().enumerate() {
+            let start = building_inst.len() as u32;
+            let (sc, yaw, yo) = building_tweak(kind);
+            for s in &self.sim.structures {
+                if s.kind != kind { continue; }
+                let (x, y, zz) = (s.p.x as f32, s.p.y as f32, s.p.z as f32);
+                let frac = (s.hp / s.kind.max_hp()).clamp(0.0, 1.0) as f32;
+                let ang = (zz - ccz).atan2(x - ccx);
+                let destroyed = s.hp <= 0.0;
+                let dmg = 1.0 - frac;
+                // tint.a = damage strength: healthy (a=0) shows the model's own
+                // colours, damage lerps the tint toward alarm-red; rubble = dark + sunk.
+                let sink = if destroyed { -sc * 0.55 } else { 0.0 };
+                let m = Mat4::from_translation(Vec3::new(x, y + yo + sink, zz)) * Mat4::from_rotation_y(-ang + yaw) * Mat4::from_scale(Vec3::splat(sc));
+                let col = if destroyed { [0.16, 0.13, 0.11, 0.85] } else { [wound[0], wound[1], wound[2], dmg * 0.7] };
+                building_inst.push(SkinInstance { model: m.to_cols_array_2d(), color: col, frame_base: 0, _pad: [0; 3] });
+                if kind == SKind::Tower && !destroyed {
+                    let cm = Mat4::from_translation(Vec3::new(x, y + sc * 1.6, zz)) * Mat4::from_rotation_y(-ang + std::f32::consts::FRAC_PI_2) * Mat4::from_scale(Vec3::splat(7.0));
+                    cannon_inst.push(SkinInstance { model: cm.to_cols_array_2d(), color: [0.2, 0.2, 0.22, 0.25], frame_base: 0, _pad: [0; 3] });
+                }
             }
+            building_ranges[bi] = (start, building_inst.len() as u32 - start);
         }
+        building_inst.truncate(1024);
         // Loaded porters carry a visible brown bundle — the supply line reads
         // at a glance (and you can tell who the porters are).
         for d in &self.sim.defenders {
@@ -1196,6 +1223,7 @@ impl State {
         box_inst.truncate(1024);
         cannon_inst.truncate(64);
         self.queue.write_buffer(&self.box_inst_buf, 0, bytemuck::cast_slice(&box_inst));
+        if !building_inst.is_empty() { self.queue.write_buffer(&self.building_inst_buf, 0, bytemuck::cast_slice(&building_inst)); }
         if !cannon_inst.is_empty() { self.queue.write_buffer(&self.cannon_inst_buf, 0, bytemuck::cast_slice(&cannon_inst)); }
         let (box_n, cannon_n) = (box_inst.len() as u32, cannon_inst.len() as u32);
 
@@ -1367,7 +1395,17 @@ impl State {
             pass.set_vertex_buffer(0, cm.vbuf.slice(..));
             pass.set_index_buffer(cm.ibuf.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..cm.nidx, 0, cc_range..cc_range + 1);
-            // structures (instanced boxes)
+            // structures → RTS building models, one instanced draw per SKind range
+            pass.set_vertex_buffer(1, self.building_inst_buf.slice(..));
+            for (bi, bm) in self.building_models.iter().enumerate() {
+                let (start, count) = building_ranges[bi];
+                if count == 0 { continue; }
+                pass.set_bind_group(0, &bm.bind, &[]);
+                pass.set_vertex_buffer(0, bm.vbuf.slice(..));
+                pass.set_index_buffer(bm.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..bm.nidx, 0, start..start + count);
+            }
+            // porter bundles (still instanced boxes)
             if box_n > 0 {
                 let bm = &self.box_model;
                 pass.set_bind_group(0, &bm.bind, &[]);
