@@ -69,9 +69,12 @@ const RADIX_SRC: &str = r#"
 @group(0) @binding(3) var<storage, read_write> dst_v:     array<u32>;
 @group(0) @binding(4) var<storage, read_write> tile_hist: array<u32>;
 @group(0) @binding(5) var<storage, read_write> tile_off:  array<u32>;
-@group(0) @binding(6) var<uniform>             p:         vec4<u32>; // x=n2, y=shift, z=num_tiles
+@group(0) @binding(6) var<uniform>             p:         vec4<u32>; // x=n2, y=shift, z=num_tiles, w=num_blocks
+@group(0) @binding(7) var<storage, read_write> block_tot: array<u32>;
+@group(0) @binding(8) var<storage, read_write> block_off: array<u32>;
 
 const RADIX: u32 = 16u;
+const BLOCK: u32 = 512u; // tiles per scan block (hierarchical scan)
 var<workgroup> lhist:  array<atomic<u32>, 16>;
 var<workgroup> ldig:   array<u32, 256>;
 var<workgroup> wtotal: array<u32, 16>;
@@ -90,18 +93,33 @@ fn histogram(@builtin(global_invocation_id) gid: vec3<u32>,
     if (li < RADIX) { tile_hist[wid.x * RADIX + li] = atomicLoad(&lhist[li]); }
 }
 
+// hierarchical scan: reduce (per block of tiles) → top (scan blocks) → add.
 @compute @workgroup_size(16)
-fn scan(@builtin(local_invocation_id) lid: vec3<u32>) {
-    let d = lid.x;
-    let nt = p.z;
+fn scan_reduce(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
+    let d = lid.x; let nt = p.z; let b = wid.x;
+    let lo = b * BLOCK; let hi = min(lo + BLOCK, nt);
+    var run = 0u;
+    for (var t = lo; t < hi; t = t + 1u) { tile_off[t * RADIX + d] = run; run = run + tile_hist[t * RADIX + d]; }
+    block_tot[b * RADIX + d] = run;
+}
+@compute @workgroup_size(16)
+fn scan_top(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let d = lid.x; let nb = p.w;
     var tot = 0u;
-    for (var t = 0u; t < nt; t = t + 1u) { tot = tot + tile_hist[t * RADIX + d]; }
+    for (var b = 0u; b < nb; b = b + 1u) { tot = tot + block_tot[b * RADIX + d]; }
     wtotal[d] = tot;
     workgroupBarrier();
     if (d == 0u) { var acc = 0u; for (var k = 0u; k < RADIX; k = k + 1u) { wbase[k] = acc; acc = acc + wtotal[k]; } }
     workgroupBarrier();
     var run = wbase[d];
-    for (var t = 0u; t < nt; t = t + 1u) { tile_off[t * RADIX + d] = run; run = run + tile_hist[t * RADIX + d]; }
+    for (var b = 0u; b < nb; b = b + 1u) { block_off[b * RADIX + d] = run; run = run + block_tot[b * RADIX + d]; }
+}
+@compute @workgroup_size(16)
+fn scan_add(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
+    let d = lid.x; let nt = p.z; let b = wid.x;
+    let base = block_off[b * RADIX + d];
+    let lo = b * BLOCK; let hi = min(lo + BLOCK, nt);
+    for (var t = lo; t < hi; t = t + 1u) { tile_off[t * RADIX + d] = tile_off[t * RADIX + d] + base; }
 }
 
 @compute @workgroup_size(256)
@@ -246,6 +264,9 @@ async fn run() {
     let code_orig = sbuf((n2 * 4) as u64); // un-sorted codes, kept for the verify
     let hist_b = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (num_tiles * 16 * 4) as u64, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
     let off_b  = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (num_tiles * 16 * 4) as u64, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
+    let num_blocks = num_tiles.div_ceil(512);
+    let block_tot_b = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (num_blocks * 16 * 4) as u64, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
+    let block_off_b = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (num_blocks * 16 * 4) as u64, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
     let mp_b = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
     let rp_b = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
     let rd = |sz: u64| device.create_buffer(&wgpu::BufferDescriptor { label: None, size: sz, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
@@ -269,10 +290,10 @@ async fn run() {
     // Radix pipelines
     let r_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(RADIX_SRC.into()) });
     let r_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[
-        ent(0, sto(true)), ent(1, sto(false)), ent(2, sto(true)), ent(3, sto(false)), ent(4, sto(false)), ent(5, sto(false)), ent(6, uni)] });
+        ent(0, sto(true)), ent(1, sto(false)), ent(2, sto(true)), ent(3, sto(false)), ent(4, sto(false)), ent(5, sto(false)), ent(6, uni), ent(7, sto(false)), ent(8, sto(false))] });
     let r_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&r_bgl], push_constant_ranges: &[] });
     let rpipe = |ep: &str| device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&r_pl), module: &r_mod, entry_point: ep, compilation_options: Default::default() });
-    let (hist_p, scan_p, scat_p) = (rpipe("histogram"), rpipe("scan"), rpipe("scatter"));
+    let (hist_p, reduce_p, top_p, add_p, scat_p) = (rpipe("histogram"), rpipe("scan_reduce"), rpipe("scan_top"), rpipe("scan_add"), rpipe("scatter"));
     let rbg = |sk: &wgpu::Buffer, dk: &wgpu::Buffer, sv: &wgpu::Buffer, dv: &wgpu::Buffer| device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &r_bgl, entries: &[
         wgpu::BindGroupEntry { binding: 0, resource: sk.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 1, resource: dk.as_entire_binding() },
@@ -280,7 +301,9 @@ async fn run() {
         wgpu::BindGroupEntry { binding: 3, resource: dv.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 4, resource: hist_b.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 5, resource: off_b.as_entire_binding() },
-        wgpu::BindGroupEntry { binding: 6, resource: rp_b.as_entire_binding() }] });
+        wgpu::BindGroupEntry { binding: 6, resource: rp_b.as_entire_binding() },
+        wgpu::BindGroupEntry { binding: 7, resource: block_tot_b.as_entire_binding() },
+        wgpu::BindGroupEntry { binding: 8, resource: block_off_b.as_entire_binding() }] });
     let bg_ab = rbg(&code_a, &code_b, &val_a, &val_b);
     let bg_ba = rbg(&code_b, &code_a, &val_b, &val_a);
 
@@ -322,10 +345,13 @@ async fn run() {
         // key-value radix, 8 passes ping-pong (final in code_a/val_a).
         for pass in 0..8u32 {
             let g = if pass % 2 == 0 { &bg_ab } else { &bg_ba };
-            queue.write_buffer(&rp_b, 0, bytemuck::cast_slice(&[n2 as u32, pass * 4, num_tiles as u32, 0u32]));
+            queue.write_buffer(&rp_b, 0, bytemuck::cast_slice(&[n2 as u32, pass * 4, num_tiles as u32, num_blocks as u32]));
+            let nb = num_blocks as u32;
             let mut enc = device.create_command_encoder(&Default::default());
             { let mut c = enc.begin_compute_pass(&Default::default()); c.set_bind_group(0, g, &[]); c.set_pipeline(&hist_p); c.dispatch_workgroups(wg, 1, 1); }
-            { let mut c = enc.begin_compute_pass(&Default::default()); c.set_bind_group(0, g, &[]); c.set_pipeline(&scan_p); c.dispatch_workgroups(1, 1, 1); }
+            { let mut c = enc.begin_compute_pass(&Default::default()); c.set_bind_group(0, g, &[]); c.set_pipeline(&reduce_p); c.dispatch_workgroups(nb, 1, 1); }
+            { let mut c = enc.begin_compute_pass(&Default::default()); c.set_bind_group(0, g, &[]); c.set_pipeline(&top_p); c.dispatch_workgroups(1, 1, 1); }
+            { let mut c = enc.begin_compute_pass(&Default::default()); c.set_bind_group(0, g, &[]); c.set_pipeline(&add_p); c.dispatch_workgroups(nb, 1, 1); }
             { let mut c = enc.begin_compute_pass(&Default::default()); c.set_bind_group(0, g, &[]); c.set_pipeline(&scat_p); c.dispatch_workgroups(wg, 1, 1); }
             queue.submit(Some(enc.finish()));
         }

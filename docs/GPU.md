@@ -69,16 +69,17 @@ headline is the kernel only. The honest rule:
   build is real — `gpu_lbvh_build_bench`, ~9 ms/frame at 1 M, all GPU-resident).
   - **Most of the cloud moves → GPU rebuild.** All-moving, per frame: GPU rebuild
     vs the CPU keep-index's *best case* (serial `update_ref` over all, ~no
-    relocations): **262k 1.7 vs 8.4 ms · 1 M 9.3 vs 80 ms · 4 M 35 vs 517 ms** —
-    a serial maintain-*all* pass loses to the parallel build (5–15×). (Before the
-    radix, the GPU-side build didn't exist — the bitonic sort lost to the CPU.)
+    relocations): **262k 2.3 vs 5.9 ms · 1 M 4.4 vs 62 ms** — a serial maintain-*all*
+    pass loses to the parallel build (2.6× at 262k, **14× at 1 M** now the scan is
+    hierarchical). (Before the radix, the GPU-side build didn't exist — the bitonic
+    sort lost to the CPU.)
   - **Only a fraction moves → CPU keep-index.** Its real edge is *skipping* the
     items that didn't move (the horde demo's dormant carpet keeps for ~nothing);
     `ItemRef` + the moved-only sync + `cull_many_par` is still the lever there.
   - **Adaptive hybrid (measured, viable).** Keep below a crossover fraction **f\***,
     GPU rebuild above, with a **hysteresis** dead-band so it doesn't thrash. Since
     keep skips the unmoved, keep-cost ≈ linear in the moving fraction while GPU is
-    flat, so they cross at a clean **f\* ≈ 16 % (262k) · 12–14 % (1 M)** — and f\*
+    flat, so they cross at a clean **f\* ≈ 30 % (262k) · 7 % (1 M)** — and f\*
     *drops* with N (the serial keep pass scales worse). On a wave whose moving
     fraction ramps 0→1→0 the adaptive policy beats **both** pure strategies (1 M:
     **1020 ms** vs pure-GPU 1099 vs pure-keep 5227); a ±25 %-of-f\* dead-band roughly
@@ -104,11 +105,12 @@ correct). Measured (RTX 4080 SUPER, min-of-7, whole build per frame):
 
 | points | build/frame | throughput |
 | --- | --- | --- |
-| 262 k | **1.69 ms** | 155 Mpts/s |
-| 1 M | **8.39 ms** | 125 Mpts/s |
-| 4 M | **36.3 ms** | 116 Mpts/s |
+| 262 k | 2.29 ms | 115 Mpts/s |
+| 1 M | **4.36 ms** | 241 Mpts/s |
 
-So a 1 M-point BVH **rebuilds on the GPU in ~8 ms/frame**, verified correct. This
+So a 1 M-point BVH **rebuilds on the GPU in ~4.4 ms/frame**, verified correct
+(down from 8.4 ms once the radix scan went hierarchical — see the sort row; small
+N pays a little for the extra scan passes). This
 is what lets a *moving* broad-phase rebuild on the GPU each frame rather than lean
 on the CPU keep-index — the rebuild-vs-keep crossover itself is in
 `gpu_spatial_bench` / PARALLEL.md. Further headroom: an **Onesweep** multi-workgroup
