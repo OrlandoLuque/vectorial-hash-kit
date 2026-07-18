@@ -36,6 +36,12 @@ pre-1.0, so the public API may still change between minor versions.
   [`docs/THREE_D.md`](docs/THREE_D.md).
 
 ### Changed
+- **Nudge-free 3D DDA walk.** `Tree3` and `Octree3` raycast (`raycast_dda` /
+  `raycast_dda_first`) now step to the next cell by finding the exact face-neighbour
+  via **ascend-to-LCA** (Samet's rope-free neighbour) instead of a `locate`+epsilon
+  nudge — exact, no epsilon. Gated by a new completeness test (every crossed leaf is
+  visited) plus a config-fuzz, on top of the existing subset-of-capsule / first-hit
+  gates. See [`docs/RAYCAST.md`](docs/RAYCAST.md).
 - Cleaned the `vectorial-hash` crate to be clippy-clean under `-D warnings`
   (redundant closures, a derivable `Default`).
 
