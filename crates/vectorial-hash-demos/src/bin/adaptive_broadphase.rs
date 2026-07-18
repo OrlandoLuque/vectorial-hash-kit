@@ -13,8 +13,9 @@
 //! This is the maintenance-cost story from `examples/gpu_lbvh_build_bench` made
 //! visible (the query is a separate axis — see docs/GPU.md).
 //!
-//! Keys: `,` `.` moving fraction · `A` toggle auto/adaptive vs a forced mode
-//! (`1` keep · `2` GPU) · drag orbit · scroll zoom. `ADAPT_N` sets the count.
+//! Keys: `S` auto-sweep the fraction (on by default, so the cross plays itself) ·
+//! `,` `.` moving fraction · `A` adaptive vs a forced mode (`1` keep · `2` GPU) ·
+//! drag orbit · scroll zoom. `ADAPT_N` sets the count.
 //!
 //! `cargo run -p vectorial-hash-demos --bin adaptive_broadphase --release`
 #![cfg(not(target_arch = "wasm32"))]
@@ -304,6 +305,8 @@ async fn run() {
 
     // ---- state ----
     let mut moving_frac = 0.30f32;
+    let mut sweep = true;       // auto-oscillate the fraction 0→1→0 so the cross is self-evident
+    let mut sweep_t = 0.0f32;
     let mut forced: Option<Mode> = None; // None = adaptive
     let mut mode = Mode::Keep;
     let mut switches = 0u32;
@@ -322,8 +325,9 @@ async fn run() {
             WindowEvent::CursorMoved { position, .. } => { let (dx, dy) = (position.x - last_mouse.0, position.y - last_mouse.1); last_mouse = (position.x, position.y); if drag { yaw += dx as f32 * 0.005; pitch = (pitch + dy as f32 * 0.004).clamp(-1.5, 1.5); } }
             WindowEvent::MouseWheel { delta, .. } => { let d = match delta { MouseScrollDelta::LineDelta(_, y) => y * 150.0, MouseScrollDelta::PixelDelta(p) => p.y as f32 }; dist = (dist - d).clamp(300.0, 6000.0); }
             WindowEvent::KeyboardInput { event: KeyEvent { physical_key: PhysicalKey::Code(c), state: ElementState::Pressed, .. }, .. } => match c {
-                KeyCode::Comma => moving_frac = (moving_frac - 0.02).max(0.0),
-                KeyCode::Period => moving_frac = (moving_frac + 0.02).min(1.0),
+                KeyCode::Comma => { sweep = false; moving_frac = (moving_frac - 0.02).max(0.0); }
+                KeyCode::Period => { sweep = false; moving_frac = (moving_frac + 0.02).min(1.0); }
+                KeyCode::KeyS => sweep = !sweep,
                 KeyCode::KeyA => forced = None,
                 KeyCode::Digit1 => forced = Some(Mode::Keep),
                 KeyCode::Digit2 => forced = Some(Mode::Gpu),
@@ -332,6 +336,7 @@ async fn run() {
             WindowEvent::RedrawRequested => {
                 let dt = { let d = last.elapsed().as_secs_f32().min(0.05); last = Instant::now(); d };
                 fps = if fps == 0.0 { 1.0 / dt } else { fps * 0.9 + 0.1 / dt };
+                if sweep { sweep_t += dt; moving_frac = 0.5 - 0.5 * (sweep_t * 0.45).cos(); } // slow 0→1→0
 
                 // move only the moving fraction (stable scattered subset) + flag it.
                 let movers = ((moving_frac * n as f32) as usize).min(n);
@@ -411,8 +416,8 @@ async fn run() {
                 row(&mut ui, 34.0, "CPU KEEP", keep_ms, [0.95, 0.42, 0.42, 0.95], mode == Mode::Keep);
                 row(&mut ui, 54.0, "GPU REBUILD", gpu_ms, [0.4, 0.92, 0.55, 0.95], mode == Mode::Gpu);
                 let mode_txt = match forced { None => if mode == Mode::Keep { "ADAPTIVE - KEEP" } else { "ADAPTIVE - GPU" }, Some(Mode::Keep) => "FORCED KEEP", Some(Mode::Gpu) => "FORCED GPU" };
-                push_text(&mut ui, 18.0, 78.0, 2.0, [0.5, 0.9, 1.0, 0.95], &format!("MOVING {:.0} PCT   MODE {mode_txt}   SWITCHES {switches}", moving_frac * 100.0), sw, sh);
-                push_text(&mut ui, 18.0, 96.0, 1.8, gray, "MORE MOVING . KEY   LESS COMMA KEY   A AUTO   1 KEEP   2 GPU", sw, sh);
+                push_text(&mut ui, 18.0, 78.0, 2.0, [0.5, 0.9, 1.0, 0.95], &format!("MOVING {:.0} PCT {}   MODE {mode_txt}   SWITCHES {switches}", moving_frac * 100.0, if sweep { "SWEEP" } else { "" }), sw, sh);
+                push_text(&mut ui, 18.0, 96.0, 1.8, gray, "S AUTO-SWEEP   . MORE   COMMA LESS   A AUTO   1 KEEP   2 GPU", sw, sh);
                 push_text(&mut ui, 18.0, 112.0, 1.8, gray, "WHITE BAR MARKS THE PICK. BARS CROSS AT F STAR. DRAG ORBIT SCROLL ZOOM", sw, sh);
                 queue.write_buffer(&ui_buf, 0, bytemuck::cast_slice(&ui));
                 let ui_count = (ui.len() as u32).min(40000);
