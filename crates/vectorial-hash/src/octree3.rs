@@ -555,7 +555,7 @@ impl<T: Positioned3> Octree3<T> {
                 };
                 if d2 <= r2 { out.hits.push((proj.clamp(0.0, max_t), it)); }
             }
-            match self.ray_step(leaf, origin, ux, uy, uz, max_t) {
+            match self.ray_step_lca(leaf, origin, ux, uy, uz, max_t) {
                 Some((_, next)) => leaf = next,
                 None => break,
             }
@@ -600,7 +600,7 @@ impl<T: Positioned3> Octree3<T> {
                     if best.is_none_or(|(bt, _)| t < bt) { best = Some((t, it)); }
                 }
             }
-            match self.ray_step(leaf, origin, ux, uy, uz, max_t) {
+            match self.ray_step_lca(leaf, origin, ux, uy, uz, max_t) {
                 Some((t_exit, next)) => { t_enter = t_exit; leaf = next; }
                 None => break,
             }
@@ -630,23 +630,60 @@ impl<T: Positioned3> Octree3<T> {
         Some(self.locate(entry))
     }
 
-    /// One Probe-style DDA step from `leaf`: the slab test gives the exit `t`,
-    /// then `locate` the leaf just across the exit face (nudged a hair past it).
-    /// `(t_exit, next_leaf)`, or `None` if the ray ends, leaves the world, or the
-    /// nudge fails to cross (numerical).
-    fn ray_step(&self, leaf: ONodeId, origin: Point3, ux: f64, uy: f64, uz: f64, max_t: f64) -> Option<(f64, ONodeId)> {
+    /// One **nudge-free** DDA step from `leaf`: the slab test gives the exit `t`
+    /// and face; the neighbour octant leaf across it is found by **ascending to the
+    /// least-common-ancestor** whose sibling octant lies on the far side (flip the
+    /// exit-axis octant bit), then descending — exact, no `locate`+epsilon nudge.
+    /// `(t_exit, next_leaf)`, or `None` if the ray ends or leaves the world.
+    fn ray_step_lca(&self, leaf: ONodeId, origin: Point3, ux: f64, uy: f64, uz: f64, max_t: f64) -> Option<(f64, ONodeId)> {
         let b = self.get(leaf).bbox;
         let tx = if ux > 0.0 { (b.x_max() - origin.x) / ux } else if ux < 0.0 { (b.x - origin.x) / ux } else { f64::INFINITY };
         let ty = if uy > 0.0 { (b.y_max() - origin.y) / uy } else if uy < 0.0 { (b.y - origin.y) / uy } else { f64::INFINITY };
         let tz = if uz > 0.0 { (b.z_max() - origin.z) / uz } else if uz < 0.0 { (b.z - origin.z) / uz } else { f64::INFINITY };
         let t_exit = tx.min(ty).min(tz);
         if t_exit >= max_t { return None; }
-        let eps = b.w.min(b.h).min(b.d) * 1e-4 + (t_exit.abs() + 1.0) * 1e-12;
-        let np = Point3::new(origin.x + ux * (t_exit + eps), origin.y + uy * (t_exit + eps), origin.z + uz * (t_exit + eps));
-        if !self.get(self.root).bbox.contains(np) { return None; }
-        let next = self.locate(np);
+        let (ax, dir_pos) = if t_exit == tx { (0usize, ux > 0.0) } else if t_exit == ty { (1usize, uy > 0.0) } else { (2usize, uz > 0.0) };
+        let p_exit = Point3::new(origin.x + ux * t_exit, origin.y + uy * t_exit, origin.z + uz * t_exit);
+        let next = self.face_neighbor_oct(leaf, ax, dir_pos, p_exit)?;
         if next == leaf { return None; }
         Some((t_exit, next))
+    }
+
+    /// True iff `child`'s octant is the **high** half of `parent` on axis `a`
+    /// (the low octant shares the parent's min; the high one starts at the centre).
+    fn oct_hi(&self, parent: Aabb, child: ONodeId, a: usize) -> bool { axis_min_o(self.get(child).bbox, a) > axis_min_o(parent, a) }
+
+    /// The leaf across `node`'s exit face (axis `ax`, `dir_pos` = the max face) at
+    /// `p_exit`: ascend until stepping in the exit direction stays inside a parent
+    /// (i.e. `node` is on the near side of the `ax` split), take the sibling octant
+    /// with the `ax` bit flipped and the other two bits shared, then descend it.
+    fn face_neighbor_oct(&self, mut node: ONodeId, ax: usize, dir_pos: bool, p_exit: Point3) -> Option<ONodeId> {
+        loop {
+            let par = self.get(node).parent?;
+            let pb = self.get(par).bbox;
+            let nb = self.get(node).bbox;
+            let node_hi = axis_min_o(nb, ax) > axis_min_o(pb, ax);
+            if if dir_pos { !node_hi } else { node_hi } {
+                let kids = self.get(par).children.expect("internal node has children");
+                let want = |a: usize| if a == ax { dir_pos } else { self.oct_hi(pb, node, a) };
+                let sib = *kids.iter().find(|&&k| (0..3).all(|a| self.oct_hi(pb, k, a) == want(a))).expect("octant sibling exists");
+                return Some(self.descend_face_oct(sib, ax, dir_pos, p_exit));
+            }
+            node = par;
+        }
+    }
+
+    /// Descend `node` to the leaf touching `p_exit` on the entry (`ax`) face:
+    /// off-axis, follow `p_exit`'s side; on `ax`, take the **near** octant half.
+    fn descend_face_oct(&self, mut node: ONodeId, ax: usize, dir_pos: bool, p_exit: Point3) -> ONodeId {
+        while let Some(kids) = self.get(node).children {
+            let b = self.get(node).bbox;
+            let want = |a: usize| -> bool {
+                if a == ax { !dir_pos } else { axis_coord_o(p_exit, a) >= axis_min_o(b, a) + axis_ext_o(b, a) * 0.5 }
+            };
+            node = *kids.iter().find(|&&k| (0..3).all(|a| self.oct_hi(b, k, a) == want(a))).expect("octant child exists");
+        }
+        node
     }
 }
 
@@ -654,6 +691,11 @@ impl<T: Positioned3> Octree3<T> {
 // Shared top-down build for `Octree3::bulk_load` / `bulk_load_par`. Splits every
 // level into the 8 octants at the box midpoint — the same rule `divide` uses
 // incrementally, in the same sx-fastest order, so item routing matches `locate`.
+
+// ------------------------------------------- nudge-free face-neighbour helpers
+#[inline] fn axis_min_o(b: Aabb, a: usize) -> f64 { [b.x, b.y, b.z][a] }
+#[inline] fn axis_ext_o(b: Aabb, a: usize) -> f64 { [b.w, b.h, b.d][a] }
+#[inline] fn axis_coord_o(p: Point3, a: usize) -> f64 { [p.x, p.y, p.z][a] }
 
 /// The eight octant boxes of `b`, in `divide`'s order (sz, sy, sx nested).
 fn octants8(b: Aabb) -> [Aabb; 8] {
@@ -960,6 +1002,48 @@ mod tests {
             }
         }
         assert!(any, "DDA found nothing — likely a traversal bug");
+    }
+
+    #[test]
+    fn octree_raycast_dda_lca_visits_every_crossed_leaf() {
+        // Completeness gate for the nudge-free 8-way (ascend-to-LCA, flip the
+        // exit-axis octant bit) walk: densely sample the centre ray, `locate` each
+        // interior sample, and assert every such octant leaf is one the walk visited.
+        let mut x = 0x0C7A_11CAu64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        let pts: Vec<P> = (0..8000).map(|_| P(Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0))).collect();
+        let mut tree = Octree3::<P>::new(Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0), 5);
+        for p in &pts { tree.insert(*p); }
+        let world = Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0);
+        for (o, d, mt) in [
+            (Point3::new(-40.0, 30.0, 20.0), Point3::new(1.0, 0.61, 0.37), 500.0),
+            (Point3::new(300.0, 200.0, 130.0), Point3::new(-1.0, -0.43, 0.29), 600.0),
+            (Point3::new(128.0, -20.0, 300.0), Point3::new(0.13, 1.0, -0.77), 600.0),
+            (Point3::new(5.0, 5.0, 5.0), Point3::new(0.9, 0.7, 1.0), 500.0),
+        ] {
+            let m = (d.x * d.x + d.y * d.y + d.z * d.z).sqrt();
+            let (ux, uy, uz) = (d.x / m, d.y / m, d.z / m);
+            let mut leaf = match tree.raycast_start_leaf(o, ux, uy, uz, mt) { Some(l) => l, None => continue };
+            let mut visited: Vec<ONodeId> = vec![leaf];
+            let mut guard = 0usize;
+            loop {
+                guard += 1;
+                if guard > tree.nodes.len() * 3 + 32 { break; }
+                match tree.ray_step_lca(leaf, o, ux, uy, uz, mt) {
+                    Some((_, n)) => { leaf = n; if !visited.contains(&n) { visited.push(n); } }
+                    None => break,
+                }
+            }
+            let steps = 4000;
+            for i in 0..=steps {
+                let t = mt * i as f64 / steps as f64;
+                let p = Point3::new(o.x + ux * t, o.y + uy * t, o.z + uz * t);
+                if world.contains(p) {
+                    let l = tree.locate(p);
+                    assert!(visited.contains(&l), "LCA 8-way walk skipped a leaf the ray crosses (t={t})");
+                }
+            }
+        }
     }
 
     #[test]

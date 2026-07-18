@@ -528,9 +528,15 @@ crossover visible (`PARALLEL.md`), like siege. wasm runs the wave serially.
    `raycast_dda_first` on the 8-way octree (Probe-style, ported from `Tree3`).
    Brute-force gated (DDA ⊆ exact capsule + sorted + first==nearest; thick ==
    brute). Still uses the `locate`+epsilon nudge → item 2 (nudge-free walk).
-2. **Nudge-free 3D walk** — real 3D neighbour-finding (Samet ascend-to-LCA, or
-   ropes) so the `Tree3`/`Octree3` DDA steps without the `locate`+epsilon nudge.
-   (The 2D ledger says ropes rarely pay upkeep → Samet first.)
+2. ~~**Nudge-free 3D walk**~~ — **DONE** (2026-07-18). Both `Tree3` and `Octree3`
+   DDA now step **without** the `locate`+epsilon nudge: the exact face-neighbour is
+   found by **ascending to the LCA** whose sibling is across the exit face, then
+   descending to the leaf at the exit point (Samet's rope-free neighbour). Tree3
+   reads the split axis back from the child boxes; Octree3 flips the exit-axis octant
+   bit. Verified by the existing gates (DDA ⊆ capsule, sorted, first == nearest)
+   **plus a new completeness test** (sample the ray, `locate` each point, assert every
+   crossed leaf was visited — catches the under-collection the subset test couldn't).
+   `raycast_start_leaf` keeps one `locate` for the entry only. See RAYCAST.md.
 3. **Promote a 2D `Circle` `Shape` to the lib** (analytic `classify_box`, like
    `Capsule`) — the examples each redefine a `Disc`; one lib primitive dedups
    them and gives users a tight 2D circle cull.

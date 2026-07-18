@@ -297,17 +297,23 @@ bands** — 86.6 ms vs Morton's 207 ms at r=256 — because the tree *prunes*
 `r³` bbox. So the 3D scorecard: thin ray / first-hit → either DDA (fast); thick
 "all within `r`" → the **`Tree3` capsule**, not the Morton one.
 
-The Probe step nudges a hair across the exit face, so on pathologically thin
-neighbour cells a sliver can be skipped (never a false positive — always a subset
-of the exact capsule). A nudge-free **3D Samet/ropes** walk is the remaining
-refinement (the 2D ledger already showed ropes rarely pay their upkeep, so Probe
-is a fine default).
+The DDA step is now **nudge-free** (2026-07-18). The old Probe step nudged a hair
+across the exit face and re-`locate`d from the root — an epsilon that could skip a
+thin neighbour sliver on pathological cells (never a false positive — always a
+subset). The step now finds the exact face-neighbour by **ascending to the
+least-common-ancestor** whose sibling lies across the exit face, then descending to
+the leaf touching the exit point — **Samet's rope-free neighbour**, no epsilon. On
+`Tree3` the split axis is read back from the two child boxes (the upper child starts
+higher on exactly the split axis); on `Octree3` the exit-axis **octant bit is
+flipped** and the other two shared. Beyond the existing gates (DDA ⊆ exact capsule,
+sorted, first == nearest) a **completeness** test now densely samples the ray,
+`locate`s each interior point, and asserts every crossed leaf is one the walk
+visited — a direct check the nudge couldn't guarantee (it could under-collect). Both
+`Tree3` and `Octree3` carry the nudge-free walk; `raycast_start_leaf` still uses a
+single `locate` for the *entry* leaf only (not a per-step nudge).
 
-The **8-way `Octree3`** now carries the same surface — `Octree3::raycast` (thick
-capsule), `raycast_dda`, `raycast_dda_first` — ported verbatim from `Tree3` (the
-walk only touches `locate`/`bbox`/`items`, which the octree shares). Same
-Probe-style nudge, same subset guarantee; brute-force gated identically (DDA ⊆
-exact capsule, sorted, first == nearest). So both adaptive 3D trees and the flat
+The **8-way `Octree3`** carries the same surface — `Octree3::raycast` (thick
+capsule), `raycast_dda`, `raycast_dda_first`. So both adaptive 3D trees and the flat
 Morton grid answer thin-ray / first-hit; the hierarchical capsule still wins the
 thick band.
 

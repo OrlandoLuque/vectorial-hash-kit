@@ -1034,7 +1034,7 @@ impl<T: Positioned3> Tree3<T> {
                     out.hits.push((proj.clamp(0.0, max_t), it));
                 }
             }
-            match self.ray_step3(leaf, origin, ux, uy, uz, max_t) {
+            match self.ray_step3_lca(leaf, origin, ux, uy, uz, max_t) {
                 Some((_, next)) => leaf = next,
                 None => break,
             }
@@ -1088,7 +1088,7 @@ impl<T: Positioned3> Tree3<T> {
                     }
                 }
             }
-            match self.ray_step3(leaf, origin, ux, uy, uz, max_t) {
+            match self.ray_step3_lca(leaf, origin, ux, uy, uz, max_t) {
                 Some((t_exit, next)) => {
                     t_enter = t_exit;
                     leaf = next;
@@ -1129,11 +1129,13 @@ impl<T: Positioned3> Tree3<T> {
         Some(self.locate(entry))
     }
 
-    /// One Probe-style DDA step from `leaf`: the slab test gives the exit `t`,
-    /// then `locate` the leaf just across the exit face (nudged a hair past it).
-    /// `(t_exit, next_leaf)`, or `None` if the ray ends (`t_exit ≥ max_t`),
-    /// leaves the world, or the nudge fails to cross (numerical).
-    fn ray_step3(&self, leaf: Node3Id, origin: Point3, ux: f64, uy: f64, uz: f64, max_t: f64) -> Option<(f64, Node3Id)> {
+    /// One **nudge-free** DDA step from `leaf`: the slab test gives the exit `t`
+    /// and which face the ray leaves by; the neighbour leaf just across that face
+    /// is found by **ascending to the least-common-ancestor** whose sibling lies on
+    /// the far side, then descending to the leaf touching the exit point — exact, no
+    /// `locate`+epsilon nudge (Samet's rope-free face neighbour). `(t_exit,
+    /// next_leaf)`, or `None` if the ray ends (`t_exit ≥ max_t`) or leaves the world.
+    fn ray_step3_lca(&self, leaf: Node3Id, origin: Point3, ux: f64, uy: f64, uz: f64, max_t: f64) -> Option<(f64, Node3Id)> {
         let b = self.get(leaf).bbox;
         let tx = if ux > 0.0 { (b.x_max() - origin.x) / ux } else if ux < 0.0 { (b.x - origin.x) / ux } else { f64::INFINITY };
         let ty = if uy > 0.0 { (b.y_max() - origin.y) / uy } else if uy < 0.0 { (b.y - origin.y) / uy } else { f64::INFINITY };
@@ -1142,16 +1144,47 @@ impl<T: Positioned3> Tree3<T> {
         if t_exit >= max_t {
             return None;
         }
-        let eps = b.w.min(b.h).min(b.d) * 1e-4 + (t_exit.abs() + 1.0) * 1e-12;
-        let np = Point3::new(origin.x + ux * (t_exit + eps), origin.y + uy * (t_exit + eps), origin.z + uz * (t_exit + eps));
-        if !self.get(self.root).bbox.contains(np) {
+        let (ax, dir_pos) = if t_exit == tx { (0usize, ux > 0.0) } else if t_exit == ty { (1usize, uy > 0.0) } else { (2usize, uz > 0.0) };
+        let p_exit = Point3::new(origin.x + ux * t_exit, origin.y + uy * t_exit, origin.z + uz * t_exit);
+        let next = self.face_neighbor3(leaf, ax, dir_pos, p_exit)?;
+        if next == leaf {
             return None;
         }
-        let next = self.locate(np);
-        if next == leaf {
-            return None; // nudge didn't cross — stop (the result stays a subset)
-        }
         Some((t_exit, next))
+    }
+
+    /// The leaf on the far side of `node`'s exit face (axis `ax`; `dir_pos` = the
+    /// max face) at `p_exit`. Ascends via parents until the split *is* on `ax` and
+    /// `node` is the near child, so the sibling is the neighbour subtree, then
+    /// descends it. `None` ⇒ the face is the world boundary (the ray leaves).
+    fn face_neighbor3(&self, mut node: Node3Id, ax: usize, dir_pos: bool, p_exit: Point3) -> Option<Node3Id> {
+        loop {
+            let par = self.get(node).parent?;
+            let [c0, c1] = self.get(par).children.expect("internal node has children");
+            if split_axis3(self.get(c0).bbox, self.get(c1).bbox) == ax {
+                if dir_pos && node == c0 { return Some(self.descend_face3(c1, ax, dir_pos, p_exit)); }
+                if !dir_pos && node == c1 { return Some(self.descend_face3(c0, ax, dir_pos, p_exit)); }
+            }
+            node = par; // split off-axis, or we are already on the far side → keep climbing
+        }
+    }
+
+    /// Descend `node` to the leaf touching `p_exit` on the entry (`ax`) face:
+    /// off-axis, follow `p_exit`'s side of each split; on `ax`, take the **near**
+    /// child (we enter from that face) — so the walk needs no epsilon.
+    fn descend_face3(&self, mut node: Node3Id, ax: usize, dir_pos: bool, p_exit: Point3) -> Node3Id {
+        while let Some([c0, c1]) = self.get(node).children {
+            let (lo, hi) = (self.get(c0).bbox, self.get(c1).bbox);
+            let sax = split_axis3(lo, hi);
+            node = if sax == ax {
+                if dir_pos { c0 } else { c1 }
+            } else if axis_coord3(p_exit, sax) < axis_min3(hi, sax) {
+                c0
+            } else {
+                c1
+            };
+        }
+        node
     }
 
     /// Parallel [`Tree3::cull_many`]: the independent, read-only queries run on
@@ -1295,6 +1328,17 @@ pub(crate) fn knn_offer<'a, T: Positioned3>(heap: &mut std::collections::BinaryH
         heap.push(KnnEntry { d2, item: it });
     }
 }
+
+// ------------------------------------------- nudge-free face-neighbour helpers
+/// The axis a longest-axis-midpoint split cut, read back from its two child boxes
+/// (`lo` = lower half, `hi` = upper): the one axis where the upper child starts
+/// higher (the other two share the parent's extent, so their delta is 0).
+fn split_axis3(lo: Aabb, hi: Aabb) -> usize {
+    let d = [hi.x - lo.x, hi.y - lo.y, hi.z - lo.z];
+    if d[0] >= d[1] && d[0] >= d[2] { 0 } else if d[1] >= d[2] { 1 } else { 2 }
+}
+#[inline] fn axis_min3(b: Aabb, a: usize) -> f64 { [b.x, b.y, b.z][a] }
+#[inline] fn axis_coord3(p: Point3, a: usize) -> f64 { [p.x, p.y, p.z][a] }
 
 // ------------------------------------------------------------- bulk build
 // Shared top-down build for `Tree3::bulk_load` / `bulk_load_par`. Splits the
@@ -1739,6 +1783,49 @@ mod tests {
             }
         }
         assert!(any, "DDA found nothing — likely a traversal bug");
+    }
+
+    #[test]
+    fn raycast_dda_lca_visits_every_crossed_leaf() {
+        // Completeness gate for the nudge-free (ascend-to-LCA) walk, independent of
+        // the old nudge: densely sample the centre ray, `locate` each interior
+        // sample, and assert every such leaf is one the walk actually stepped into.
+        // (A leaf the ray demonstrably passes through must never be skipped.)
+        let mut x = 0x11CA_7EE1u64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64 };
+        let pts: Vec<P> = (0..8000).map(|_| P(Point3::new(rng() * 256.0, rng() * 256.0, rng() * 256.0))).collect();
+        let mut tree = Tree3::<P>::new(Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0), 5);
+        for p in &pts { tree.insert(*p); }
+        let world = Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0);
+        for (o, d, mt) in [
+            (Point3::new(-40.0, 30.0, 20.0), Point3::new(1.0, 0.61, 0.37), 500.0),
+            (Point3::new(300.0, 200.0, 130.0), Point3::new(-1.0, -0.43, 0.29), 600.0),
+            (Point3::new(128.0, -20.0, 300.0), Point3::new(0.13, 1.0, -0.77), 600.0),
+            (Point3::new(5.0, 5.0, 5.0), Point3::new(0.9, 0.7, 1.0), 500.0),
+        ] {
+            let m = (d.x * d.x + d.y * d.y + d.z * d.z).sqrt();
+            let (ux, uy, uz) = (d.x / m, d.y / m, d.z / m);
+            let mut leaf = match tree.raycast_start_leaf(o, ux, uy, uz, mt) { Some(l) => l, None => continue };
+            let mut visited: Vec<Node3Id> = vec![leaf];
+            let mut guard = 0usize;
+            loop {
+                guard += 1;
+                if guard > tree.nodes.len() * 3 + 32 { break; }
+                match tree.ray_step3_lca(leaf, o, ux, uy, uz, mt) {
+                    Some((_, n)) => { leaf = n; if !visited.contains(&n) { visited.push(n); } }
+                    None => break,
+                }
+            }
+            let steps = 4000;
+            for i in 0..=steps {
+                let t = mt * i as f64 / steps as f64;
+                let p = Point3::new(o.x + ux * t, o.y + uy * t, o.z + uz * t);
+                if world.contains(p) {
+                    let l = tree.locate(p);
+                    assert!(visited.contains(&l), "LCA walk skipped a leaf the ray crosses (t={t})");
+                }
+            }
+        }
     }
 
     #[test]
