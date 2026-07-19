@@ -923,10 +923,12 @@ impl Horde {
                 });
             }
         };
+        // Fighter counts bumped ~40% (user 2026-07-19: defenders "aplastadísimos") so
+        // the ranged line thins the horde before it reaches melee. Tune with the eyes.
         let mut ds = Vec::new();
-        spawn(DKind::Ranger, 20, &mut ds);
-        spawn(DKind::Soldier, 12, &mut ds);
-        spawn(DKind::Sniper, 6, &mut ds);
+        spawn(DKind::Ranger, 28, &mut ds);
+        spawn(DKind::Soldier, 16, &mut ds);
+        spawn(DKind::Sniper, 9, &mut ds);
         spawn(DKind::Crew, 4, &mut ds);
         spawn(DKind::Porter, 8, &mut ds);
         self.defenders = ds;
@@ -1717,8 +1719,10 @@ impl Horde {
             let bite = Sphere3::new(d.p.x, d.p.y, d.p.z, 4.5);
             let dps: f64 = zq.cull(&bite).iter().filter(|it| !it.dormant).map(|it| it.class.dmg()).sum();
             if dps > 0.0 {
-                d.hp -= dps * 0.4 * dt;
-                if d.hp <= 0.0 { d.respawn_t = if d.kind.fighter() { 25.0 } else { 30.0 }; dead_screams.push(d.p); }
+                // contact damage 0.4→0.3 and fighter respawn 25→18 s (same balance
+                // pass): survive the swarm ~25% longer and return quicker to the line.
+                d.hp -= dps * 0.3 * dt;
+                if d.hp <= 0.0 { d.respawn_t = if d.kind.fighter() { 18.0 } else { 30.0 }; dead_screams.push(d.p); }
             }
         }
         for p in dead_screams { self.pending.push((p, 10.0)); }

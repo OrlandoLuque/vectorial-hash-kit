@@ -61,20 +61,30 @@ const BUILDING_FILES: [&str; 5] = ["wall.glb", "gate.glb", "tower.glb", "house.g
 /// Y-up, ~1-unit, origin at the base).
 fn building_tweak(k: SKind) -> (f32, f32, f32) {
     // yaw = +90° (counterclockwise) — the Quaternius props face 90° off from the box
-    // orientation (user feedback 2026-07-19). CommandCenter (castle) is drawn separately.
+    // orientation (user feedback 2026-07-19). scale = the model's HEIGHT (the loader
+    // normalises to unit height), so a wide-short wall (3.5× wider than tall) at a big
+    // scale comes out far too wide + overlapping. Sizes below are derived from
+    // `model_dims` (aspect) + the sim's 8-wu wall spacing so segments tile, not overlap:
+    //   wall  aspect 3.5 → scale 2.5 ⇒ width ≈ 8.75 (just touches the 8-wu ring)
+    //   gate  aspect 2.7 → scale 3.3 ⇒ width ≈ 8.9 (a touch taller, gate presence)
+    //   tower aspect 0.6 → tall/narrow; cannon sits on top (see the render loop)
     let ccw = std::f32::consts::FRAC_PI_2;
     match k {
-        SKind::Wall => (7.0, ccw, 0.0),
-        SKind::Gate => (7.0, ccw, 0.0),
+        SKind::Wall => (2.5, ccw, 0.0),
+        SKind::Gate => (3.3, ccw, 0.0),
         SKind::Tower => (9.0, ccw, 0.0),
-        SKind::House => (7.0, ccw, 0.0),
-        SKind::Storehouse => (8.0, ccw, 0.0),
+        SKind::House => (6.5, ccw, 0.0),
+        SKind::Storehouse => (7.5, ccw, 0.0),
         SKind::CommandCenter => (40.0, 0.0, 0.0),
     }
 }
 fn zmodel(c: ZClass) -> usize { c.index() } // 0..5 in UNIT_FILES order
 fn dmodel(k: DKind) -> usize { match k { DKind::Ranger => 5, DKind::Soldier => 6, DKind::Sniper => 7, DKind::Crew => 8, DKind::Porter => 9 } }
-fn zscale(c: ZClass) -> f32 { match c { ZClass::Chubby => 9.0, ZClass::Harpy => 5.0, _ => 7.0 } }
+// Render height in world units. The models are ~1.4× wider than tall, but the sim
+// packs zombies ~2.4–3 wu apart, so a height-7 zombie (~9.7 wu wide) visually clumps.
+// Trimmed ~28% (user 2026-07-19: "se apelotonan demasiado") — closer to the logical
+// footprint while still readable; go smaller here if it still reads too dense.
+fn zscale(c: ZClass) -> f32 { match c { ZClass::Chubby => 6.5, ZClass::Harpy => 4.0, _ => 5.0 } }
 fn ztint(c: ZClass, dormant: bool) -> [f32; 4] {
     // Greenish undead cast; dormant reads darker (the sleeping carpet).
     let a = if dormant { 0.42 } else { 0.22 };
@@ -1207,7 +1217,9 @@ impl State {
                 let col = if destroyed { [0.16, 0.13, 0.11, 0.85] } else { [wound[0], wound[1], wound[2], dmg * 0.7] };
                 building_inst.push(SkinInstance { model: m.to_cols_array_2d(), color: col, frame_base: 0, _pad: [0; 3] });
                 if kind == SKind::Tower && !destroyed {
-                    let cm = Mat4::from_translation(Vec3::new(x, y + sc * 1.6, zz)) * Mat4::from_rotation_y(-ang + std::f32::consts::FRAC_PI_2) * Mat4::from_scale(Vec3::splat(7.0));
+                    // small cannon sitting ON the tower's platform (tower height = sc,
+                    // feet at y): base at ~0.82·sc so it rests near the top, ~2.6 tall.
+                    let cm = Mat4::from_translation(Vec3::new(x, y + sc * 0.82, zz)) * Mat4::from_rotation_y(-ang + std::f32::consts::FRAC_PI_2) * Mat4::from_scale(Vec3::splat(2.6));
                     cannon_inst.push(SkinInstance { model: cm.to_cols_array_2d(), color: [0.2, 0.2, 0.22, 0.25], frame_base: 0, _pad: [0; 3] });
                 }
             }
