@@ -55,24 +55,14 @@
       </div>
     </a>
     <a class="card" href="siege.html">
-      <img class="thumb" src="shots/siege.jpg" alt="Procedural voxel battlefield with a volcano and two clashing armies" loading="lazy">
+      <img class="thumb" src="shots/siege_wgpu.jpg" alt="Procedural voxel battlefield with two clashing armies, GPU skeletal skinning" loading="lazy">
       <div class="body">
-      <span class="tag">3D</span>
+      <span class="tag">3D · wgpu</span>
       <h2>Siege →</h2>
       <span class="d">A procedural medieval battlefield: two castles sally their armies and clash.
       Every unit's brain is a spatial query — k-NN targeting, raycast line-of-fire, sphere-cull
-      AoE, smoke that blocks shots. Eight troop types, one query each. (Native runs the AI
-      across all cores via a live thread slider; the web build is single-threaded.)</span>
-      </div>
-    </a>
-    <a class="card" href="siege_wgpu.html">
-      <img class="thumb" src="shots/siege_wgpu.jpg" alt="The same battle rendered on wgpu with GPU skeletal skinning" loading="lazy">
-      <div class="body">
-      <span class="tag">wgpu · WebGPU</span>
-      <h2>Siege (wgpu) →</h2>
-      <span class="d">The same battle on a modern GPU stack — real <b>GPU skeletal skinning</b> of
-      the whole army (the thing macroquad's WebGL1 can't). Shares the exact simulation with the
-      macroquad siege. Needs a <b>WebGPU</b> browser (recent Chrome / Edge).</span>
+      AoE, smoke that blocks shots. Renders with real <b>GPU skeletal skinning</b> on WebGPU
+      browsers (Chrome / Edge / recent Safari), and falls back to the WebGL build otherwise.</span>
       </div>
     </a>
     <a class="card" href="horde_wgpu.html">

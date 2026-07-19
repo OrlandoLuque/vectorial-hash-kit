@@ -2,6 +2,13 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<script>
+  // wgpu-first (user 2026-07-19): the wgpu build renders better — incl. on mobile —
+  // so if this browser has WebGPU, hop to the GPU-skinned Siege before loading the
+  // heavier WebGL wasm. Browsers WITHOUT WebGPU (Firefox, older Safari/iOS, older
+  // Android) fall through and get this working WebGL (macroquad) build as the fallback.
+  if (navigator.gpu) { location.replace('siege_wgpu.html' + location.search + location.hash); }
+</script>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Siege — vectorial-hash-kit</title>
 <style>
