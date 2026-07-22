@@ -1339,6 +1339,28 @@ impl State {
         let wal = (got_hp / max_hp.max(1.0) * 100.0) as u32;
         let walc = if wal > 70 { [0.55, 1.0, 0.60, 1.0] } else if wal > 35 { [1.0, 0.85, 0.4, 1.0] } else { [1.0, 0.45, 0.35, 1.0] };
         push_text(&mut ui, hx, 156.0, 3.0, walc, &format!("WAL {wal}"), sw, sh);
+        // North compass (user 2026-07-23): project the world cardinals through the
+        // camera so the letters track where each direction is on screen as you orbit;
+        // north = −Z (matches the wave banner's FROM-N). N is highlighted.
+        {
+            let vpm = glam::Mat4::from_cols_array_2d(&cam.vp);
+            let c = Vec3::new(WORLD as f32 * 0.5, 30.0, WORLD as f32 * 0.5);
+            let scr = |p: Vec3| -> glam::Vec2 { let q = vpm * p.extend(1.0); glam::Vec2::new(q.x / q.w, -q.y / q.w) };
+            let c0 = scr(c);
+            let (ccx, ccy, r) = (sw - 44.0, 212.0, 18.0f32);
+            push_quad(&mut ui, ccx - r - 5.0, ccy - r - 5.0, (r + 5.0) * 2.0, (r + 5.0) * 2.0, [0.06, 0.08, 0.14, 0.5], sw, sh);
+            for (dir, lbl, col) in [
+                (Vec3::new(0.0, 0.0, -1.0), "N", [1.0, 0.5, 0.45, 1.0]),
+                (Vec3::new(0.0, 0.0, 1.0), "S", [0.65, 0.72, 0.85, 1.0]),
+                (Vec3::new(1.0, 0.0, 0.0), "E", [0.65, 0.72, 0.85, 1.0]),
+                (Vec3::new(-1.0, 0.0, 0.0), "W", [0.65, 0.72, 0.85, 1.0]),
+            ] {
+                let d = scr(c + dir * 60.0) - c0;
+                let d = if d.length() > 1e-4 { d.normalize() } else { glam::Vec2::new(0.0, -1.0) };
+                push_text(&mut ui, ccx + d.x * r - 3.0, ccy + d.y * r - 4.0, 3.0, col, lbl, sw, sh);
+            }
+            push_quad(&mut ui, ccx - 1.5, ccy - 1.5, 3.0, 3.0, [0.9, 0.9, 0.95, 0.9], sw, sh);
+        }
         // Wave banner — centre-top, with compass direction + countdown.
         if announced {
             let (dx, dz) = (wdir.cos(), wdir.sin());

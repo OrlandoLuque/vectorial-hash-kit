@@ -136,8 +136,10 @@ impl IZombie {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SKind { Wall, Gate, Tower, House, Storehouse, CommandCenter }
 impl SKind {
-    /// TAB-researched HP (stone wall 1000, gate 1500, tower 2000, CC 5000).
-    pub fn max_hp(self) -> f64 { match self { Self::Wall => 1000.0, Self::Gate => 1500.0, Self::Tower => 2000.0, Self::House => 500.0, Self::Storehouse => 800.0, Self::CommandCenter => 5000.0 } }
+    /// Structure HP. Bumped from the TAB baseline (1000/1500/2000/·/·/5000) so a
+    /// big flood grinds the ring for a while instead of bursting straight to the CC
+    /// (balance harness 2026-07-23; the CC especially needs to outlast the rush).
+    pub fn max_hp(self) -> f64 { match self { Self::Wall => 2000.0, Self::Gate => 3000.0, Self::Tower => 4000.0, Self::House => 500.0, Self::Storehouse => 800.0, Self::CommandCenter => 14000.0 } }
 }
 
 #[derive(Clone)]
@@ -447,9 +449,9 @@ impl FlowField {
 
 // ------------------------------------------------------------------ towers
 
-pub const TOWER_RANGE: f64 = 72.0; // 9 TAB tiles
+pub const TOWER_RANGE: f64 = 84.0; // reach a bit further down the funnel
 pub const TOWER_DMG: f64 = 150.0;
-pub const TOWER_RELOAD: f64 = 1.2;
+pub const TOWER_RELOAD: f64 = 0.6; // faster — the towers are the TAB backbone (balance harness)
 pub const TOWER_NOISE: f64 = 5.0; // the ballista: quiet per kill — by design
 
 // --------------------------------------------------------------- defenders
@@ -569,6 +571,13 @@ pub struct Horde {
     /// fighters hold the line (no sorties, recall the ones already out). Set on
     /// announce to spawn+35 s; `wave_announced` alone misses the post-spawn march.
     wave_active_until: f64,
+    /// Trickle reinforcements (user 2026-07-23): a new fighter arrives every
+    /// `reinforce_interval` s (faster at higher pop) up to `fighter_cap`, so the
+    /// garrison recovers + grows through the escalating waves instead of only
+    /// respawning its dead.
+    reinforce_t: f64,
+    reinforce_interval: f64,
+    fighter_cap: usize,
     /// Set when the Command Center falls (defeat) or the final wave is cleared
     /// (victory): (time it happened, victory?). The run resets ~12 s later.
     pub game_over: Option<(f64, bool)>,
@@ -653,7 +662,7 @@ fn build_base(rng: &mut Rng, seed: f64, sc: Scenario) -> Vec<Structure> {
     for i in 0..segs {
         let a = i as f64 * step;
         let (x, z) = (cx + a.cos() * BASE_R, cz + a.sin() * BASE_R);
-        let kind = if gates.contains(&i) { SKind::Gate } else if i % 10 == 5 { SKind::Tower } else { SKind::Wall };
+        let kind = if gates.contains(&i) { SKind::Gate } else if i % 6 == 3 { SKind::Tower } else { SKind::Wall };
         s.push(Structure { kind, p: at(x, z), hp: kind.max_hp(), pop: 0 });
     }
     // Houses: rejection-sampled so no two buildings interpenetrate (≥16 wu
@@ -896,6 +905,7 @@ impl Horde {
             tower_reload: vec![0.0; ns], free_slots: Vec::new(),
             tower_threat_mode: false, cc_id,
             wave_k: 0, wave_spawn_t: 50.0, wave_dir: 0.0, wave_announced: false, wave_active_until: 0.0,
+            reinforce_t: 0.0, reinforce_interval: 30.0, fighter_cap: 0,
             game_over: None, run: 1, kills: 0,
             rng, now: 0.0, frame: 0,
             decide_n: std::env::var("HORDE_DECIDE_N").ok().and_then(|s| s.parse().ok()).filter(|&n| n >= 1).unwrap_or(DECIDE_N_DEFAULT),
@@ -935,10 +945,10 @@ impl Horde {
                 });
             }
         };
-        // Fighter counts scale with the zombie population (user 2026-07-22: the
-        // garrison didn't grow with the pop slider, so big hordes always crushed it).
-        // m = √(pop/6000) clamped 1..4 → base counts at ≤6k, up to ~4× at 96k.
-        let m = (self.base_pop as f64 / 6000.0).sqrt().clamp(1.0, 4.0);
+        // Fighter counts scale with the zombie population. The wake cascade grows
+        // ~linearly with pop, so √ wasn't enough (harness 2026-07-23: 100k died at
+        // wave 1). pop^0.72 clamped 1..8 → base at ≤6k, ~2.4× at 20k, ~7.6× at 100k.
+        let m = (self.base_pop as f64 / 6000.0).powf(0.72).clamp(1.0, 8.0);
         let fc = |n: usize| ((n as f64) * m).round() as usize;
         let lc = |n: usize| ((n as f64) * m.sqrt()).round() as usize; // logistics scale gentler
         let mut ds = Vec::new();
@@ -947,6 +957,12 @@ impl Horde {
         spawn(DKind::Sniper, fc(9), &mut ds);
         spawn(DKind::Crew, lc(4), &mut ds);
         spawn(DKind::Porter, lc(8), &mut ds);
+        // Trickle reinforcements: the garrison can grow to 2× its fighters, one every
+        // `reinforce_interval` s — faster at higher pop (30 s at ≤6k → ~4 s at 100k).
+        let fighters0 = ds.iter().filter(|d| d.kind.fighter()).count();
+        self.fighter_cap = fighters0 * 2;
+        self.reinforce_interval = (30.0 / m).clamp(4.0, 30.0);
+        self.reinforce_t = 0.0;
         self.defenders = ds;
     }
 
@@ -1414,6 +1430,26 @@ impl Horde {
         }
         self.step_towers(dt);
         self.step_defenders(dt);
+        self.reinforce(dt);
+    }
+
+    /// Trickle a fresh fighter in at the wall ring every `reinforce_interval` s, up
+    /// to `fighter_cap` (2× the starting fighters), rotating ranger/soldier/sniper —
+    /// the garrison recovers and grows through the escalating waves (user 2026-07-23).
+    fn reinforce(&mut self, dt: f64) {
+        if self.game_over.is_some() { return; }
+        self.reinforce_t += dt;
+        if self.reinforce_t < self.reinforce_interval { return; }
+        self.reinforce_t = 0.0;
+        if self.defenders.iter().filter(|d| d.kind.fighter()).count() >= self.fighter_cap { return; }
+        let kind = match self.defenders.len() % 3 { 0 => DKind::Ranger, 1 => DKind::Soldier, _ => DKind::Sniper };
+        let (cx, cz) = (WORLD / 2.0, WORLD / 2.0);
+        let a = self.defenders.len() as f64 * 2.399963;
+        let (x, z) = (cx + a.cos() * (BASE_R - 10.0), cz + a.sin() * (BASE_R - 10.0));
+        self.defenders.push(Defender {
+            kind, p: Point3::new(x, terrain_h(x, z, self.seed, self.scenario), z), hp: kind.max_hp(),
+            state: DState::Post, sector: self.defenders.len() % SECTORS, reload_t: 0.0, respawn_t: 0.0, face: 0.0, stock: 0.0, shots: 0, path: Vec::new(),
+        });
     }
 
     /// Towers auto-fire: "nearest" = one k-NN(1) per tower per shot;
@@ -1744,9 +1780,9 @@ impl Horde {
             let bite = Sphere3::new(d.p.x, d.p.y, d.p.z, 4.5);
             let dps: f64 = zq.cull(&bite).iter().filter(|it| !it.dormant).map(|it| it.class.dmg()).sum();
             if dps > 0.0 {
-                // contact damage 0.4→0.3 and fighter respawn 25→18 s (same balance
-                // pass): survive the swarm ~25% longer and return quicker to the line.
-                d.hp -= dps * 0.3 * dt;
+                // contact damage 0.4→0.22 and fighter respawn 25→18 s: survive the
+                // swarm longer and return quicker to the line (balance harness).
+                d.hp -= dps * 0.22 * dt;
                 if d.hp <= 0.0 { d.respawn_t = if d.kind.fighter() { 18.0 } else { 30.0 }; dead_screams.push(d.p); }
             }
         }
