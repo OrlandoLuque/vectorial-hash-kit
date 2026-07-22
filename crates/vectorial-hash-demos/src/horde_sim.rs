@@ -497,6 +497,9 @@ pub struct Defender {
     pub sector: usize,
     pub reload_t: f64,
     pub respawn_t: f64,
+    /// Heading (radians) updated as it walks, so the renderer turns the model to
+    /// face its movement instead of always looking one way (user 2026-07-22).
+    pub face: f32,
     /// Crew: repair stock (a porter delivery = +20; repair burns 2/s).
     pub stock: f64,
     pub shots: u64,
@@ -562,6 +565,10 @@ pub struct Horde {
     wave_spawn_t: f64,
     pub wave_dir: f64,
     pub wave_announced: bool,
+    /// While `now < wave_active_until` a wave is announced OR still marching in, so
+    /// fighters hold the line (no sorties, recall the ones already out). Set on
+    /// announce to spawn+35 s; `wave_announced` alone misses the post-spawn march.
+    wave_active_until: f64,
     /// Set when the Command Center falls (defeat) or the final wave is cleared
     /// (victory): (time it happened, victory?). The run resets ~12 s later.
     pub game_over: Option<(f64, bool)>,
@@ -689,6 +696,9 @@ fn spawn_field_at(rng: &mut Rng, pop: usize, seed: f64, sc: Scenario, centers: &
             // contact-wake radius, so a fresh field has no self-igniting pairs.
             let (x, z) = ((x0 + rng.range(-0.3, 0.3)).clamp(MARGIN, WORLD - MARGIN), (z0 + rng.range(-0.3, 0.3)).clamp(MARGIN, WORLD - MARGIN));
             if !pass(x, z) { continue; }
+            // Never bed a sleeper IN water (the connectivity pass may carve a passable
+            // corridor across a water blob — fine to cross, wrong to spawn on). 2026-07-22.
+            if sc == Scenario::Patches && patch_cell(x, z, seed) == 3 { continue; }
             if centers.iter().any(|(nx, nz)| { let (dx, dz) = (x - nx, z - nz); dx * dx + dz * dz < nr * nr }) { spots.push((x, z)); }
         }
     }
@@ -701,7 +711,9 @@ fn spawn_field_at(rng: &mut Rng, pop: usize, seed: f64, sc: Scenario, centers: &
         spots.swap(k, j);
         let (x, z) = spots[k];
         let roll = rng.unit();
-        let class = if roll < 0.70 { ZClass::Walker } else if roll < 0.85 { ZClass::Runner } else if roll < 0.91 { ZClass::Chubby } else if roll < 0.96 { ZClass::Venom } else { ZClass::Harpy };
+        // Patches is the TAB choke design: flyers bypass the maze, so drop them here
+        // (harpy → runner) so the funnel actually holds (user 2026-07-22).
+        let class = if roll < 0.70 { ZClass::Walker } else if roll < 0.85 { ZClass::Runner } else if roll < 0.91 { ZClass::Chubby } else if roll < 0.96 { ZClass::Venom } else if sc == Scenario::Patches { ZClass::Runner } else { ZClass::Harpy };
         let y = terrain_h(x, z, seed, sc) + class.altitude();
         units.push(Zombie { class, p: Point3::new(x, y, z), vel: (0.0, 0.0), state: ZState::Dormant, hp: class.max_hp(), heard: 0.0, linger: 0.0, groan_t: rng.range(0.5, 2.0), swing_t: 0.0, bump: u32::MAX, moved: false });
     }
@@ -883,7 +895,7 @@ impl Horde {
             pending: Vec::new(), corpses: Vec::new(), tracers: Vec::new(),
             tower_reload: vec![0.0; ns], free_slots: Vec::new(),
             tower_threat_mode: false, cc_id,
-            wave_k: 0, wave_spawn_t: 50.0, wave_dir: 0.0, wave_announced: false,
+            wave_k: 0, wave_spawn_t: 50.0, wave_dir: 0.0, wave_announced: false, wave_active_until: 0.0,
             game_over: None, run: 1, kills: 0,
             rng, now: 0.0, frame: 0,
             decide_n: std::env::var("HORDE_DECIDE_N").ok().and_then(|s| s.parse().ok()).filter(|&n| n >= 1).unwrap_or(DECIDE_N_DEFAULT),
@@ -918,19 +930,23 @@ impl Horde {
                 ds.push(Defender {
                     kind, p: Point3::new(x, terrain_h(x, z, self.seed, self.scenario), z), hp: kind.max_hp(),
                     state: if kind.fighter() { DState::Post } else { DState::Idle },
-                    sector: (ds.len()) % SECTORS, reload_t: 0.0, respawn_t: 0.0, stock: 0.0, shots: 0,
+                    sector: (ds.len()) % SECTORS, reload_t: 0.0, respawn_t: 0.0, face: 0.0, stock: 0.0, shots: 0,
                     path: Vec::new(),
                 });
             }
         };
-        // Fighter counts bumped ~40% (user 2026-07-19: defenders "aplastadísimos") so
-        // the ranged line thins the horde before it reaches melee. Tune with the eyes.
+        // Fighter counts scale with the zombie population (user 2026-07-22: the
+        // garrison didn't grow with the pop slider, so big hordes always crushed it).
+        // m = √(pop/6000) clamped 1..4 → base counts at ≤6k, up to ~4× at 96k.
+        let m = (self.base_pop as f64 / 6000.0).sqrt().clamp(1.0, 4.0);
+        let fc = |n: usize| ((n as f64) * m).round() as usize;
+        let lc = |n: usize| ((n as f64) * m.sqrt()).round() as usize; // logistics scale gentler
         let mut ds = Vec::new();
-        spawn(DKind::Ranger, 28, &mut ds);
-        spawn(DKind::Soldier, 16, &mut ds);
-        spawn(DKind::Sniper, 9, &mut ds);
-        spawn(DKind::Crew, 4, &mut ds);
-        spawn(DKind::Porter, 8, &mut ds);
+        spawn(DKind::Ranger, fc(28), &mut ds);
+        spawn(DKind::Soldier, fc(16), &mut ds);
+        spawn(DKind::Sniper, fc(9), &mut ds);
+        spawn(DKind::Crew, lc(4), &mut ds);
+        spawn(DKind::Porter, lc(8), &mut ds);
         self.defenders = ds;
     }
 
@@ -971,6 +987,7 @@ impl Horde {
             self.wave_announced = true;
             self.wave_dir = self.rng.range(0.0, std::f64::consts::TAU);
             self.wave_spawn_t = self.now + 5.0;
+            self.wave_active_until = self.wave_spawn_t + 35.0;
         } else {
             self.wave_spawn_t = self.now;
         }
@@ -996,6 +1013,7 @@ impl Horde {
         if !self.wave_announced && self.now >= self.wave_spawn_t - 30.0 {
             self.wave_announced = true;
             self.wave_dir = self.rng.range(0.0, std::f64::consts::TAU);
+            self.wave_active_until = self.wave_spawn_t + 35.0; // hold the line through the march-in
         }
         if self.now < self.wave_spawn_t { return; }
         let k = self.wave_k;
@@ -1016,13 +1034,15 @@ impl Horde {
                     x = (cx + a.cos() * r).clamp(MARGIN, WORLD - MARGIN);
                     z = (cz + a.sin() * r).clamp(MARGIN, WORLD - MARGIN);
                     // Passable AND connected — never strand a wave in a forest
-                    // pocket the flow field can't route out of.
-                    if self.passable(x, z) && self.flow.reachable(x, z) { break; }
+                    // pocket the flow field can't route out of. Also never land IN
+                    // Patches water (a carved corridor may be passable water).
+                    if self.passable(x, z) && self.flow.reachable(x, z)
+                        && !(self.scenario == Scenario::Patches && patch_cell(x, z, self.seed) == 3) { break; }
                 }
                 // Escalating mix: early waves are shambler seas; specials join
                 // from wave 2 (venom/chubby) and wave 4 (harpies).
                 let roll = self.rng.unit();
-                let class = if k >= 4 && roll > 0.95 { ZClass::Harpy }
+                let class = if k >= 4 && roll > 0.95 && self.scenario != Scenario::Patches { ZClass::Harpy }
                     else if k >= 2 && roll > 0.88 { ZClass::Venom }
                     else if k >= 2 && roll > 0.80 { ZClass::Chubby }
                     else if roll > 0.65 { ZClass::Runner } else { ZClass::Walker };
@@ -1504,9 +1524,12 @@ impl Horde {
             // SORTIE: send a ranger squad out through the gate to silently
             // clear the nearest nest (rangers = noise 1; the TAB map-clearing
             // move). Runs in every lull — recalled when a wave gets close.
-            let (total_threat, eta) = (self.threat.iter().sum::<f64>(), self.wave_spawn_t - self.now);
+            let total_threat = self.threat.iter().sum::<f64>();
             let out = self.defenders.iter().filter(|d| matches!(d.state, DState::Sortie { .. })).count();
-            if total_threat < 8.0 && (!self.wave_announced || eta > 25.0) && out == 0 {
+            // Only sortie in a genuine lull: no wave announced or still marching in
+            // (`wave_active_until`) and the sectors are quiet (user 2026-07-22: the
+            // rangers used to wander out INTO a landing wave).
+            if total_threat < 6.0 && self.now > self.wave_active_until && out == 0 {
                 let target = self.zq().knn(Point3::new(cx, 0.0, cz), 48).into_iter()
                     .find(|(_, it)| it.dormant)
                     .map(|(_, it)| it.p);
@@ -1531,8 +1554,9 @@ impl Horde {
                     }
                 }
             }
-            // Wave closing in → everyone home to the walls.
-            if self.wave_announced && eta <= 25.0 {
+            // Wave announced OR marching in → recall everyone to the walls (covers
+            // the whole active window, not just the 30 s warning).
+            if self.now <= self.wave_active_until {
                 for d in self.defenders.iter_mut() {
                     if matches!(d.state, DState::Sortie { .. }) { d.state = DState::Post; }
                 }
@@ -1555,6 +1579,7 @@ impl Horde {
             let (dx, dz) = (tx - d.p.x, tz - d.p.z);
             let dist = (dx * dx + dz * dz).sqrt();
             if dist > 2.0 {
+                d.face = (dz as f32).atan2(dx as f32); // heading, so the render can turn the model
                 let sp = d.kind.speed().min(dist / dt);
                 let (mut nx, mut nz) = ((d.p.x + dx / dist * sp * dt).clamp(MARGIN, WORLD - MARGIN), (d.p.z + dz / dist * sp * dt).clamp(MARGIN, WORLD - MARGIN));
                 if !pass2(nx, nz) { // slide along the blocked edge (axis drop)

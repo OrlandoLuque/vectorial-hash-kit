@@ -65,13 +65,16 @@ fn building_tweak(k: SKind) -> (f32, f32, f32) {
     // normalises to unit height), so a wide-short wall (3.5× wider than tall) at a big
     // scale comes out far too wide + overlapping. Sizes below are derived from
     // `model_dims` (aspect) + the sim's 8-wu wall spacing so segments tile, not overlap:
-    //   wall  aspect 3.5 → scale 2.5 ⇒ width ≈ 8.75 (just touches the 8-wu ring)
-    //   gate  aspect 2.7 → scale 3.3 ⇒ width ≈ 8.9 (a touch taller, gate presence)
+    //   wall  aspect 3.5, but the model bbox is ~½ decorative overhang (user
+    //         2026-07-22) — so the SOLID core is ~half the footprint. Size the core
+    //         to the 8-wu spacing: scale 4.6 ⇒ core ≈ 8 (tiles, no gaps at towers),
+    //         decorative fringe overlaps its neighbours (continuous rampart).
+    //   gate  same reasoning → scale 5.0 so it fills between the wider walls.
     //   tower aspect 0.6 → tall/narrow; cannon sits on top (see the render loop)
     let ccw = std::f32::consts::FRAC_PI_2;
     match k {
-        SKind::Wall => (2.5, ccw, 0.0),
-        SKind::Gate => (3.3, ccw, 0.0),
+        SKind::Wall => (4.6, ccw, 0.0),
+        SKind::Gate => (5.0, ccw, 0.0),
         SKind::Tower => (9.0, ccw, 0.0),
         SKind::House => (6.5, ccw, 0.0),
         SKind::Storehouse => (7.5, ccw, 0.0),
@@ -761,11 +764,13 @@ impl State {
 
         let seed = std::env::var("HORDE_SEED").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0x40BDE);
         let pop = std::env::var("HORDE_POP").ok().and_then(|s| s.parse().ok()).unwrap_or(20_000).clamp(2_000, MAX_POP);
-        // Optional start scenario (OPEN/PASS/RIVER/FOREST/PATCHES), else Classic.
+        // Start scenario. Default = PATCHES (user 2026-07-22): the blob-patch maze
+        // funnels the horde through chokepoints (the TAB defence loop) instead of a
+        // uniform wall of bodies. Override with HORDE_SCENARIO=CLASSIC/PASS/RIVER/FOREST.
         let start_sc = match std::env::var("HORDE_SCENARIO").ok().as_deref().map(|s| s.to_ascii_uppercase()).as_deref() {
-            Some("PASS") => Scenario::Pass, Some("RIVER") => Scenario::River,
-            Some("FOREST") => Scenario::Forest, Some("PATCHES") => Scenario::Patches,
-            _ => Scenario::Classic,
+            Some("CLASSIC") | Some("OPEN") => Scenario::Classic, Some("PASS") => Scenario::Pass,
+            Some("RIVER") => Scenario::River, Some("FOREST") => Scenario::Forest,
+            _ => Scenario::Patches,
         };
         let sim = Horde::with_scenario(seed, pop, start_sc);
 
@@ -1150,7 +1155,8 @@ impl State {
             let m = &self.models[mi];
             let nf = m.n_frames.max(1);
             let frame = (((now as f32 * 1.8) * nf as f32) as u32) % nf;
-            let model = Mat4::from_translation(Vec3::new(x, y, zz)) * Mat4::from_scale(Vec3::splat(7.0));
+            // turn the model to face where it's walking (was fixed — user 2026-07-22)
+            let model = Mat4::from_translation(Vec3::new(x, y, zz)) * Mat4::from_rotation_y(-d.face + std::f32::consts::FRAC_PI_2) * Mat4::from_scale(Vec3::splat(7.0));
             buckets[mi].push(SkinInstance { model: model.to_cols_array_2d(), color: dtint(d.kind), frame_base: frame * m.num_joints, _pad: [0; 3] });
         }
         // Sleepers inside the LOD bubble: full skinned models playing their
