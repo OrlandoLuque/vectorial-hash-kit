@@ -18,8 +18,9 @@ the measured verdict on when the GPU wins vs a parallel CPU path).
 
 Mature. **Seven structures** share one arena layout and query surface: `Tree`
 (2D binary), `QuadTree` (2D 4-way), `IntegerTree` (2D, `i32` / power-of-two),
-`Tree3` (3D binary), `Octree3` (3D 8-way), plus the pointer-free Z-order grids
-`MortonGrid` (2D) and `MortonGrid3` (3D). Each supports template-driven `cull`,
+`Tree3` (3D binary), `Octree3` (3D 8-way), the pointer-free Z-order grids
+`MortonGrid` (2D) and `MortonGrid3` (3D), and the adaptive pointer-free
+`LinearOctree3` (3D). Each supports template-driven `cull`,
 dynamic `insert`/`remove`/`update` (merge-up rule), an **O(1) stable `ItemRef`**
 relocation handle (`insert_ref`/`update_ref`/`remove_ref`), **k-NN**, **ray-cast**
 (thick capsule + DDA leaf-walk, `raycast`/`raycast_dda`/`raycast_first`), and
@@ -59,6 +60,7 @@ Leaf items can additionally be answered by a 1×1 raster (`Shape::point_template
 | `tree3` (shapes) | `Shape3`, `Sphere3`, `Polyhedron3`, `Segment3`, `VoxelRaster` | 3D query volumes. `Polyhedron3` = convex half-spaces (`from_corners` builds a frustum; `segment_hit` is the exact line-of-sight/occlusion test); `Segment3` = capsule behind `raycast`. |
 | `octree3` | `Octree3<T>`, `ONode`, `ONodeId` | 3D 8-way (2×2×2) split — the 3D `QuadTree`. Same dynamic contract + `knn` + DDA `raycast` + `bulk_load`. |
 | `morton3` | `MortonGrid3<T>` | 3D Z-order linear octree: fastest on uniform data, cheapest build, `knn` (ring shell) + `raycast`, `extend_par` bulk build. |
+| `linear_octree3` | `LinearOctree3<T>` | 3D **adaptive** linear octree: sparse hash of leaf buckets keyed by a self-describing Morton location code (path + level in one `u64`), pointer-free; a leaf splits into 8 only where points cluster. `from_items`/`insert`/`cull`/`knn`. Grid-cheap builds (~2× faster than `Octree3`) + ~5× faster clustered k-NN than the uniform `MortonGrid3` — the pick for skewed data you rebuild often (measured, `docs/THREE_D.md`). |
 | `advisor` | `SpatialProfile`, `StructureHint` | Self-tuning structure selection: track a region's relocation rate + query:move ratio (EMA); `recommend()` returns `BruteForce`/`KeepIndexTree`/`CoarserOrRebuild` from measured crossovers. |
 
 Beyond `cull`, every structure answers **`knn`** (k-nearest, best-first with bbox

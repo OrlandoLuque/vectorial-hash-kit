@@ -439,6 +439,40 @@ where the trees use `update`, the grid just re-buckets). `visit_cells` exposes
 the occupied cells for the `B` box overlay; `demorton3` decodes a code back to
 its `(x,y,z)` cell.
 
+## Adaptive linear octree (`LinearOctree3`) — grid build, octree queries (measured 2026-07-24)
+
+`MortonGrid3` has *one* cell size everywhere — great on uniform data, poor when the
+density varies (a fine-enough cell for the clusters is far too fine for the void, and
+a coarse one dumps a whole cluster in one bucket). `Octree3` is fully adaptive but
+each node is a heap cell reached by chasing pointers. `LinearOctree3` is the middle:
+a **sparse, adaptive** octree stored the *linear* way — leaf buckets in a
+`HashMap<u64, Vec<T>>` keyed by a self-describing **location code** (Morton path +
+level in one `u64`: the root is `1`, octant `o` of key `K` is `(K<<3)|o`, so the
+leading sentinel bit encodes the level). A companion `HashSet` marks the subdivided
+keys so an empty subtree prunes in O(1). A leaf splits into 8 only where points pile
+up, down to `max_depth`. `from_items` (bulk) / `insert` / `cull` / `knn`, all
+brute-force-gated.
+
+Measured (`examples/linear_octree3_bench`, 200k points, 67 % in 8 dense blobs, 2 000
+sphere culls r=40 and k-NN k=8, release):
+
+| structure | build (ms) | cull 2000q (ms) | knn 2000q (ms) | leaves/cells |
+|-----------|-----------:|----------------:|---------------:|-------------:|
+| **LinearOctree3** | **18.2** | 9.98 | 3.52 | 12 397 (depth 8) |
+| `Octree3` (pointer) | 38.4 | **7.56** | **2.85** | — |
+| `MortonGrid3` (uniform) | 16.3 | 11.6 | 17.8 | 28 589 (flat) |
+
+Honest read: the tuned **pointer `Octree3` still wins the queries** (cull 1.3×, knn
+1.2× over the linear octree) — the arena already captures the adaptivity with better
+locality, the same result the wide-BVH probe reached. But `LinearOctree3` has two
+real wins: it **builds ~2.1× faster than `Octree3`** (pointer-free, one bucket pass
+per level — near the uniform grid's build cost) *and* on clustered data its **k-NN is
+~5× faster than `MortonGrid3`** (the uniform grid's ring-shell expansion wades through
+thousands of empty cells; the adaptive tree descends straight to the cluster). So it's
+the pick when the data is **skewed** *and* you **rebuild often** — grid-cheap builds
+without the grid's clustered-kNN cliff. On uniform data or a keep-maintained index,
+`MortonGrid3` / `Tree3`+`ItemRef` remain the calls (see the decision map below).
+
 ## k-nearest-neighbour (`knn`) — a different query than range cull
 
 Range cull answers "which points are inside this volume?" (you supply the
