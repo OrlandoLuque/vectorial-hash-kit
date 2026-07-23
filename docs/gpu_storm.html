@@ -25,10 +25,10 @@
   <script type="module">
     import { setupMobileControls } from './mobile-controls.js';
     const MOBILE_KEYS = [
-      { label: 'Mode', sub: 'collide↔field', code: 'KeyF', key: 'f', keyCode: 70 },
-      { label: 'GPU', code: 'Digit2', key: '2', keyCode: 50 },
-      { label: 'Count −', code: 'BracketLeft', key: '[', keyCode: 219 },
-      { label: 'Count +', code: 'BracketRight', key: ']', keyCode: 221 },
+      { label: 'Mode', code: 'KeyF', key: 'f', keyCode: 70, cycle: [{ name: 'collide' }, { name: 'field' }] },
+      { label: 'GPU', sub: 'backend', code: 'Digit2', key: '2', keyCode: 50, cost: 0.2 },
+      { label: 'Count −', code: 'BracketLeft', key: '[', keyCode: 219, cost: 0.15 },
+      { label: 'Count +', code: 'BracketRight', key: ']', keyCode: 221, cost: 0.85 },
     ];
     const msg = document.getElementById('msg');
     if (!navigator.gpu) {
@@ -48,7 +48,7 @@
       };
       import('./gpu/gpu_storm.js')
         .then(m => m.default())
-        .then(() => { setTimeout(() => msg.remove(), 1500); setupMobileControls({ keys: MOBILE_KEYS }); })
+        .then(() => { setTimeout(() => msg.remove(), 1500); setupMobileControls({ title: 'GPU storm', keys: MOBILE_KEYS }); })
         .catch(e => { msg.innerHTML = '<div>Failed to start.</div><div class="small">' + e + '</div>'; console.error(e); });
     }
   </script>

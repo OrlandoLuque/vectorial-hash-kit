@@ -1,12 +1,14 @@
-// Shared mobile control overlay for the demos (user 2026-07-23). On touch / coarse
-// pointers it adds a ☰ hamburger that opens a grid of big buttons; each button
-// dispatches a physical-`code` KeyboardEvent on `window`, so it triggers the demo's
-// existing key handlers (winit maps `event.code` → KeyCode). Camera stays on
-// drag/pinch. Force it on desktop for testing with `?mobileui`.
+// Shared mobile control overlay for the demos (user 2026-07-23). On touch-primary
+// devices it adds a ☰ button (top-LEFT, clear of the on-screen FPS/meters on the
+// right) that opens a card of big finger-buttons. Each button dispatches a
+// physical-`code` KeyboardEvent at BOTH `window` (winit/wgpu) and the <canvas>
+// (macroquad/miniquad), so the demo's own key handlers fire — no per-demo plumbing.
+// Camera stays on drag/pinch. Force it on desktop for testing with `?mobileui`.
 //
-// Usage (after the wasm has started):
-//   import { setupMobileControls } from './mobile-controls.js';
-//   setupMobileControls({ keys: [{ label:'Pause', code:'KeyP', key:'p' }, …] });
+// A key entry: { label, code, key, keyCode, sub?, cost?, start?, cycle? }.
+//   cost: 0(light/green)…1(heavy/red) tints the button by performance impact.
+//   cycle: [{ name, cost? }, …] — a button that steps through options on each tap,
+//          updating its own caption + colour to the CURRENT option (start = index).
 export function setupMobileControls(cfg) {
   const force = location.search.includes('mobileui');
   const mm = (q) => window.matchMedia && matchMedia(q).matches;
@@ -19,32 +21,67 @@ export function setupMobileControls(cfg) {
 
   const style = document.createElement('style');
   style.textContent = `
-    #mc-burger { position: fixed; top: calc(env(safe-area-inset-top, 0px) + 8px); right: 8px; z-index: 100000;
-      width: 54px; height: 54px; border-radius: 13px; border: 1px solid #3a4666;
-      background: #141a2cd8; color: #cdd6ea; font-size: 26px; line-height: 52px; text-align: center;
+    #mc-burger { position: fixed; top: calc(env(safe-area-inset-top, 0px) + 10px);
+      left: calc(env(safe-area-inset-left, 0px) + 10px); z-index: 100000;
+      width: 54px; height: 54px; border-radius: 15px; border: 1px solid #3c4c78;
+      background: linear-gradient(160deg, #202a49, #141a2c); color: #e6ecfb;
+      font-size: 25px; line-height: 54px; text-align: center; box-shadow: 0 3px 16px #000a;
+      -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
       -webkit-tap-highlight-color: transparent; user-select: none; touch-action: manipulation;
-      backdrop-filter: blur(3px); box-shadow: 0 2px 10px #0008; }
-    #mc-panel { position: fixed; top: calc(env(safe-area-inset-top, 0px) + 70px); right: 8px; z-index: 100000;
-      display: none; grid-template-columns: repeat(3, minmax(78px, 1fr)); gap: 8px; padding: 10px;
-      max-width: min(76vw, 340px); max-height: 74vh; overflow-y: auto;
-      background: #0e1424f0; border: 1px solid #3a4666; border-radius: 14px; box-shadow: 0 6px 22px #000a; }
-    #mc-panel.open { display: grid; }
-    .mc-btn { min-height: 52px; padding: 7px 8px; border-radius: 11px; border: 1px solid #34406a;
-      background: #1b2440; color: #e6ecfa; font: 600 14px system-ui, sans-serif; text-align: center;
-      -webkit-tap-highlight-color: transparent; user-select: none; touch-action: manipulation; }
-    .mc-btn:active { background: #2f3f70; border-color: #5570c0; }
-    .mc-btn small { display: block; margin-top: 2px; color: #93a3cc; font-weight: 400; font-size: 10.5px; }
+      transition: transform .12s ease, box-shadow .12s ease; }
+    #mc-burger:active { transform: scale(.93); box-shadow: 0 1px 8px #000a; }
+    #mc-burger.open { background: linear-gradient(160deg, #2a3a63, #1a2138); }
+    #mc-panel { position: fixed; top: calc(env(safe-area-inset-top, 0px) + 74px);
+      left: calc(env(safe-area-inset-left, 0px) + 10px); z-index: 100000; display: none;
+      grid-template-columns: repeat(auto-fill, minmax(106px, 1fr)); gap: 9px; padding: 12px;
+      width: min(88vw, 384px); max-height: 78vh; overflow-y: auto;
+      background: linear-gradient(180deg, #121a2df4, #0c1120f7); border: 1px solid #2f3c5e;
+      border-radius: 20px; box-shadow: 0 12px 38px #000c;
+      -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
+      -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
+    #mc-panel.open { display: grid; animation: mc-in .16s ease; }
+    @keyframes mc-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
+    #mc-title { grid-column: 1/-1; margin: 1px 3px 3px; color: #93a3c8; font: 700 11px system-ui, sans-serif;
+      letter-spacing: 1.1px; text-transform: uppercase; }
+    .mc-btn { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px;
+      min-height: 62px; padding: 8px 6px; border-radius: 14px; border: 1px solid #37436e; background: #1a2340;
+      color: #eef3fc; text-align: center; cursor: pointer; box-shadow: inset 0 1px 0 #ffffff0f;
+      -webkit-tap-highlight-color: transparent; user-select: none; touch-action: manipulation;
+      transition: transform .07s ease, filter .07s ease; }
+    .mc-btn.pressed { transform: scale(.93); filter: brightness(1.4); }
+    .mc-name { font: 700 15px system-ui, sans-serif; line-height: 1.1; }
+    .mc-sub { font: 600 11px system-ui, sans-serif; letter-spacing: .2px; padding: 1px 8px; border-radius: 999px;
+      background: #ffffff1f; color: #f2f6ff; max-width: 96px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .mc-sub:empty { display: none; }
   `;
   document.head.appendChild(style);
+
+  // cost 0 → green, .5 → amber, 1 → red (dark-UI friendly).
+  const costStyle = (c) => {
+    if (c == null) return null;
+    const h = Math.round(120 * (1 - Math.max(0, Math.min(1, c))));
+    return { bg: `hsl(${h} 44% 23%)`, bd: `hsl(${h} 48% 41%)` };
+  };
 
   const burger = document.createElement('div');
   burger.id = 'mc-burger'; burger.textContent = '☰'; burger.setAttribute('aria-label', 'controls');
   const panel = document.createElement('div');
   panel.id = 'mc-panel';
-  burger.addEventListener('click', () => panel.classList.toggle('open'));
+  const title = document.createElement('div');
+  title.id = 'mc-title'; title.textContent = cfg.title || 'Controls';
+  panel.appendChild(title);
 
-  // Fire at both `window` (winit/wgpu demos listen there) and the <canvas>
-  // (macroquad/miniquad registers keydown/keyup on the canvas element).
+  // Macroquad shells keep a “← demos” link at top-left; drop the burger below it.
+  if (document.getElementById('back')) {
+    burger.style.top = 'calc(env(safe-area-inset-top, 0px) + 56px)';
+    panel.style.top = 'calc(env(safe-area-inset-top, 0px) + 120px)';
+  }
+  burger.addEventListener('click', () => {
+    const open = panel.classList.toggle('open');
+    burger.classList.toggle('open', open);
+    burger.textContent = open ? '✕' : '☰';
+  });
+
   const mkEvent = (type, k) => new KeyboardEvent(type, {
     key: k.key, code: k.code, keyCode: k.keyCode || 0, which: k.keyCode || 0, bubbles: true, cancelable: true,
   });
@@ -53,15 +90,43 @@ export function setupMobileControls(cfg) {
     const cv = document.querySelector('canvas');
     if (cv) { if (cv.tabIndex < 0) cv.tabIndex = 0; cv.dispatchEvent(mkEvent(type, k)); }
   };
+  const vibe = () => { try { navigator.vibrate && navigator.vibrate(8); } catch (e) {} };
 
   for (const k of cfg.keys) {
-    const b = document.createElement('div');
+    const b = document.createElement('button');
     b.className = 'mc-btn';
-    b.innerHTML = k.label + (k.sub ? `<small>${k.sub}</small>` : '');
-    // A tap = keydown then keyup. Hold-to-repeat (camera) works via press/release too.
-    let down = false;
-    const press = (e) => { if (e) e.preventDefault(); if (!down) { down = true; send('keydown', k); } };
-    const release = (e) => { if (e) e.preventDefault(); if (down) { down = false; send('keyup', k); } };
+    const nm = document.createElement('span'); nm.className = 'mc-name'; nm.textContent = k.label;
+    const sub = document.createElement('span'); sub.className = 'mc-sub';
+    b.appendChild(nm); b.appendChild(sub);
+
+    let idx = k.start || 0;
+    const paint = () => {
+      let cost = k.cost;
+      if (k.cycle && k.cycle.length) {
+        const st = k.cycle[idx % k.cycle.length];
+        sub.textContent = st.name || '';
+        if (st.cost != null) cost = st.cost;
+      } else {
+        sub.textContent = k.sub || '';
+      }
+      const cs = costStyle(cost);
+      if (cs) { b.style.background = cs.bg; b.style.borderColor = cs.bd; }
+      else { b.style.background = ''; b.style.borderColor = ''; }
+    };
+    paint();
+
+    let held = false;
+    const press = (e) => {
+      if (e) e.preventDefault();
+      if (held) return; held = true;
+      b.classList.add('pressed'); send('keydown', k); vibe();
+      if (k.cycle && k.cycle.length) { idx = (idx + 1) % k.cycle.length; paint(); } // reflect the new state now
+    };
+    const release = (e) => {
+      if (e) e.preventDefault();
+      if (!held) return; held = false;
+      b.classList.remove('pressed'); send('keyup', k);
+    };
     b.addEventListener('touchstart', press, { passive: false });
     b.addEventListener('touchend', release, { passive: false });
     b.addEventListener('touchcancel', release, { passive: false });

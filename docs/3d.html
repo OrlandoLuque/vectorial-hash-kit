@@ -64,20 +64,20 @@
 <script>load("critters3d.wasm");</script>
 <script type="module">
   import { setupMobileControls } from './mobile-controls.js';
-  setupMobileControls({ keys: [
-    { label: 'Index', sub: 'structure', code: 'KeyM', key: 'm', keyCode: 77 },
-    { label: 'Render', sub: 'mode', code: 'KeyG', key: 'g', keyCode: 71 },
-    { label: 'Mode', sub: 'observe↔combat', code: 'KeyT', key: 't', keyCode: 84 },
-    { label: 'Boxes', code: 'KeyB', key: 'b', keyCode: 66 },
-    { label: 'Separate', code: 'KeyO', key: 'o', keyCode: 79 },
-    { label: 'Random', sub: 'attacks', code: 'KeyR', key: 'r', keyCode: 82 },
-    { label: 'Cull', sub: 'repeats', code: 'KeyC', key: 'c', keyCode: 67 },
-    { label: 'FPS cap', code: 'KeyV', key: 'v', keyCode: 86 },
-    { label: 'Hide UI', code: 'KeyU', key: 'u', keyCode: 85 },
-    { label: 'Pop +', code: 'Equal', key: '=', keyCode: 187 },
-    { label: 'Pop −', code: 'Minus', key: '-', keyCode: 189 },
-    { label: 'Threads −', sub: '[', code: 'BracketLeft', key: '[', keyCode: 219 },
-    { label: 'Threads +', sub: ']', code: 'BracketRight', key: ']', keyCode: 221 },
+  setupMobileControls({ title: 'Critters 3D', keys: [
+    { label: 'Index', code: 'KeyM', key: 'm', keyCode: 77, cycle: [{ name: 'Tree3', cost: 0.45 }, { name: 'Octree3', cost: 0.5 }, { name: 'Morton', cost: 0.3 }, { name: 'Projection', cost: 0.35 }] },
+    { label: 'Render', code: 'KeyG', key: 'g', keyCode: 71, cycle: [{ name: 'spheres', cost: 0.8 }, { name: 'billboards', cost: 0.5 }, { name: 'sq bill', cost: 0.35 }, { name: 'no render', cost: 0.1 }] },
+    { label: 'Mode', code: 'KeyT', key: 't', keyCode: 84, cycle: [{ name: 'observe' }, { name: 'combat' }] },
+    { label: 'Boxes', code: 'KeyB', key: 'b', keyCode: 66, cycle: [{ name: 'off' }, { name: 'on' }] },
+    { label: 'Separate', code: 'KeyO', key: 'o', keyCode: 79, cycle: [{ name: 'off', cost: 0.25 }, { name: 'on', cost: 0.55 }] },
+    { label: 'Random', sub: 'attacks', code: 'KeyR', key: 'r', keyCode: 82, cycle: [{ name: 'off' }, { name: 'on' }] },
+    { label: 'Cull', code: 'KeyC', key: 'c', keyCode: 67, cycle: [{ name: '×1', cost: 0.15 }, { name: '×50', cost: 0.4 }, { name: '×200', cost: 0.65 }, { name: '×1000', cost: 0.95 }] },
+    { label: 'FPS cap', code: 'KeyV', key: 'v', keyCode: 86, cycle: [{ name: 'uncapped', cost: 0.8 }, { name: 'capped', cost: 0.3 }] },
+    { label: 'Hide UI', code: 'KeyU', key: 'u', keyCode: 85, cycle: [{ name: 'shown' }, { name: 'hidden' }] },
+    { label: 'Pop +', code: 'Equal', key: '=', keyCode: 187, cost: 0.85 },
+    { label: 'Pop −', code: 'Minus', key: '-', keyCode: 189, cost: 0.15 },
+    { label: 'Threads −', code: 'BracketLeft', key: '[', keyCode: 219, cost: 0.6 },
+    { label: 'Threads +', code: 'BracketRight', key: ']', keyCode: 221, cost: 0.2 },
   ]});
 </script>
 </body>

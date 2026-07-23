@@ -25,11 +25,11 @@
   <script type="module">
     import { setupMobileControls } from './mobile-controls.js';
     const MOBILE_KEYS = [
-      { label: 'CPU Tree', code: 'Digit1', key: '1', keyCode: 49 },
-      { label: 'GPU brute', code: 'Digit2', key: '2', keyCode: 50 },
-      { label: 'GPU LBVH', code: 'Digit3', key: '3', keyCode: 51 },
-      { label: 'Count −', code: 'BracketLeft', key: '[', keyCode: 219 },
-      { label: 'Count +', code: 'BracketRight', key: ']', keyCode: 221 },
+      { label: 'CPU Tree', sub: 'backend', code: 'Digit1', key: '1', keyCode: 49, cost: 0.45 },
+      { label: 'GPU brute', sub: 'backend', code: 'Digit2', key: '2', keyCode: 50, cost: 0.7 },
+      { label: 'GPU LBVH', sub: 'backend', code: 'Digit3', key: '3', keyCode: 51, cost: 0.2 },
+      { label: 'Count −', code: 'BracketLeft', key: '[', keyCode: 219, cost: 0.15 },
+      { label: 'Count +', code: 'BracketRight', key: ']', keyCode: 221, cost: 0.85 },
     ];
     const msg = document.getElementById('msg');
     if (!navigator.gpu) {
@@ -51,7 +51,7 @@
       };
       import('./gpu/gpu_lbvh_demo.js')
         .then(m => m.default())
-        .then(() => { setTimeout(() => msg.remove(), 1500); setupMobileControls({ keys: MOBILE_KEYS }); })
+        .then(() => { setTimeout(() => msg.remove(), 1500); setupMobileControls({ title: 'GPU LBVH', keys: MOBILE_KEYS }); })
         .catch(e => { msg.innerHTML = '<div>Failed to start.</div><div class="small">' + e + '</div>'; console.error(e); });
     }
   </script>

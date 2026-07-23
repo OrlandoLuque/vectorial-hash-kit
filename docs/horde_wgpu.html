@@ -25,18 +25,19 @@
   <script type="module">
     import { setupMobileControls } from './mobile-controls.js';
     const MOBILE_KEYS = [
-      { label: 'Pause', code: 'KeyP', key: 'p', keyCode: 80 },
-      { label: 'Wave', code: 'KeyN', key: 'n', keyCode: 78 },
-      { label: 'Wake all', code: 'KeyA', key: 'a', keyCode: 65 },
-      { label: 'Map', sub: 'scenario', code: 'KeyG', key: 'g', keyCode: 71 },
-      { label: 'Index', sub: 'Tree↔Morton', code: 'KeyM', key: 'm', keyCode: 77 },
-      { label: 'Night', code: 'KeyL', key: 'l', keyCode: 76 },
-      { label: 'Towers', sub: 'targeting', code: 'KeyT', key: 't', keyCode: 84 },
-      { label: 'Frustum', sub: 'cull', code: 'KeyK', key: 'k', keyCode: 75 },
-      { label: 'Goals', sub: 'CC↔all', code: 'KeyO', key: 'o', keyCode: 79 },
-      { label: 'Free-fly', code: 'KeyF', key: 'f', keyCode: 70 },
-      { label: 'Pop −', code: 'BracketLeft', key: '[', keyCode: 219 },
-      { label: 'Pop +', code: 'BracketRight', key: ']', keyCode: 221 },
+      { label: 'Pause', code: 'KeyP', key: 'p', keyCode: 80, cycle: [{ name: 'running' }, { name: 'paused' }] },
+      { label: 'Wave', code: 'KeyN', key: 'n', keyCode: 78, cost: 0.7 },
+      { label: 'Wake all', code: 'KeyA', key: 'a', keyCode: 65, cost: 0.95 },
+      { label: 'Map', code: 'KeyG', key: 'g', keyCode: 71, start: 4,
+        cycle: [{ name: 'OPEN', cost: 0.3 }, { name: 'PASS', cost: 0.35 }, { name: 'RIVER', cost: 0.4 }, { name: 'FOREST', cost: 0.55 }, { name: 'PATCHES', cost: 0.45 }] },
+      { label: 'Index', code: 'KeyM', key: 'm', keyCode: 77, cycle: [{ name: 'Tree3', cost: 0.5 }, { name: 'Morton', cost: 0.28 }] },
+      { label: 'Night', code: 'KeyL', key: 'l', keyCode: 76, cycle: [{ name: 'day', cost: 0.15 }, { name: 'night', cost: 0.6 }] },
+      { label: 'Towers', code: 'KeyT', key: 't', keyCode: 84, cycle: [{ name: 'nearest', cost: 0.35 }, { name: 'threat', cost: 0.6 }] },
+      { label: 'Frustum', code: 'KeyK', key: 'k', keyCode: 75, start: 1, cycle: [{ name: 'off', cost: 0.7 }, { name: 'on', cost: 0.25 }] },
+      { label: 'Goals', code: 'KeyO', key: 'o', keyCode: 79, cycle: [{ name: 'CC', cost: 0.3 }, { name: 'all', cost: 0.55 }] },
+      { label: 'Free-fly', code: 'KeyF', key: 'f', keyCode: 70, cycle: [{ name: 'orbit' }, { name: 'free' }] },
+      { label: 'Pop −', code: 'BracketLeft', key: '[', keyCode: 219, cost: 0.15 },
+      { label: 'Pop +', code: 'BracketRight', key: ']', keyCode: 221, cost: 0.85 },
     ];
     const msg = document.getElementById('msg');
     if (!navigator.gpu) {
@@ -59,7 +60,7 @@
       };
       import('./horde/horde_wgpu.js')
         .then(m => m.default())
-        .then(() => { setTimeout(() => msg.remove(), 1500); setupMobileControls({ keys: MOBILE_KEYS }); })
+        .then(() => { setTimeout(() => msg.remove(), 1500); setupMobileControls({ title: 'Horde', keys: MOBILE_KEYS }); })
         .catch(e => { msg.innerHTML = '<div>Failed to start.</div><div class="small">' + e + '</div>'; console.error(e); });
     }
   </script>

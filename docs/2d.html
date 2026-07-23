@@ -75,16 +75,16 @@
 <script>load("critters.wasm");</script>
 <script type="module">
   import { setupMobileControls } from './mobile-controls.js';
-  setupMobileControls({ keys: [
-    { label: 'Pause', code: 'Space', key: ' ', keyCode: 32 },
+  setupMobileControls({ title: 'Critters 2D', keys: [
+    { label: 'Pause', code: 'Space', key: ' ', keyCode: 32, cycle: [{ name: 'running' }, { name: 'paused' }] },
     { label: 'Index', sub: 'mode', code: 'KeyM', key: 'm', keyCode: 77 },
-    { label: 'Add', sub: '+5', code: 'Equal', key: '=', keyCode: 187 },
-    { label: 'Remove', sub: '−5', code: 'Minus', key: '-', keyCode: 189 },
+    { label: 'Add', sub: '+5', code: 'Equal', key: '=', keyCode: 187, cost: 0.8 },
+    { label: 'Remove', sub: '−5', code: 'Minus', key: '-', keyCode: 189, cost: 0.2 },
     { label: 'Slower', code: 'BracketLeft', key: '[', keyCode: 219 },
     { label: 'Faster', code: 'BracketRight', key: ']', keyCode: 221 },
-    { label: 'Region', sub: 'query shape', code: 'KeyR', key: 'r', keyCode: 82 },
-    { label: 'Dilate', sub: 'body radius', code: 'KeyD', key: 'd', keyCode: 68 },
-    { label: 'Hide UI', code: 'KeyU', key: 'u', keyCode: 85 },
+    { label: 'Region', code: 'KeyR', key: 'r', keyCode: 82, cycle: [{ name: 'fill+lines', cost: 0.6 }, { name: 'lines', cost: 0.4 }, { name: 'off', cost: 0.2 }] },
+    { label: 'Dilate', code: 'KeyD', key: 'd', keyCode: 68, cycle: [{ name: 'off' }, { name: 'on' }] },
+    { label: 'Hide UI', code: 'KeyU', key: 'u', keyCode: 85, cycle: [{ name: 'shown' }, { name: 'hidden' }] },
     { label: 'Drifter', sub: 'brush', code: 'Digit1', key: '1', keyCode: 49 },
     { label: 'Hunter', sub: 'brush', code: 'Digit2', key: '2', keyCode: 50 },
     { label: 'Pulsar', sub: 'brush', code: 'Digit3', key: '3', keyCode: 51 },

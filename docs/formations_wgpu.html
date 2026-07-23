@@ -25,11 +25,11 @@
   <script type="module">
     import { setupMobileControls } from './mobile-controls.js';
     const MOBILE_KEYS = [
-      { label: 'Pause', code: 'KeyP', key: 'p', keyCode: 80 },
-      { label: 'Frustum', sub: 'cull', code: 'KeyK', key: 'k', keyCode: 75 },
-      { label: 'Free-fly', code: 'KeyF', key: 'f', keyCode: 70 },
-      { label: 'Pop −', code: 'BracketLeft', key: '[', keyCode: 219 },
-      { label: 'Pop +', code: 'BracketRight', key: ']', keyCode: 221 },
+      { label: 'Pause', code: 'KeyP', key: 'p', keyCode: 80, cycle: [{ name: 'running' }, { name: 'paused' }] },
+      { label: 'Frustum', code: 'KeyK', key: 'k', keyCode: 75, start: 1, cycle: [{ name: 'off', cost: 0.7 }, { name: 'on', cost: 0.25 }] },
+      { label: 'Free-fly', code: 'KeyF', key: 'f', keyCode: 70, cycle: [{ name: 'orbit' }, { name: 'free' }] },
+      { label: 'Pop −', code: 'BracketLeft', key: '[', keyCode: 219, cost: 0.15 },
+      { label: 'Pop +', code: 'BracketRight', key: ']', keyCode: 221, cost: 0.85 },
     ];
     const msg = document.getElementById('msg');
     if (!navigator.gpu) {
@@ -52,7 +52,7 @@
       };
       import('./formations/formations_wgpu.js')
         .then(m => m.default())
-        .then(() => { setTimeout(() => msg.remove(), 1500); setupMobileControls({ keys: MOBILE_KEYS }); })
+        .then(() => { setTimeout(() => msg.remove(), 1500); setupMobileControls({ title: 'Formations', keys: MOBILE_KEYS }); })
         .catch(e => { msg.innerHTML = '<div>Failed to start.</div><div class="small">' + e + '</div>'; console.error(e); });
     }
   </script>
