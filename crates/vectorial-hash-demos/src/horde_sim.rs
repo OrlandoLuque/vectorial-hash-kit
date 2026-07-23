@@ -952,9 +952,15 @@ impl Horde {
         let fc = |n: usize| ((n as f64) * m).round() as usize;
         let lc = |n: usize| ((n as f64) * m.sqrt()).round() as usize; // logistics scale gentler
         let mut ds = Vec::new();
-        spawn(DKind::Ranger, fc(28), &mut ds);
-        spawn(DKind::Soldier, fc(16), &mut ds);
-        spawn(DKind::Sniper, fc(9), &mut ds);
+        // Interleave the fighter kinds round-robin (user 2026-07-23): sectors are
+        // assigned ∝ list index, so a kind-blocked list colour-BANDED the ring; a
+        // round-robin gives each sector a heterogeneous ranger/soldier/sniper mix.
+        let mut want = [(DKind::Ranger, fc(28)), (DKind::Soldier, fc(16)), (DKind::Sniper, fc(9))];
+        loop {
+            let mut any = false;
+            for slot in want.iter_mut() { if slot.1 > 0 { spawn(slot.0, 1, &mut ds); slot.1 -= 1; any = true; } }
+            if !any { break; }
+        }
         spawn(DKind::Crew, lc(4), &mut ds);
         spawn(DKind::Porter, lc(8), &mut ds);
         // Trickle reinforcements: the garrison can grow to 2× its fighters, one every
@@ -1506,7 +1512,10 @@ impl Horde {
                 if self.wave_announced {
                     let mut da = (a - self.wave_dir).abs(); if da > std::f64::consts::PI { da = std::f64::consts::TAU - da; }
                     let eta = (self.wave_spawn_t - self.now).max(0.0);
-                    if da < 0.7 { t += 25.0 * (1.0 - eta / 30.0).clamp(0.0, 1.0); }
+                    // Anticipate the announced direction, but softly — a big bump used
+                    // to yank fighters off an ACTIVE front toward a merely-announced one
+                    // (user 2026-07-23: "defenders on the opposite side"). 25→10.
+                    if da < 0.7 { t += 10.0 * (1.0 - eta / 30.0).clamp(0.0, 1.0); }
                 }
                 self.threat[s] = t;
                 total += t;
@@ -1638,44 +1647,45 @@ impl Horde {
             }
             match d.state {
                 DState::Post => {
-                    // Hold the sector post; engage under the noise policy.
-                    // (Routing goes via the gate when returning from a sortie.)
-                    // FALL BACK when swarmed: zombies inside biting distance of
-                    // the post line → step to the inner line and fight from
-                    // there (they live to hold the second ring).
-                    let crowd = Sphere3::new(d.p.x, d.p.y, d.p.z, 16.0);
-                    let swarmed = zq.cull(&crowd).iter().filter(|it| !it.dormant).count() >= 5;
-                    let post_r = if swarmed || d.hp < d.kind.max_hp() * 0.35 { BASE_R - 48.0 } else { BASE_R - 10.0 };
+                    d.reload_t -= dt;
+                    // Sector post — the Commander re-weights `d.sector` by live threat
+                    // each second, so this ALREADY drifts fighters toward the attack
+                    // (keeping the ring covered, not all piling on one cluster).
                     let a = (d.sector as f64 + 0.5) / SECTORS as f64 * std::f64::consts::TAU;
-                    // Personal spot within the sector (golden jitter by index) —
-                    // fighters spread along the wall instead of stacking.
                     let jit = ((dix % 9) as f64 - 4.0) * 0.022;
                     let ro = (dix % 4) as f64 * 2.2;
-                    let (px, pz) = (cx + (a + jit).cos() * (post_r - ro), cz + (a + jit).sin() * (post_r - ro));
-                    // A ranger back from a sortie retraces its stored trail
-                    // home first (the A* minimum path), then the normal post walk.
-                    let (wx, wz) = if let Some(&(w0x, w0z)) = d.path.first() {
+                    let (px, pz) = (cx + (a + jit).cos() * (BASE_R - 10.0 - ro), cz + (a + jit).sin() * (BASE_R - 10.0 - ro));
+                    let (mut wx, mut wz) = if let Some(&(w0x, w0z)) = d.path.first() {
                         if (w0x - d.p.x).powi(2) + (w0z - d.p.z).powi(2) < 36.0 { d.path.remove(0); }
                         d.path.first().copied().unwrap_or_else(|| via_gate(&gate_pts, d.p, px, pz))
                     } else { via_gate(&gate_pts, d.p, px, pz) };
+                    let nearest = zq.knn(d.p, 1).into_iter().next();
+                    // KITE only from a REAL melee threat (a breacher that got within
+                    // ~11 wu) — not from wall-attackers the standing wall already
+                    // stops, so fighters keep manning the line instead of fleeing it
+                    // (user 2026-07-23: don't stand there getting mauled, but don't
+                    // abandon the wall either). Bounded to the ring: retreat inward.
+                    if let Some((zd, it)) = &nearest {
+                        if *zd < 11.0 {
+                            let (fx, fz) = (d.p.x - it.p.x, d.p.z - it.p.z);
+                            let l = (fx * fx + fz * fz).sqrt().max(0.5);
+                            wx = d.p.x + fx / l * (16.0 - zd);
+                            wz = d.p.z + fz / l * (16.0 - zd);
+                            let (rcx, rcz) = (wx - cx, wz - cz);
+                            let rr = (rcx * rcx + rcz * rcz).sqrt().max(0.5);
+                            if rr > BASE_R - 4.0 { wx = cx + rcx / rr * (BASE_R - 4.0); wz = cz + rcz / rr * (BASE_R - 4.0); }
+                        }
+                    }
                     walk(d, wx, wz, dt);
-                    d.reload_t -= dt;
                     let may_fire = self.weapons_free || d.kind == DKind::Ranger;
                     if d.reload_t <= 0.0 && may_fire {
-                        if let Some((dist, it)) = zq.knn(d.p, 1).into_iter().next() {
-                            if dist <= d.kind.range() {
+                        if let Some((dist, it)) = &nearest {
+                            if *dist <= d.kind.range() {
                                 d.reload_t = d.kind.reload();
                                 d.shots += 1;
                                 shot.push((it.id as usize, d.kind.dmg()));
                                 noise.push((d.p, d.kind.noise()));
                                 tracer.push((Point3::new(d.p.x, d.p.y + 5.0, d.p.z), it.p, 0.0));
-                                // Ranger kite: too close → step back while firing.
-                                if d.kind == DKind::Ranger && dist < 14.0 {
-                                    let (dx, dz) = (d.p.x - it.p.x, d.p.z - it.p.z);
-                                    let l = (dx * dx + dz * dz).sqrt().max(0.5);
-                                    let (nx, nz) = ((d.p.x + dx / l * 6.0).clamp(MARGIN, WORLD - MARGIN), (d.p.z + dz / l * 6.0).clamp(MARGIN, WORLD - MARGIN));
-                                    if pass2(nx, nz) { d.p = Point3::new(nx, terrain_h(nx, nz, seed, sc), nz); }
-                                }
                             }
                         }
                     }

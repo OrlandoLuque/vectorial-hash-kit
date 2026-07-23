@@ -432,7 +432,8 @@ fn unit_box() -> vectorial_hash_demos::model::SkinnedModel {
 /// siege's `model_tweak`, and it reads big). Baked into the impostor photos at
 /// capture time, applied live on the skinned path.
 fn ztweak(c: ZClass) -> (f32, f32) {
-    match c { ZClass::Chubby => (-std::f32::consts::FRAC_PI_2, 0.80), _ => (0.0, 1.0) }
+    // Chubby (slime) faced 90° off — turned another 90° left (user 2026-07-23): −π/2 → 0.
+    match c { ZClass::Chubby => (0.0, 0.80), _ => (0.0, 1.0) }
 }
 
 /// LOD switch distance (camera→unit, wu): only units the camera is REALLY
