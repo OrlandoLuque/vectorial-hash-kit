@@ -1247,6 +1247,33 @@ impl Horde {
         self.pass_grid[((z / self.pass_cell) as usize).min(self.pass_n - 1) * self.pass_n + ((x / self.pass_cell) as usize).min(self.pass_n - 1)]
     }
 
+    /// Is (x,z) under sight-blocking forest canopy? Only the wooded scenarios have
+    /// any — dense woods in Forest, the forest blobs in Patches.
+    pub fn under_canopy(&self, x: f64, z: f64) -> bool {
+        match self.scenario {
+            Scenario::Forest => is_forest(x, z, self.seed) >= 0.46, // dense stands (also the movement-block density)
+            Scenario::Patches => patch_cell(x, z, self.seed) == 1,  // forest patch
+            _ => false,
+        }
+    }
+
+    /// Line-of-sight between two ground points: clear unless the segment crosses
+    /// forest canopy. This is what turns the tree network into COVER — a zombie
+    /// approaching through the woods is hidden from the towers until it steps into
+    /// the open (the TAB "forest is safe passage" rule). Canopy blobs are large
+    /// (~90 wu), so a 5-wu march samples them exactly; open scenarios short-circuit.
+    pub fn los_clear(&self, a: Point3, b: Point3) -> bool {
+        if !matches!(self.scenario, Scenario::Forest | Scenario::Patches) { return true; }
+        let (dx, dz) = (b.x - a.x, b.z - a.z);
+        let dist = (dx * dx + dz * dz).sqrt();
+        let steps = (dist / 5.0).ceil() as usize;
+        for k in 1..steps { // interior samples: the endpoints (tower, target) are never "canopy" that matters
+            let t = k as f64 / steps as f64;
+            if self.under_canopy(a.x + dx * t, a.z + dz * t) { return false; }
+        }
+        true
+    }
+
     /// One fixed step: waves → noise events → wake culls → parallel decide →
     /// serial apply (movement, swings, towers, destructions) → next frame's
     /// keep-index sync.
@@ -1545,14 +1572,18 @@ impl Horde {
             self.tower_reload[sid] -= dt;
             if self.tower_reload[sid] > 0.0 { continue; }
             let tp = self.structures[sid].p;
+            // Targets hidden behind forest canopy are UNSHOOTABLE (the woods are
+            // cover) — so pick the best/nearest zombie with a CLEAR line of sight.
             let target: Option<u32> = if self.tower_threat_mode {
                 let ring = Sphere3::new(tp.x, tp.y, tp.z, TOWER_RANGE);
-                self.zq().cull(&ring).iter()
+                let cands = self.zq().cull(&ring);
+                cands.iter()
+                    .filter(|it| self.los_clear(tp, it.p))
                     .map(|it| { let (dx, dz) = (it.p.x - tp.x, it.p.z - tp.z); (it.id, it.class.threat() / (1.0 + (dx * dx + dz * dz).sqrt() * 0.02)) })
                     .max_by(|a, b| a.1.total_cmp(&b.1))
                     .map(|(id, _)| id)
             } else {
-                self.zq().knn(tp, 1).into_iter().find(|(d, _)| *d <= TOWER_RANGE).map(|(_, it)| it.id)
+                self.zq().knn(tp, 8).into_iter().find(|(d, it)| *d <= TOWER_RANGE && self.los_clear(tp, it.p)).map(|(_, it)| it.id)
             };
             let Some(tid) = target else { continue; };
             // Morton mode rebuilds next frame, so a zombie another tower just
@@ -2503,5 +2534,39 @@ mod tests {
         let uncapped = run(usize::MAX);
         assert!(capped <= 300, "the awake front broke its cap: peak {capped} > 300");
         assert!(uncapped > capped, "the cap must actually bite: uncapped peak {uncapped} !> capped {capped}");
+    }
+
+    #[test]
+    fn forest_canopy_is_line_of_sight_cover() {
+        let h = Horde::with_scenario(7, 3000, Scenario::Forest);
+        // Find a canopy cell by scanning; a sight line straight through it is blocked.
+        let mut canopy = None;
+        'scan: for gx in 0..120 { for gz in 0..120 {
+            let (x, z) = (gx as f64 * 15.0 + 7.0, gz as f64 * 15.0 + 7.0);
+            if h.under_canopy(x, z) { canopy = Some((x, z)); break 'scan; }
+        } }
+        let (cx, cz) = canopy.expect("a Forest map has dense canopy");
+        assert!(!h.los_clear(Point3::new(cx - 45.0, 0.0, cz), Point3::new(cx + 45.0, 0.0, cz)),
+            "a sight line through canopy must be blocked");
+        // Cross-check the helper against a DENSE independent sample on that segment
+        // (the brute reference): both must agree there IS canopy on the line.
+        let (a, b) = (Point3::new(cx - 45.0, 0.0, cz), Point3::new(cx + 45.0, 0.0, cz));
+        let (dx, dz) = (b.x - a.x, b.z - a.z);
+        let n = ((dx * dx + dz * dz).sqrt() / 0.5).ceil() as usize;
+        let dense_has_canopy = (0..=n).any(|k| { let t = k as f64 / n as f64; h.under_canopy(a.x + dx * t, a.z + dz * t) });
+        assert!(dense_has_canopy, "dense sample must confirm canopy on the blocked line");
+        // Non-vacuous but partial: across the map the woods block SOME lines, not all
+        // (otherwise it's not cover, it's a wall).
+        let (mut blocked, mut total) = (0, 0);
+        for gx in (0..WORLD as i64).step_by(80) { for gz in (0..WORLD as i64).step_by(80) {
+            let (a, b) = (Point3::new(gx as f64 + 5.0, 0.0, gz as f64 + 5.0), Point3::new(gx as f64 + 125.0, 0.0, gz as f64 + 45.0));
+            if b.x < WORLD && b.z < WORLD { total += 1; if !h.los_clear(a, b) { blocked += 1; } }
+        } }
+        assert!(blocked > 0 && blocked < total, "forest must provide PARTIAL cover: {blocked}/{total} lines blocked");
+        // Open scenarios have no canopy → every line of sight is clear (short-circuit).
+        for sc in [Scenario::Classic, Scenario::Pass, Scenario::River] {
+            let ho = Horde::with_scenario(7, 3000, sc);
+            assert!(ho.los_clear(Point3::new(50.0, 0.0, 50.0), Point3::new(1700.0, 0.0, 1700.0)), "{sc:?}: no canopy, LoS must be clear");
+        }
     }
 }

@@ -166,6 +166,17 @@ scenario, no ground unit ever stands in a blocked cell, PATCHES stays >90%
 connected and in a sane open-fraction band across 10 seeds, Morton culls ==
 Tree culls == brute force.
 
+**Forests are line-of-sight cover** (`los_clear`, a new query verb — a segment
+sampled against the canopy grid). In FOREST and PATCHES a tower will not fire on a
+zombie whose sight line crosses dense canopy: the tree network becomes safe
+approach, so the horde filters *through* the woods and only takes tower fire once
+it steps into the open (the TAB rule). Both tower targeting modes (nearest-`knn`
+and threat-`cull`) pick the best zombie with a *clear* line instead of the best
+zombie outright. Open scenarios short-circuit (no canopy → every line clear).
+Brute-force-gated (`forest_canopy_is_line_of_sight_cover`): a line through canopy
+is blocked and matches a dense reference sample, the woods give *partial* cover
+(some lines blocked, not all), and OPEN/PASS/RIVER are always clear.
+
 ## Wake the whole horde (`A`) — 100k active, measured
 
 The `A` key / ALL button (`wake_all`) rouses **every** sleeper into the march
