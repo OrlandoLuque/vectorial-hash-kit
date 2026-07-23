@@ -502,6 +502,9 @@ pub struct Defender {
     /// Heading (radians) updated as it walks, so the renderer turns the model to
     /// face its movement instead of always looking one way (user 2026-07-22).
     pub face: f32,
+    /// Did it actually move this frame? The renderer plays the idle clip when not
+    /// (user 2026-07-23). Reset each frame, set by the movement code.
+    pub moving: bool,
     /// Crew: repair stock (a porter delivery = +20; repair burns 2/s).
     pub stock: f64,
     pub shots: u64,
@@ -940,7 +943,7 @@ impl Horde {
                 ds.push(Defender {
                     kind, p: Point3::new(x, terrain_h(x, z, self.seed, self.scenario), z), hp: kind.max_hp(),
                     state: if kind.fighter() { DState::Post } else { DState::Idle },
-                    sector: (ds.len()) % SECTORS, reload_t: 0.0, respawn_t: 0.0, face: 0.0, stock: 0.0, shots: 0,
+                    sector: (ds.len()) % SECTORS, reload_t: 0.0, respawn_t: 0.0, face: 0.0, moving: false, stock: 0.0, shots: 0,
                     path: Vec::new(),
                 });
             }
@@ -1454,7 +1457,7 @@ impl Horde {
         let (x, z) = (cx + a.cos() * (BASE_R - 10.0), cz + a.sin() * (BASE_R - 10.0));
         self.defenders.push(Defender {
             kind, p: Point3::new(x, terrain_h(x, z, self.seed, self.scenario), z), hp: kind.max_hp(),
-            state: DState::Post, sector: self.defenders.len() % SECTORS, reload_t: 0.0, respawn_t: 0.0, face: 0.0, stock: 0.0, shots: 0, path: Vec::new(),
+            state: DState::Post, sector: self.defenders.len() % SECTORS, reload_t: 0.0, respawn_t: 0.0, face: 0.0, moving: false, stock: 0.0, shots: 0, path: Vec::new(),
         });
     }
 
@@ -1625,6 +1628,7 @@ impl Horde {
             let dist = (dx * dx + dz * dz).sqrt();
             if dist > 2.0 {
                 d.face = (dz as f32).atan2(dx as f32); // heading, so the render can turn the model
+                d.moving = true;
                 let sp = d.kind.speed().min(dist / dt);
                 let (mut nx, mut nz) = ((d.p.x + dx / dist * sp * dt).clamp(MARGIN, WORLD - MARGIN), (d.p.z + dz / dist * sp * dt).clamp(MARGIN, WORLD - MARGIN));
                 if !pass2(nx, nz) { // slide along the blocked edge (axis drop)
@@ -1633,6 +1637,25 @@ impl Horde {
                 d.p = Point3::new(nx, terrain_h(nx, nz, seed, sc), nz);
             }
             dist
+        };
+        // Steer a logistics unit toward its goal but AROUND nearby awake zombies
+        // (user 2026-07-23: crews used to walk straight through the horde). Reactive
+        // repulsion (1/d²) blended into the goal heading → an intermediate waypoint.
+        let avoid = |p: Point3, tx: f64, tz: f64| -> (f64, f64) {
+            let (mut rx, mut rz) = (0.0f64, 0.0f64);
+            for it in zq.cull(&Sphere3::new(p.x, p.y, p.z, 24.0)) {
+                if it.dormant { continue; }
+                let (dx, dz) = (p.x - it.p.x, p.z - it.p.z);
+                let d2 = dx * dx + dz * dz;
+                if d2 > 1e-3 { let w = 1.0 / d2; rx += dx * w; rz += dz * w; }
+            }
+            let (gx, gz) = (tx - p.x, tz - p.z);
+            let gl = (gx * gx + gz * gz).sqrt().max(0.5);
+            let (mut ax, mut az) = (gx / gl, gz / gl);
+            let rl = (rx * rx + rz * rz).sqrt();
+            if rl > 1e-4 { ax += rx / rl * 1.4; az += rz / rl * 1.4; } // repulsion weight
+            let al = (ax * ax + az * az).sqrt().max(0.5);
+            (p.x + ax / al * gl.min(28.0), p.z + az / al * gl.min(28.0))
         };
         for (dix, d) in self.defenders.iter_mut().enumerate() {
             if !d.alive() {
@@ -1645,6 +1668,7 @@ impl Horde {
                 }
                 continue;
             }
+            d.moving = false; // set true by the movement code; drives the idle clip
             match d.state {
                 DState::Post => {
                     d.reload_t -= dt;
@@ -1693,7 +1717,10 @@ impl Horde {
                 DState::Repairing { sid } => {
                     let s = &mut self.structures[sid as usize];
                     if s.hp >= s.kind.max_hp() { d.state = DState::Idle; continue; }
-                    if walk(d, s.p.x + 3.0, s.p.z, dt) < 6.0 && d.stock > 0.0 {
+                    let (sx, sz) = (s.p.x + 3.0, s.p.z);
+                    let (wx, wz) = avoid(d.p, sx, sz);
+                    walk(d, wx, wz, dt);
+                    if ((d.p.x - sx).powi(2) + (d.p.z - sz).powi(2)).sqrt() < 6.0 && d.stock > 0.0 {
                         let was_dead = s.hp <= 0.0;
                         s.hp = (s.hp + CREW_REPAIR * dt).min(s.kind.max_hp());
                         d.stock = (d.stock - 2.0 * dt).max(0.0);
@@ -1761,12 +1788,19 @@ impl Horde {
             let DState::Hauling { did, loaded } = self.defenders[di].state else { continue; };
             if !self.defenders[di].alive() { continue; }
             let target = if loaded { self.defenders[did as usize].p } else { home };
-            let (dx, dz) = (target.x - self.defenders[di].p.x, target.z - self.defenders[di].p.z);
-            let dist = (dx * dx + dz * dz).sqrt();
+            let pp = self.defenders[di].p;
+            let dist = ((target.x - pp.x).powi(2) + (target.z - pp.z).powi(2)).sqrt();
             if dist > 3.0 {
+                // steer around zombie groups en route (user 2026-07-23)
+                let (tx, tz) = avoid(pp, target.x, target.z);
+                let (sx, sz) = (tx - pp.x, tz - pp.z);
+                let sl = (sx * sx + sz * sz).sqrt().max(0.5);
+                let (dx, dz) = (sx / sl, sz / sl);
                 let sp = DKind::Porter.speed().min(dist / dt);
                 let d = &mut self.defenders[di];
-                let (mut nx, mut nz) = ((d.p.x + dx / dist * sp * dt).clamp(MARGIN, WORLD - MARGIN), (d.p.z + dz / dist * sp * dt).clamp(MARGIN, WORLD - MARGIN));
+                d.face = (dz as f32).atan2(dx as f32);
+                d.moving = true;
+                let (mut nx, mut nz) = ((d.p.x + dx * sp * dt).clamp(MARGIN, WORLD - MARGIN), (d.p.z + dz * sp * dt).clamp(MARGIN, WORLD - MARGIN));
                 if !pass2(nx, nz) { if pass2(nx, d.p.z) { nz = d.p.z; } else if pass2(d.p.x, nz) { nx = d.p.x; } else { nx = d.p.x; nz = d.p.z; } }
                 d.p = Point3::new(nx, terrain_h(nx, nz, seed, sc), nz);
             } else if loaded {

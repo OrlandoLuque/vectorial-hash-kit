@@ -661,7 +661,9 @@ impl State {
         // ---- Impostor atlas: photograph every zombie model (walk / idle /
         // death) from 8 yaw angles into a texture array, then billboards
         // replace the far models. All through the existing skin pipeline.
-        let idle_models: Vec<GpuModel> = UNIT_FILES[..5].iter().map(|f| build_gpu_model_prefs(&device, &cam_buf, &skin_layout, &bytes_of(f), &["idle", "fly", "walk"])).collect();
+        // Idle-clip variant of EVERY unit (zombies 0..5 + defenders 5..10), so any
+        // stationary skinned unit can play idle instead of walking-on-the-spot.
+        let idle_models: Vec<GpuModel> = UNIT_FILES.iter().map(|f| build_gpu_model_prefs(&device, &cam_buf, &skin_layout, &bytes_of(f), &["idle", "fly", "walk"])).collect();
         let death_models: Vec<GpuModel> = UNIT_FILES[..5].iter().map(|f| build_gpu_model_prefs(&device, &cam_buf, &skin_layout, &bytes_of(f), &["death", "hit", "idle"])).collect();
         let atlas_w = IMP_VIEWS * IMP_ELEVS.len() as u32 * IMP_CELL; // 8 yaws × 3 elevations
         let atlas = device.create_texture(&wgpu::TextureDescriptor {
@@ -1115,6 +1117,9 @@ impl State {
         // ACTIVE zombies: full skinned model when near (LOD_DIST), the standing
         // proxy when far; defenders always skinned (there are ~50 of them).
         let mut buckets: Vec<Vec<SkinInstance>> = (0..self.models.len()).map(|_| Vec::new()).collect();
+        // Idle-clip buckets, one per unit model (zombies + defenders): any stationary
+        // skinned unit renders here instead of walking on the spot (user 2026-07-23).
+        let mut idle_buckets: Vec<Vec<SkinInstance>> = (0..self.models.len()).map(|_| Vec::new()).collect();
         let mut proxies: Vec<BillboardInst> = Vec::new();
         for (i, z) in self.sim.units.iter().enumerate() {
             if !z.alive() { continue; }
@@ -1137,13 +1142,18 @@ impl State {
             }
             let (tw_yaw, tw_scale) = ztweak(z.class);
             let mi = zmodel(z.class);
-            let m = &self.models[mi];
+            // Stationary (attacking/standing) or dormant → play the IDLE clip, not a
+            // walk-on-the-spot (user 2026-07-23). Idle uses a varied id-based facing.
+            let idle = dormant || (z.vel.0.abs() + z.vel.1.abs() < 0.08);
+            let m = if idle { &self.idle_models[mi] } else { &self.models[mi] };
             let nf = m.n_frames.max(1);
             let phase = (i as u32 % 8) as f32 / 8.0; // per-instance anim jitter
-            let frame = if dormant { ((phase * nf as f32) as u32) % nf } // NOLOD A/B path
+            let frame = if idle { (((now as f32 * 0.7 + phase) * nf as f32) as u32) % nf }
                 else { (((now as f32 * 1.6 + phase) * nf as f32) as u32) % nf };
-            let model = Mat4::from_translation(Vec3::new(x, y, zz)) * Mat4::from_rotation_y(-yaw + std::f32::consts::FRAC_PI_2 + tw_yaw) * Mat4::from_scale(Vec3::splat(scale * tw_scale));
-            buckets[mi].push(SkinInstance { model: model.to_cols_array_2d(), color: ztint(z.class, dormant), frame_base: frame * m.num_joints, _pad: [0; 3] });
+            let rot = if idle { i as f32 * 2.399963 + tw_yaw } else { -yaw + std::f32::consts::FRAC_PI_2 + tw_yaw };
+            let model = Mat4::from_translation(Vec3::new(x, y, zz)) * Mat4::from_rotation_y(rot) * Mat4::from_scale(Vec3::splat(scale * tw_scale));
+            let inst = SkinInstance { model: model.to_cols_array_2d(), color: ztint(z.class, dormant), frame_base: frame * m.num_joints, _pad: [0; 3] };
+            if idle { idle_buckets[mi].push(inst); } else { buckets[mi].push(inst); }
         }
         proxies.truncate(MAX_POP + 8192);
         if !proxies.is_empty() { self.queue.write_buffer(&self.proxy_buf, 0, bytemuck::cast_slice(&proxies)); }
@@ -1153,16 +1163,19 @@ impl State {
             let (x, y, zz) = (d.p.x as f32, d.p.y as f32, d.p.z as f32);
             if do_cull && !sphere_in_frustum(&planes, glam::Vec3::new(x, y, zz), 11.0) { continue; }
             let mi = dmodel(d.kind);
-            let m = &self.models[mi];
+            // Idle clip when it didn't move this frame (holding the post) — user
+            // 2026-07-23. Turned to face its heading either way.
+            let idle = !d.moving;
+            let m = if idle { &self.idle_models[mi] } else { &self.models[mi] };
             let nf = m.n_frames.max(1);
-            let frame = (((now as f32 * 1.8) * nf as f32) as u32) % nf;
-            // turn the model to face where it's walking (was fixed — user 2026-07-22)
+            let frame = if idle { (((now as f32 * 0.7) * nf as f32) as u32) % nf } else { (((now as f32 * 1.8) * nf as f32) as u32) % nf };
             let model = Mat4::from_translation(Vec3::new(x, y, zz)) * Mat4::from_rotation_y(-d.face + std::f32::consts::FRAC_PI_2) * Mat4::from_scale(Vec3::splat(7.0));
-            buckets[mi].push(SkinInstance { model: model.to_cols_array_2d(), color: dtint(d.kind), frame_base: frame * m.num_joints, _pad: [0; 3] });
+            let inst = SkinInstance { model: model.to_cols_array_2d(), color: dtint(d.kind), frame_base: frame * m.num_joints, _pad: [0; 3] };
+            if idle { idle_buckets[mi].push(inst); } else { buckets[mi].push(inst); }
         }
         // Sleepers inside the LOD bubble: full skinned models playing their
-        // REAL Idle clip (one index cull around the eye finds them).
-        let mut idle_buckets: Vec<Vec<SkinInstance>> = (0..5).map(|_| Vec::new()).collect();
+        // REAL Idle clip (one index cull around the eye finds them) — into the
+        // shared idle_buckets declared above.
         if self.lod {
             use vectorial_hash::Sphere3;
             let near = Sphere3::new(eye.x as f64, eye.y as f64, eye.z as f64, LOD_DIST as f64 + 8.0);
