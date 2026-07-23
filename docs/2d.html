@@ -73,5 +73,22 @@
 </script>
 <script src="mq_js_bundle.js"></script>
 <script>load("critters.wasm");</script>
+<script type="module">
+  import { setupMobileControls } from './mobile-controls.js';
+  setupMobileControls({ keys: [
+    { label: 'Pause', code: 'Space', key: ' ', keyCode: 32 },
+    { label: 'Index', sub: 'mode', code: 'KeyM', key: 'm', keyCode: 77 },
+    { label: 'Add', sub: '+5', code: 'Equal', key: '=', keyCode: 187 },
+    { label: 'Remove', sub: '−5', code: 'Minus', key: '-', keyCode: 189 },
+    { label: 'Slower', code: 'BracketLeft', key: '[', keyCode: 219 },
+    { label: 'Faster', code: 'BracketRight', key: ']', keyCode: 221 },
+    { label: 'Region', sub: 'query shape', code: 'KeyR', key: 'r', keyCode: 82 },
+    { label: 'Dilate', sub: 'body radius', code: 'KeyD', key: 'd', keyCode: 68 },
+    { label: 'Hide UI', code: 'KeyU', key: 'u', keyCode: 85 },
+    { label: 'Drifter', sub: 'brush', code: 'Digit1', key: '1', keyCode: 49 },
+    { label: 'Hunter', sub: 'brush', code: 'Digit2', key: '2', keyCode: 50 },
+    { label: 'Pulsar', sub: 'brush', code: 'Digit3', key: '3', keyCode: 51 },
+  ]});
+</script>
 </body>
 </html>

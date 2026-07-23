@@ -48,5 +48,15 @@
 </script>
 <script src="mq_js_bundle.js"></script>
 <script>load("siege.wasm");</script>
+<script type="module">
+  import { setupMobileControls } from './mobile-controls.js';
+  setupMobileControls({ keys: [
+    { label: 'Pause', code: 'KeyP', key: 'p', keyCode: 80 },
+    { label: 'Collide', sub: 'on/off', code: 'KeyC', key: 'c', keyCode: 67 },
+    { label: 'Terrain', sub: 'voxel↔smooth', code: 'KeyV', key: 'v', keyCode: 86 },
+    { label: 'Pop −', code: 'BracketLeft', key: '[', keyCode: 219 },
+    { label: 'Pop +', code: 'BracketRight', key: ']', keyCode: 221 },
+  ]});
+</script>
 </body>
 </html>

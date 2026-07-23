@@ -23,6 +23,13 @@
       <b>1</b> CPU grid · <b>2</b> GPU-resident · <b>F</b> collision ↔ influence field · <b>[ ]</b> count · drag orbit · scroll zoom.</div>
   </div>
   <script type="module">
+    import { setupMobileControls } from './mobile-controls.js';
+    const MOBILE_KEYS = [
+      { label: 'Mode', sub: 'collide↔field', code: 'KeyF', key: 'f', keyCode: 70 },
+      { label: 'GPU', code: 'Digit2', key: '2', keyCode: 50 },
+      { label: 'Count −', code: 'BracketLeft', key: '[', keyCode: 219 },
+      { label: 'Count +', code: 'BracketRight', key: ']', keyCode: 221 },
+    ];
     const msg = document.getElementById('msg');
     if (!navigator.gpu) {
       msg.innerHTML = '<div>This demo needs <b>WebGPU</b>.</div>' +
@@ -41,7 +48,7 @@
       };
       import('./gpu/gpu_storm.js')
         .then(m => m.default())
-        .then(() => { setTimeout(() => msg.remove(), 1500); })
+        .then(() => { setTimeout(() => msg.remove(), 1500); setupMobileControls({ keys: MOBILE_KEYS }); })
         .catch(e => { msg.innerHTML = '<div>Failed to start.</div><div class="small">' + e + '</div>'; console.error(e); });
     }
   </script>
