@@ -151,6 +151,15 @@ a list of bigger levers that cost quality (left for you to decide, per your note
    the whole thread-scaling curve. (A parallel `bulk_load_par` *rebuild* was an
    intermediate step, ~1.1–1.16×; keep beats it and needs no threads, so wasm wins
    too. `bulk_load` stays a library primitive for from-scratch static builds.)
+4. **Horde awake-front cap bounds the per-frame decide cost at high pop
+   (2026-07-24).** The heavy per-frame work (decide + move + re-sync) is O(active),
+   not O(population) — dormant zombies are skipped. Capping the simultaneously-active
+   front (`active_cap`, flat ~2600) therefore bounds the frame cost *regardless of
+   population*: a 100k horde does the same per-frame work as a 20k one (it just has a
+   deeper dormant reserve). So the cap that made 100k *playable* (it was a wave-1
+   instant loss — see [HORDE.md](HORDE.md) § "awake-front cap") also keeps 100k
+   *fast* — the awake front, not the indexed population, sets the cost. The `A`/
+   wake-all stress button still forces the uncapped 100k-active ceiling (~79 fps).
 
 ### Reported (FPS for a quality / complexity trade-off — NOT applied)
 

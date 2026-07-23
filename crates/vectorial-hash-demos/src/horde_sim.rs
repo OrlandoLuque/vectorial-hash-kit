@@ -541,6 +541,30 @@ fn via_gate(gates: &[(f64, f64)], from: Point3, tx: f64, tz: f64) -> (f64, f64) 
 /// visible change to the march (steering stays coherent, combat is unbucketed).
 /// Override with `$HORDE_DECIDE_N`.
 pub const DECIDE_N_DEFAULT: u64 = 8;
+/// Awake-front anchor: the soft cap on simultaneously-ACTIVE zombies at the tuned
+/// 20 000-pop fight. The dormant carpet feeds the front up to the cap; the rest
+/// stay a reserve that rises as the front is thinned — so a 100k horde is a
+/// drawn-out siege, not an instant wave-1 dogpile. `HORDE_ACTIVE_CAP` overrides.
+pub const ACTIVE_CAP_ANCHOR: usize = 2600;
+
+/// Default awake-front cap for a population — deliberately FLAT (`.min(pop)` keeps
+/// small hordes effectively uncapped). Measured 2026-07-24: there's an ABSOLUTE
+/// front ceiling (~2600) above which the defence collapses no matter how big the
+/// garrison — breaches open faster than crews can repair, so a 5k front routs even
+/// 244 fighters while a 2.6k front is held by 126. So the cap doesn't scale with
+/// pop; a 100k horde plays like the tuned 20k fight with a far deeper reserve
+/// behind the same sustained front (and the per-frame decide cost stays bounded →
+/// 100k renders fast). Difficulty-vs-pop is the garrison's job (see spawn_defenders).
+/// `HORDE_ACTIVE_CAP` overrides.
+pub fn default_active_cap(pop: usize) -> usize { ACTIVE_CAP_ANCHOR.min(pop) }
+
+/// Default STAGGER rate: the maximum zombies that may wake per second. Without
+/// it a dense carpet fills the whole cap in one frame (a wave-1 instant loss at
+/// 100k — the front saturates before the garrison can react); metering the RAMP
+/// makes the front build over ~45 s of pressure, a besieging escalation instead
+/// of a wall of bodies. Scaled so the cap fills in a roughly constant time across
+/// population. `HORDE_WAKE_RATE` overrides. Measured 2026-07-24.
+pub fn default_wake_rate(pop: usize) -> f64 { (default_active_cap(pop) as f64 / 45.0).max(30.0) }
 
 pub struct Horde {
     pub units: Vec<Zombie>,
@@ -605,6 +629,22 @@ pub struct Horde {
     /// `(run, dormant_epoch)` moves. Positions of sleepers never change, so
     /// between bumps the buffer is exact.
     pub dormant_epoch: u64,
+    /// Soft cap on simultaneously-ACTIVE zombies: the dormant carpet feeds the
+    /// front up to this many, the rest stay a reserve that rises as the front is
+    /// thinned. Bounds BOTH the defender-overwhelm and the decide cost at high
+    /// population — the 100k-playable lever (`usize::MAX` = uncapped).
+    pub active_cap: usize,
+    /// Live active count (alive && !dormant): incremented on wake, reconciled
+    /// ~1 Hz against the truth (cheap correction for deaths / re-sleeps).
+    pub active_n: usize,
+    active_recount_t: f64,
+    /// Stagger: max wakes/second (the front RAMPS, doesn't teleport to the cap).
+    pub wake_rate: f64,
+    /// Refilling wake allowance (≤ ~1.5 s worth); each dormant→active wake spends 1.
+    wake_credit: f64,
+    /// The final wave fired → meter the WHOLE remaining reserve in through the
+    /// capped front, so the climax is a playable grind, not one 100k dogpile.
+    surge: bool,
     base_pop: usize,
     base_seed: u64,
     // ---- the defense (Commander + mobile defenders + works economy)
@@ -913,6 +953,12 @@ impl Horde {
             rng, now: 0.0, frame: 0,
             decide_n: std::env::var("HORDE_DECIDE_N").ok().and_then(|s| s.parse().ok()).filter(|&n| n >= 1).unwrap_or(DECIDE_N_DEFAULT),
             seed: fseed, woken_last: 0, dormant_epoch: 1,
+            active_cap: std::env::var("HORDE_ACTIVE_CAP").ok().and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| default_active_cap(pop)),
+            active_n: 0, active_recount_t: 0.0, surge: false,
+            wake_rate: std::env::var("HORDE_WAKE_RATE").ok().and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| default_wake_rate(pop)),
+            wake_credit: 0.0,
             base_pop: pop, base_seed: seed,
             defenders: Vec::new(), threat: [0.0; SECTORS], weapons_free: false, cmd_t: 0.0, breach: None,
             gates: Vec::new(),
@@ -1001,6 +1047,7 @@ impl Horde {
             if z.alive() && z.dormant() { z.state = ZState::Marching; z.heard = 0.0; z.moved = true; rose += 1; }
         }
         if rose > 0 { self.dormant_epoch += 1; }
+        self.active_n = self.counts().1; // the stress button bypasses the cap — resync the counter
         rose
     }
 
@@ -1021,7 +1068,7 @@ impl Horde {
     /// Spawn (or reuse a dead slot for) one zombie. Public for scenario
     /// drivers and tests.
     pub fn spawn_zombie(&mut self, class: ZClass, x: f64, z: f64, state: ZState) {
-        if state == ZState::Dormant { self.dormant_epoch += 1; }
+        if state == ZState::Dormant { self.dormant_epoch += 1; } else { self.active_n += 1; } // wave/infection marchers count against the front
         let y = terrain_h(x, z, self.seed, self.scenario) + class.altitude();
         let z0 = Zombie { class, p: Point3::new(x, y, z), vel: (0.0, 0.0), state, hp: class.max_hp(), heard: 0.0, linger: 0.0, groan_t: 1.0, swing_t: 0.5, bump: u32::MAX, moved: false };
         match self.free_slots.pop() {
@@ -1074,12 +1121,7 @@ impl Horde {
                 self.spawn_zombie(class, x, z, ZState::Marching);
             }
         }
-        if is_final { // the map itself rises
-            for z in self.units.iter_mut() {
-                if z.alive() && z.dormant() { z.state = ZState::Marching; z.moved = true; }
-            }
-            self.dormant_epoch += 1;
-        }
+        if is_final { self.surge = true; } // the map itself rises — but METERED in through the cap (step)
         self.wave_k += 1;
         self.wave_spawn_t += 70.0;
         self.wave_announced = false;
@@ -1206,6 +1248,14 @@ impl Horde {
         self.now += dt;
         self.frame += 1;
         self.sync_index();
+        // Reconcile the active-front counter with the truth ~1 Hz: the incremental
+        // path counts wakes but not deaths / re-sleeps, so it drifts high (safe —
+        // the cap just engages a touch early); this frees the front back up.
+        self.active_recount_t -= dt;
+        if self.active_recount_t <= 0.0 { self.active_n = self.counts().1; self.active_recount_t = 1.0; }
+        // Stagger: replenish the wake allowance (≤ ~1.5 s burst) — the front ramps
+        // at wake_rate/s toward the cap instead of saturating in one frame.
+        self.wake_credit = (self.wake_credit + self.wake_rate * dt).min(self.wake_rate * 1.5);
         self.step_waves();
         // Throttled flow-field rebuild after breaches / repairs.
         self.flow.rebuild_t -= dt;
@@ -1238,6 +1288,7 @@ impl Horde {
                 if !z.dormant() || d > z.class.hear() { continue; }
                 z.heard += amount;
                 if z.heard >= z.class.wake_threshold() {
+                    if self.active_n >= self.active_cap || self.wake_credit < 1.0 { continue; } // full / ramp-throttled — stays a primed sleeper
                     // Personal investigate spot: a golden-angle jitter around
                     // the noise, so a pack spreads over the area instead of
                     // stacking on (and fighting over) one exact point.
@@ -1250,6 +1301,8 @@ impl Horde {
                     z.heard = 0.0;
                     z.moved = true; // dormant flag changed → index item refresh
                     self.woken_last += 1;
+                    self.active_n += 1;
+                    self.wake_credit -= 1.0;
                 }
             }
         }
@@ -1421,13 +1474,29 @@ impl Horde {
         for id in bumped {
             let z = &mut self.units[id as usize];
             if !z.alive() || !z.dormant() { continue; }
+            if self.active_n >= self.active_cap || self.wake_credit < 1.0 { continue; } // full / ramp-throttled — the reserve waits its turn
             z.state = ZState::Marching;
             z.heard = 0.0;
             z.moved = true;
             rose = true;
             self.woken_last += 1;
+            self.active_n += 1;
+            self.wake_credit -= 1.0;
         }
         if rose { self.dormant_epoch += 1; }
+        // Meter the reserve into the capped front. During the final-wave surge the
+        // WHOLE map wants in, but only `active_cap` may be active at once — promote
+        // dormant up to the cap each frame, so the climax drains through a bounded,
+        // playable front instead of one 100k dogpile. Cheap: a state-only scan.
+        if self.surge && self.active_n < self.active_cap && self.wake_credit >= 1.0 {
+            let need = (self.active_cap - self.active_n).min(self.wake_credit as usize);
+            let mut promoted = 0;
+            for z in self.units.iter_mut() {
+                if promoted >= need { break; }
+                if z.alive() && z.dormant() { z.state = ZState::Marching; z.moved = true; promoted += 1; }
+            }
+            if promoted > 0 { self.active_n += promoted; self.wake_credit -= promoted as f64; self.dormant_epoch += 1; }
+        }
         // Resolve this frame's structure hits (attack noise feeds the wake
         // loop: pounding on a wall is what pulls the map in).
         for (sid, dmg, at, noise) in hits {
@@ -1890,6 +1959,7 @@ mod tests {
     #[test]
     fn wake_cull_matches_brute_force() {
         let mut h = Horde::new(7, 6000);
+        h.active_cap = usize::MAX; h.wake_rate = 1e9; // test the RULE, not the stagger (that's active_cap_bounds_the_awake_front)
         h.step(1.0 / 60.0); // populate the index
         // Pick a nest zombie as the blast point; amount 400 discriminates by
         // class: runners (333) & specials wake, walkers (500) don't.
@@ -1914,6 +1984,7 @@ mod tests {
     #[test]
     fn heard_accumulates_and_decays() {
         let mut h = Horde::new(9, 1500);
+        h.active_cap = usize::MAX; h.wake_rate = 1e9; // exercise the noise→wake rule unthrottled
         h.step(1.0 / 60.0);
         let p = h.units[0].p;
         // 300 twice in quick succession beats the walker threshold (500)
@@ -1942,6 +2013,7 @@ mod tests {
         let mut h = Horde::new(21, 3000);
         h.wave_spawn_t = 1e9;    // no waves — this test is about re-settling
         h.defenders.clear();     // …and no sorties/towers keeping fights alive
+        h.active_cap = usize::MAX; h.wake_rate = 1e9; // full blast wakes — testing re-settle, not the stagger
         h.step(1.0 / 60.0);
         h.emit_noise(h.units[0].p, 1000.0); // wake everything nearby
         h.step(1.0 / 60.0);
@@ -2395,5 +2467,34 @@ mod tests {
         h.sync_index();
         let alive = h.units.iter().filter(|z| z.alive()).count();
         assert_eq!(h.zindex.item_count(), alive, "tree lost items across the round-trip");
+    }
+
+    #[test]
+    fn active_cap_bounds_the_awake_front() {
+        // The 100k-playable lever: with a low cap the ambient noise/contact
+        // cascade may NEVER push the awake front past the cap — the rest of the
+        // carpet stays a dormant reserve. Contrast (the "brute" baseline): with
+        // the cap removed, the very same barrage wakes strictly more.
+        let run = |cap: usize| -> usize {
+            let mut h = Horde::new(41, 6000);
+            h.wave_spawn_t = 1e9;      // no scripted wave spawns
+            h.defenders.clear();       // isolate the zombie cascade
+            h.active_cap = cap;
+            h.active_n = h.counts().1; // resync the counter to the new regime
+            // Barrage: hammer 40 points scattered across the sleeping carpet, so
+            // an uncapped run wakes a big slice of it.
+            let seeds: Vec<Point3> = h.units.iter().filter(|z| z.dormant()).step_by(53).take(40).map(|z| z.p).collect();
+            let mut peak = 0;
+            for f in 0..(25.0 * 60.0) as usize {
+                if f % 12 == 0 { for &p in &seeds { h.emit_noise(p, 6000.0); } }
+                h.step(1.0 / 60.0);
+                peak = peak.max(h.counts().1);
+            }
+            peak
+        };
+        let capped = run(300);
+        let uncapped = run(usize::MAX);
+        assert!(capped <= 300, "the awake front broke its cap: peak {capped} > 300");
+        assert!(uncapped > capped, "the cap must actually bite: uncapped peak {uncapped} !> capped {capped}");
     }
 }

@@ -178,6 +178,38 @@ plus the impostor draw for all of them. Normal play never wakes everything at
 once (only the final wave does), so this is the stress bound, not the
 steady state.
 
+## The awake-front cap + stagger — 100k playable (measured, 2026-07-24)
+
+`wake_all` is the *stress* bound; the *steady state* is governed by a **soft cap
+on the simultaneously-active front**. The dormant carpet feeds the front up to
+`active_cap`; the rest stay a reserve that rises only as the front is thinned, and
+new wakes are also **rate-limited** (`wake_rate`/s) so the front *ramps* toward the
+cap over ~45 s of pressure instead of saturating in one frame. Both the ambient
+noise/contact cascade and the final-wave surge are metered through it (the surge
+drains the whole reserve through the bounded front — a playable grind, not a single
+dogpile). `HORDE_ACTIVE_CAP` / `HORDE_WAKE_RATE` override.
+
+**Why it's needed** (headless `examples/horde_balance`, seed 7, Patches): without
+the cap the wake cascade scales ~linearly with population while the garrison
+scales only ~pop^0.72, so **100k died at wave 1** (an instant dogpile). With the
+cap the front is bounded and the fight is a real siege:
+
+| pop | before (uncapped) | after (cap 2600 + stagger) | front (awake) |
+|----:|-------------------|----------------------------|--------------:|
+| 20k | fight, DEFEAT ~w5 | HELD, wave-8 surge scare (CC→71%) | ~500–2700 |
+| 50k | overrun fast      | **HELD ≥ wave 8**, CC 100% | ~700–2700 |
+| 100k| **DEFEAT wave 1** | **HELD ≥ wave 8**, CC 100% | ~900–2600 |
+
+Measured lesson: there's an **absolute front ceiling (~2600)** above which the
+defence collapses no matter how big the garrison — breaches open faster than crews
+repair, so a 5k front routs even 244 fighters while a 2.6k front is held by 126.
+So the cap is **flat**, not pop-scaled: a 100k horde plays like the tuned 20k
+fight with a far deeper reserve behind the *same* sustained front — and because the
+active set is bounded, the per-frame decide cost is too, so **100k renders fast**
+(the front, not the population, sets the cost). Making higher populations
+*harder* (rather than merely deeper) is the garrison's job — a separate balance
+pass. `active_cap_bounds_the_awake_front` brute-force-gates the invariant.
+
 ## The multi-goal flow field (`O`) — the user's idea, measured
 
 The baseline flow field floods from **one** goal (the CC). A colony has many
