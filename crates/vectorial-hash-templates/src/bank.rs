@@ -365,7 +365,7 @@ impl TemplateBank {
         // cells as its key (build-time only; could be dropped after
         // generation).
         let mut dedup_keys_bytes = 0usize;
-        for (key, _) in self.dedup.iter() {
+        for key in self.dedup.keys() {
             dedup_keys_bytes += size_of::<DedupKey>() + key.4.capacity();
         }
         dedup_keys_bytes +=
