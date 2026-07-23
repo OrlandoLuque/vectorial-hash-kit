@@ -206,9 +206,30 @@ repair, so a 5k front routs even 244 fighters while a 2.6k front is held by 126.
 So the cap is **flat**, not pop-scaled: a 100k horde plays like the tuned 20k
 fight with a far deeper reserve behind the *same* sustained front — and because the
 active set is bounded, the per-frame decide cost is too, so **100k renders fast**
-(the front, not the population, sets the cost). Making higher populations
-*harder* (rather than merely deeper) is the garrison's job — a separate balance
-pass. `active_cap_bounds_the_awake_front` brute-force-gates the invariant.
+(the front, not the population, sets the cost). `active_cap_bounds_the_awake_front`
+brute-force-gates the invariant.
+
+### The garrison: gentle scaling, anchored at 20k (measured, 2026-07-24)
+
+Because the front is now flat-capped at every population, the garrison that makes
+the tuned 20k fight (**~127 fighters** holding a 2.6k front with a wave-8 scare)
+is the *right* garrison at every population. So the fighter count no longer scales
+`pop^0.72` (the steep curve the *uncapped* cascade once needed — it over-garrisoned
+big hordes into a trivial hold, the inversion where **more pop was easier**). It
+now scales gently, anchored at 20k: `2.4·(pop/20k)^0.10` (`HORDE_FIGHTER_EXP`).
+Higher populations get *harder* through **reserve depth** — a far longer surge
+grinding the same line down — not a bigger instant garrison:
+
+| pop | fighters (was → now) | outcome (seed 7, to wave 12) |
+|----:|----------------------|------------------------------|
+| 20k | 126 → **127** | HELD, CC 100%, walls 117→85 |
+| 50k | 244 → **140** | HELD, **CC 95%**, walls →88 (a real fight) |
+| 100k| 401 → **149** | HELD, **CC 90%**, walls 117→70 (hard siege) |
+
+Now the CC damage and wall attrition *rise* with population (100/95/90 %) instead
+of inverting — a genuine escalating fight at every size, survivable but costly
+(consistent across seeds 3/7/42). Balance is measured, not guessed; `horde_balance`
+is the harness.
 
 ## The multi-goal flow field (`O`) — the user's idea, measured
 

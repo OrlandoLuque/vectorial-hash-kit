@@ -994,10 +994,16 @@ impl Horde {
                 });
             }
         };
-        // Fighter counts scale with the zombie population. The wake cascade grows
-        // ~linearly with pop, so √ wasn't enough (harness 2026-07-23: 100k died at
-        // wave 1). pop^0.72 clamped 1..8 → base at ≤6k, ~2.4× at 20k, ~7.6× at 100k.
-        let m = (self.base_pop as f64 / 6000.0).powf(0.72).clamp(1.0, 8.0);
+        // Garrison scale. The awake front is now FLAT-capped (~2600 at every pop —
+        // see active_cap), so the garrison that makes the tuned 20k fight (m≈2.4,
+        // ~127 fighters holding a ~2.6k front with a wave-8 scare) is the RIGHT
+        // garrison at every pop. So the scaling is gentle and ANCHORED at 20k, not
+        // the steep pop^0.72 the *uncapped* cascade once needed (which over-garrisoned
+        // high pops into a trivial hold). Higher populations get harder through
+        // reserve DEPTH — a far longer surge grinding the same line down — not a bigger
+        // instant garrison. `HORDE_FIGHTER_EXP` tunes the (gentle) slope. Measured 2026-07-24.
+        let fexp = std::env::var("HORDE_FIGHTER_EXP").ok().and_then(|s| s.parse().ok()).unwrap_or(0.10);
+        let m = (2.4 * (self.base_pop as f64 / 20000.0).powf(fexp)).clamp(1.0, 4.0);
         let fc = |n: usize| ((n as f64) * m).round() as usize;
         let lc = |n: usize| ((n as f64) * m.sqrt()).round() as usize; // logistics scale gentler
         let mut ds = Vec::new();
@@ -2075,6 +2081,7 @@ mod tests {
     #[test]
     fn infection_cascade_spawns_runners_and_detonates_noise() {
         let mut h = Horde::new(17, 500);
+        h.defenders.clear(); // isolate the cascade: no mobile garrison to intercept the attacker
         h.step(1.0 / 60.0);
         // The innermost populated house — safely outside tower range (the
         // first pick got the attacker shot off the wall: the base defends
