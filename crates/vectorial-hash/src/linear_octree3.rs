@@ -27,9 +27,14 @@
 //! Octant bits match [`morton3`](crate::morton3::morton3): x = bit 0, y = bit 1,
 //! z = bit 2 (0 = low half, 1 = high half of the parent box on that axis).
 
+use crate::serde_io::{corrupt, r_aabb, r_u32, r_u64, r_u8, w_aabb, w_u32, w_u64, w_u8};
 use crate::template::CellState;
 use crate::tree3::{aabb_min_dist2, knn_offer, knn_worst, Aabb, KnnEntry, Point3, Positioned3, Shape3};
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::io::{self, Read, Write};
+
+const LINOCT3_MAGIC: &[u8; 4] = b"LOC3";
+const LINOCT3_VERSION: u8 = 1;
 
 /// Level of a location code (root = 0). `key` is always ≥ 1 (the sentinel).
 #[inline]
@@ -208,6 +213,55 @@ impl<T: Positioned3> LinearOctree3<T> {
     }
 }
 
+impl<T: Positioned3> LinearOctree3<T> {
+    /// Serialize the built tree to any `Write` — dependency-free, items written by
+    /// a caller closure so it works for any `T`. Only the leaf buckets are stored;
+    /// the internal-node set is rebuilt on load from each leaf key's ancestors
+    /// (exact and smaller — no rebuild of the tree itself).
+    pub fn serialize<W: Write>(&self, w: &mut W, write_item: impl Fn(&mut W, &T) -> io::Result<()>) -> io::Result<()> {
+        w.write_all(LINOCT3_MAGIC)?;
+        w_u8(w, LINOCT3_VERSION)?;
+        w_aabb(w, &self.world)?;
+        w_u32(w, self.capacity as u32)?;
+        w_u8(w, self.max_depth)?;
+        w_u32(w, self.leaves.len() as u32)?;
+        for (&key, bucket) in &self.leaves {
+            w_u64(w, key)?;
+            w_u32(w, bucket.len() as u32)?;
+            for it in bucket { write_item(w, it)?; }
+        }
+        Ok(())
+    }
+
+    /// Reload a serialized tree — no rebuild, the leaf map is restored directly and
+    /// the internal set reconstructed from the leaf keys. Rejects corrupt input.
+    pub fn deserialize<R: Read>(r: &mut R, read_item: impl Fn(&mut R) -> io::Result<T>) -> io::Result<Self> {
+        let mut magic = [0u8; 4];
+        r.read_exact(&mut magic)?;
+        if &magic != LINOCT3_MAGIC { return Err(corrupt("bad LinearOctree3 magic")); }
+        if r_u8(r)? != LINOCT3_VERSION { return Err(corrupt("unsupported LinearOctree3 version")); }
+        let world = r_aabb(r)?;
+        let capacity = r_u32(r)? as usize;
+        let max_depth = r_u8(r)?;
+        if max_depth > 21 { return Err(corrupt("LinearOctree3 max_depth out of 0..=21")); }
+        let mut t = Self::new(world, capacity, max_depth);
+        let nleaves = r_u32(r)? as usize;
+        t.leaves.reserve(nleaves);
+        for _ in 0..nleaves {
+            let key = r_u64(r)?;
+            if key == 0 { return Err(corrupt("LinearOctree3 leaf key 0 (missing sentinel)")); }
+            let n = r_u32(r)? as usize;
+            let mut bucket = Vec::with_capacity(n);
+            for _ in 0..n { bucket.push(read_item(r)?); }
+            t.len += bucket.len();
+            let mut k = key; // every proper ancestor of a leaf is an internal node
+            while k > 1 { k >>= 3; t.internal.insert(k); }
+            t.leaves.insert(key, bucket);
+        }
+        Ok(t)
+    }
+}
+
 /// The world-space box of a location code, decoded by replaying its octant bits
 /// from the root down (used by [`LinearOctree3::visit_leaves`]).
 fn box_of(world: Aabb, key: u64) -> Aabb {
@@ -311,5 +365,48 @@ mod tests {
             a.sort(); b.sort();
             assert_eq!(a, b, "incremental vs bulk cull diverged");
         }
+    }
+
+    #[test]
+    fn linear_octree3_serialize_roundtrip() {
+        use std::io::{Read, Write};
+        let (world, items) = scatter(3000, 9);
+        let t = LinearOctree3::from_items(world, 16, 12, items);
+        let mut buf = Vec::new();
+        t.serialize(&mut buf, |w: &mut Vec<u8>, p: &P| {
+            w.write_all(&p.id.to_le_bytes())?;
+            w.write_all(&p.p.x.to_le_bytes())?;
+            w.write_all(&p.p.y.to_le_bytes())?;
+            w.write_all(&p.p.z.to_le_bytes())
+        }).unwrap();
+
+        let mut rd = &buf[..];
+        let back = LinearOctree3::<P>::deserialize(&mut rd, |r: &mut &[u8]| {
+            let mut b4 = [0u8; 4]; r.read_exact(&mut b4)?; let id = u32::from_le_bytes(b4);
+            let mut b8 = [0u8; 8];
+            r.read_exact(&mut b8)?; let x = f64::from_le_bytes(b8);
+            r.read_exact(&mut b8)?; let y = f64::from_le_bytes(b8);
+            r.read_exact(&mut b8)?; let z = f64::from_le_bytes(b8);
+            Ok(P { id, p: Point3::new(x, y, z) })
+        }).unwrap();
+
+        // Structure restored exactly (no rebuild): counts, leaves, depth.
+        assert_eq!(back.item_count(), t.item_count());
+        assert_eq!(back.leaf_count(), t.leaf_count());
+        assert_eq!(back.depth(), t.depth());
+        // Queries identical after the round-trip.
+        for &(cx, cy, cz, r) in &[(50.0, 30.0, 50.0, 20.0), (12.0, 12.0, 12.0, 5.0), (0.0, 0.0, 0.0, 40.0)] {
+            let s = Sphere3::new(cx, cy, cz, r);
+            let mut a: Vec<u32> = t.cull(&s).iter().map(|p| p.id).collect();
+            let mut b: Vec<u32> = back.cull(&s).iter().map(|p| p.id).collect();
+            a.sort(); b.sort();
+            assert_eq!(a, b, "cull diverged after round-trip");
+        }
+        let q = Point3::new(20.0, 15.0, 20.0);
+        let da: Vec<f64> = t.knn(q, 8).iter().map(|(d, _)| *d).collect();
+        let db: Vec<f64> = back.knn(q, 8).iter().map(|(d, _)| *d).collect();
+        assert_eq!(da, db, "knn diverged after round-trip");
+        // Corrupt input is rejected, not panicked on.
+        assert!(LinearOctree3::<P>::deserialize(&mut &b"XXXX"[..], |_r: &mut &[u8]| -> std::io::Result<P> { unreachable!() }).is_err());
     }
 }
