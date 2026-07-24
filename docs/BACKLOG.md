@@ -4,6 +4,31 @@ Future work queued for review. Nothing here is committed scope — prune,
 reprioritise, or drop freely. Items graduate into the per-crate roadmaps
 (e.g. `crates/vectorial-hash/README.md`) once picked up.
 
+## ★ 2026-07-24 (cooperative night) — landed + follow-ups
+
+**Landed (all on `main`, CI green):** horde **awake-front cap + stagger** (100k
+playable — was a wave-1 instant loss), **garrison flattened** (higher pop now
+*harder* via reserve depth, not trivially easier — the inversion fixed), **forests
+= line-of-sight cover** (towers can't shoot through canopy), **`LinearOctree3`** (a
+new adaptive pointer-free 3D linear-octree library structure, benched + THREE_D.md)
+and it's **selectable in `critters3d`** (`M`). Plus a pre-existing templates clippy
+fix (`for_kv_map`) to restore green CI. Full write-up in the local `CLAUDE.md`.
+
+**Follow-ups queued (autonomous-safe):**
+- `LinearOctree3::serialize`/`deserialize` (kit convention — Tree3 + MortonGrid3
+  have it; Octree3 doesn't yet either, so low priority).
+- Add `LinearOctree3` to the **headless decision-map sweep**
+  (`critters3d_headless --sweep`) so it appears in the *measured* decision map, not
+  just the interactive demo.
+- Horde: a HUD line for the awake-front cap / reserve (so the cap is legible on
+  screen); maybe a slider like the pop/thread ones.
+
+**Eyes-dependent (do NOT silently finish — need the user):**
+- `building_tweak` per-model scale/orientation for the Quaternius RTS buildings in
+  `horde_wgpu` — tune live.
+- **Mobile UI** on a real phone: confirm the synthetic-`KeyboardEvent` overlay
+  (`docs/mobile-controls.js`) actually drives winit/miniquad; fix in `send()` if not.
+
 ## ⚠️ MORNING REMINDER (user asked, 2026-07-11)
 
 **Test the battle fix in the browser** — `formations_wgpu` was black on web
