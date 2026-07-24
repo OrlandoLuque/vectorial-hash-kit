@@ -195,6 +195,32 @@ impl<T: Positioned> LinearQuadTree<T> {
 }
 
 impl<T: Positioned> LinearQuadTree<T> {
+    /// Batch cull — one result list per shape (serial).
+    pub fn cull_many<'a, S: Shape>(&'a self, shapes: &[S]) -> Vec<Vec<&'a T>> {
+        shapes.iter().map(|s| self.cull(s)).collect()
+    }
+    /// Parallel batch cull: rayon fans the independent reads over the query set (the
+    /// tree is immutable for reads). Native only — rayon isn't in the wasm build.
+    #[cfg(feature = "parallel")]
+    pub fn cull_many_par<'a, S: Shape + Sync>(&'a self, shapes: &[S]) -> Vec<Vec<&'a T>>
+    where T: Sync {
+        use rayon::prelude::*;
+        shapes.par_iter().map(|s| self.cull(s)).collect()
+    }
+    /// Batch k-NN — one result list per query (serial).
+    pub fn knn_many(&self, queries: &[Point], k: usize) -> Vec<Vec<(f64, &T)>> {
+        queries.iter().map(|&q| self.knn(q, k)).collect()
+    }
+    /// Parallel batch k-NN (rayon over the query set).
+    #[cfg(feature = "parallel")]
+    pub fn knn_many_par(&self, queries: &[Point], k: usize) -> Vec<Vec<(f64, &T)>>
+    where T: Sync {
+        use rayon::prelude::*;
+        queries.par_iter().map(|&q| self.knn(q, k)).collect()
+    }
+}
+
+impl<T: Positioned> LinearQuadTree<T> {
     /// Serialize the built tree to any `Write` — dependency-free, items via a caller
     /// closure. Only the leaf buckets are stored; the internal-node set is rebuilt on
     /// load from each leaf key's ancestors (exact and smaller).
@@ -367,5 +393,30 @@ mod tests {
             assert_eq!(a, b, "cull diverged after round-trip");
         }
         assert!(LinearQuadTree::<P>::deserialize(&mut &b"XXXX"[..], |_r: &mut &[u8]| -> std::io::Result<P> { unreachable!() }).is_err());
+    }
+
+    #[test]
+    fn linear_quadtree_cull_many_matches_singles() {
+        let (world, items) = scatter(2000, 13);
+        let t = LinearQuadTree::from_items(world, 16, 16, items);
+        let shapes: Vec<Circle> = (0..20).map(|i| Circle::new(Point::new(10.0 + i as f64 * 4.0, 50.0), 12.0)).collect();
+        for (s, m) in shapes.iter().zip(t.cull_many(&shapes).iter()) {
+            let single: Vec<u32> = t.cull(s).iter().map(|p| p.id).collect();
+            let batch: Vec<u32> = m.iter().map(|p| p.id).collect();
+            assert_eq!(single, batch, "cull_many != individual cull");
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn linear_quadtree_batch_par_matches_serial() {
+        let (world, items) = scatter(3000, 17);
+        let t = LinearQuadTree::from_items(world, 16, 16, items);
+        let shapes: Vec<Circle> = (0..40).map(|i| Circle::new(Point::new((i % 10) as f64 * 10.0, (i / 10) as f64 * 25.0), 18.0)).collect();
+        let sort = |vs: Vec<Vec<&P>>| -> Vec<Vec<u32>> { vs.iter().map(|v| { let mut ids: Vec<u32> = v.iter().map(|p| p.id).collect(); ids.sort(); ids }).collect() };
+        assert_eq!(sort(t.cull_many(&shapes)), sort(t.cull_many_par(&shapes)), "cull_many_par != cull_many");
+        let qs: Vec<Point> = (0..20).map(|i| Point::new(i as f64 * 5.0, 50.0)).collect();
+        let kd = |vs: Vec<Vec<(f64, &P)>>| -> Vec<Vec<f64>> { vs.iter().map(|v| v.iter().map(|(d, _)| *d).collect()).collect() };
+        assert_eq!(kd(t.knn_many(&qs, 8)), kd(t.knn_many_par(&qs, 8)), "knn_many_par != knn_many");
     }
 }
