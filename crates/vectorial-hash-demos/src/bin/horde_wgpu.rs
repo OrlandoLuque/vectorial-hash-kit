@@ -1299,6 +1299,12 @@ impl State {
         push_quad(&mut ui, bx - 2.0, by - 2.0, bw + 4.0, bh + 4.0, [0.0, 0.0, 0.0, 0.45], sw, sh);
         push_quad(&mut ui, bx, by, dw, bh, [0.25, 0.45, 0.28, 0.95], sw, sh); // sleeping
         push_quad(&mut ui, bx + dw, by, bw - dw, bh, [0.85, 0.28, 0.20, 0.95], sw, sh); // awake
+        // Awake-front CAP tick: the front (green|red boundary) can rise leftward only
+        // to here — when it touches this mark, the active front is maxed and the rest
+        // of the horde stays a dormant reserve (the 100k-playable lever).
+        let cap = (self.sim.active_cap.min(total as usize)) as f32;
+        let cap_x = bx + bw - bw * cap / total;
+        push_quad(&mut ui, cap_x - 1.0, by - 3.0, 2.0, bh + 6.0, [1.0, 0.9, 0.35, 0.95], sw, sh);
         let (tx, ty, tw, th) = UI_SLIDER;
         push_quad(&mut ui, tx, ty, tw, th, [0.22, 0.22, 0.28, 0.85], sw, sh);
         let frac = ((self.pop as f32 - 2_000.0) / (MAX_POP as f32 - 2_000.0)).clamp(0.0, 1.0);
@@ -1337,7 +1343,7 @@ impl State {
         let (wave_k, announced, wdir, eta) = self.sim.wave_info();
         push_text(&mut ui, hx, 12.0, 3.0, white, &format!("FPS {:.0}", self.fps), sw, sh);
         push_text(&mut ui, hx, 30.0, 3.0, [0.55, 0.95, 0.60, 1.0], &format!("SLP {dormant}"), sw, sh);
-        push_text(&mut ui, hx, 48.0, 3.0, [1.0, 0.55, 0.45, 1.0], &format!("ACT {active}"), sw, sh);
+        push_text(&mut ui, hx, 48.0, 3.0, [1.0, 0.55, 0.45, 1.0], &format!("ACT {active}/{}", self.sim.active_cap.min(self.pop)), sw, sh);
         push_text(&mut ui, hx, 66.0, 3.0, white, &format!("KIL {}", self.sim.kills), sw, sh);
         push_text(&mut ui, hx, 84.0, 3.0, white, &format!("RUN {}", self.sim.run), sw, sh);
         push_text(&mut ui, hx, 102.0, 3.0, white, &tri_label(tris), sw, sh);

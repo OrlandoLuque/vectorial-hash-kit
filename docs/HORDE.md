@@ -198,7 +198,11 @@ new wakes are also **rate-limited** (`wake_rate`/s) so the front *ramps* toward 
 cap over ~45 s of pressure instead of saturating in one frame. Both the ambient
 noise/contact cascade and the final-wave surge are metered through it (the surge
 drains the whole reserve through the bounded front — a playable grind, not a single
-dogpile). `HORDE_ACTIVE_CAP` / `HORDE_WAKE_RATE` override.
+dogpile). `HORDE_ACTIVE_CAP` / `HORDE_WAKE_RATE` override. On screen it's legible: a
+**yellow tick on the dormant|active bar** marks where the front tops out (when the
+green|red boundary reaches it, the active set is at the cap and the rest of the horde
+is a dormant reserve — the green `SLP` count), and the `ACT n/cap` readout shows the
+front against its ceiling.
 
 **Why it's needed** (headless `examples/horde_balance`, seed 7, Patches): without
 the cap the wake cascade scales ~linearly with population while the garrison
