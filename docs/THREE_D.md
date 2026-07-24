@@ -472,6 +472,9 @@ thousands of empty cells; the adaptive tree descends straight to the cluster). S
 the pick when the data is **skewed** *and* you **rebuild often** — grid-cheap builds
 without the grid's clustered-kNN cliff. On uniform data or a keep-maintained index,
 `MortonGrid3` / `Tree3`+`ItemRef` remain the calls (see the decision map below).
+It's selectable live in the `critters3d` demo — `M` cycles to it (after Morton),
+or `CRITTERS3D_STRUCTURE=linear`; the HUD shows its leaf count and adaptive depth,
+`B` draws its (variably-sized) leaf boxes.
 
 ## k-nearest-neighbour (`knn`) — a different query than range cull
 
