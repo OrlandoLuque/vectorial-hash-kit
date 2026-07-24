@@ -476,6 +476,20 @@ It's selectable live in the `critters3d` demo — `M` cycles to it (after Morton
 or `CRITTERS3D_STRUCTURE=linear`; the HUD shows its leaf count and adaptive depth,
 `B` draws its (variably-sized) leaf boxes.
 
+**In the measured decision-map sweep** (`critters3d_headless --sweep`, added as a 6th
+structure, culls **exact** vs the other five) it wins **0 of 16 configs** — and that's
+the honest, *expected* result: the critters workload is bouncing balls that fill the
+box roughly **uniformly**, so there's no skew for the adaptivity to exploit. The flat
+`MortonGrid3` is already ideal there (cheap uniform rebuild, comparable cull) and
+`Tree3`+`ItemRef` wins maintain outright by never rebuilding (its O(1) handle). But the
+number that *is* interesting: its per-frame **rebuild beats the flat grid's** at coarser
+leaf capacities — at 50 000 pop / 1024³ / cap 32 it rebuilds in **2 499 µs vs Morton's
+3 154 µs** (~1.26×) and lands **2nd overall** on total frame cost (behind only the
+no-rebuild `binary-ref`), because its adaptive buckets skip the fine grid cells the
+uniform grid spends on empty space. So even where it doesn't *win*, the pointer-free
+adaptive build is a real, measured edge over the grid; its outright win needs the
+skewed-data case the bench above isolates.
+
 ## k-nearest-neighbour (`knn`) — a different query than range cull
 
 Range cull answers "which points are inside this volume?" (you supply the
