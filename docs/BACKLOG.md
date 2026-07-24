@@ -4,6 +4,30 @@ Future work queued for review. Nothing here is committed scope — prune,
 reprioritise, or drop freely. Items graduate into the per-crate roadmaps
 (e.g. `crates/vectorial-hash/README.md`) once picked up.
 
+## ★ 2026-07-25 (cooperative night 2) — landed + follow-ups
+
+**Landed (all on `main`, CI green):** `LinearOctree3` **in the headless decision-map
+sweep** (measured: wins 0/16 on the *uniform* critters workload — expected, its niche
+is skew — but its per-frame rebuild beats the flat grid's; THREE_D.md); **`LinearOctree3`
++ `Octree3` serialize/deserialize** (Octree3 already had it — stale README note fixed);
+**horde awake-front cap HUD** (yellow tick + `ACT n/cap`, wasm republished); and the
+big swing **`LinearQuadTree`** — the 2D adaptive linear quadtree completing the
+LinearOctree family (structure + bench + serialize + 5 tests + README).
+
+**Finding:** the documented "GPU-resident collision storm" big swing **already exists**
+as `gpu_storm` (whole hot loop in compute shaders + CPU↔GPU switch) — the memory note
+was stale.
+
+**Follow-ups queued (autonomous-safe):**
+- **GPU LBVH broadphase for `gpu_storm`** — the genuinely-new GPU extension: add an
+  LBVH-broadphase collision path (reuse `gpu_lbvh_build_bench`'s on-GPU radix+Karras+
+  refit) as a 3rd backend / a headless grid-vs-LBVH pair-count bench with an agreement
+  gate. GPU-shader-heavy → best in a session where the GPU can be iterated with faster
+  feedback.
+- Wire `LinearQuadTree` into the 2D `critters` demo as a selectable index (mirrors the
+  `LinearOctree3`-in-critters3d integration).
+- Optional: `parallel` `cull_many_par` for the linear structures.
+
 ## ★ 2026-07-24 (cooperative night) — landed + follow-ups
 
 **Landed (all on `main`, CI green):** horde **awake-front cap + stagger** (100k
