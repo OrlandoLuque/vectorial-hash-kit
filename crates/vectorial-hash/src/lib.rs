@@ -38,6 +38,7 @@ pub mod itree;
 pub mod tree3;
 pub mod octree3;
 pub mod linear_octree3;
+pub mod linear_quadtree;
 pub mod morton3;
 pub mod morton;
 pub mod advisor;
@@ -51,6 +52,7 @@ pub use itree::{INode, INodeId, IPoint, IPositioned, IRect, IUpdateStrategy, Int
 pub use tree3::{Aabb, Crossing, ItemRef, Node3, Node3Id, Point3, Polyhedron3, Positioned3, Segment3, Shape3, Sphere3, Tree3, VoxelRaster};
 pub use octree3::{OCrossing, ONode, ONodeId, Octree3};
 pub use linear_octree3::LinearOctree3;
+pub use linear_quadtree::LinearQuadTree;
 pub use morton3::MortonGrid3;
 pub use morton::MortonGrid;
 pub use advisor::{SpatialProfile, StructureHint};

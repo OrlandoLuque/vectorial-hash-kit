@@ -20,7 +20,7 @@ Mature. **Seven structures** share one arena layout and query surface: `Tree`
 (2D binary), `QuadTree` (2D 4-way), `IntegerTree` (2D, `i32` / power-of-two),
 `Tree3` (3D binary), `Octree3` (3D 8-way), the pointer-free Z-order grids
 `MortonGrid` (2D) and `MortonGrid3` (3D), and the adaptive pointer-free
-`LinearOctree3` (3D). Each supports template-driven `cull`,
+`LinearQuadTree` (2D) + `LinearOctree3` (3D). Each supports template-driven `cull`,
 dynamic `insert`/`remove`/`update` (merge-up rule), an **O(1) stable `ItemRef`**
 relocation handle (`insert_ref`/`update_ref`/`remove_ref`), **k-NN**, **ray-cast**
 (thick capsule + DDA leaf-walk, `raycast`/`raycast_dda`/`raycast_first`), and
@@ -56,6 +56,7 @@ Leaf items can additionally be answered by a 1×1 raster (`Shape::point_template
 | `quadtree` | `QuadTree<T>`, `QNode<T>`, `QNodeId` | Reference 4-way structure with the tree's full dynamic contract (`insert`, `remove`, `update`, 4-way merge rule, `cull` through the same template machinery) for head-to-head comparisons. |
 | `itree` | `IntegerTree<T>` | 2D binary tree on `i32` coordinates with a power-of-two root extent (bit-shift `locate`); converts IRect↔Rect at the `Shape` boundary so all the float template machinery works unchanged. |
 | `morton` | `MortonGrid<T>` | 2D pointer-free Z-order (linear-quadtree) hash grid: quantise → interleave bits → bucket by code. Fastest index on uniform data; `raycast` too. |
+| `linear_quadtree` | `LinearQuadTree<T>` | 2D **adaptive** linear quadtree — the 2D twin of `LinearOctree3`: sparse hash of leaf buckets keyed by a self-describing quadrant location code (path + level in one `u64`), pointer-free; a leaf splits into 4 only where points cluster. `from_items`/`insert`/`cull`/`knn`/`serialize`. Builds ~1.9× faster than the pointer `QuadTree` and beats the uniform `MortonGrid` on cull + k-NN (measured, `examples/linear_quadtree_bench`); the pick for skewed 2D data you rebuild often. |
 | `tree3` | `Tree3<T>`, `Node3`, `Node3Id`, `Positioned3`, `Point3`, `Aabb` | 3D binary-split tree. `insert`/`remove`/`update`(LCA)/`cull`/`knn`/`raycast`(+DDA)/`serialize` + the `ItemRef` handle path (`insert_ref`/`update_ref`/`update_ref_tracked`→`Crossing`/`remove_ref`), `bulk_load`(+`_par`). |
 | `tree3` (shapes) | `Shape3`, `Sphere3`, `Polyhedron3`, `Segment3`, `VoxelRaster` | 3D query volumes. `Polyhedron3` = convex half-spaces (`from_corners` builds a frustum; `segment_hit` is the exact line-of-sight/occlusion test); `Segment3` = capsule behind `raycast`. |
 | `octree3` | `Octree3<T>`, `ONode`, `ONodeId` | 3D 8-way (2×2×2) split — the 3D `QuadTree`. Same dynamic contract + `knn` + DDA `raycast` + `bulk_load` + `serialize`. |
