@@ -218,6 +218,52 @@ fn range_count(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+// ---- k-NN over the GPU-built LBVH: one thread per query keeps the k nearest in a
+// small local buffer, pruning any subtree whose box is farther than the current
+// k-th. (No child ordering — the worst-distance prune alone keeps it correct.)
+const KNN_SRC: &str = r#"
+@group(0) @binding(0) var<storage, read>       children: array<u32>;
+@group(0) @binding(1) var<storage, read>       aabb:     array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read>       queries:  array<vec4<f32>>; // xyz = centre
+@group(0) @binding(3) var<storage, read_write> results:  array<f32>;        // nq*KMAX nearest d2 (CPU sorts)
+@group(0) @binding(4) var<uniform>             qp:       vec4<u32>;         // x=n, y=nq, z=k
+const KMAX: u32 = 16u;
+@compute @workgroup_size(64)
+fn knn(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let qi = gid.x;
+    if (qi >= qp.y) { return; }
+    let c = queries[qi].xyz;
+    let k = min(qp.z, KMAX);
+    var best: array<f32, 16>;
+    for (var i = 0u; i < KMAX; i = i + 1u) { best[i] = 3.0e38; }
+    var worst = 3.0e38;
+    let leaf_base = qp.x - 1u;
+    var stack: array<u32, 64>;
+    var sp = 1u; stack[0] = 0u;
+    loop {
+        if (sp == 0u) { break; }
+        sp = sp - 1u;
+        let nd = stack[sp];
+        let dv = clamp(c, aabb[nd * 2u].xyz, aabb[nd * 2u + 1u].xyz) - c;
+        let boxd = dot(dv, dv);
+        if (boxd >= worst) { continue; }              // whole subtree beyond the k-th → prune
+        if (nd >= leaf_base) {
+            // insert boxd (a leaf box IS its point, so boxd == the point distance)
+            var mi = 0u; var mv = best[0];
+            for (var i = 1u; i < k; i = i + 1u) { if (best[i] > mv) { mv = best[i]; mi = i; } }
+            best[mi] = boxd;
+            var w = best[0];
+            for (var i = 1u; i < k; i = i + 1u) { if (best[i] > w) { w = best[i]; } }
+            worst = w;
+        } else if (sp < 62u) {
+            stack[sp] = children[nd * 2u];     sp = sp + 1u;
+            stack[sp] = children[nd * 2u + 1u]; sp = sp + 1u;
+        }
+    }
+    for (var i = 0u; i < k; i = i + 1u) { results[qi * KMAX + i] = best[i]; }
+}
+"#;
+
 // A bind-group entry borrowing `buf` — a fn (not a closure) so the elided lifetime
 // ties the entry's borrow to the buffer.
 fn be(b: u32, buf: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
@@ -299,6 +345,13 @@ async fn run() {
     let q_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&q_bgl], push_constant_ranges: &[] });
     let q_pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&q_pl), module: &q_mod, entry_point: "range_count", compilation_options: Default::default() });
     let q_bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &q_bgl, entries: &[be(0, &children_b), be(1, &aabb_b), be(2, &queries_b), be(3, &counts_b), be(4, &qp_b)] });
+    // k-NN pipeline — same 5-binding layout as the range query (results replaces counts).
+    let k: usize = 8;
+    let results_b = sbuf((nq * 16 * 4) as u64); // KMAX = 16 stride
+    let kqp_b = uni_b(16);
+    let kn_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(KNN_SRC.into()) });
+    let kn_pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&q_pl), module: &kn_mod, entry_point: "knn", compilation_options: Default::default() });
+    let kn_bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &q_bgl, entries: &[be(0, &children_b), be(1, &aabb_b), be(2, &queries_b), be(3, &results_b), be(4, &kqp_b)] });
 
     let wg = num_tiles as u32;
     let build = || {
@@ -335,6 +388,14 @@ async fn run() {
         queue.write_buffer(&qp_b, 0, bytemuck::cast_slice(&[n as u32, nq as u32, 0, 0]));
         let mut enc = device.create_command_encoder(&Default::default());
         { let mut c = enc.begin_compute_pass(&Default::default()); c.set_bind_group(0, &q_bg, &[]); c.set_pipeline(&q_pipe); c.dispatch_workgroups((nq as u32).div_ceil(64), 1, 1); }
+        queue.submit(Some(enc.finish()));
+        device.poll(wgpu::Maintain::Wait);
+    };
+    let knn_run = || {
+        queue.write_buffer(&queries_b, 0, bytemuck::cast_slice(&queries));
+        queue.write_buffer(&kqp_b, 0, bytemuck::cast_slice(&[n as u32, nq as u32, k as u32, 0]));
+        let mut enc = device.create_command_encoder(&Default::default());
+        { let mut c = enc.begin_compute_pass(&Default::default()); c.set_bind_group(0, &kn_bg, &[]); c.set_pipeline(&kn_pipe); c.dispatch_workgroups((nq as u32).div_ceil(64), 1, 1); }
         queue.submit(Some(enc.finish()));
         device.poll(wgpu::Maintain::Wait);
     };
@@ -376,7 +437,12 @@ async fn run() {
     let mut cpu_ms = f64::MAX;
     let mut cpu_hits = 0u64;
     for _ in 0..5 { let t = Instant::now(); cpu_hits = spheres.iter().map(|s| tree.cull(s).len() as u64).sum(); cpu_ms = cpu_ms.min(t.elapsed().as_secs_f64() * 1e3); }
-    assert_eq!(cpu_hits, total_hits, "CPU Tree3 total hits != GPU total (same spheres)");
+    // Cross-check (NOT the primary gate — that's GPU == brute above): the CPU Tree3
+    // is f64 while the GPU/brute path is f32, so a point at distance ≈ radius can round
+    // in on one side and out on the other. Over 4096×~55 hits that's a handful of ties;
+    // allow ≤0.2 % slack, which still catches a real divergence (thousands off).
+    let diff = (cpu_hits as i64 - total_hits as i64).unsigned_abs();
+    assert!(diff * 500 <= total_hits.max(1), "CPU Tree3 total {cpu_hits} vs GPU {total_hits}: {diff} apart (>0.2% — real divergence, not a boundary tie)");
 
     println!("batch range-count — {nq} queries over {n} points (min timing):");
     println!("  GPU LBVH query (build EXCLUDED)      : {gpu_ms:>8.3} ms   ({:.1} Mqueries/s)", nq as f64 / (gpu_ms / 1e3) / 1e6);
@@ -384,5 +450,34 @@ async fn run() {
     println!("  CPU Tree3 cull_many (serial)         : {cpu_ms:>8.3} ms");
     let vs = if gpu_ms < cpu_ms { format!("the GPU LBVH query BEATS the CPU serial cull {:.2}×", cpu_ms / gpu_ms) } else { format!("the CPU serial cull still wins {:.2}×", gpu_ms / cpu_ms) };
     println!("\n→ At {nq} queries / {n} points, {vs} (query only). With the build folded in, the GPU\n  pays off once the tree is queried enough times per rebuild to amortise the {gpu_build_ms:.1} ms build.");
+
+    // ---- k-NN on the GPU: one thread per query keeps the k nearest, verified by distance ----
+    knn_run();
+    let krb = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (nq * 16 * 4) as u64, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+    let mut enc = device.create_command_encoder(&Default::default());
+    enc.copy_buffer_to_buffer(&results_b, 0, &krb, 0, (nq * 16 * 4) as u64);
+    queue.submit(Some(enc.finish()));
+    krb.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    device.poll(wgpu::Maintain::Wait);
+    let gpu_knn: Vec<f32> = bytemuck::cast_slice(&krb.slice(..).get_mapped_range()).to_vec();
+    for qi in 0..sample {
+        let c = queries[qi];
+        let mut d2: Vec<f32> = pts[..n].iter().map(|p| (p[0] - c[0]).powi(2) + (p[1] - c[1]).powi(2) + (p[2] - c[2]).powi(2)).collect();
+        d2.sort_by(|a, b| a.total_cmp(b));
+        let mut got: Vec<f32> = gpu_knn[qi * 16..qi * 16 + k].to_vec();
+        got.sort_by(|a, b| a.total_cmp(b));
+        for j in 0..k { assert!((got[j].sqrt() - d2[j].sqrt()).abs() < 1e-2, "GPU knn dist != brute at query {qi} rank {j}: {} vs {}", got[j].sqrt(), d2[j].sqrt()); }
+    }
+    let mut gpu_knn_ms = f64::MAX;
+    for _ in 0..9 { let t = Instant::now(); knn_run(); gpu_knn_ms = gpu_knn_ms.min(t.elapsed().as_secs_f64() * 1e3); }
+    let qpts: Vec<Point3> = queries.iter().map(|q| Point3::new(q[0] as f64, q[1] as f64, q[2] as f64)).collect();
+    let mut cpu_knn_ms = f64::MAX;
+    for _ in 0..5 { let t = Instant::now(); let v: usize = qpts.iter().map(|&q| tree.knn(q, k).len()).sum(); std::hint::black_box(v); cpu_knn_ms = cpu_knn_ms.min(t.elapsed().as_secs_f64() * 1e3); }
+    println!("\nbatch k-NN (k={k}) — {nq} queries over {n} points:");
+    println!("  GPU LBVH k-NN (build EXCLUDED)  : {gpu_knn_ms:>8.3} ms   (verified == brute distances ✓)");
+    println!("  CPU Tree3 knn (serial)          : {cpu_knn_ms:>8.3} ms");
+    let kvs = if gpu_knn_ms < cpu_knn_ms { format!("{:.2}× the CPU serial knn", cpu_knn_ms / gpu_knn_ms) } else { format!("slower than the CPU knn ({:.2}×)", gpu_knn_ms / cpu_knn_ms) };
+    println!("  → GPU LBVH k-NN is {kvs} (query only).");
+
     println!("(Honest: the GPU query is the batch-broadphase primitive — its edge is throughput over a\nhuge query set on a resident tree; a handful of queries never amortise the build + the launch.)");
 }
