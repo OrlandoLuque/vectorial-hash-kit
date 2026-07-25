@@ -4,6 +4,31 @@ Future work queued for review. Nothing here is committed scope — prune,
 reprioritise, or drop freely. Items graduate into the per-crate roadmaps
 (e.g. `crates/vectorial-hash/README.md`) once picked up.
 
+## ★ 2026-07-26 (cooperative night 3) — landed + follow-ups
+
+**Landed (all on `main`):** **raycast** for `LinearOctree3` + `LinearQuadTree`
+(capsule-over-cull, brute-force-gated); **`LinearQuadTree` maintain bench** (keep-index
+vs rebuild — the 2D echo of the 3D decision map); **GPU LBVH k-NN** in
+`gpu_lbvh_query_bench` (the honest inverse: GPU k-NN ~2.3× SLOWER than CPU — per-thread
+k-buffer is GPU-hostile, unlike the ~140× range-count); the big swing **`KdTree3`** — a
+median-split k-d tree with a measured clustered niche (cull ~2× / knn ~1.6× over Tree3
+on clustered data — it stays balanced where the midpoint trees bloat over empty space);
+plus parallel batch `cull_many_par`/`knn_many_par` on the linear structures.
+
+**Three more stale "todo"s were already done** (verified, not duplicated): serialize on
+the 2D trees, and the GPU LBVH query already had `gpu_spatial_bench`/`gpu_lbvh_demo` (my
+bench added the fully-resident build+query loop).
+
+**Follow-ups queued (autonomous-safe):**
+- `KdTree3` serialize / raycast / the `Shape3` batch — round out its API (raycast is the
+  same capsule-over-cull one-liner; serialize is the arena; ItemRef is a pointer-tree
+  lever, not applicable to a static tree).
+- Add `KdTree3` (rebuild) to the decision-map sweep (`critters3d_headless`) — the 7th
+  structure, measured vs the others.
+- **Defensive**: `QuadTree::update_ref` (and the other trees') corrupts its handle table
+  if handed an out-of-world point (a boundary point at the half-open max) — it should
+  clamp/guard instead of panicking later. Minor, found via the LinearQuadTree bench.
+
 ## ★ 2026-07-25 (cooperative night 2) — landed + follow-ups
 
 **Landed (all on `main`, CI green):** `LinearOctree3` **in the headless decision-map
