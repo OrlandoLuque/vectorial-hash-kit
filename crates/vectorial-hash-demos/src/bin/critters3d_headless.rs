@@ -27,15 +27,15 @@
 use std::time::Instant;
 
 use vectorial_hash::{
-    Aabb, ItemRef, LinearOctree3, MortonGrid3, Octree3, Point, Point3, Positioned, Positioned3, Rect, Shape,
+    Aabb, ItemRef, KdTree3, LinearOctree3, MortonGrid3, Octree3, Point, Point3, Positioned, Positioned3, Rect, Shape,
     Sphere3, Tree, Tree3,
 };
 
 const MARGIN: f64 = 4.0;
 // "binary-ref" is the binary Tree3 maintained through the stable ItemRef handle
 // (O(1) update_ref) instead of the predicate update — the Stable-ItemRef test.
-const NAMES: [&str; 6] = ["binary", "octree", "morton", "projection", "binary-ref", "linear-octree"];
-const SHORT: [&str; 6] = ["bin", "oct", "mor", "prj", "binR", "lin"];
+const NAMES: [&str; 7] = ["binary", "octree", "morton", "projection", "binary-ref", "linear-octree", "kd-tree"];
+const SHORT: [&str; 7] = ["bin", "oct", "mor", "prj", "binR", "lin", "kd"];
 
 struct Args {
     sweep: bool,
@@ -119,7 +119,7 @@ struct Cfg { world: f64, pop: usize, item_limit: usize, vision: f64, speed: f64,
 /// Run the deterministic sim with all four structures maintained on the same
 /// positions; return per-structure (maintain µs/frame, cull µs/cull) and
 /// whether all four culls agreed.
-fn measure(cfg: &Cfg) -> ([f64; 6], [f64; 6], bool) {
+fn measure(cfg: &Cfg) -> ([f64; 7], [f64; 7], bool) {
     let mut rng = Rng::new(cfg.seed);
     let world = Aabb::new(0.0, 0.0, 0.0, cfg.world, cfg.world, cfg.world);
     let rect = Rect::new(0.0, 0.0, cfg.world, cfg.world);
@@ -145,8 +145,8 @@ fn measure(cfg: &Cfg) -> ([f64; 6], [f64; 6], bool) {
     }
     let levels = MortonGrid3::<C3>::levels_for_cell_size(world, cfg.vision.max(4.0));
 
-    let mut mt: [Series; 6] = std::array::from_fn(|_| Series::new());
-    let mut cl: [Series; 6] = std::array::from_fn(|_| Series::new());
+    let mut mt: [Series; 7] = std::array::from_fn(|_| Series::new());
+    let mut cl: [Series; 7] = std::array::from_fn(|_| Series::new());
     let mut blackhole = 0usize;
     let mut agree = true;
 
@@ -192,6 +192,11 @@ fn measure(cfg: &Cfg) -> ([f64; 6], [f64; 6], bool) {
         let linear = LinearOctree3::<C3>::from_items(world, cfg.item_limit, 12, (0..cfg.pop).map(|id| C3 { id: id as u32, p: pos[id] }).collect());
         if measuring { mt[5].push(us(t)); }
 
+        // k-d tree: median split, also rebuilt each frame (static structure).
+        let t = Instant::now();
+        let kd = KdTree3::<C3>::from_items(cfg.item_limit, (0..cfg.pop).map(|id| C3 { id: id as u32, p: pos[id] }).collect());
+        if measuring { mt[6].push(us(t)); }
+
         let t = Instant::now();
         let mut proj = Tree::<P2>::new(rect, cfg.item_limit);
         for id in 0..cfg.pop { let p = pos[id]; proj.insert(P2 { id: id as u32, p: Point::new(p.x, p.y), z: p.z }); }
@@ -222,6 +227,10 @@ fn measure(cfg: &Cfg) -> ([f64; 6], [f64; 6], bool) {
         if measuring { cl[5].push(us(t) / n); }
 
         let t = Instant::now();
+        for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(kd.cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); }
+        if measuring { cl[6].push(us(t) / n); }
+
+        let t = Instant::now();
         for &id in &ids {
             let c = pos[id];
             let cand = proj.cull(&Disc { cx: c.x, cy: c.y, r: cfg.vision });
@@ -250,8 +259,9 @@ fn measure(cfg: &Cfg) -> ([f64; 6], [f64; 6], bool) {
                 .map(|p2| p2.id).collect();
             let mut a4: Vec<u32> = tree_h.cull(&s).iter().map(|x| x.id).collect();
             let mut a5: Vec<u32> = linear.cull(&s).iter().map(|x| x.id).collect();
-            a0.sort_unstable(); a1.sort_unstable(); a2.sort_unstable(); a3.sort_unstable(); a4.sort_unstable(); a5.sort_unstable();
-            if a1 != a0 || a2 != a0 || a3 != a0 || a4 != a0 || a5 != a0 { agree = false; }
+            let mut a6: Vec<u32> = kd.cull(&s).iter().map(|x| x.id).collect();
+            a0.sort_unstable(); a1.sort_unstable(); a2.sort_unstable(); a3.sort_unstable(); a4.sort_unstable(); a5.sort_unstable(); a6.sort_unstable();
+            if a1 != a0 || a2 != a0 || a3 != a0 || a4 != a0 || a5 != a0 || a6 != a0 { agree = false; }
         }
     }
     if blackhole == usize::MAX { println!("unreachable"); }
@@ -287,11 +297,11 @@ fn main() {
         cfg.world, cfg.pop, cfg.item_limit, cfg.vision, cfg.speed, cfg.n_cull, cfg.frames, cfg.warmup, cfg.seed);
     let (maintain, cull, agree) = measure(&cfg);
     println!("\n{:<12} {:>16} {:>14} {:>20}", "structure", "maintain us/frame", "cull us/cull", "per-frame total us");
-    for k in 0..6 {
+    for k in 0..7 {
         let total = maintain[k] + cfg.n_cull as f64 * cull[k];
         println!("{:<14} {:>16.1} {:>14.3} {:>20.1}", NAMES[k], maintain[k], cull[k], total);
     }
-    let total: [f64; 6] = std::array::from_fn(|k| maintain[k] + cfg.n_cull as f64 * cull[k]);
+    let total: [f64; 7] = std::array::from_fn(|k| maintain[k] + cfg.n_cull as f64 * cull[k]);
     let (wm, mm) = winner(&maintain);
     let (wc, mc) = winner(&cull);
     let (wt, mt) = winner(&total);
@@ -321,8 +331,8 @@ fn run_sweep(args: &Args) {
     println!("(maintain = per-frame update[bin/oct] or rebuild[mor/prj]; cull = per-cull. winner = lowest, margin = 2nd/1st.)\n");
     println!("{:>6} {:>7} {:>4} {:>5} | {:<24} | {:<24} | {:<10}", "world", "pop", "il", "churn", "maintain winner", "cull winner", "agree");
 
-    let mut wins_m = [0u32; 6];
-    let mut wins_c = [0u32; 6];
+    let mut wins_m = [0u32; 7];
+    let mut wins_c = [0u32; 7];
     let mut all_agree = true;
     let mut n = 0;
     for &world in &worlds {
@@ -344,9 +354,9 @@ fn run_sweep(args: &Args) {
             }
         }
     }
-    println!("\nwins over {n} configs (binR = binary via stable ItemRef; lin = adaptive LinearOctree3):");
-    println!("  maintain: bin {} | oct {} | mor {} | prj {} | binR {} | lin {}", wins_m[0], wins_m[1], wins_m[2], wins_m[3], wins_m[4], wins_m[5]);
-    println!("  cull:     bin {} | oct {} | mor {} | prj {} | binR {} | lin {}", wins_c[0], wins_c[1], wins_c[2], wins_c[3], wins_c[4], wins_c[5]);
+    println!("\nwins over {n} configs (binR = binary via stable ItemRef; lin = adaptive LinearOctree3; kd = median-split KdTree3):");
+    println!("  maintain: bin {} | oct {} | mor {} | prj {} | binR {} | lin {} | kd {}", wins_m[0], wins_m[1], wins_m[2], wins_m[3], wins_m[4], wins_m[5], wins_m[6]);
+    println!("  cull:     bin {} | oct {} | mor {} | prj {} | binR {} | lin {} | kd {}", wins_c[0], wins_c[1], wins_c[2], wins_c[3], wins_c[4], wins_c[5], wins_c[6]);
     println!("\nagreement across all structures, every config: {}", if all_agree { "EXACT" } else { "DISAGREEMENT <-- BUG" });
 }
 

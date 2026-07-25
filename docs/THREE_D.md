@@ -490,6 +490,15 @@ uniform grid spends on empty space. So even where it doesn't *win*, the pointer-
 adaptive build is a real, measured edge over the grid; its outright win needs the
 skewed-data case the bench above isolates.
 
+The **`KdTree3`** (median split) was added as the 7th structure — the surprise of the
+sweep: it **ties `Tree3`+`ItemRef` for the most cull wins, 6 of 16 each** (Morton 4),
+*even on this uniform data*. The median split keeps the tree perfectly balanced and its
+tight per-node boxes prune harder than the midpoint trees', so it's a top-tier cull
+structure whenever a per-frame rebuild is affordable — it does not win *maintain* (still
+`binary-ref` at 15/16; a rebuild can't beat the O(1) handle). On the *clustered* data of
+`examples/kdtree3_bench` the cull gap over `Tree3` widens to ~2×. Culls **exact** vs all
+six others, every config.
+
 ## k-nearest-neighbour (`knn`) — a different query than range cull
 
 Range cull answers "which points are inside this volume?" (you supply the
