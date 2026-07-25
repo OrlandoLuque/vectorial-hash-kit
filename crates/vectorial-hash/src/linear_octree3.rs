@@ -29,7 +29,7 @@
 
 use crate::serde_io::{corrupt, r_aabb, r_u32, r_u64, r_u8, w_aabb, w_u32, w_u64, w_u8};
 use crate::template::CellState;
-use crate::tree3::{aabb_min_dist2, knn_offer, knn_worst, Aabb, KnnEntry, Point3, Positioned3, Shape3};
+use crate::tree3::{aabb_min_dist2, knn_offer, knn_worst, Aabb, KnnEntry, Point3, Positioned3, Segment3, Shape3};
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io::{self, Read, Write};
 
@@ -236,6 +236,27 @@ impl<T: Positioned3> LinearOctree3<T> {
     where T: Sync {
         use rayon::prelude::*;
         queries.par_iter().map(|&q| self.knn(q, k)).collect()
+    }
+
+    /// "Thick ray-cast": every item within `radius` of the ray `origin + t·normalize(dir)`,
+    /// `t ∈ [0, max_dist]`, as `(t, &item)` sorted by `t`. Built on the [`Segment3`]
+    /// capsule + `cull` — the analytic capsule descent the tree already does.
+    pub fn raycast(&self, origin: Point3, dir: Point3, max_dist: f64, radius: f64) -> Vec<(f64, &T)> {
+        let m = (dir.x * dir.x + dir.y * dir.y + dir.z * dir.z).sqrt();
+        if m == 0.0 { return Vec::new(); }
+        let (ux, uy, uz) = (dir.x / m, dir.y / m, dir.z / m);
+        let end = Point3::new(origin.x + ux * max_dist, origin.y + uy * max_dist, origin.z + uz * max_dist);
+        let mut hits: Vec<(f64, &T)> = self.cull(&Segment3::new(origin, end, radius)).into_iter().map(|it| {
+            let p = it.position();
+            let t = ((p.x - origin.x) * ux + (p.y - origin.y) * uy + (p.z - origin.z) * uz).clamp(0.0, max_dist);
+            (t, it)
+        }).collect();
+        hits.sort_by(|a, b| a.0.total_cmp(&b.0));
+        hits
+    }
+    /// The nearest item along the ray (smallest `t`), if any.
+    pub fn raycast_first(&self, origin: Point3, dir: Point3, max_dist: f64, radius: f64) -> Option<(f64, &T)> {
+        self.raycast(origin, dir, max_dist, radius).into_iter().next()
     }
 }
 
@@ -459,5 +480,27 @@ mod tests {
         let qs: Vec<Point3> = (0..20).map(|i| Point3::new(i as f64 * 5.0, 30.0, 50.0)).collect();
         let kd = |vs: Vec<Vec<(f64, &P)>>| -> Vec<Vec<f64>> { vs.iter().map(|v| v.iter().map(|(d, _)| *d).collect()).collect() };
         assert_eq!(kd(t.knn_many(&qs, 8)), kd(t.knn_many_par(&qs, 8)), "knn_many_par != knn_many");
+    }
+
+    #[test]
+    fn linear_octree3_raycast_matches_brute() {
+        let (world, items) = scatter(3000, 23);
+        let t = LinearOctree3::from_items(world, 16, 12, items.clone());
+        let origin = Point3::new(5.0, 30.0, 5.0);
+        let dir = Point3::new(1.0, 0.1, 1.0);
+        let (max_dist, radius) = (120.0, 6.0);
+        let hits = t.raycast(origin, dir, max_dist, radius);
+        for w in hits.windows(2) { assert!(w[0].0 <= w[1].0 + 1e-9, "raycast hits not sorted by t"); }
+        let m = (dir.x * dir.x + dir.y * dir.y + dir.z * dir.z).sqrt();
+        let (ux, uy, uz) = (dir.x / m, dir.y / m, dir.z / m);
+        let d2seg = |p: Point3| -> f64 {
+            let s = ((p.x - origin.x) * ux + (p.y - origin.y) * uy + (p.z - origin.z) * uz).clamp(0.0, max_dist);
+            (p.x - origin.x - ux * s).powi(2) + (p.y - origin.y - uy * s).powi(2) + (p.z - origin.z - uz * s).powi(2)
+        };
+        let mut got: Vec<u32> = hits.iter().map(|(_, p)| p.id).collect();
+        let mut want: Vec<u32> = items.iter().filter(|p| d2seg(p.p) <= radius * radius).map(|p| p.id).collect();
+        got.sort(); want.sort();
+        assert_eq!(got, want, "raycast set != brute capsule");
+        assert_eq!(t.raycast_first(origin, dir, max_dist, radius).map(|(_, p)| p.id), hits.first().map(|(_, p)| p.id));
     }
 }

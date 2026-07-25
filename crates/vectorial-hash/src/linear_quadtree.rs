@@ -25,7 +25,7 @@
 //! *template* path the pointer `QuadTree` offers is not wired here; the analytic /
 //! bbox path is exact regardless.)
 
-use crate::culling::Shape;
+use crate::culling::{Capsule, Shape};
 use crate::geom::{Point, Rect};
 use crate::serde_io::{corrupt, r_f64, r_u32, r_u64, r_u8, w_f64, w_u32, w_u64, w_u8};
 use crate::template::CellState;
@@ -217,6 +217,26 @@ impl<T: Positioned> LinearQuadTree<T> {
     where T: Sync {
         use rayon::prelude::*;
         queries.par_iter().map(|&q| self.knn(q, k)).collect()
+    }
+
+    /// "Thick ray-cast": every item within `radius` of the ray `origin + t·normalize(dir)`,
+    /// `t ∈ [0, max_dist]`, as `(t, &item)` sorted by `t`. Built on the [`Capsule`] + `cull`.
+    pub fn raycast(&self, origin: Point, dir: Point, max_dist: f64, radius: f64) -> Vec<(f64, &T)> {
+        let m = (dir.x * dir.x + dir.y * dir.y).sqrt();
+        if m == 0.0 { return Vec::new(); }
+        let (ux, uy) = (dir.x / m, dir.y / m);
+        let end = Point::new(origin.x + ux * max_dist, origin.y + uy * max_dist);
+        let mut hits: Vec<(f64, &T)> = self.cull(&Capsule::new(origin, end, radius)).into_iter().map(|it| {
+            let p = it.position();
+            let t = ((p.x - origin.x) * ux + (p.y - origin.y) * uy).clamp(0.0, max_dist);
+            (t, it)
+        }).collect();
+        hits.sort_by(|a, b| a.0.total_cmp(&b.0));
+        hits
+    }
+    /// The nearest item along the ray (smallest `t`), if any.
+    pub fn raycast_first(&self, origin: Point, dir: Point, max_dist: f64, radius: f64) -> Option<(f64, &T)> {
+        self.raycast(origin, dir, max_dist, radius).into_iter().next()
     }
 }
 
@@ -418,5 +438,27 @@ mod tests {
         let qs: Vec<Point> = (0..20).map(|i| Point::new(i as f64 * 5.0, 50.0)).collect();
         let kd = |vs: Vec<Vec<(f64, &P)>>| -> Vec<Vec<f64>> { vs.iter().map(|v| v.iter().map(|(d, _)| *d).collect()).collect() };
         assert_eq!(kd(t.knn_many(&qs, 8)), kd(t.knn_many_par(&qs, 8)), "knn_many_par != knn_many");
+    }
+
+    #[test]
+    fn linear_quadtree_raycast_matches_brute() {
+        let (world, items) = scatter(3000, 23);
+        let t = LinearQuadTree::from_items(world, 16, 16, items.clone());
+        let origin = Point::new(5.0, 5.0);
+        let dir = Point::new(1.0, 0.6);
+        let (max_dist, radius) = (120.0, 6.0);
+        let hits = t.raycast(origin, dir, max_dist, radius);
+        for w in hits.windows(2) { assert!(w[0].0 <= w[1].0 + 1e-9, "raycast hits not sorted by t"); }
+        let m = (dir.x * dir.x + dir.y * dir.y).sqrt();
+        let (ux, uy) = (dir.x / m, dir.y / m);
+        let d2seg = |p: Point| -> f64 {
+            let s = ((p.x - origin.x) * ux + (p.y - origin.y) * uy).clamp(0.0, max_dist);
+            (p.x - origin.x - ux * s).powi(2) + (p.y - origin.y - uy * s).powi(2)
+        };
+        let mut got: Vec<u32> = hits.iter().map(|(_, p)| p.id).collect();
+        let mut want: Vec<u32> = items.iter().filter(|p| d2seg(p.p) <= radius * radius).map(|p| p.id).collect();
+        got.sort(); want.sort();
+        assert_eq!(got, want, "raycast set != brute capsule");
+        assert_eq!(t.raycast_first(origin, dir, max_dist, radius).map(|(_, p)| p.id), hits.first().map(|(_, p)| p.id));
     }
 }

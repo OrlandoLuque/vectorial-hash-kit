@@ -272,6 +272,13 @@ radius   capsule ms   dda ms   first ms   cells  tested  coverage
   `Octree3`** are the right home: `Tree3::raycast` (the `Segment3` capsule over
   the binary tree) now prunes tightly too, because `Segment3` gained an analytic
   `classify_aabb` (conservative sphere test: box bounding-sphere vs the spine).
+- The adaptive **`LinearOctree3`** (and 2D **`LinearQuadTree`**) also carry
+  `raycast`/`raycast_first` — the same `Segment3`/`Capsule`-capsule-over-`cull`
+  form, sorted by `t`. Being *hierarchical* (a sparse pointer-free octree, not a
+  flat grid) they prune the thick band the way `Octree3` does, unlike the flat
+  Morton grid — so on skewed data they get the grid's cheap build *and* a real
+  ray-cast. (Brute-force-gated == the exact capsule; the DDA thin-corridor walk
+  stays a pointer-tree lever.)
 
 ### Variable-cell 3D DDA — `Tree3::raycast_dda`
 
