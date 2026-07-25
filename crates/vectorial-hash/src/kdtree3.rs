@@ -13,9 +13,14 @@
 //! `cull` prunes with tight boxes through the shared [`Shape3`] classify path).
 //! `from_items` / `cull` / `knn`, brute-force-gated.
 
+use crate::serde_io::{corrupt, r_aabb, r_u32, r_u8, w_aabb, w_u32, w_u8};
 use crate::template::CellState;
-use crate::tree3::{aabb_min_dist2, knn_offer, knn_worst, Aabb, KnnEntry, Point3, Positioned3, Shape3};
+use crate::tree3::{aabb_min_dist2, knn_offer, knn_worst, Aabb, KnnEntry, Point3, Positioned3, Segment3, Shape3};
 use std::collections::BinaryHeap;
+use std::io::{self, Read, Write};
+
+const KD3_MAGIC: &[u8; 4] = b"KDT3";
+const KD3_VERSION: u8 = 1;
 
 enum Split { Leaf { start: u32, len: u32 }, Internal { left: u32, right: u32 } }
 struct KdNode { bbox: Aabb, split: Split }
@@ -148,6 +153,73 @@ impl<T: Positioned3> KdTree3<T> {
             }
         }
     }
+
+    /// "Thick ray-cast": every item within `radius` of the ray `origin + t·normalize
+    /// (dir)`, `t ∈ [0, max_dist]`, as `(t, &item)` sorted by `t`. Built on the
+    /// [`Segment3`] capsule + `cull`.
+    pub fn raycast(&self, origin: Point3, dir: Point3, max_dist: f64, radius: f64) -> Vec<(f64, &T)> {
+        let m = (dir.x * dir.x + dir.y * dir.y + dir.z * dir.z).sqrt();
+        if m == 0.0 { return Vec::new(); }
+        let (ux, uy, uz) = (dir.x / m, dir.y / m, dir.z / m);
+        let end = Point3::new(origin.x + ux * max_dist, origin.y + uy * max_dist, origin.z + uz * max_dist);
+        let mut hits: Vec<(f64, &T)> = self.cull(&Segment3::new(origin, end, radius)).into_iter().map(|it| {
+            let p = it.position();
+            let t = ((p.x - origin.x) * ux + (p.y - origin.y) * uy + (p.z - origin.z) * uz).clamp(0.0, max_dist);
+            (t, it)
+        }).collect();
+        hits.sort_by(|a, b| a.0.total_cmp(&b.0));
+        hits
+    }
+    /// The nearest item along the ray (smallest `t`), if any.
+    pub fn raycast_first(&self, origin: Point3, dir: Point3, max_dist: f64, radius: f64) -> Option<(f64, &T)> {
+        self.raycast(origin, dir, max_dist, radius).into_iter().next()
+    }
+
+    /// Serialize the built tree (the node arena + the point-ordered items) to any
+    /// `Write`. Dependency-free; items via a caller closure.
+    pub fn serialize<W: Write>(&self, w: &mut W, write_item: impl Fn(&mut W, &T) -> io::Result<()>) -> io::Result<()> {
+        w.write_all(KD3_MAGIC)?;
+        w_u8(w, KD3_VERSION)?;
+        w_u32(w, self.capacity as u32)?;
+        w_u32(w, self.root)?;
+        w_u32(w, self.nodes.len() as u32)?;
+        for nd in &self.nodes {
+            w_aabb(w, &nd.bbox)?;
+            match nd.split {
+                Split::Leaf { start, len } => { w_u8(w, 0)?; w_u32(w, start)?; w_u32(w, len)?; }
+                Split::Internal { left, right } => { w_u8(w, 1)?; w_u32(w, left)?; w_u32(w, right)?; }
+            }
+        }
+        w_u32(w, self.items.len() as u32)?;
+        for it in &self.items { write_item(w, it)?; }
+        Ok(())
+    }
+
+    /// Reload a serialized tree — no rebuild. Rejects corrupt input.
+    pub fn deserialize<R: Read>(r: &mut R, read_item: impl Fn(&mut R) -> io::Result<T>) -> io::Result<Self> {
+        let mut magic = [0u8; 4];
+        r.read_exact(&mut magic)?;
+        if &magic != KD3_MAGIC { return Err(corrupt("bad KdTree3 magic")); }
+        if r_u8(r)? != KD3_VERSION { return Err(corrupt("unsupported KdTree3 version")); }
+        let capacity = r_u32(r)? as usize;
+        let root = r_u32(r)?;
+        let nn = r_u32(r)? as usize;
+        let mut nodes = Vec::with_capacity(nn);
+        for _ in 0..nn {
+            let bbox = r_aabb(r)?;
+            let split = match r_u8(r)? {
+                0 => Split::Leaf { start: r_u32(r)?, len: r_u32(r)? },
+                1 => Split::Internal { left: r_u32(r)?, right: r_u32(r)? },
+                _ => return Err(corrupt("bad KdTree3 node tag")),
+            };
+            nodes.push(KdNode { bbox, split });
+        }
+        let ni = r_u32(r)? as usize;
+        let mut items = Vec::with_capacity(ni);
+        for _ in 0..ni { items.push(read_item(r)?); }
+        if !nodes.is_empty() && root as usize >= nodes.len() { return Err(corrupt("KdTree3 root out of range")); }
+        Ok(KdTree3 { nodes, items, capacity: capacity.max(1), root })
+    }
 }
 
 #[cfg(test)]
@@ -215,5 +287,60 @@ mod tests {
             assert_eq!(got.len(), 10);
             for (a, b) in got.iter().zip(want.iter()) { assert!((a - b).abs() < 1e-9, "knn dist {a} != brute {b}"); }
         }
+    }
+
+    #[test]
+    fn kdtree3_raycast_matches_brute() {
+        let items = scatter(3000, 23);
+        let t = KdTree3::from_items(16, items.clone());
+        let origin = Point3::new(5.0, 30.0, 5.0);
+        let dir = Point3::new(1.0, 0.1, 1.0);
+        let (max_dist, radius) = (120.0, 6.0);
+        let hits = t.raycast(origin, dir, max_dist, radius);
+        for w in hits.windows(2) { assert!(w[0].0 <= w[1].0 + 1e-9, "not sorted by t"); }
+        let m = (dir.x * dir.x + dir.y * dir.y + dir.z * dir.z).sqrt();
+        let (ux, uy, uz) = (dir.x / m, dir.y / m, dir.z / m);
+        let d2seg = |p: Point3| -> f64 {
+            let s = ((p.x - origin.x) * ux + (p.y - origin.y) * uy + (p.z - origin.z) * uz).clamp(0.0, max_dist);
+            (p.x - origin.x - ux * s).powi(2) + (p.y - origin.y - uy * s).powi(2) + (p.z - origin.z - uz * s).powi(2)
+        };
+        let mut got: Vec<u32> = hits.iter().map(|(_, p)| p.id).collect();
+        let mut want: Vec<u32> = items.iter().filter(|p| d2seg(p.p) <= radius * radius).map(|p| p.id).collect();
+        got.sort(); want.sort();
+        assert_eq!(got, want, "raycast set != brute capsule");
+    }
+
+    #[test]
+    fn kdtree3_serialize_roundtrip() {
+        use std::io::{Read, Write};
+        let items = scatter(3000, 9);
+        let t = KdTree3::from_items(16, items);
+        let mut buf = Vec::new();
+        t.serialize(&mut buf, |w: &mut Vec<u8>, p: &P| {
+            w.write_all(&p.id.to_le_bytes())?;
+            w.write_all(&p.p.x.to_le_bytes())?;
+            w.write_all(&p.p.y.to_le_bytes())?;
+            w.write_all(&p.p.z.to_le_bytes())
+        }).unwrap();
+        let mut rd = &buf[..];
+        let back = KdTree3::<P>::deserialize(&mut rd, |r: &mut &[u8]| {
+            let mut b4 = [0u8; 4]; r.read_exact(&mut b4)?; let id = u32::from_le_bytes(b4);
+            let mut b8 = [0u8; 8];
+            r.read_exact(&mut b8)?; let x = f64::from_le_bytes(b8);
+            r.read_exact(&mut b8)?; let y = f64::from_le_bytes(b8);
+            r.read_exact(&mut b8)?; let z = f64::from_le_bytes(b8);
+            Ok(P { id, p: Point3::new(x, y, z) })
+        }).unwrap();
+        assert_eq!(back.item_count(), t.item_count());
+        assert_eq!(back.node_count(), t.node_count());
+        assert_eq!(back.depth(), t.depth());
+        for &(cx, cy, cz, r) in &[(50.0, 30.0, 50.0, 20.0), (12.0, 12.0, 12.0, 5.0)] {
+            let s = Sphere3::new(cx, cy, cz, r);
+            let mut a: Vec<u32> = t.cull(&s).iter().map(|p| p.id).collect();
+            let mut b: Vec<u32> = back.cull(&s).iter().map(|p| p.id).collect();
+            a.sort(); b.sort();
+            assert_eq!(a, b, "cull diverged after round-trip");
+        }
+        assert!(KdTree3::<P>::deserialize(&mut &b"XXXX"[..], |_r: &mut &[u8]| -> std::io::Result<P> { unreachable!() }).is_err());
     }
 }
