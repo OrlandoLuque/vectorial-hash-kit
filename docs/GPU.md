@@ -44,6 +44,9 @@ cargo run -p vectorial-hash-demos --bin adaptive_broadphase --release   # ADAPT_
 | `gpu_sort_bench` | GPU **bitonic sort** of Morton codes, verified == CPU sort | **slower** than the CPU sort (log² work + dispatch/pass) — the honest negative that motivated the radix |
 | `gpu_radix_bench` | GPU **stable LSD radix sort** of Morton codes (hierarchical scan), **4-bit×8 vs 8-bit×4** widths, verified == CPU sort | 8-bit/4-pass is **1.3–1.8× faster** than 4-bit/8-pass → **8–23× faster** than `sort_unstable` (1M **8.1×** · 4M 16.8× · **8M peak 22.6×** · 16M 17.2×) — fewer global passes, the portable Onesweep step |
 | `gpu_lbvh_build_bench` | the **whole LBVH built on the GPU** — Morton → radix → Karras → refit — verified by traversal-vs-brute | **1 M-point BVH in ~4.4 ms/frame** (262k 2.28 · 4M 13.0), all GPU-resident — the on-GPU per-frame rebuild |
+| `gpu_lbvh_query_bench` | **closes the resident loop**: build the LBVH on GPU *and* range-count-query it on GPU (stack traversal), against the GPU-built `children`/`aabb` buffers directly — verified == brute force | 1 M pts, 4 096 queries r=24: GPU query **0.32 ms** (12.8 M q/s) vs CPU `Tree3` serial cull 44.8 ms → **~140×** (query only); build 12.4 ms amortises over query-heavy frames |
+
+The last one is the piece between the other two: `gpu_spatial_bench` builds the LBVH on the *CPU* then queries on GPU, and `gpu_lbvh_build_bench` builds on GPU but *verifies on the CPU*; `gpu_lbvh_query_bench` proves the GPU-built tree is queryable on the GPU with no CPU touch — a fully GPU-resident build→query broad-phase.
 
 ```bash
 cargo run -p vectorial-hash-demos --example gpu_spatial_bench    --release --features parallel   # GPU_N/M/R/CLUSTER
@@ -51,6 +54,7 @@ cargo run -p vectorial-hash-demos --example gpu_visibility_bench  --release     
 cargo run -p vectorial-hash-demos --example gpu_sort_bench        --release                        # SORT_N (bitonic)
 cargo run -p vectorial-hash-demos --example gpu_radix_bench       --release                        # SORT_N (radix)
 cargo run -p vectorial-hash-demos --example gpu_lbvh_build_bench  --release                        # LBVH_N (full build)
+cargo run -p vectorial-hash-demos --example gpu_lbvh_query_bench  --release                        # LBVHQ_N/Q/R (build+query)
 ```
 
 ## The verdict — when the GPU wins (measured, not assumed)
