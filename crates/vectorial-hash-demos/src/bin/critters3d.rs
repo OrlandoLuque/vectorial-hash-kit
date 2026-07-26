@@ -56,7 +56,7 @@ use macroquad::window::get_internal_gl;
 use rayon::prelude::*;
 
 use vectorial_hash::{
-    Aabb, LinearOctree3, MortonGrid3, Octree3, Point, Point3, Positioned, Positioned3, Rect, Shape, Shape3, Sphere3,
+    Aabb, KdTree3, LinearOctree3, MortonGrid3, Octree3, Point, Point3, Positioned, Positioned3, Rect, Shape, Shape3, Sphere3,
     Tree, Tree3,
 };
 use vectorial_hash_demos::instanced3d::{
@@ -245,14 +245,15 @@ impl RenderMode {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Structure { Binary3, Octree, Morton, Linear, Projection }
+enum Structure { Binary3, Octree, Morton, Linear, Kd, Projection }
 impl Structure {
     fn next(self) -> Self {
         match self {
             Structure::Binary3 => Structure::Octree,
             Structure::Octree => Structure::Morton,
             Structure::Morton => Structure::Linear,
-            Structure::Linear => Structure::Projection,
+            Structure::Linear => Structure::Kd,
+            Structure::Kd => Structure::Projection,
             Structure::Projection => Structure::Binary3,
         }
     }
@@ -262,6 +263,7 @@ impl Structure {
             Structure::Octree => "Octree3 (8-way)",
             Structure::Morton => "MortonGrid3 (Z-order)",
             Structure::Linear => "LinearOctree3 (adaptive Z-order)",
+            Structure::Kd => "KdTree3 (median split)",
             Structure::Projection => "projection (1×2D + z-reject)",
         }
     }
@@ -270,6 +272,7 @@ impl Structure {
             Some("octree") => Structure::Octree,
             Some("morton") => Structure::Morton,
             Some("linear") => Structure::Linear,
+            Some("kd") | Some("kdtree") => Structure::Kd,
             Some("projection") => Structure::Projection,
             _ => Structure::Binary3,
         }
@@ -593,6 +596,7 @@ enum Index {
     Octree { tree: Octree3<C3>, refs: Vec<vectorial_hash::ItemRef> },
     Morton { grid: MortonGrid3<C3> },
     Linear { tree: LinearOctree3<C3> },
+    Kd { tree: KdTree3<C3> },
     Projection { tree: Tree<P2>, refs: Vec<vectorial_hash::ItemRef> },
 }
 
@@ -626,6 +630,12 @@ impl Index {
                 let items = critters.iter().enumerate().map(|(i, c)| C3 { id: i as u32, p: pt3(c) }).collect();
                 Index::Linear { tree: LinearOctree3::<C3>::from_items(wa, ITEM_LIMIT, 12, items) }
             }
+            Structure::Kd => {
+                // Median split: balanced by point COUNT, tight per-node boxes. Static,
+                // so like Morton/Linear its "update" is a cheap full rebuild.
+                let items = critters.iter().enumerate().map(|(i, c)| C3 { id: i as u32, p: pt3(c) }).collect();
+                Index::Kd { tree: KdTree3::<C3>::from_items(ITEM_LIMIT, items) }
+            }
             Structure::Projection => {
                 let mut tree = Tree::<P2>::new(Rect::new(0.0, 0.0, world as f64, world as f64), ITEM_LIMIT);
                 let refs = critters.iter().enumerate()
@@ -642,6 +652,7 @@ impl Index {
             Index::Octree { .. } => Structure::Octree,
             Index::Morton { .. } => Structure::Morton,
             Index::Linear { .. } => Structure::Linear,
+            Index::Kd { .. } => Structure::Kd,
             Index::Projection { .. } => Structure::Projection,
         }
     }
@@ -658,6 +669,7 @@ impl Index {
             }
             Index::Morton { .. } => *self = Index::build(Structure::Morton, world, cell, critters),
             Index::Linear { .. } => *self = Index::build(Structure::Linear, world, cell, critters),
+            Index::Kd { .. } => *self = Index::build(Structure::Kd, world, cell, critters),
             Index::Projection { tree, refs } => {
                 for (i, c) in critters.iter().enumerate() {
                     tree.update_ref(refs[i], |p| { p.p = Point::new(c.pos.x as f64, c.pos.y as f64); p.z = c.pos.z as f64; });
@@ -674,6 +686,7 @@ impl Index {
             Index::Octree { tree, .. } => tree.cull(shape).iter().map(|c| c.id).collect(),
             Index::Morton { grid } => grid.cull(shape).iter().map(|c| c.id).collect(),
             Index::Linear { tree } => tree.cull(shape).iter().map(|c| c.id).collect(),
+            Index::Kd { tree } => tree.cull(shape).iter().map(|c| c.id).collect(),
             Index::Projection { tree, .. } => {
                 let bb = shape.bounding_box();
                 let (cx, cy) = (bb.x + bb.w * 0.5, bb.y + bb.h * 0.5);
@@ -691,6 +704,7 @@ impl Index {
             Index::Octree { tree, .. } => tree.visit_leaves(|l| boxes.push(aabb_box(&l.bbox))),
             Index::Morton { grid } => grid.visit_cells(|b, _| boxes.push(aabb_box(b))),
             Index::Linear { tree } => tree.visit_leaves(|b, _| boxes.push(aabb_box(b))),
+            Index::Kd { tree } => tree.visit_leaves(|b, _| boxes.push(aabb_box(b))),
             Index::Projection { tree, .. } => tree.visit_leaves(|_, l| {
                 let b = l.bbox;
                 let c = vec3((b.x + b.width * 0.5) as f32, (b.y + b.height * 0.5) as f32, world * 0.5);
@@ -705,6 +719,7 @@ impl Index {
             Index::Octree { tree, .. } => format!("Octree3 (8-way, ItemRef): {:>6} leaves, {:>6} arena", tree.leaf_count(), tree.node_count()),
             Index::Morton { grid } => format!("MortonGrid3 (Z-order, rebuilt): {:>6} cells, {:.2} items/cell", grid.cell_count(), grid.item_count() as f64 / grid.cell_count().max(1) as f64),
             Index::Linear { tree } => format!("LinearOctree3 (adaptive, rebuilt): {:>6} leaves, depth {}, {:.2} items/leaf", tree.leaf_count(), tree.depth(), tree.item_count() as f64 / tree.leaf_count().max(1) as f64),
+            Index::Kd { tree } => format!("KdTree3 (median split, rebuilt): {:>6} nodes, depth {} (balanced)", tree.node_count(), tree.depth()),
             Index::Projection { tree, .. } => format!("projection (2D xy ItemRef + z-reject): {:>6} leaves, {:>6} arena", tree.leaf_count(), tree.node_count()),
         }
     }

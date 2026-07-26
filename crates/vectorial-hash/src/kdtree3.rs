@@ -63,6 +63,15 @@ impl<T: Positioned3> KdTree3<T> {
 
     #[inline] pub fn item_count(&self) -> usize { self.items.len() }
     #[inline] pub fn node_count(&self) -> usize { self.nodes.len() }
+    /// Visit every leaf as `(box, item_count)` — for debug / rendering overlays. The
+    /// boxes are **tight** (the median build fits each node to its own points), so
+    /// unlike the midpoint trees' space-partitioning cells they don't tile the world:
+    /// the gaps between them are exactly the empty space the k-d tree refuses to index.
+    pub fn visit_leaves<F: FnMut(&Aabb, usize)>(&self, mut f: F) {
+        for nd in &self.nodes {
+            if let Split::Leaf { len, .. } = nd.split { f(&nd.bbox, len as usize); }
+        }
+    }
     /// Deepest leaf level (0 = a single root leaf) — a k-d tree stays ~balanced.
     pub fn depth(&self) -> u32 { if self.nodes.is_empty() { 0 } else { self.depth_of(self.root) } }
     fn depth_of(&self, id: u32) -> u32 {

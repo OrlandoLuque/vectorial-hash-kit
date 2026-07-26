@@ -472,7 +472,7 @@ thousands of empty cells; the adaptive tree descends straight to the cluster). S
 the pick when the data is **skewed** *and* you **rebuild often** — grid-cheap builds
 without the grid's clustered-kNN cliff. On uniform data or a keep-maintained index,
 `MortonGrid3` / `Tree3`+`ItemRef` remain the calls (see the decision map below).
-It's selectable live in the `critters3d` demo — `M` cycles to it (after Morton),
+It's selectable live in the `critters3d` demo — `M` cycles to it (after Morton, before KdTree3),
 or `CRITTERS3D_STRUCTURE=linear`; the HUD shows its leaf count and adaptive depth,
 `B` draws its (variably-sized) leaf boxes.
 
@@ -497,7 +497,10 @@ tight per-node boxes prune harder than the midpoint trees', so it's a top-tier c
 structure whenever a per-frame rebuild is affordable — it does not win *maintain* (still
 `binary-ref` at 15/16; a rebuild can't beat the O(1) handle). On the *clustered* data of
 `examples/kdtree3_bench` the cull gap over `Tree3` widens to ~2×. Culls **exact** vs all
-six others, every config.
+six others, every config. It's selectable live in `critters3d` too (`M` cycles to it
+after the linear octree, or `CRITTERS3D_STRUCTURE=kd`): the `B` overlay shows its
+**tight** leaf boxes — they don't tile the world like the midpoint trees' cells, the
+gaps are exactly the empty space a median split refuses to index.
 
 ## k-nearest-neighbour (`knn`) — a different query than range cull
 
