@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>stealth — vectorial-hash</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #05070d; color: #cdd2dc;
+      font-family: system-ui, -apple-system, sans-serif; overflow: hidden; }
+    #msg { position: fixed; inset: 0; z-index: 10; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; text-align: center; padding: 2rem; gap: .5rem; }
+    #msg a { color: #7ab8ff; }
+    #msg .small { color: #8b93a3; font-size: .85rem; max-width: 32rem; }
+    canvas { display: block; touch-action: none; }
+  </style>
+</head>
+<body>
+  <div id="msg">
+    <div>Waking the guards…</div>
+    <div class="small">Sneak to the green pad. Each guard's <b>view cone is a real frustum cull</b>
+      (six half-spaces — the wireframe you see <i>is</i> the query volume) and each sight line is a
+      real <b>segment↔solid</b> test against the crates: green rays reach you, red ones are blocked.
+      The HUD races the index against a plain linear scan every frame — use <b>[</b> / <b>]</b> to
+      change the crowd and watch which one wins.</div>
+  </div>
+  <script type="module">
+    import { setupMobileControls } from './mobile-controls.js';
+    const MOBILE_KEYS = [
+      { label: 'Up', code: 'KeyW', key: 'w', keyCode: 87 },
+      { label: 'Down', code: 'KeyS', key: 's', keyCode: 83 },
+      { label: 'Left', code: 'KeyA', key: 'a', keyCode: 65 },
+      { label: 'Right', code: 'KeyD', key: 'd', keyCode: 68 },
+      { label: 'Sight lines', code: 'KeyL', key: 'l', keyCode: 76, cycle: [{ name: 'off' }, { name: 'on' }] },
+      { label: 'Crowd −', code: 'BracketLeft', key: '[', keyCode: 219, cost: 0.15 },
+      { label: 'Crowd +', code: 'BracketRight', key: ']', keyCode: 221, cost: 0.85 },
+      { label: 'Pause', code: 'KeyP', key: 'p', keyCode: 80 },
+      { label: 'Restart', code: 'KeyR', key: 'r', keyCode: 82 },
+    ];
+    const msg = document.getElementById('msg');
+    if (!navigator.gpu) {
+      msg.innerHTML = '<div>This demo needs <b>WebGPU</b>.</div>' +
+        '<div class="small">Open it in a recent <b>Chrome</b> or <b>Edge</b> (or Firefox Nightly with WebGPU enabled). ' +
+        'Meanwhile the other demos on the <a href="./index.html">index</a> run anywhere.</div>';
+    } else {
+      const _requestDevice = GPUAdapter.prototype.requestDevice;
+      GPUAdapter.prototype.requestDevice = function (desc) {
+        if (desc && desc.requiredLimits) {
+          for (const key of Object.keys(desc.requiredLimits)) {
+            if (!(key in this.limits)) delete desc.requiredLimits[key];
+          }
+        }
+        return _requestDevice.call(this, desc);
+      };
+      import('./stealth/stealth_wgpu.js')
+        .then(m => m.default())
+        .then(() => { setTimeout(() => msg.remove(), 1600); setupMobileControls({ title: 'Stealth', keys: MOBILE_KEYS }); })
+        .catch(e => { msg.innerHTML = '<div>Failed to start.</div><div class="small">' + e + '</div>'; console.error(e); });
+    }
+  </script>
+</body>
+</html>
