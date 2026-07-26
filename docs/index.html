@@ -97,6 +97,18 @@
       compute shader). Identical picture, wildly different cost. Needs a <b>WebGPU</b> browser.</span>
       </div>
     </a>
+    <a class="card" href="stealth_wgpu.html">
+      <img class="thumb" src="shots/stealth_wgpu.jpg" alt="Guards with wireframe view frustums and green/red sight lines in a yard of crates" loading="lazy">
+      <div class="body">
+      <span class="tag">wgpu &middot; WebGPU &middot; measured</span>
+      <h2>Stealth &rarr;</h2>
+      <span class="d">Sneak past guards whose <b>view cone is a real frustum cull</b>
+      (<code>Polyhedron3</code>, six half-spaces) and whose <b>line of sight is a real
+      segment&harr;solid test</b> &mdash; capsule broadphase, then exact. Green rays see you,
+      red ones are blocked by a crate. The HUD races the index against a linear scan every
+      frame and tells you which wins. Needs <b>WebGPU</b>.</span>
+      </div>
+    </a>
     <a class="card" href="pointcloud_wgpu.html">
       <img class="thumb" src="shots/pointcloud_wgpu.jpg" alt="A scanned point cloud of terrain and buildings, coloured by local density" loading="lazy">
       <div class="body">
