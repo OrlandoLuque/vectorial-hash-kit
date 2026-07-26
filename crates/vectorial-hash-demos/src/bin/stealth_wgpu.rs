@@ -11,6 +11,7 @@
 //!      target collects the crates *near* that sight line (a cheap broadphase).
 //!   3. **`Polyhedron3::segment_hit`** — the exact segment↔solid test on those few
 //!      crates: `Some(t)` with `t < 1` means the crate blocks the line.
+//!
 //! That is the same broadphase-then-exact shape the GPU visibility bench measures, on
 //! the CPU, driving a game.
 //!
@@ -152,7 +153,7 @@ struct World {
 
 impl World {
     fn new(n_civs: usize) -> World {
-        let mut r = Rng(0x57EA_17u64);
+        let mut r = Rng(0x0057_EA17u64);
         let mut crates = Vec::with_capacity(CRATES);
         for _ in 0..CRATES {
             let (x, z) = (r.r(60.0, WORLD - 60.0), r.r(60.0, WORLD - 60.0));
@@ -417,8 +418,10 @@ async fn run() {
                 let fwd = Vec3::new(-cy2, 0.0, -sy);
                 let right = Vec3::new(sy, 0.0, -cy2);
                 let mut d = Vec3::ZERO;
-                if mv[0] { d += fwd; } if mv[1] { d -= fwd; }
-                if mv[3] { d += right; } if mv[2] { d -= right; }
+                if mv[0] { d += fwd; }
+                if mv[1] { d -= fwd; }
+                if mv[3] { d += right; }
+                if mv[2] { d -= right; }
                 if d.length_squared() > 0.0 && !paused && !w.escaped && w.caught < 1.0 {
                     w.player += d.normalize() * 150.0 * dt;
                     w.player.x = w.player.x.clamp(12.0, WORLD - 12.0);

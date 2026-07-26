@@ -311,7 +311,8 @@ async fn run() {
     let smoke: Option<u64> = std::env::var("CLOUD_MAX_FRAMES").ok().and_then(|s| s.parse().ok());
     let (mut yaw, mut pitch, mut dist) = (0.9f32, 0.55f32, 1500.0f32);
     let (mut drag, mut last_mouse) = (false, (0.0f64, 0.0f64));
-    let (mut probe, mut probe_n, mut probe_us) = (Vec3::new(WORLD * 0.5, 60.0, WORLD * 0.5), 0usize, 0.0f32);
+    let (mut probe, mut probe_us) = (Vec3::new(WORLD * 0.5, 60.0, WORLD * 0.5), 0.0f32);
+    let mut probe_n = 0usize;
     let mut sel: Vec<u32> = Vec::new();
     let (mut fps, mut frame) = (0.0f32, 0u64);
     let mut last = Instant::now();
