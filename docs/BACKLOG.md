@@ -19,15 +19,15 @@ plus parallel batch `cull_many_par`/`knn_many_par` on the linear structures.
 the 2D trees, and the GPU LBVH query already had `gpu_spatial_bench`/`gpu_lbvh_demo` (my
 bench added the fully-resident build+query loop).
 
-**Follow-ups queued (autonomous-safe):**
-- `KdTree3` serialize / raycast / the `Shape3` batch — round out its API (raycast is the
-  same capsule-over-cull one-liner; serialize is the arena; ItemRef is a pointer-tree
-  lever, not applicable to a static tree).
-- Add `KdTree3` (rebuild) to the decision-map sweep (`critters3d_headless`) — the 7th
-  structure, measured vs the others.
-- **Defensive**: `QuadTree::update_ref` (and the other trees') corrupts its handle table
-  if handed an out-of-world point (a boundary point at the half-open max) — it should
-  clamp/guard instead of panicking later. Minor, found via the LinearQuadTree bench.
+**Follow-ups — all DONE (2026-07-26 morning):**
+- ~~`KdTree3` serialize / raycast~~ — landed (`72ec332`).
+- ~~`KdTree3` in the decision-map sweep~~ — landed (`8eb0cb2`); it ties Tree3+ItemRef for
+  the most cull wins (6/16). Also now selectable in the `critters3d` demo (`M`).
+- ~~**Defensive** handle guard~~ — landed, and it was a **real correctness bug**, not just
+  a panic: a freed `ItemRef` (item removed, or dropped for leaving the root) kept naming
+  a live `(node, slot)` that `swap_remove` had refilled, so reusing it silently mutated /
+  removed the WRONG item. Fixed across all five handle-carrying trees with a `DEAD_HANDLE`
+  marker + `live_loc` guard; regression-tested (the test fails without the guard).
 
 ## ★ 2026-07-25 (cooperative night 2) — landed + follow-ups
 
