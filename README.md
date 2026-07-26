@@ -58,6 +58,19 @@ cargo run -p vectorial-hash-demos --bin siege --release
 # siege_wgpu: the same battle rendered with wgpu (modern GPU stack) — real GPU
 # skeletal skinning, to compare with the macroquad version
 cargo run -p vectorial-hash-demos --bin siege_wgpu --release
+
+# fluid: an interactive position-based fluid you STIR with mouse or finger —
+# SPH is the workload an index is for; M races three of them (docs/FLUID.md)
+cargo run -p vectorial-hash-demos --bin fluid_wgpu --release
+
+# point cloud: a big skewed scanned cloud coloured by local density, i.e. one
+# k-NN query per point — where KdTree3 earns its keep (docs/POINTCLOUD.md)
+cargo run -p vectorial-hash-demos --bin pointcloud_wgpu --release
+
+# stealth: sneak past guards whose view cone IS a frustum cull and whose line of
+# sight IS a segment-vs-solid test; the HUD races the index against a linear
+# scan every frame and tells you which wins (docs/STEALTH.md)
+cargo run -p vectorial-hash-demos --bin stealth_wgpu --release
 ```
 
 Live demos (WebAssembly): <https://orlandoluque.github.io/vectorial-hash-kit/>

@@ -4,6 +4,44 @@ Future work queued for review. Nothing here is committed scope — prune,
 reprioritise, or drop freely. Items graduate into the per-crate roadmaps
 (e.g. `crates/vectorial-hash/README.md`) once picked up.
 
+## ★ 2026-07-27 (cooperative night 4) — the three-demo night
+
+**The user's ask:** "haz todas" — build all three proposed demos, make one of them
+interactive (stirrable with mouse or finger), and finish with RustRover run configs.
+All three landed on `main`, published to the site, docs written in-step:
+
+- **`fluid_wgpu`** (interactive) — a 2D **position-based fluid** you stir with the mouse
+  or a touch drag. `M` races three neighbour indexes live with the frame split into
+  maintain / query / physics: the kept `Tree`+`ItemRef` maintains **~3.5× cheaper** than
+  either rebuild, while the adaptive `LinearQuadTree` **wins the query** — its measured
+  niche showing up on a real workload. Query dominates every mode: in SPH the neighbour
+  search *is* the simulation cost. Getting it stable was the work (see FLUID.md: the
+  paper's relaxation ε is unit-dependent; position-based solvers inject energy through
+  `v = (q−p)/dt`). → `docs/FLUID.md`
+- **`pointcloud_wgpu`** — a large static, strongly skewed scanned cloud coloured by local
+  density, i.e. **one k-NN query per point**. `KdTree3` answers k-NN **1.68× faster than
+  the flat grid** and builds **1.7× faster than the midpoint octree**; the grid still wins
+  the build outright. Where the median split earns its keep. → `docs/POINTCLOUD.md`
+- **`stealth_wgpu`** — guards whose **view cone is a real frustum cull** and whose **line
+  of sight is a real segment↔solid test** (capsule broadphase → `segment_hit`). Races the
+  index against a linear scan every frame: **crossover ~1000 agents** — below it a plain
+  loop honestly wins and the HUD says so; at 40k the index is **7.1×**. Exact LoS swamps
+  both at scale, which is the argument for a tight cone. → `docs/STEALTH.md`
+- **RustRover run configs** (the "al final" ask): fluid, point cloud, stealth + benches
+  for KdTree3, the linear structures and the GPU LBVH query.
+
+**Two bugs the self-checks caught (no eyes available):**
+- The point cloud generated points *exactly* on the world maximum / below the floor.
+  `Aabb` is half-open → `Octree3::bulk_load` panicked, `MortonGrid3::insert` silently
+  dropped them. The smoke run now prints the cloud's bounds.
+- Stealth's index and linear scan disagreed on ~77% of frames. The library was innocent
+  (`examples/frustum_check.rs`: 400 frustums × 4000 points, **0 disagreements**) — the
+  demo's wanderers escaped the arena and therefore the index's world box, which
+  `bulk_load` drops while a scan still counts. **An index only knows what it holds.**
+
+**Follow-ups:** impostor/LOD for the point cloud at 1M+; stealth guard AI (investigate a
+lost sighting) if the user wants it to be more of a game; fluid 3D variant.
+
 ## ★ 2026-07-26 (cooperative night 3) — landed + follow-ups
 
 **Landed (all on `main`):** **raycast** for `LinearOctree3` + `LinearQuadTree`
