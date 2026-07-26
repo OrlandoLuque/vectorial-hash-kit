@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>point cloud — vectorial-hash</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #05070d; color: #cdd2dc;
+      font-family: system-ui, -apple-system, sans-serif; overflow: hidden; }
+    #msg { position: fixed; inset: 0; z-index: 10; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; text-align: center; padding: 2rem; gap: .5rem; }
+    #msg a { color: #7ab8ff; }
+    #msg .small { color: #8b93a3; font-size: .85rem; max-width: 32rem; }
+    canvas { display: block; touch-action: none; }
+  </style>
+</head>
+<body>
+  <div id="msg">
+    <div>Scanning the scene…</div>
+    <div class="small">A large <b>static, strongly skewed</b> point cloud — dense on surfaces, empty
+      in between — which is the case a median-split k-d tree is built for. Every point is coloured by
+      its local density, computed with a k-NN query <i>per point</i>; <b>M</b> rebuilds the cloud on a
+      different structure and re-runs the whole pass, so the build and k-NN numbers are measured live
+      (and cross-checked against the previous structure).</div>
+  </div>
+  <script type="module">
+    import { setupMobileControls } from './mobile-controls.js';
+    const MOBILE_KEYS = [
+      { label: 'Structure', code: 'KeyM', key: 'm', keyCode: 77,
+        cycle: [{ name: 'KdTree3', cost: 0.3 }, { name: 'Octree3', cost: 0.4 }, { name: 'Morton', cost: 0.6 }] },
+      { label: 'k', code: 'KeyK', key: 'k', keyCode: 75,
+        cycle: [{ name: '16', cost: 0.4 }, { name: '32', cost: 0.8 }, { name: '8', cost: 0.2 }] },
+      { label: 'Colour', code: 'KeyC', key: 'c', keyCode: 67, cycle: [{ name: 'density' }, { name: 'height' }] },
+      { label: 'Points −', code: 'BracketLeft', key: '[', keyCode: 219, cost: 0.15 },
+      { label: 'Points +', code: 'BracketRight', key: ']', keyCode: 221, cost: 0.85 },
+    ];
+    const msg = document.getElementById('msg');
+    if (!navigator.gpu) {
+      msg.innerHTML = '<div>This demo needs <b>WebGPU</b>.</div>' +
+        '<div class="small">Open it in a recent <b>Chrome</b> or <b>Edge</b> (or Firefox Nightly with WebGPU enabled). ' +
+        'Meanwhile the other demos on the <a href="./index.html">index</a> run anywhere.</div>';
+    } else {
+      const _requestDevice = GPUAdapter.prototype.requestDevice;
+      GPUAdapter.prototype.requestDevice = function (desc) {
+        if (desc && desc.requiredLimits) {
+          for (const key of Object.keys(desc.requiredLimits)) {
+            if (!(key in this.limits)) delete desc.requiredLimits[key];
+          }
+        }
+        return _requestDevice.call(this, desc);
+      };
+      import('./pointcloud/pointcloud_wgpu.js')
+        .then(m => m.default())
+        .then(() => { setTimeout(() => msg.remove(), 1600); setupMobileControls({ title: 'Point cloud', keys: MOBILE_KEYS }); })
+        .catch(e => { msg.innerHTML = '<div>Failed to start.</div><div class="small">' + e + '</div>'; console.error(e); });
+    }
+  </script>
+</body>
+</html>
