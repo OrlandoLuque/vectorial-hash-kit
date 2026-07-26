@@ -37,13 +37,14 @@ fn main() {
     let tree = Tree3::bulk_load(world, 8, pts.clone());
 
     let (mut bad_cases, mut miss, mut extra, mut checked) = (0u32, 0u32, 0u32, 0u32);
+    let (mut hits, mut empty) = (0u32, 0u32);
     let mut worst: Option<(u32, f64, [f64; 3])> = None;
     for _ in 0..400 {
         let eye = [r.r(60.0, 840.0), 9.0, r.r(60.0, 840.0)];
         let k = cone(eye, r.r(-3.2, 3.2), 6.0, 300.0, 1.15);
         let got: std::collections::HashSet<u32> = tree.cull(&k).iter().map(|p| p.id).collect();
         let want: std::collections::HashSet<u32> = pts.iter().filter(|p| k.contains_point(p.p)).map(|p| p.id).collect();
-        checked += 1;
+        checked += 1; hits += want.len() as u32; if want.is_empty() { empty += 1; }
         if got != want {
             bad_cases += 1;
             miss += want.difference(&got).count() as u32;
@@ -62,6 +63,7 @@ fn main() {
             }
         }
     }
+    println!("frustum_check: {} points found across the cones ({} cones found nothing) - a vacuous test would report 0", hits, empty);
     println!("frustum_check: {} cones, {} disagreed — {} points missed by cull, {} extra", checked, bad_cases, miss, extra);
     if let Some((id, d, p)) = worst { println!("first miss: id {} at {:?}, {:.3} units inside", id, p, d); }
 }

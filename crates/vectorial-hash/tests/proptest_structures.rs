@@ -16,7 +16,8 @@
 use proptest::prelude::*;
 use vectorial_hash::{
     Aabb, IPoint, IPositioned, IRect, IntegerTree, Octree3, Point, Point3, Positioned,
-    Positioned3, QuadTree, Rect, Shape, Sphere3, Tree, Tree3, ItemRef, MortonGrid, MortonGrid3,
+    Positioned3, QuadTree, Rect, Shape, Shape3, Sphere3, Tree, Tree3, ItemRef, MortonGrid, MortonGrid3,
+    KdTree3, LinearOctree3, LinearQuadTree, Polyhedron3,
 };
 
 const W: f64 = 256.0;
@@ -228,6 +229,122 @@ proptest! {
                 prop_assert_eq!(got.len(), brute.len(), "knn count k={}", k);
                 for (a, b) in got.iter().zip(brute.iter()) { prop_assert!((a - b).abs() <= 1e-6 * (1.0 + b), "knn dist {} != brute {}", a, b); }
             }
+        }
+    }
+}
+
+// ============ build-once structures: KdTree3 / LinearOctree3 / LinearQuadTree ============
+// These three have no handle/remove surface, so — like the Morton grids — they're fuzzed
+// over a random point set. Beyond cull/knn-vs-brute they get two properties the trees
+// can't have: the incremental `insert` path must land in the same place as the bulk
+// `from_items` build, and (3D) a **frustum** cull must agree with brute force, which is
+// the query verb the stealth demo leans on.
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    #[test]
+    fn kdtree3_cull_knn_match_brute(pts in pts(), cap in 1usize..24) {
+        let live: Vec<Point3> = pts.iter().map(|&(x, y, z)| Point3::new(x, y, z)).collect();
+        let t = KdTree3::from_items(cap, live.iter().map(|&p| M3 { p }).collect());
+        prop_assert_eq!(t.item_count(), live.len());
+        for (cx, cy, cz, rr) in SPHERES {
+            let s = Sphere3::new(cx, cy, cz, rr);
+            let mut want: Vec<(u64, u64, u64)> = live.iter().filter(|p| { let (dx, dy, dz) = (p.x - cx, p.y - cy, p.z - cz); dx * dx + dy * dy + dz * dz <= rr * rr }).map(|p| (p.x.to_bits(), p.y.to_bits(), p.z.to_bits())).collect();
+            let mut got: Vec<(u64, u64, u64)> = t.cull(&s).iter().map(|m| (m.p.x.to_bits(), m.p.y.to_bits(), m.p.z.to_bits())).collect();
+            want.sort(); got.sort();
+            prop_assert_eq!(want, got, "kdtree3 cull != brute ({},{},{}) r={}", cx, cy, cz, rr);
+        }
+        for k in KS {
+            let qp = Point3::new(120.0, 120.0, 120.0);
+            let mut brute: Vec<f64> = live.iter().map(|p| { let (dx, dy, dz) = (p.x - qp.x, p.y - qp.y, p.z - qp.z); dx * dx + dy * dy + dz * dz }).collect();
+            brute.sort_by(|a, b| a.total_cmp(b)); brute.truncate(k);
+            let got: Vec<f64> = t.knn(qp, k).iter().map(|(d, _)| d * d).collect();
+            prop_assert_eq!(got.len(), brute.len(), "kdtree3 knn count k={}", k);
+            for (a, b) in got.iter().zip(brute.iter()) { prop_assert!((a - b).abs() <= 1e-6 * (1.0 + b), "kdtree3 knn dist {} != brute {}", a, b); }
+        }
+    }
+
+    /// A frustum (six half-spaces) over the adaptive 3D structures — the verb the stealth
+    /// demo's view cones use, fuzzed against `contains_point` on every item.
+    #[test]
+    fn frustum_cull_matches_brute(pts in pts(), fx in 0.0..W, fz in 0.0..W, ang in -3.2..3.2f64) {
+        let live: Vec<Point3> = pts.iter().map(|&(x, y, z)| Point3::new(x, y, z)).collect();
+        let (s, c) = (ang.sin(), ang.cos());
+        let quad = |dist: f64, half: f64, vh: f64| {
+            let ctr = (fx + c * dist, 110.0, fz + s * dist);
+            [Point3::new(ctr.0 + s * half, ctr.1 - vh, ctr.2 - c * half), Point3::new(ctr.0 - s * half, ctr.1 - vh, ctr.2 + c * half),
+             Point3::new(ctr.0 - s * half, ctr.1 + vh, ctr.2 + c * half), Point3::new(ctr.0 + s * half, ctr.1 + vh, ctr.2 - c * half)]
+        };
+        let (n, f) = (quad(4.0, 8.0, 12.0), quad(210.0, 110.0, 95.0));
+        let cone = Polyhedron3::from_corners([n[0], n[1], n[2], n[3], f[0], f[1], f[2], f[3]]);
+        let mut want: Vec<(u64, u64, u64)> = live.iter().filter(|p| cone.contains_point(**p)).map(|p| (p.x.to_bits(), p.y.to_bits(), p.z.to_bits())).collect();
+        want.sort();
+        let world = Aabb::new(0.0, 0.0, 0.0, W, W, W);
+        let kd = KdTree3::from_items(8, live.iter().map(|&p| M3 { p }).collect());
+        let lo = LinearOctree3::from_items(world, 8, 6, live.iter().map(|&p| M3 { p }).collect());
+        let t3 = Tree3::bulk_load(world, 8, live.iter().map(|&p| M3 { p }).collect());
+        for (label, mut got) in [
+            ("kdtree3", kd.cull(&cone).iter().map(|m| (m.p.x.to_bits(), m.p.y.to_bits(), m.p.z.to_bits())).collect::<Vec<_>>()),
+            ("linear_octree3", lo.cull(&cone).iter().map(|m| (m.p.x.to_bits(), m.p.y.to_bits(), m.p.z.to_bits())).collect::<Vec<_>>()),
+            ("tree3", t3.cull(&cone).iter().map(|m| (m.p.x.to_bits(), m.p.y.to_bits(), m.p.z.to_bits())).collect::<Vec<_>>()),
+        ] {
+            got.sort();
+            prop_assert_eq!(&want, &got, "{} frustum cull != brute at ({}, {}) ang {}", label, fx, fz, ang);
+        }
+    }
+
+    #[test]
+    fn linear_octree3_cull_knn_match_brute(pts in pts(), depth in 2u8..8) {
+        let live: Vec<Point3> = pts.iter().map(|&(x, y, z)| Point3::new(x, y, z)).collect();
+        let world = Aabb::new(0.0, 0.0, 0.0, W, W, W);
+        let t = LinearOctree3::from_items(world, 8, depth, live.iter().map(|&p| M3 { p }).collect());
+        prop_assert_eq!(t.item_count(), live.len());
+        // the incremental path must land in the same place as the bulk build
+        let mut inc = LinearOctree3::<M3>::new(world, 8, depth);
+        for &p in &live { inc.insert(M3 { p }); }
+        for (cx, cy, cz, rr) in SPHERES {
+            let s = Sphere3::new(cx, cy, cz, rr);
+            let mut want: Vec<(u64, u64, u64)> = live.iter().filter(|p| { let (dx, dy, dz) = (p.x - cx, p.y - cy, p.z - cz); dx * dx + dy * dy + dz * dz <= rr * rr }).map(|p| (p.x.to_bits(), p.y.to_bits(), p.z.to_bits())).collect();
+            let mut got: Vec<(u64, u64, u64)> = t.cull(&s).iter().map(|m| (m.p.x.to_bits(), m.p.y.to_bits(), m.p.z.to_bits())).collect();
+            let mut gi: Vec<(u64, u64, u64)> = inc.cull(&s).iter().map(|m| (m.p.x.to_bits(), m.p.y.to_bits(), m.p.z.to_bits())).collect();
+            want.sort(); got.sort(); gi.sort();
+            prop_assert_eq!(&want, &got, "linear_octree3 cull != brute ({},{},{}) r={}", cx, cy, cz, rr);
+            prop_assert_eq!(&got, &gi, "linear_octree3 insert path != from_items");
+        }
+        for k in KS {
+            let qp = Point3::new(30.0, 200.0, 60.0);
+            let mut brute: Vec<f64> = live.iter().map(|p| { let (dx, dy, dz) = (p.x - qp.x, p.y - qp.y, p.z - qp.z); dx * dx + dy * dy + dz * dz }).collect();
+            brute.sort_by(|a, b| a.total_cmp(b)); brute.truncate(k);
+            let got: Vec<f64> = t.knn(qp, k).iter().map(|(d, _)| d * d).collect();
+            prop_assert_eq!(got.len(), brute.len(), "linear_octree3 knn count k={}", k);
+            for (a, b) in got.iter().zip(brute.iter()) { prop_assert!((a - b).abs() <= 1e-6 * (1.0 + b), "linear_octree3 knn dist {} != brute {}", a, b); }
+        }
+    }
+
+    #[test]
+    fn linear_quadtree_cull_knn_match_brute(pts in pts(), depth in 2u8..9) {
+        let live: Vec<Point> = pts.iter().map(|&(x, y, _)| Point::new(x, y)).collect();
+        let world = Rect::new(0.0, 0.0, W, W);
+        let t = LinearQuadTree::from_items(world, 8, depth, live.iter().map(|&p| M2 { p }).collect());
+        prop_assert_eq!(t.item_count(), live.len());
+        let mut inc = LinearQuadTree::<M2>::new(world, 8, depth);
+        for &p in &live { inc.insert(M2 { p }); }
+        for (cx, cy, rr) in DISCS {
+            let s = Disc { cx, cy, r: rr };
+            let mut want: Vec<(u64, u64)> = live.iter().filter(|p| { let (dx, dy) = (p.x - cx, p.y - cy); dx * dx + dy * dy <= rr * rr }).map(|p| (p.x.to_bits(), p.y.to_bits())).collect();
+            let mut got: Vec<(u64, u64)> = t.cull(&s).iter().map(|m| (m.p.x.to_bits(), m.p.y.to_bits())).collect();
+            let mut gi: Vec<(u64, u64)> = inc.cull(&s).iter().map(|m| (m.p.x.to_bits(), m.p.y.to_bits())).collect();
+            want.sort(); got.sort(); gi.sort();
+            prop_assert_eq!(&want, &got, "linear_quadtree cull != brute ({},{}) r={}", cx, cy, rr);
+            prop_assert_eq!(&got, &gi, "linear_quadtree insert path != from_items");
+        }
+        for k in KS {
+            let qp = Point::new(120.0, 120.0);
+            let mut brute: Vec<f64> = live.iter().map(|p| { let (dx, dy) = (p.x - qp.x, p.y - qp.y); dx * dx + dy * dy }).collect();
+            brute.sort_by(|a, b| a.total_cmp(b)); brute.truncate(k);
+            let got: Vec<f64> = t.knn(qp, k).iter().map(|(d, _)| d * d).collect();
+            prop_assert_eq!(got.len(), brute.len(), "linear_quadtree knn count k={}", k);
+            for (a, b) in got.iter().zip(brute.iter()) { prop_assert!((a - b).abs() <= 1e-6 * (1.0 + b), "linear_quadtree knn dist {} != brute {}", a, b); }
         }
     }
 }
