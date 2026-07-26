@@ -97,6 +97,18 @@
       compute shader). Identical picture, wildly different cost. Needs a <b>WebGPU</b> browser.</span>
       </div>
     </a>
+    <a class="card" href="fluid_wgpu.html">
+      <img class="thumb" src="shots/fluid_wgpu.jpg" alt="A 2D fluid of thousands of droplets settling in a tank, with per-phase timing bars" loading="lazy">
+      <div class="body">
+      <span class="tag">wgpu &middot; WebGPU &middot; interactive</span>
+      <h2>Fluid (SPH) &rarr;</h2>
+      <span class="d"><b>Drag with the mouse or a finger to stir it.</b> A position-based fluid whose
+      neighbour search runs through the kit &mdash; the archetypal index workload (every particle wants the
+      ones inside its kernel radius, every step, and a fluid is as clustered as data gets).
+      <b>M</b> switches the index live (Morton grid &harr; kept tree &harr; linear quadtree) and the bars
+      show where the frame goes: maintain vs query vs physics. Needs a <b>WebGPU</b> browser.</span>
+      </div>
+    </a>
     <a class="card" href="gpu_storm.html">
       <img class="thumb" src="shots/gpu_storm.jpg" alt="A GPU-resident collision storm of particles coloured by density" loading="lazy">
       <div class="body">

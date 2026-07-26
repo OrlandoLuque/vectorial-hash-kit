@@ -12,8 +12,9 @@
 //! and the HUD bars break the frame into *maintain* (build/relocate) vs *query*
 //! (the neighbour culls) vs *physics*, so the trade-off is visible rather than asserted.
 //!
-//! Physics: the classic Müller et al. 2003 formulation (poly6 density, spiky pressure
-//! gradient, viscosity laplacian) with the widely-used 2D parameterisation.
+//! Physics: **Position Based Fluids** (Macklin & Müller 2013) — density constraints
+//! solved iteratively, which stays stable at dt = 1/60 where the classic Müller-2003
+//! equation-of-state formulation needs a sub-millisecond step.
 //!
 //! Controls: **hold left mouse / drag a finger** to stir · `M` index · `[` `]` particles
 //! · `P` pause · `R` reset · `G` gravity flip.
@@ -262,10 +263,15 @@ impl Fluid {
         rho.max(1e-6)
     }
 
+    /// Keep a particle in the tank. The stand-off is jittered per particle: clamping
+    /// everything to exactly EPS lines them up in a one-particle-wide column welded to
+    /// the wall (visible in the first screenshot), and the density solver then pushes
+    /// that column along the wall. A sub-particle spread breaks the alignment.
     #[inline]
-    fn clamp_box(x: &mut f32, y: &mut f32) {
-        *x = x.clamp(EPS, WW - EPS);
-        *y = y.clamp(EPS, WH - EPS);
+    fn clamp_box(i: usize, x: &mut f32, y: &mut f32) {
+        let j = (i % 5) as f32 * 0.55;
+        *x = x.clamp(EPS + j, WW - EPS - j);
+        *y = y.clamp(EPS + j, WH - EPS - j);
     }
 
     /// One PBF step. Returns (maintain us, query us, physics us) so the HUD can show
@@ -277,7 +283,7 @@ impl Fluid {
         for i in 0..n {
             self.vy[i] += DT * self.grav;
             let (mut qx, mut qy) = (self.px[i] + DT * self.vx[i], self.py[i] + DT * self.vy[i]);
-            Self::clamp_box(&mut qx, &mut qy);
+            Self::clamp_box(i, &mut qx, &mut qy);
             self.qx[i] = qx; self.qy[i] = qy;
         }
 
@@ -351,7 +357,7 @@ impl Fluid {
                 self.qx[i] += cx;
                 self.qy[i] += cy;
                 let (mut x, mut y) = (self.qx[i], self.qy[i]);
-                Self::clamp_box(&mut x, &mut y);
+                Self::clamp_box(i, &mut x, &mut y);
                 self.qx[i] = x; self.qy[i] = y;
             }
         }
@@ -401,6 +407,7 @@ impl Fluid {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() { pollster::block_on(run()); }
 
 #[cfg(target_arch = "wasm32")]
@@ -409,7 +416,7 @@ pub fn start() { console_error_panic_hook::set_once(); wasm_bindgen_futures::spa
 
 async fn run() {
     let event_loop = EventLoop::new().unwrap();
-    let window = Arc::new(WindowBuilder::new().with_title("vectorial-hash — fluid (SPH)").with_inner_size(winit::dpi::LogicalSize::new(1300, 900)).build(&event_loop).unwrap());
+    let window = Arc::new(WindowBuilder::new().with_title("vectorial-hash fluid SPH").with_inner_size(winit::dpi::LogicalSize::new(1300, 900)).build(&event_loop).unwrap());
     #[cfg(target_arch = "wasm32")]
     {
         use winit::platform::web::WindowExtWebSys;
@@ -552,17 +559,22 @@ async fn run() {
                     let tp = 3.0 * dpr.clamp(1.0, 3.0);
                     let mut ui: Vec<UiVertex> = Vec::new();
                     let pad = 6.0 * tp;
-                    push_quad(&mut ui, pad, pad, 118.0 * tp, 46.0 * tp, [0.03, 0.06, 0.12, 0.62], cw, ch);
+                    // Panel rows: title, hint, then one (label + bar) block per phase.
+                    // Each block owns 11*tp so the label never lands on the bar above.
+                    let (row, bar_h, bar_w) = (11.0 * tp, 4.0 * tp, 100.0 * tp);
+                    let y0 = pad + 16.0 * tp;
+                    push_quad(&mut ui, pad, pad, 110.0 * tp, y0 - pad + 3.0 * row, [0.03, 0.06, 0.12, 0.62], cw, ch);
+                    push_text(&mut ui, pad + 3.0 * tp, pad + 2.0 * tp, tp, [1.0, 1.0, 1.0, 1.0], &format!("{} {:.0}FPS", kind.label(), fps), cw, ch);
+                    push_text(&mut ui, pad + 3.0 * tp, pad + 9.0 * tp, tp * 0.8, [0.72, 0.80, 0.95, 0.9], &format!("{} DROPS - DRAG TO STIR - M INDEX", fluid.n()), cw, ch);
                     let total = (maint_us + query_us + phys_us).max(1.0);
                     let bars = [([0.40, 0.70, 1.0, 0.95], maint_us, "MAINTAIN"), ([1.0, 0.72, 0.30, 0.95], query_us, "QUERY"), ([0.45, 0.95, 0.55, 0.95], phys_us, "PHYSICS")];
                     for (i, (col, us, label)) in bars.iter().enumerate() {
-                        let y = pad + (10.0 + i as f32 * 8.0) * tp;
-                        push_quad(&mut ui, pad + 2.0 * tp, y, 100.0 * tp, 5.0 * tp, [0.13, 0.15, 0.22, 0.85], cw, ch);
-                        push_quad(&mut ui, pad + 2.0 * tp, y, 100.0 * tp * (us / total), 5.0 * tp, *col, cw, ch);
-                        push_text(&mut ui, pad + 2.0 * tp, y - 5.5 * tp, tp * 0.85, [0.85, 0.9, 1.0, 0.95], &format!("{label} {:.2}MS", us / 1000.0), cw, ch);
+                        let ty = y0 + i as f32 * row;
+                        push_text(&mut ui, pad + 3.0 * tp, ty, tp * 0.8, [0.85, 0.9, 1.0, 0.95], &format!("{label} {:.2}MS", us / 1000.0), cw, ch);
+                        let by = ty + 5.0 * tp;
+                        push_quad(&mut ui, pad + 3.0 * tp, by, bar_w, bar_h, [0.13, 0.15, 0.22, 0.85], cw, ch);
+                        push_quad(&mut ui, pad + 3.0 * tp, by, bar_w * (us / total), bar_h, *col, cw, ch);
                     }
-                    push_text(&mut ui, pad + 2.0 * tp, pad + 2.0 * tp, tp, [1.0, 1.0, 1.0, 1.0], &format!("{} - {} DROPS - {:.0} FPS", kind.label(), fluid.n(), fps), cw, ch);
-                    push_text(&mut ui, pad + 2.0 * tp, pad + 38.0 * tp, tp * 0.85, [0.75, 0.82, 0.95, 0.9], "DRAG TO STIR - M INDEX - P PAUSE - R RESET - G GRAVITY", cw, ch);
                     queue.write_buffer(&ui_buf, 0, bytemuck::cast_slice(&ui));
                     let ui_count = ui.len() as u32;
 
