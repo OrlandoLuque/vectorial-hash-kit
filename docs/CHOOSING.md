@@ -1,85 +1,126 @@
 # Choosing a structure
 
-`vectorial-hash` ships six spatial indexes. They all answer the same two
-queries — `cull` (everything inside a shape) and `knn` (k nearest neighbours) —
-so picking one is about *your data and access pattern*, not features. This is
-the one-glance guide; the quantitative backing is the decision map in
-[`THREE_D.md`](THREE_D.md) and the parallelism crossover in
-[`PARALLEL.md`](PARALLEL.md).
+`vectorial-hash` ships **ten** spatial indexes. They all answer the same two queries —
+`cull` (everything inside a shape) and `knn` (k nearest neighbours) — so picking one is
+about *your data and access pattern*, not features. This is the one-glance guide; the
+quantitative backing is the decision map in [`THREE_D.md`](THREE_D.md), the parallelism
+crossovers in [`PARALLEL.md`](PARALLEL.md), and the demo write-ups
+([`FLUID.md`](FLUID.md), [`POINTCLOUD.md`](POINTCLOUD.md), [`STEALTH.md`](STEALTH.md))
+where each one is measured on a real workload rather than a synthetic one.
+
+## The first question is not "which tree"
+
+**Do the points move?** That splits the whole family in two, and it matters more than any
+other property:
+
+- **They move every tick (a simulation).** You want a structure you can *maintain*:
+  `Tree` / `QuadTree` / `IntegerTree` / `Tree3` / `Octree3`, held across frames with the
+  `ItemRef` handle (`insert_ref` → `update_ref`, O(1) relocation). Measured on the siege
+  demo, keeping the index beats a per-frame rebuild ~1.06× (1 thread) → ~1.4× (12–16),
+  and it needs no threads at all.
+- **They're static, or you rebuild wholesale anyway.** Then maintenance is worth nothing
+  and *build + query* is the whole cost: `KdTree3`, `LinearOctree3`, `LinearQuadTree`,
+  `MortonGrid` / `MortonGrid3`. These have no handle or remove surface by design.
+
+**Second question: is the density even?** Uniform data suits a flat grid (Morton) —
+nothing to adapt to. Skewed data (points on surfaces, crowds, clusters in empty space) is
+where the adaptive structures earn their keep, and where the *median* split (`KdTree3`)
+beats the *midpoint* splits.
 
 ## Flowchart
 
 ```
-                          ┌─────────────────────────────┐
-                          │  2D or 3D?                  │
-                          └──────────────┬──────────────┘
-              2D ─────────────────────────┴───────────────────────── 3D
-               │                                                       │
-   ┌───────────┴────────────┐                          ┌──────────────┴───────────────┐
-   │ integer coordinates    │                          │ do points relocate every     │
-   │ (pixels / a grid)?     │                          │ frame (a live simulation)?   │
-   └───────┬────────────┬───┘                          └───────┬───────────────┬──────┘
-        yes│            │no                                 yes│               │no (mostly static,
-           │            │                                      │               │     query-heavy)
-   ┌───────┴──────┐  ┌──┴────────────────────┐        ┌────────┴─────────┐  ┌──┴───────────────────┐
-   │ IntegerTree  │  │ uniform density and   │        │ keep a handle    │  │ density very uneven? │
-   │ (i32, exact, │  │ you like simple 4-way │        │ per item →       │  └───┬──────────────┬───┘
-   │  no float    │  │ recursion?            │        │ Tree3 +          │   yes│              │no
-   │  fuzz)       │  └────┬─────────────┬────┘        │ insert_ref/      │  ┌───┴────────┐  ┌──┴─────────┐
-   └──────────────┘    yes│             │no           │ update_ref       │  │ Tree3 or   │  │ MortonGrid3│
-                    ┌─────┴─────┐  ┌────┴──────┐      │ (O(1) relocate,  │  │ Octree3    │  │ (flat grid:│
-                    │ QuadTree  │  │ Tree (2D, │      │ ~5–10× the       │  │ (adaptive  │  │ cheapest   │
-                    │ (4-way,   │  │ binary    │      │ predicate path)  │  │ leaf size) │  │ build+cull │
-                    │ uniform)  │  │ split —   │      └──────────────────┘  └────────────┘  │ when dense │
-                    └───────────┘  │ the       │                                            │ & uniform) │
-                                   │ default)  │                                            └────────────┘
-                                   └───────────┘
+                        ┌──────────────────────────────────┐
+                        │ Do the points MOVE every tick?   │
+                        └──────────────┬───────────────────┘
+             yes (simulation) ─────────┴───────── no (static / rebuilt wholesale)
+                      │                                        │
+   ┌──────────────────┴──────────────┐        ┌────────────────┴─────────────────┐
+   │ 2D or 3D?                       │        │ density even, or skewed?         │
+   └──────┬───────────────────┬──────┘        └──────┬────────────────────┬──────┘
+        2D│                   │3D                even│                    │skewed
+   ┌──────┴─────────┐   ┌─────┴──────────┐    ┌──────┴───────┐   ┌────────┴─────────┐
+   │ integer coords?│   │ Tree3 + ItemRef│    │ MortonGrid3  │   │ KdTree3 (median  │
+   │ yes→IntegerTree│   │ (the default)  │    │ / MortonGrid │   │ split: balanced  │
+   │ no →Tree       │   │ Octree3 if the │    │ (cheapest    │   │ whatever the     │
+   │    (QuadTree   │   │ density varies │    │  build+cull  │   │ clumping)        │
+   │     if uniform)│   │ a lot locally  │    │  when dense  │   │ …or LinearOctree3│
+   └────────────────┘   └────────────────┘    │  & uniform)  │   │ /LinearQuadTree  │
+                                              └──────────────┘   │ if you rebuild   │
+                                                                 │ far more often   │
+                                                                 │ than you query   │
+                                                                 └──────────────────┘
 ```
 
-Two cross-cutting choices that sit on top of the above:
+Three cross-cutting choices that sit on top of the above:
 
-- **Points that live on a plane (e.g. a heightfield, units on terrain)?** A 3D
-  query can be answered by a **2D `Tree` on xy + a z-slab reject + exact 3D
-  narrowphase** (the "projection" path in the demo). Wins when the z-extent is
-  thin relative to xy. See the decision map.
-- **Many independent queries at once** (one cull per attacker, a batch of
-  frustums)? Use `cull_many` / `cull_many_par` (feature `parallel`). The
-  crossover — when threads pay — is in [`PARALLEL.md`](PARALLEL.md).
+- **Points that live on a plane** (a heightfield, units on terrain)? A 3D query can be
+  answered by a **2D `Tree` on xy + a z-slab reject + exact 3D narrowphase** (the
+  "projection" path). Wins when the z-extent is thin relative to xy.
+- **Many independent queries at once** (one cull per attacker, a batch of frustums)?
+  `cull_many` / `cull_many_par` (feature `parallel`). The crossover is in
+  [`PARALLEL.md`](PARALLEL.md).
+- **Building once, with cores to spare?** `Tree3::bulk_load_par` and
+  `KdTree3::from_items_par`. The k-d tree recovers the most from threads (**3.3× on 16**
+  vs the binary tree's 1.7–2.0×) because a median split hands each fork exactly half the
+  points; a midpoint split can hand one side almost everything.
 
 ## Summary table
 
-| Structure | Dim | Best when | Build | Cull | Relocate |
+| Structure | Dim | Points move? | Best when | Build | Query |
 | --- | --- | --- | --- | --- | --- |
-| **`Tree`** | 2D | general-purpose 2D, the default | adaptive | 14–16× brute | `update` / `update_ref` |
-| **`QuadTree`** | 2D | uniform density, simple 4-way | adaptive | similar to `Tree` | same |
-| **`IntegerTree`** | 2D | integer coords, no float fuzz | adaptive | similar | same |
-| **`Tree3`** | 3D | dynamic 3D, the 3D default | adaptive | strong | **`update_ref` O(1)** |
-| **`Octree3`** | 3D | 3D with locally varying density | adaptive (8-way) | strong | `update` / `update_ref` |
-| **`MortonGrid3`** | 3D | dense + uniform, rebuilt per frame | **cheapest** | **cheapest** | rebuild (flat) |
+| **`Tree`** | 2D | yes | general-purpose 2D, the default | adaptive | 14–16× brute |
+| **`QuadTree`** | 2D | yes | uniform density, simple 4-way | adaptive | ≈ `Tree` |
+| **`IntegerTree`** | 2D | yes | integer coords, no float fuzz | adaptive | ≈ `Tree` |
+| **`Tree3`** | 3D | yes | dynamic 3D, the 3D default | adaptive | strong; **`update_ref` O(1)** |
+| **`Octree3`** | 3D | yes | 3D with locally varying density | adaptive (8-way) | strong |
+| **`MortonGrid`** | 2D | rebuild | dense + uniform 2D, refilled each frame | **cheapest** | **cheapest** when uniform |
+| **`MortonGrid3`** | 3D | rebuild | dense + uniform 3D, refilled each frame | **cheapest** | cheap; loses on skew |
+| **`KdTree3`** | 3D | static | **skewed/clustered, query-heavy** | median select (**3.3× on 16 threads**) | **best cull + k-NN on clusters** |
+| **`LinearOctree3`** | 3D | static | skewed data you **rebuild often** | ~2.1× faster than `Octree3` | loses cull ~1.3× to `Octree3` |
+| **`LinearQuadTree`** | 2D | static | skewed 2D you rebuild often | fast | **won the fluid's neighbour query** |
+
+The three headline measurements behind the right-hand column:
+
+- **Point cloud** (150k static points, k-NN per point): `KdTree3` is **1.68×** the flat
+  grid and 1.12× the pointer octree on k-NN, and builds 1.7× faster than `Octree3` — but
+  `MortonGrid3` still builds fastest of all. → [`POINTCLOUD.md`](POINTCLOUD.md)
+- **Fluid** (every particle relocates every step): kept `Tree`+`ItemRef` maintains ~3.5×
+  cheaper than either rebuild, while `LinearQuadTree` **wins the neighbour query** on the
+  same data. → [`FLUID.md`](FLUID.md)
+- **Stealth** (frustum culls per guard): an index only beats a linear scan **above ~1000
+  agents** — 7.1× by 40 000, but honestly *slower* at 40. → [`STEALTH.md`](STEALTH.md)
 
 ## Rules of thumb
 
-- **Start with `Tree` (2D) or `Tree3` (3D).** They adapt leaf size to local
-  density and carry the full dynamic contract. Only move off the default for a
-  concrete reason below.
-- **Relocating everything every frame?** Hold the `ItemRef` that `insert_ref`
-  returns and call `update_ref` — it skips the predicate's leaf scan and is the
-  single biggest maintain win (the decision map flipped on it). One extra field
-  per entity; see [`THREE_D.md`](THREE_D.md) § "The fix: Stable ItemRef".
-- **Rebuilding from scratch each frame** (no persistent handles, uniform dense
-  field)? `MortonGrid3` has the cheapest build and cull — there's nothing to
-  maintain, you just refill it.
-- **Integer world (tiles, pixels)?** `IntegerTree` avoids float boundary
-  fuzz entirely.
-- **`item_limit`** is the main tuning knob: smaller = deeper tree, fewer
-  per-leaf tests, more nodes; larger = shallower, more brute per leaf. 8–16 is a
-  good default; profile with the Criterion suite / regression gate
-  (`benches/README.md`) if it matters.
-- **Measure your workload.** The decision maps rank the structures head-to-head
-  on a moving-points sim: `examples/decision2d.rs` (2D: binary / quad / morton)
-  and `critters3d_headless --sweep` (3D). Rough 2D read: **QuadTree** is the
-  all-rounder; **MortonGrid** (rebuilt each frame) wins **dense + high-churn**
-  scenes where the trees' `update` split/merge churn dominates.
-- **Don't reach for threads first.** Reads parallelise (`cull_many_par`),
-  writes don't — the lever for write-heavy loops is `update_ref` + the right
-  structure, not rayon. See [`PARALLEL.md`](PARALLEL.md).
+- **Start with `Tree` (2D) or `Tree3` (3D).** They adapt leaf size to local density and
+  carry the full dynamic contract. Only move off the default for a concrete reason below.
+- **Check whether you need an index at all.** Below ~500–1000 items a contiguous scan
+  wins — no descent, no allocation, perfect cache behaviour. The kit says so out loud:
+  `advisor::BRUTE_FORCE_MAX`, the `formations` regiment level, and the stealth HUD all
+  report the scan winning at small N. Don't index 40 guards.
+- **Relocating everything every frame?** Hold the `ItemRef` that `insert_ref` returns and
+  call `update_ref` — it skips the predicate's leaf scan and is the single biggest
+  maintain win (the decision map flipped on it). One extra field per entity.
+- **Rebuilding from scratch each frame** (no persistent handles, uniform dense field)?
+  `MortonGrid3` has the cheapest build and cull — there's nothing to maintain, you refill
+  it. If the field is *skewed* rather than uniform, try `LinearOctree3` /
+  `LinearQuadTree`: same rebuild-friendly shape, adaptive where the points actually are.
+- **Static and query-heavy, especially clustered?** `KdTree3`. The median split keeps
+  depth at ~log₂(n/leaf) however the points clump, and its tight per-node boxes prune
+  harder. It's also the structure that gains most from a parallel build.
+- **Integer world (tiles, pixels)?** `IntegerTree` avoids float boundary fuzz entirely.
+- **`item_limit` / `capacity`** is the main tuning knob: smaller = deeper tree, fewer
+  per-leaf tests, more nodes; larger = shallower, more brute per leaf. 8–16 is a good
+  default; profile with the Criterion suite / regression gate (`benches/README.md`).
+- **Measure your workload.** The decision maps rank the structures head-to-head on a
+  moving-points sim: `examples/decision2d.rs` (2D) and `critters3d_headless --sweep` (3D).
+  Rough 2D read: **QuadTree** is the all-rounder; **MortonGrid** (rebuilt each frame) wins
+  **dense + high-churn** scenes where the trees' `update` split/merge churn dominates.
+- **Don't reach for threads first.** Reads parallelise (`cull_many_par`), writes don't —
+  the lever for write-heavy loops is `update_ref` + the right structure, not rayon. See
+  [`PARALLEL.md`](PARALLEL.md).
+- **An index only knows what it holds.** Items outside its world box are dropped at
+  insert/bulk-load time, so an index and a linear scan will legitimately disagree about
+  anything that escaped. If you compare the two (and you should), make sure both are
+  looking at the same set — see the bug in [`STEALTH.md`](STEALTH.md).

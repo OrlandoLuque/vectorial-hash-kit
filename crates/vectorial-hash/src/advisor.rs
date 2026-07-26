@@ -23,6 +23,16 @@ pub enum StructureHint {
     /// A looser/coarser structure keeps moves in-cell (fewer relocations); or, if
     /// relocation is truly dominant, a per-tick rebuilt uniform grid can win.
     CoarserOrRebuild,
+    /// Nothing has moved for a while: the maintain surface is worth nothing, and the
+    /// whole cost is build + query. Use a **build-once** structure — `KdTree3` /
+    /// `LinearOctree3` / `LinearQuadTree` / a Morton grid — which drop the handle and
+    /// remove machinery the dynamic trees carry.
+    ///
+    /// *Which* build-once structure depends on how the points are distributed, and this
+    /// profiler counts rates, not skew: uniform and dense → a Morton grid (cheapest
+    /// build and cull); clustered/skewed and query-heavy → `KdTree3` (median split, so
+    /// depth stays ~log₂(n/leaf) however the points clump). See `docs/CHOOSING.md`.
+    StaticBuildOnce,
 }
 
 /// Crossover where a linear scan stops beating an index — **workload-dependent**,
@@ -42,6 +52,11 @@ pub const BRUTE_FORCE_MAX: usize = 512;
 /// moves cross a leaf. Heuristic.
 pub const HIGH_RELOCATION: f64 = 0.30;
 
+/// Consecutive ticks with **zero moves** after which the workload counts as static and
+/// the advisor stops recommending a structure you can maintain. ~1 second at 30 Hz: long
+/// enough not to fire on a pause frame, short enough to notice a level that has settled.
+pub const STATIC_TICKS: u32 = 30;
+
 /// Rolling telemetry of a moving-point workload. Feed it per-tick counts; it
 /// keeps exponential moving averages of the rates that pick the structure.
 #[derive(Clone, Debug)]
@@ -51,10 +66,11 @@ pub struct SpatialProfile {
     query_move: f64, // EMA of queries / move
     alpha: f64,
     warmed: bool,
+    still: u32,      // consecutive ticks with no movement at all
 }
 
 impl Default for SpatialProfile {
-    fn default() -> Self { SpatialProfile { items: 0, reloc_rate: 0.0, query_move: 0.0, alpha: 0.1, warmed: false } }
+    fn default() -> Self { SpatialProfile { items: 0, reloc_rate: 0.0, query_move: 0.0, alpha: 0.1, warmed: false, still: 0 } }
 }
 
 impl SpatialProfile {
@@ -67,6 +83,7 @@ impl SpatialProfile {
     /// `queries` since the last call.
     pub fn observe(&mut self, items: usize, moves: u64, relocations: u64, queries: u64) {
         self.items = items;
+        self.still = if moves == 0 { self.still.saturating_add(1) } else { 0 };
         let (rr, qm) = if moves > 0 {
             (relocations as f64 / moves as f64, queries as f64 / moves as f64)
         } else {
@@ -85,10 +102,15 @@ impl SpatialProfile {
     pub fn relocation_rate(&self) -> f64 { self.reloc_rate }
     /// Smoothed queries per move (read-heavy vs write-heavy).
     pub fn query_per_move(&self) -> f64 { self.query_move }
+    /// Consecutive ticks observed with no movement at all.
+    pub fn still_ticks(&self) -> u32 { self.still }
 
     /// The recommended structure for the observed workload.
     pub fn recommend(&self) -> StructureHint {
         if self.items < BRUTE_FORCE_MAX { return StructureHint::BruteForce; }
+        // Stillness is checked before churn: a settled workload's LAST measured
+        // relocation rate says nothing about a structure that no longer relocates.
+        if self.still >= STATIC_TICKS { return StructureHint::StaticBuildOnce; }
         if self.reloc_rate > HIGH_RELOCATION { return StructureHint::CoarserOrRebuild; }
         StructureHint::KeepIndexTree
     }
@@ -121,6 +143,33 @@ mod tests {
         let mut p = SpatialProfile::default();
         p.observe(100_000, 0, 0, 1_000);
         assert!(p.relocation_rate().is_finite());
+    }
+
+    #[test]
+    fn settled_workload_switches_to_a_build_once_structure() {
+        let mut p = SpatialProfile::default();
+        // a lively phase that would otherwise recommend a rebuild (60% relocation)
+        for _ in 0..20 { p.observe(100_000, 100_000, 60_000, 5_000); }
+        assert_eq!(p.recommend(), StructureHint::CoarserOrRebuild);
+        // …then everything settles: queries keep coming, nothing moves
+        for _ in 0..STATIC_TICKS { p.observe(100_000, 0, 0, 5_000); }
+        assert_eq!(p.recommend(), StructureHint::StaticBuildOnce, "still for {} ticks", p.still_ticks());
+        // one moving tick and it is a live workload again — but NOT instantly "high churn":
+        // the still period decayed the relocation EMA, so the rate has to be re-earned.
+        p.observe(100_000, 100_000, 60_000, 5_000);
+        assert_eq!(p.still_ticks(), 0);
+        assert_eq!(p.recommend(), StructureHint::KeepIndexTree, "one tick should not re-declare churn");
+        for _ in 0..20 { p.observe(100_000, 100_000, 60_000, 5_000); }
+        assert_eq!(p.recommend(), StructureHint::CoarserOrRebuild);
+        // a short pause must NOT flip it (a paused frame is not a static level)
+        let mut q = SpatialProfile::default();
+        for _ in 0..20 { q.observe(100_000, 100_000, 3_500, 5_000); }
+        for _ in 0..(STATIC_TICKS - 1) { q.observe(100_000, 0, 0, 5_000); }
+        assert_eq!(q.recommend(), StructureHint::KeepIndexTree);
+        // and a small static set is still brute force, not a build-once index
+        let mut r = SpatialProfile::default();
+        for _ in 0..(STATIC_TICKS + 5) { r.observe(50, 0, 0, 100); }
+        assert_eq!(r.recommend(), StructureHint::BruteForce);
     }
 
     #[test]
