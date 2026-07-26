@@ -39,8 +39,28 @@ All three landed on `main`, published to the site, docs written in-step:
   demo's wanderers escaped the arena and therefore the index's world box, which
   `bulk_load` drops while a scan still counts. **An index only knows what it holds.**
 
-**Follow-ups:** impostor/LOD for the point cloud at 1M+; stealth guard AI (investigate a
-lost sighting) if the user wants it to be more of a game; fluid 3D variant.
+**Also landed the same night (library):**
+- **Proptest for the three build-once structures** (KdTree3 / LinearOctree3 /
+  LinearQuadTree) plus a **frustum-cull property** across KdTree3 / LinearOctree3 /
+  Tree3 — that verb had no fuzz coverage and it is what the stealth cones run on.
+  Checked the properties are **not vacuous** (12.3 items found per cone on average,
+  max 66; the standalone `frustum_check` example finds 77820 over 400 cones).
+- **`KdTree3::from_items_par`** — **3.3× on 16 threads** (200k points, 20.1 → 6.0 ms) vs
+  `Tree3::bulk_load_par`'s 1.7–2.0×, and **node-for-node identical** to the serial build
+  (tested). The reason is structural: a median split hands each fork exactly n/2 points,
+  a midpoint split can hand one side almost everything. Threaded, the k-d build beats
+  every serial build in the table.
+- **Regression gate** now covers KdTree3 (build/cull/knn) + LinearOctree3 (build/cull).
+  Re-baselined — every existing op read 20–40% "improved" beforehand, which is a stale
+  baseline, not fifteen simultaneous optimisations.
+
+**Follow-ups queued:**
+- **LinearQuadTree is still ungated** in the regression gate — the gate has no 2D section
+  at all (its whole item set is `C3`). Adding one is a real change, not a line.
+- Impostor/LOD for the point cloud at 1M+ points; stealth guard AI (investigate a lost
+  sighting) if the user wants it to be more of a game; a 3D variant of the fluid.
+- The point-cloud `probe_n` clippy `unused_assignments` warning is a false-ish positive
+  from the winit closure; left as-is (demos are not clippy-gated).
 
 ## ★ 2026-07-26 (cooperative night 3) — landed + follow-ups
 
