@@ -174,6 +174,18 @@ impl<T: IPositioned> IntegerTree<T> {
         if let Some(h) = self.free_handles.pop() { h }
         else { let h = self.locs.len() as u32; self.locs.push(IItemLoc { node: INodeId(0), slot: 0 }); h }
     }
+    /// Retire a handle: mark its location [`crate::tree::DEAD_HANDLE`] before recycling
+    /// the id, so a stale `ItemRef` can't alias whatever item later lands in that slot.
+    fn free_handle(&mut self, h: u32) {
+        self.locs[h as usize] = IItemLoc { node: INodeId(crate::tree::DEAD_HANDLE), slot: 0 };
+        self.free_handles.push(h);
+    }
+    /// The live location behind a handle, or `None` if it was freed (item removed or
+    /// dropped out of the root) or never belonged to this tree.
+    fn live_loc(&self, r: ItemRef) -> Option<IItemLoc> {
+        let loc = *self.locs.get(r.0 as usize)?;
+        (loc.node.0 != crate::tree::DEAD_HANDLE).then_some(loc)
+    }
     fn push_h(&mut self, node: INodeId, item: T, h: u32) {
         let slot = self.get(node).items.len() as u32;
         let n = self.get_mut(node);
@@ -232,6 +244,7 @@ impl<T: IPositioned> IntegerTree<T> {
             new_nodes.push(node);
         }
         for loc in self.locs.iter_mut() {
+            if loc.node.0 == crate::tree::DEAD_HANDLE { continue; } // freed handle: no live node to remap
             let nn = old2new[loc.node.0 as usize];
             if nn != u32::MAX { loc.node = INodeId(nn); }
         }
@@ -282,7 +295,7 @@ impl<T: IPositioned> IntegerTree<T> {
 
     /// O(1) relocation through a stable [`crate::ItemRef`] (no locate, no scan).
     pub fn update_ref<M: FnOnce(&mut T)>(&mut self, r: ItemRef, mutator: M) -> bool {
-        let loc = self.locs[r.0 as usize];
+        let Some(loc) = self.live_loc(r) else { return false }; // stale handle: item already gone
         let (node, slot) = (loc.node, loc.slot as usize);
         mutator(&mut self.get_mut(node).items[slot]);
         let np = self.get(node).items[slot].position();
@@ -292,9 +305,9 @@ impl<T: IPositioned> IntegerTree<T> {
 
     /// Remove the item behind a stable [`crate::ItemRef`] in O(1).
     pub fn remove_ref(&mut self, r: ItemRef) -> Option<T> {
-        let loc = self.locs[r.0 as usize];
+        let loc = self.live_loc(r)?; // stale handle: already removed
         let (item, h) = self.swap_remove_h(loc.node, loc.slot as usize);
-        self.free_handles.push(h);
+        self.free_handle(h);
         self.try_merge_up(loc.node);
         Some(item)
     }
@@ -305,7 +318,7 @@ impl<T: IPositioned> IntegerTree<T> {
             Some(id) => id,
             None => {
                 let (_, h) = self.swap_remove_h(leaf, slot);
-                self.free_handles.push(h);
+                self.free_handle(h);
                 self.try_merge_up(leaf);
                 return false;
             }
@@ -352,7 +365,7 @@ impl<T: IPositioned> IntegerTree<T> {
         let leaf = self.locate(point);
         let idx = self.get(leaf).items.iter().position(&predicate)?;
         let (item, h) = self.swap_remove_h(leaf, idx);
-        self.free_handles.push(h);
+        self.free_handle(h);
         self.try_merge_up(leaf);
         Some(item)
     }
@@ -385,7 +398,7 @@ impl<T: IPositioned> IntegerTree<T> {
             IUpdateStrategy::Legacy => {
                 // remove + re-insert reassigns the handle; the Lca path preserves it.
                 let (item, h) = self.swap_remove_h(leaf, idx);
-                self.free_handles.push(h);
+                self.free_handle(h);
                 self.try_merge_up(leaf);
                 self.insert(item)
             }

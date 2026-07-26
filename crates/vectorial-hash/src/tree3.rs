@@ -21,7 +21,7 @@
 use std::io::{self, Read, Write};
 
 use crate::template::CellState;
-use crate::tree::RaycastOut;
+use crate::tree::{RaycastOut, DEAD_HANDLE};
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Point3 {
@@ -602,6 +602,18 @@ impl<T: Positioned3> Tree3<T> {
             h
         }
     }
+    /// Retire a handle: mark its location [`DEAD_HANDLE`] before recycling the id, so
+    /// a stale `ItemRef` can't alias whatever item later lands in that slot.
+    fn free_handle(&mut self, h: u32) {
+        self.locs[h as usize] = ItemLoc { node: Node3Id(DEAD_HANDLE), slot: 0 };
+        self.free_handles.push(h);
+    }
+    /// The live location behind a handle, or `None` if it was freed (item removed or
+    /// dropped out of the root) or never belonged to this tree.
+    fn live_loc(&self, r: ItemRef) -> Option<ItemLoc> {
+        let loc = *self.locs.get(r.0 as usize)?;
+        (loc.node.0 != DEAD_HANDLE).then_some(loc)
+    }
 
     /// Push `item` (with handle `h`) into leaf `node`, recording its location.
     fn push_h(&mut self, node: Node3Id, item: T, h: u32) {
@@ -667,6 +679,7 @@ impl<T: Positioned3> Tree3<T> {
         // Remap the handle table (live handles always point at a reachable node;
         // stale free-handle locs may not, so guard on the sentinel).
         for loc in self.locs.iter_mut() {
+            if loc.node.0 == DEAD_HANDLE { continue; } // freed handle: no live node to remap
             let nn = old2new[loc.node.0 as usize];
             if nn != u32::MAX { loc.node = Node3Id(nn); }
         }
@@ -802,7 +815,7 @@ impl<T: Positioned3> Tree3<T> {
     /// ascend-to-LCA descent if it actually leaves its leaf. Returns `false`
     /// (and frees the handle) if it left the root.
     pub fn update_ref<M: FnOnce(&mut T)>(&mut self, r: ItemRef, mutator: M) -> bool {
-        let loc = self.locs[r.0 as usize];
+        let Some(loc) = self.live_loc(r) else { return false }; // stale handle: item already gone
         let (node, slot) = (loc.node, loc.slot as usize);
         mutator(&mut self.get_mut(node).items[slot]);
         let np = self.get(node).items[slot].position();
@@ -824,7 +837,7 @@ impl<T: Positioned3> Tree3<T> {
     /// the coarse debounce is yours. Cost is identical to `update_ref` (the
     /// from/to leaf ids were already computed internally, just not surfaced).
     pub fn update_ref_tracked<M: FnOnce(&mut T)>(&mut self, r: ItemRef, mutator: M) -> Crossing {
-        let loc = self.locs[r.0 as usize];
+        let Some(loc) = self.live_loc(r) else { return Crossing::Left }; // stale handle: item already gone
         let (node, slot) = (loc.node, loc.slot as usize);
         mutator(&mut self.get_mut(node).items[slot]);
         let np = self.get(node).items[slot].position();
@@ -851,7 +864,7 @@ impl<T: Positioned3> Tree3<T> {
                 Some(a) => anc = self.get(a).parent,
                 None => { // out of bounds: drop + merge, free the handle
                     let (_, h) = self.swap_remove_h(leaf, slot);
-                    self.free_handles.push(h);
+                    self.free_handle(h);
                     self.try_merge_up(leaf);
                     return None;
                 }
@@ -880,7 +893,7 @@ impl<T: Positioned3> Tree3<T> {
         let leaf = self.locate(p);
         let idx = self.get(leaf).items.iter().position(&predicate)?;
         let (item, h) = self.swap_remove_h(leaf, idx);
-        self.free_handles.push(h);
+        self.free_handle(h);
         self.try_merge_up(leaf);
         Some(item)
     }
@@ -888,9 +901,9 @@ impl<T: Positioned3> Tree3<T> {
     /// Remove the item behind a stable [`ItemRef`] in O(1) (no scan). The
     /// handle is consumed; reusing it is a logic error.
     pub fn remove_ref(&mut self, r: ItemRef) -> Option<T> {
-        let loc = self.locs[r.0 as usize];
+        let loc = self.live_loc(r)?; // stale handle: already removed
         let (item, h) = self.swap_remove_h(loc.node, loc.slot as usize);
-        self.free_handles.push(h);
+        self.free_handle(h);
         self.try_merge_up(loc.node);
         Some(item)
     }
@@ -2300,6 +2313,58 @@ mod tests {
         loaded.update_ref(r0, |m| seen = Some(m.id));
         assert_eq!(seen, Some(id0), "ItemRef did not survive the round-trip");
         let _ = p0;
+    }
+
+    #[test]
+    fn stale_item_ref_is_inert_not_corrupting() {
+        // A handle is FREED when its item leaves the root (update_ref → false) or is
+        // removed. The caller may still hold that ItemRef. Before the DEAD_HANDLE
+        // marker its stale location still named a live (node, slot) that swap_remove
+        // had refilled with a DIFFERENT item, so reusing it silently mutated/removed
+        // the wrong item — or panicked on a shrunk leaf. It must now be inert.
+        #[derive(Clone, Copy, PartialEq, Debug)]
+        struct M { id: u32, p: Point3 }
+        impl Positioned3 for M { fn position(&self) -> Point3 { self.p } }
+
+        let world = Aabb::new(0.0, 0.0, 0.0, 100.0, 100.0, 100.0);
+        let mut t = Tree3::<M>::new(world, 4);
+        // Enough items to force splits, all in one corner region so they share leaves.
+        let refs: Vec<ItemRef> = (0..40u32)
+            .map(|id| t.insert_ref(M { id, p: Point3::new(1.0 + (id % 8) as f64, 1.0 + (id / 8) as f64, 1.0) }).unwrap())
+            .collect();
+        let before = t.item_count();
+
+        // 1) Push item 0 out of the world: the update fails and the handle is freed.
+        assert!(!t.update_ref(refs[0], |m| m.p = Point3::new(-50.0, -50.0, -50.0)), "leaving the root must report false");
+        assert_eq!(t.item_count(), before - 1, "the item that left is dropped");
+
+        // 2) Reusing the stale handle must be INERT — no panic, no aliasing.
+        let mut touched = None;
+        assert!(!t.update_ref(refs[0], |m| touched = Some(m.id)), "a stale handle must report false");
+        assert_eq!(touched, None, "a stale handle must not reach ANY item (it aliased one before the fix)");
+        assert!(t.remove_ref(refs[0]).is_none(), "a stale handle must remove nothing");
+        assert!(matches!(t.update_ref_tracked(refs[0], |_| {}), Crossing::Left), "a stale handle reports Left");
+        assert_eq!(t.item_count(), before - 1, "no extra item may vanish");
+
+        // 3) Every surviving item is untouched and still reachable by its own handle.
+        for (id, &r) in refs.iter().enumerate().skip(1) {
+            let mut got = None;
+            assert!(t.update_ref(r, |m| got = Some(m.id)), "live handle {id} broke");
+            assert_eq!(got, Some(id as u32), "handle {id} now points at the wrong item");
+        }
+
+        // 4) remove_ref frees too — the second use is equally inert.
+        assert!(t.remove_ref(refs[1]).is_some());
+        assert!(t.remove_ref(refs[1]).is_none(), "double remove_ref must be a no-op");
+        assert!(!t.update_ref(refs[1], |_| panic!("must not reach an item")));
+        assert_eq!(t.item_count(), before - 2);
+
+        // 5) A handle from a DIFFERENT tree (out of range here) is inert, not a panic.
+        let mut other = Tree3::<M>::new(world, 4);
+        let far = other.insert_ref(M { id: 999, p: Point3::new(9.0, 9.0, 9.0) }).unwrap();
+        let mut empty = Tree3::<M>::new(world, 4);
+        assert!(!empty.update_ref(far, |_| panic!("must not reach an item")), "foreign handle must be inert");
+        assert!(empty.remove_ref(far).is_none());
     }
 
     #[test]

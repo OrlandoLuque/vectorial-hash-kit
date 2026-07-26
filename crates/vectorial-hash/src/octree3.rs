@@ -11,7 +11,7 @@
 
 use crate::serde_io::{corrupt, r_aabb, r_f64, r_u32, r_u64, r_u8, w_aabb, w_f64, w_u32, w_u64, w_u8};
 use crate::template::CellState;
-use crate::tree::RaycastOut;
+use crate::tree::{RaycastOut, DEAD_HANDLE};
 use crate::tree3::{aabb_min_dist2, knn_offer, knn_worst, Aabb, ItemRef, KnnEntry, Point3, Positioned3, Segment3, Shape3};
 use std::io::{self, Read, Write};
 
@@ -126,6 +126,7 @@ impl<T: Positioned3> Octree3<T> {
             new_nodes.push(node);
         }
         for loc in self.locs.iter_mut() {
+            if loc.node.0 == DEAD_HANDLE { continue; } // freed handle: no live node to remap
             let nn = old2new[loc.node.0 as usize];
             if nn != u32::MAX { loc.node = ONodeId(nn); }
         }
@@ -138,6 +139,18 @@ impl<T: Positioned3> Octree3<T> {
     fn alloc_handle(&mut self) -> u32 {
         if let Some(h) = self.free_handles.pop() { h }
         else { let h = self.locs.len() as u32; self.locs.push(OItemLoc { node: ONodeId(0), slot: 0 }); h }
+    }
+    /// Retire a handle: mark its location [`DEAD_HANDLE`] before recycling the id, so
+    /// a stale `ItemRef` can't alias whatever item later lands in that slot.
+    fn free_handle(&mut self, h: u32) {
+        self.locs[h as usize] = OItemLoc { node: ONodeId(DEAD_HANDLE), slot: 0 };
+        self.free_handles.push(h);
+    }
+    /// The live location behind a handle, or `None` if it was freed (item removed or
+    /// dropped out of the root) or never belonged to this tree.
+    fn live_loc(&self, r: ItemRef) -> Option<OItemLoc> {
+        let loc = *self.locs.get(r.0 as usize)?;
+        (loc.node.0 != DEAD_HANDLE).then_some(loc)
     }
     fn push_h(&mut self, node: ONodeId, item: T, h: u32) {
         let slot = self.get(node).items.len() as u32;
@@ -281,7 +294,7 @@ impl<T: Positioned3> Octree3<T> {
 
     /// O(1) relocation via a stable [`crate::ItemRef`] — no locate, no scan.
     pub fn update_ref<M: FnOnce(&mut T)>(&mut self, r: ItemRef, mutator: M) -> bool {
-        let loc = self.locs[r.0 as usize];
+        let Some(loc) = self.live_loc(r) else { return false }; // stale handle: item already gone
         let (node, slot) = (loc.node, loc.slot as usize);
         mutator(&mut self.get_mut(node).items[slot]);
         let np = self.get(node).items[slot].position();
@@ -300,7 +313,7 @@ impl<T: Positioned3> Octree3<T> {
                 Some(a) => anc = self.get(a).parent,
                 None => {
                     let (_, h) = self.swap_remove_h(leaf, slot);
-                    self.free_handles.push(h);
+                    self.free_handle(h);
                     self.try_merge_up(leaf);
                     return None;
                 }
@@ -320,7 +333,7 @@ impl<T: Positioned3> Octree3<T> {
     /// `Octree3`'s `ONodeId` (a leaf is finer than any coarse region — debounce
     /// against a leaf→region map if you only track coarse crossings).
     pub fn update_ref_tracked<M: FnOnce(&mut T)>(&mut self, r: ItemRef, mutator: M) -> OCrossing {
-        let loc = self.locs[r.0 as usize];
+        let Some(loc) = self.live_loc(r) else { return OCrossing::Left }; // stale handle: item already gone
         let (node, slot) = (loc.node, loc.slot as usize);
         mutator(&mut self.get_mut(node).items[slot]);
         let np = self.get(node).items[slot].position();
@@ -352,16 +365,16 @@ impl<T: Positioned3> Octree3<T> {
         let leaf = self.locate(p);
         let idx = self.get(leaf).items.iter().position(&predicate)?;
         let (item, h) = self.swap_remove_h(leaf, idx);
-        self.free_handles.push(h);
+        self.free_handle(h);
         self.try_merge_up(leaf);
         Some(item)
     }
 
     /// Remove the item behind a stable [`crate::ItemRef`] in O(1).
     pub fn remove_ref(&mut self, r: ItemRef) -> Option<T> {
-        let loc = self.locs[r.0 as usize];
+        let loc = self.live_loc(r)?; // stale handle: already removed
         let (item, h) = self.swap_remove_h(loc.node, loc.slot as usize);
-        self.free_handles.push(h);
+        self.free_handle(h);
         self.try_merge_up(loc.node);
         Some(item)
     }

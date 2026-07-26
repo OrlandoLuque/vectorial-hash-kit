@@ -14,7 +14,7 @@
 use crate::culling::{classify_child, collect_matching_items, SizeCache};
 use crate::geom::{Point, Rect};
 use crate::serde_io::{corrupt, r_f64, r_rect, r_u32, r_u64, r_u8, w_f64, w_rect, w_u32, w_u64, w_u8};
-use crate::tree::{Positioned, UpdateStrategy};
+use crate::tree::{Positioned, UpdateStrategy, DEAD_HANDLE};
 use crate::tree3::ItemRef;
 use crate::CellState;
 use crate::Shape;
@@ -90,6 +90,18 @@ impl<T: Positioned> QuadTree<T> {
         if let Some(h) = self.free_handles.pop() { h }
         else { let h = self.locs.len() as u32; self.locs.push(QItemLoc { node: QNodeId(0), slot: 0 }); h }
     }
+    /// Retire a handle: mark its location [`DEAD_HANDLE`] before recycling the id, so
+    /// a stale `ItemRef` can't alias whatever item later lands in that slot.
+    fn free_handle(&mut self, h: u32) {
+        self.locs[h as usize] = QItemLoc { node: QNodeId(DEAD_HANDLE), slot: 0 };
+        self.free_handles.push(h);
+    }
+    /// The live location behind a handle, or `None` if it was freed (item removed or
+    /// dropped out of the root) or never belonged to this tree.
+    fn live_loc(&self, r: ItemRef) -> Option<QItemLoc> {
+        let loc = *self.locs.get(r.0 as usize)?;
+        (loc.node.0 != DEAD_HANDLE).then_some(loc)
+    }
     fn push_h(&mut self, node: QNodeId, item: T, h: u32) {
         let slot = self.get(node).items.len() as u32;
         let n = self.get_mut(node);
@@ -142,7 +154,7 @@ impl<T: Positioned> QuadTree<T> {
 
     /// O(1) relocation through a stable [`ItemRef`] (no locate, no scan).
     pub fn update_ref<M: FnOnce(&mut T)>(&mut self, r: ItemRef, mutator: M) -> bool {
-        let loc = self.locs[r.0 as usize];
+        let Some(loc) = self.live_loc(r) else { return false }; // stale handle: item already gone
         let (node, slot) = (loc.node, loc.slot as usize);
         mutator(&mut self.get_mut(node).items[slot]);
         let np = self.get(node).items[slot].position();
@@ -154,9 +166,9 @@ impl<T: Positioned> QuadTree<T> {
 
     /// Remove the item behind a stable [`ItemRef`] in O(1).
     pub fn remove_ref(&mut self, r: ItemRef) -> Option<T> {
-        let loc = self.locs[r.0 as usize];
+        let loc = self.live_loc(r)?; // stale handle: already removed
         let (item, h) = self.swap_remove_h(loc.node, loc.slot as usize);
-        self.free_handles.push(h);
+        self.free_handle(h);
         self.try_merge_up(loc.node);
         Some(item)
     }
@@ -167,7 +179,7 @@ impl<T: Positioned> QuadTree<T> {
             Some(id) => id,
             None => {
                 let (_, h) = self.swap_remove_h(leaf, slot);
-                self.free_handles.push(h);
+                self.free_handle(h);
                 self.try_merge_up(leaf);
                 return false;
             }
@@ -224,7 +236,7 @@ impl<T: Positioned> QuadTree<T> {
         let leaf = self.locate(point);
         let idx = self.get(leaf).items.iter().position(&predicate)?;
         let (item, h) = self.swap_remove_h(leaf, idx);
-        self.free_handles.push(h);
+        self.free_handle(h);
         self.try_merge_up(leaf);
         Some(item)
     }
@@ -270,7 +282,7 @@ impl<T: Positioned> QuadTree<T> {
             UpdateStrategy::Legacy => {
                 // remove + re-insert reassigns the handle; the Lca path preserves it.
                 let (item, h) = self.swap_remove_h(leaf, idx);
-                self.free_handles.push(h);
+                self.free_handle(h);
                 self.try_merge_up(leaf);
                 self.insert(item)
             }
@@ -826,5 +838,40 @@ mod tests {
         a.sort_by_key(key);
         b.sort_by_key(key);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn stale_item_ref_is_inert_not_corrupting() {
+        // Same contract as Tree3's test of the same name: a handle freed by its item
+        // leaving the root (or by remove_ref) must be INERT afterwards. Before the
+        // DEAD_HANDLE marker the stale location still named a live (node, slot) that
+        // swap_remove had refilled, so reuse aliased the wrong item or panicked.
+        let world = Rect::new(0.0, 0.0, 100.0, 100.0);
+        let mut q = QuadTree::<Pt>::new(world, 4);
+        let refs: Vec<ItemRef> = (0..40u32)
+            .map(|i| q.insert_ref(Pt(Point::new(1.0 + (i % 8) as f64, 1.0 + (i / 8) as f64))).unwrap())
+            .collect();
+        let before = q.item_count();
+
+        assert!(!q.update_ref(refs[0], |p| p.0 = Point::new(-50.0, -50.0)), "leaving the root reports false");
+        assert_eq!(q.item_count(), before - 1);
+
+        let mut touched = false;
+        assert!(!q.update_ref(refs[0], |_| touched = true), "a stale handle must report false");
+        assert!(!touched, "a stale handle must not reach ANY item");
+        assert!(q.remove_ref(refs[0]).is_none(), "a stale handle removes nothing");
+        assert_eq!(q.item_count(), before - 1);
+
+        // Every surviving handle still resolves to its own item.
+        for (i, &r) in refs.iter().enumerate().skip(1) {
+            let mut got = None;
+            assert!(q.update_ref(r, |p| got = Some(p.0)), "live handle {i} broke");
+            assert_eq!(got, Some(Point::new(1.0 + (i % 8) as f64, 1.0 + (i / 8) as f64)), "handle {i} points at the wrong item");
+        }
+        // Double remove is a no-op, and a foreign handle is inert (not a panic).
+        assert!(q.remove_ref(refs[1]).is_some());
+        assert!(q.remove_ref(refs[1]).is_none(), "double remove_ref must be a no-op");
+        let mut empty = QuadTree::<Pt>::new(world, 4);
+        assert!(!empty.update_ref(refs[2], |_| panic!("must not reach an item")), "foreign handle must be inert");
     }
 }

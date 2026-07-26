@@ -112,6 +112,16 @@ impl<T> Node<T> {
 #[derive(Copy, Clone)]
 struct ItemLoc { node: NodeId, slot: u32 }
 
+/// Node id stamped into a **freed** handle's location. A handle is freed when its
+/// item is removed (`remove_ref`/`remove`) or dropped for leaving the root during a
+/// relocate — after which the caller may still hold that now-stale [`ItemRef`].
+/// Without the marker the stale handle would still name a live `(node, slot)` that
+/// `swap_remove` has since refilled with a DIFFERENT item, so reusing it would
+/// silently mutate/remove the wrong item (or panic on a shrunk leaf). Every
+/// handle-taking entry point checks for it and reports "gone" instead.
+/// (Real ids index the arena, so `u32::MAX` can never collide with one.)
+pub(crate) const DEAD_HANDLE: u32 = u32::MAX;
+
 /// Squared distance from `q` to the nearest point of `r` (0 if inside) — the 2D
 /// analogue of `tree3::aabb_min_dist2`, shared by the 2D k-NN searches.
 #[inline]
@@ -202,6 +212,18 @@ impl<T: Positioned> Tree<T> {
     fn alloc_handle(&mut self) -> u32 {
         if let Some(h) = self.free_handles.pop() { h }
         else { let h = self.locs.len() as u32; self.locs.push(ItemLoc { node: NodeId(0), slot: 0 }); h }
+    }
+    /// Retire a handle: mark its location [`DEAD_HANDLE`] before recycling the id, so
+    /// a stale `ItemRef` can't alias whatever item later lands in that slot.
+    fn free_handle(&mut self, h: u32) {
+        self.locs[h as usize] = ItemLoc { node: NodeId(DEAD_HANDLE), slot: 0 };
+        self.free_handles.push(h);
+    }
+    /// The live location behind a handle, or `None` if it was freed (item removed or
+    /// dropped out of the root) or never belonged to this tree.
+    fn live_loc(&self, r: ItemRef) -> Option<ItemLoc> {
+        let loc = *self.locs.get(r.0 as usize)?;
+        (loc.node.0 != DEAD_HANDLE).then_some(loc)
     }
     fn push_h(&mut self, node: NodeId, item: T, h: u32) {
         let slot = self.get(node).items.len() as u32;
@@ -358,7 +380,7 @@ impl<T: Positioned> Tree<T> {
         let leaf = self.locate(point);
         let idx = self.get(leaf).items.iter().position(&predicate)?;
         let (item, h) = self.swap_remove_h(leaf, idx);
-        self.free_handles.push(h);
+        self.free_handle(h);
         self.try_merge_up(leaf);
         Some(item)
     }
@@ -367,7 +389,7 @@ impl<T: Positioned> Tree<T> {
     /// predicate scan. Mutate in place; relocate (ascend-to-LCA) only if the
     /// item leaves its leaf. `false` (and the handle freed) if it left the root.
     pub fn update_ref<M: FnOnce(&mut T)>(&mut self, r: ItemRef, mutator: M) -> bool {
-        let loc = self.locs[r.0 as usize];
+        let Some(loc) = self.live_loc(r) else { return false }; // stale handle: item already gone
         let (node, slot) = (loc.node, loc.slot as usize);
         mutator(&mut self.get_mut(node).items[slot]);
         let np = self.get(node).items[slot].position();
@@ -379,9 +401,9 @@ impl<T: Positioned> Tree<T> {
 
     /// Remove the item behind a stable [`ItemRef`] in O(1) (no scan).
     pub fn remove_ref(&mut self, r: ItemRef) -> Option<T> {
-        let loc = self.locs[r.0 as usize];
+        let loc = self.live_loc(r)?; // stale handle: already removed
         let (item, h) = self.swap_remove_h(loc.node, loc.slot as usize);
-        self.free_handles.push(h);
+        self.free_handle(h);
         self.try_merge_up(loc.node);
         Some(item)
     }
@@ -479,7 +501,7 @@ impl<T: Positioned> Tree<T> {
                 // ItemRef to it is invalidated) — the default Lca path below
                 // preserves it. Legacy is a benchmarking-only strategy.
                 let (item, h) = self.swap_remove_h(leaf, idx);
-                self.free_handles.push(h);
+                self.free_handle(h);
                 self.try_merge_up(leaf);
                 self.insert(item)
             }
@@ -503,7 +525,7 @@ impl<T: Positioned> Tree<T> {
             None => {
                 // Out of bounds: drop the item (freeing its handle), then merge.
                 let (_, h) = self.swap_remove_h(leaf, idx);
-                self.free_handles.push(h);
+                self.free_handle(h);
                 self.try_merge_up(leaf);
                 return false;
             }
@@ -671,6 +693,7 @@ impl<T: Positioned> Tree<T> {
             new_nodes.push(node);
         }
         for loc in self.locs.iter_mut() {
+            if loc.node.0 == DEAD_HANDLE { continue; } // freed handle: no live node to remap
             let nn = old2new[loc.node.0 as usize];
             if nn != u32::MAX { loc.node = NodeId(nn); }
         }
