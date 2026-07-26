@@ -48,6 +48,41 @@ fn tight_box<T: Positioned3>(items: &[T]) -> Aabb {
 
 fn axis_of<T: Positioned3>(it: &T, a: usize) -> f64 { let p = it.position(); [p.x, p.y, p.z][a] }
 
+/// Below this many points a split is built serially: `rayon::join` costs more than the
+/// median selection it would overlap.
+#[cfg(feature = "parallel")]
+const PAR_CUTOFF: usize = 4096;
+
+/// Build the subtree over `items` (whose first element is global index `base`) into a
+/// fresh node vector whose **root is index 0** and whose child ids are local to it.
+#[cfg(feature = "parallel")]
+fn build_par<T: Positioned3 + Send>(items: &mut [T], base: usize, capacity: usize) -> Vec<KdNode> {
+    let n = items.len();
+    let bbox = tight_box(items);
+    if n <= capacity {
+        return vec![KdNode { bbox, split: Split::Leaf { start: base as u32, len: n as u32 } }];
+    }
+    let a = if bbox.w >= bbox.h && bbox.w >= bbox.d { 0 } else if bbox.h >= bbox.d { 1 } else { 2 };
+    let mid = n / 2;
+    items.select_nth_unstable_by(mid, |x, y| axis_of(x, a).total_cmp(&axis_of(y, a)));
+    let (lo, hi) = items.split_at_mut(mid);
+    let (mut left, mut right) = if n >= PAR_CUTOFF {
+        rayon::join(|| build_par(lo, base, capacity), || build_par(hi, base + mid, capacity))
+    } else {
+        (build_par(lo, base, capacity), build_par(hi, base + mid, capacity))
+    };
+    // splice: [root] ++ left ++ right, shifting each subtree's internal ids.
+    let (loff, roff) = (1u32, 1 + left.len() as u32);
+    for nd in left.iter_mut() { if let Split::Internal { left: l, right: r } = &mut nd.split { *l += loff; *r += loff; } }
+    for nd in right.iter_mut() { if let Split::Internal { left: l, right: r } = &mut nd.split { *l += roff; *r += roff; } }
+    let mut out = Vec::with_capacity(1 + left.len() + right.len());
+    out.push(KdNode { bbox, split: Split::Internal { left: loff, right: roff } });
+    out.append(&mut left);
+    out.append(&mut right);
+    out
+}
+
+
 impl<T: Positioned3> KdTree3<T> {
     /// Build from a point set: one top-down median partition. `capacity` is the max
     /// points a leaf holds (floored at 1).
@@ -59,6 +94,23 @@ impl<T: Positioned3> KdTree3<T> {
         }
         t.items = items;
         t
+    }
+
+    /// Same tree, built with rayon. The serial build already emits *parent, then left
+    /// subtree, then right subtree*, so a subtree can be built into its own node vector
+    /// and spliced in with an id shift: `from_items_par` produces a **node-for-node
+    /// identical** tree to `from_items` (tested). Splits fan out with `rayon::join`
+    /// while the slice is above `PAR_CUTOFF`; below that the join overhead outweighs
+    /// an already-cheap median selection.
+    ///
+    /// The median selection is the whole build cost, and it is *the* embarrassingly
+    /// parallel part — the two halves are disjoint slices. See `docs/PARALLEL.md`.
+    #[cfg(feature = "parallel")]
+    pub fn from_items_par(capacity: usize, mut items: Vec<T>) -> Self
+    where T: Send {
+        let capacity = capacity.max(1);
+        let nodes = if items.is_empty() { Vec::new() } else { build_par(&mut items, 0, capacity) };
+        KdTree3 { nodes, items, capacity, root: 0 }
     }
 
     #[inline] pub fn item_count(&self) -> usize { self.items.len() }
@@ -233,6 +285,61 @@ impl<T: Positioned3> KdTree3<T> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "parallel")]
+    mod par {
+        use super::super::*;
+        use crate::Sphere3;
+        #[derive(Clone, Copy)]
+        struct P { p: Point3 }
+        impl Positioned3 for P { fn position(&self) -> Point3 { self.p } }
+
+        fn cloud(n: usize, seed: u64) -> Vec<P> {
+            let mut s = seed;
+            let mut f = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; ((s >> 40) as f64) / (1u64 << 24) as f64 };
+            // deliberately clustered: three blobs, which is where the median split matters
+            (0..n).map(|i| {
+                let c = [(20.0, 20.0, 20.0), (300.0, 90.0, 260.0), (140.0, 200.0, 40.0)][i % 3];
+                P { p: Point3::new(c.0 + f() * 30.0, c.1 + f() * 30.0, c.2 + f() * 30.0) }
+            }).collect()
+        }
+
+        /// The parallel build must produce the SAME tree, not merely an equivalent one:
+        /// same node count, same leaf ranges, same boxes, same answers.
+        #[test]
+        fn par_build_is_identical_to_serial() {
+            for n in [0usize, 1, 7, 100, 5000, 20000] {
+                for cap in [1usize, 8, 32] {
+                    let a = KdTree3::from_items(cap, cloud(n, 0x1234_5678));
+                    let b = KdTree3::from_items_par(cap, cloud(n, 0x1234_5678));
+                    assert_eq!(a.node_count(), b.node_count(), "node count n={} cap={}", n, cap);
+                    assert_eq!(a.item_count(), b.item_count());
+                    let mut la = Vec::new(); a.visit_leaves(|b, c| la.push((b.x.to_bits(), b.y.to_bits(), b.z.to_bits(), c)));
+                    let mut lb = Vec::new(); b.visit_leaves(|b, c| lb.push((b.x.to_bits(), b.y.to_bits(), b.z.to_bits(), c)));
+                    assert_eq!(la, lb, "leaf layout differs n={} cap={}", n, cap);
+                    assert_eq!(a.depth(), b.depth());
+                    for (cx, cy, cz, r) in [(20.0, 20.0, 20.0, 25.0), (300.0, 90.0, 260.0, 40.0), (0.0, 0.0, 0.0, 500.0)] {
+                        let s = Sphere3::new(cx, cy, cz, r);
+                        let (mut ga, mut gb): (Vec<_>, Vec<_>) = (
+                            a.cull(&s).iter().map(|m| (m.p.x.to_bits(), m.p.y.to_bits(), m.p.z.to_bits())).collect(),
+                            b.cull(&s).iter().map(|m| (m.p.x.to_bits(), m.p.y.to_bits(), m.p.z.to_bits())).collect());
+                        ga.sort(); gb.sort();
+                        assert_eq!(ga, gb, "cull differs n={} cap={}", n, cap);
+                        // and both agree with brute force
+                        let mut want: Vec<_> = cloud(n, 0x1234_5678).iter().filter(|q| { let (dx, dy, dz) = (q.p.x - cx, q.p.y - cy, q.p.z - cz); dx * dx + dy * dy + dz * dz <= r * r }).map(|q| (q.p.x.to_bits(), q.p.y.to_bits(), q.p.z.to_bits())).collect();
+                        want.sort();
+                        assert_eq!(want, ga, "cull != brute n={} cap={}", n, cap);
+                    }
+                    for k in [1usize, 9] {
+                        let q = Point3::new(150.0, 100.0, 100.0);
+                        let da: Vec<f64> = a.knn(q, k).iter().map(|(d, _)| *d).collect();
+                        let db: Vec<f64> = b.knn(q, k).iter().map(|(d, _)| *d).collect();
+                        assert_eq!(da, db, "knn differs n={} cap={} k={}", n, cap, k);
+                    }
+                }
+            }
+        }
+    }
+
     use super::*;
     use crate::tree3::Sphere3;
 

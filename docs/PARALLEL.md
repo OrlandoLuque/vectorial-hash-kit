@@ -277,6 +277,44 @@ the load hovers at f\* (110→64). Numbers + the GPU-vs-CPU verdict: [GPU.md](GP
 So the full rule: **sparse motion → CPU keep · mostly-moving huge clouds → GPU
 rebuild · varying → adaptive with hysteresis.**
 
+## Parallel builds: why the k-d tree fans out better than the midpoint tree
+
+`KdTree3::from_items_par` (feature `parallel`) splits with `rayon::join` while the slice
+is above 4096 points. Because the serial build already emits *parent, then left subtree,
+then right subtree*, a subtree can be built into its own node vector and spliced in with
+an id shift — so the parallel build produces a **node-for-node identical** tree, which is
+what the test asserts (same node count, same leaf boxes and ranges, same depth, same cull
+and k-NN answers) rather than merely an equivalent one.
+
+200 000 points, 16 threads, min-of-5, release:
+
+| build | serial | parallel | speed-up |
+| --- | ---: | ---: | ---: |
+| `KdTree3` uniform | 20.47 ms | **6.29 ms** | **3.25×** |
+| `KdTree3` clustered | 20.06 ms | **6.02 ms** | **3.33×** |
+| `Tree3::bulk_load` uniform | 41.87 ms | 25.29 ms | 1.66× |
+| `Tree3::bulk_load` clustered | 56.17 ms | 27.73 ms | 2.03× |
+
+**The median split parallelises better than the midpoint split, and it's not an accident.**
+`rayon::join` is only as fast as its slower half, so a fan-out is worth what its *load
+balance* is worth:
+
+- A **median** split hands each side exactly `n/2` points, by construction. Every fork is
+  balanced, at every level, whatever the data looks like.
+- A **midpoint** split halves the *box*, not the points. On clustered data one side can
+  get almost everything, and that fork is then a serial tail with idle threads beside it.
+
+So the structure whose build is the expensive one (the median selection) is also the one
+that recovers the most from threads. Note the end state: the parallel k-d build (6.0 ms)
+is **faster than `LinearOctree3`'s serial build** (13.6 ms), which is the fastest serial
+build in the comparison — "the k-d tree builds slowly" stops being true once you have
+cores to spend, while its query advantage on clustered data (cull 3.1×, k-NN 1.65× vs
+`Tree3`) is unchanged. Reproduce with:
+
+```bash
+cargo run -p vectorial-hash --example kdtree3_bench --release --features parallel
+```
+
 ## Why not parallelise relocation / the Morton build too?
 
 - **Relocation (`update_ref`):** a single item's move is an ascend-to-LCA +

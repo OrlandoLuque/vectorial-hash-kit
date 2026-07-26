@@ -502,6 +502,14 @@ after the linear octree, or `CRITTERS3D_STRUCTURE=kd`): the `B` overlay shows it
 **tight** leaf boxes — they don't tile the world like the midpoint trees' cells, the
 gaps are exactly the empty space a median split refuses to index.
 
+Its one real cost, the O(n) median selection per level, is also **the part that recovers
+best from threads**: `from_items_par` (feature `parallel`) is **3.3× on 16 threads**
+(200k points, 20.1 → 6.0 ms) against `Tree3::bulk_load_par`'s 1.7–2.0×, because a median
+split hands each fork exactly n/2 points while a midpoint split can hand one side almost
+everything. Threaded, the k-d build is *faster than every serial build in the table* —
+see [PARALLEL.md](PARALLEL.md). The parallel build is node-for-node identical to the
+serial one (tested, not just equivalent).
+
 ## k-nearest-neighbour (`knn`) — a different query than range cull
 
 Range cull answers "which points are inside this volume?" (you supply the

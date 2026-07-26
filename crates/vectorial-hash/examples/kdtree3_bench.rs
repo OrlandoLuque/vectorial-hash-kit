@@ -30,6 +30,10 @@ fn run(name: &str, items: &[P], queries: &[Point3], radius: f64) {
     let world = Aabb::new(0.0, 0.0, 0.0, 1000.0, 300.0, 1000.0);
     let v: Vec<P> = items.to_vec();
     let t_b_kd = best(5, || { let _ = KdTree3::from_items(16, v.clone()); });
+    #[cfg(feature = "parallel")]
+    let t_b_kd_par = best(5, || { let _ = KdTree3::from_items_par(16, v.clone()); });
+    #[cfg(feature = "parallel")]
+    let t_b_bin_par = best(5, || { let _ = Tree3::bulk_load_par(world, 16, v.clone()); });
     let t_b_bin = best(5, || { let _ = Tree3::bulk_load(world, 16, v.clone()); });
     let t_b_oct = best(5, || { let _ = Octree3::bulk_load(world, 16, v.clone()); });
     let t_b_lin = best(5, || { let _ = LinearOctree3::from_items(world, 16, 18, v.clone()); });
@@ -49,6 +53,8 @@ fn run(name: &str, items: &[P], queries: &[Point3], radius: f64) {
 
     println!("── {name} ──   (KdTree3 depth {}, {} nodes | Tree3 {} nodes | Octree3 {} nodes)", kd.depth(), kd.node_count(), bin.node_count(), oct.node_count());
     println!("  build ms   KdTree3 {t_b_kd:6.2} | Tree3 {t_b_bin:6.2} | Octree3 {t_b_oct:6.2} | LinearOct {t_b_lin:6.2}");
+    #[cfg(feature = "parallel")]
+    println!("  build par  KdTree3 {t_b_kd_par:6.2} ({:.2}x) | Tree3 {t_b_bin_par:6.2} ({:.2}x)   [{} threads]", t_b_kd / t_b_kd_par, t_b_bin / t_b_bin_par, rayon::current_num_threads());
     println!("  cull  ms   KdTree3 {t_c_kd:6.2} | Tree3 {t_c_bin:6.2} | Octree3 {t_c_oct:6.2} | LinearOct {t_c_lin:6.2}   (kd vs Tree3 {:.2}×)", t_c_bin / t_c_kd);
     println!("  knn   ms   KdTree3 {t_k_kd:6.2} | Tree3 {t_k_bin:6.2}                                    (kd vs Tree3 {:.2}×)", t_k_bin / t_k_kd);
     if s == usize::MAX { println!("{s}"); }
