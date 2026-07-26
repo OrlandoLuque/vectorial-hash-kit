@@ -20,7 +20,8 @@ Mature. **Ten structures** share one arena layout and query surface: `Tree`
 (2D binary), `QuadTree` (2D 4-way), `IntegerTree` (2D, `i32` / power-of-two),
 `Tree3` (3D binary), `Octree3` (3D 8-way), the pointer-free Z-order grids
 `MortonGrid` (2D) and `MortonGrid3` (3D), the adaptive pointer-free
-`LinearQuadTree` (2D) + `LinearOctree3` (3D), and the median-split `KdTree3` (3D).
+`LinearQuadTree` (2D) + `LinearOctree3` (3D), and the median-split `KdTree2` (2D) +
+`KdTree3` (3D).
 Each supports template-driven `cull`,
 dynamic `insert`/`remove`/`update` (merge-up rule), an **O(1) stable `ItemRef`**
 relocation handle (`insert_ref`/`update_ref`/`remove_ref`), **k-NN**, **ray-cast**
@@ -63,6 +64,7 @@ Leaf items can additionally be answered by a 1×1 raster (`Shape::point_template
 | `octree3` | `Octree3<T>`, `ONode`, `ONodeId` | 3D 8-way (2×2×2) split — the 3D `QuadTree`. Same dynamic contract + `knn` + DDA `raycast` + `bulk_load` + `serialize`. |
 | `morton3` | `MortonGrid3<T>` | 3D Z-order linear octree: fastest on uniform data, cheapest build, `knn` (ring shell) + `raycast`, `extend_par` bulk build. |
 | `kdtree3` | `KdTree3<T>` | 3D **median-split** k-d tree (tight per-node AABBs). Unlike the midpoint-split `Tree3`/`Octree3`, it balances by point COUNT, so depth stays ~log₂(n/leaf) on CLUSTERED data where the midpoint trees halve the empty middle and bloat. `from_items`/`cull`/`knn`/`raycast`/`serialize`. Static; measured cull ~2× / k-NN ~1.6× faster than `Tree3` on clustered data (`examples/kdtree3_bench`), ~1.2× on uniform. |
+| `kdtree2` | `KdTree2<T>` | The 2D twin: **median-split** k-d tree with tight per-node rects. Completes the family — every other 2D index splits at the midpoint (`Tree`, `QuadTree`, `LinearQuadTree`) or not at all (`MortonGrid`). `from_items`/`from_items_par`/`cull`/`knn`/`raycast`. Static. Measured on 200k clustered points (`examples/linear_quadtree_bench`): **fastest build AND fastest cull** of the 2D set (8.06 ms / 7.47 ms vs QuadTree 34.10 / 11.40), k-NN a hair behind the pointer quadtree; parallel build 3.06× on 16 threads. |
 | `linear_octree3` | `LinearOctree3<T>` | 3D **adaptive** linear octree: sparse hash of leaf buckets keyed by a self-describing Morton location code (path + level in one `u64`), pointer-free; a leaf splits into 8 only where points cluster. `from_items`/`insert`/`cull`/`knn`/`serialize`/`raycast` + parallel batch `cull_many_par`/`knn_many_par`. Grid-cheap builds (~2× faster than `Octree3`) + ~5× faster clustered k-NN than the uniform `MortonGrid3` — the pick for skewed data you rebuild often (measured, `docs/THREE_D.md`). |
 | `advisor` | `SpatialProfile`, `StructureHint` | Self-tuning structure selection: track a region's relocation rate + query:move ratio (EMA); `recommend()` returns `BruteForce`/`KeepIndexTree`/`CoarserOrRebuild` from measured crossovers. |
 

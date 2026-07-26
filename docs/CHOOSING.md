@@ -1,6 +1,6 @@
 # Choosing a structure
 
-`vectorial-hash` ships **ten** spatial indexes. They all answer the same two queries —
+`vectorial-hash` ships **eleven** spatial indexes. They all answer the same two queries —
 `cull` (everything inside a shape) and `knn` (k nearest neighbours) — so picking one is
 about *your data and access pattern*, not features. This is the one-glance guide; the
 quantitative backing is the decision map in [`THREE_D.md`](THREE_D.md), the parallelism
@@ -19,13 +19,13 @@ other property:
   demo, keeping the index beats a per-frame rebuild ~1.06× (1 thread) → ~1.4× (12–16),
   and it needs no threads at all.
 - **They're static, or you rebuild wholesale anyway.** Then maintenance is worth nothing
-  and *build + query* is the whole cost: `KdTree3`, `LinearOctree3`, `LinearQuadTree`,
+  and *build + query* is the whole cost: `KdTree2`, `KdTree3`, `LinearOctree3`, `LinearQuadTree`,
   `MortonGrid` / `MortonGrid3`. These have no handle or remove surface by design.
 
 **Second question: is the density even?** Uniform data suits a flat grid (Morton) —
 nothing to adapt to. Skewed data (points on surfaces, crowds, clusters in empty space) is
-where the adaptive structures earn their keep, and where the *median* split (`KdTree3`)
-beats the *midpoint* splits.
+where the adaptive structures earn their keep, and where the *median* split (`KdTree2` /
+`KdTree3`) beats the *midpoint* splits.
 
 ## Flowchart
 
@@ -79,6 +79,7 @@ Three cross-cutting choices that sit on top of the above:
 | **`KdTree3`** | 3D | static | **skewed/clustered, query-heavy** | median select (**3.3× on 16 threads**) | **best cull + k-NN on clusters** |
 | **`LinearOctree3`** | 3D | static | skewed data you **rebuild often** | ~2.1× faster than `Octree3` | loses cull ~1.3× to `Octree3` |
 | **`LinearQuadTree`** | 2D | static | skewed 2D you rebuild often | fast | **won the fluid's neighbour query** |
+| **`KdTree2`** | 2D | static | **skewed/clustered 2D, query-heavy** | **fastest of the 2D builds** (3.1× on 16 threads) | **cull 1.53× the pointer quadtree** |
 
 The three headline measurements behind the right-hand column:
 
@@ -106,9 +107,13 @@ The three headline measurements behind the right-hand column:
   `MortonGrid3` has the cheapest build and cull — there's nothing to maintain, you refill
   it. If the field is *skewed* rather than uniform, try `LinearOctree3` /
   `LinearQuadTree`: same rebuild-friendly shape, adaptive where the points actually are.
-- **Static and query-heavy, especially clustered?** `KdTree3`. The median split keeps
+- **Static and query-heavy, especially clustered?** `KdTree3` in 3D, `KdTree2` in 2D. The median split keeps
   depth at ~log₂(n/leaf) however the points clump, and its tight per-node boxes prune
-  harder. It's also the structure that gains most from a parallel build.
+  harder. It's also the structure that gains most from a parallel build. Measured on a
+  clustered 2D set (200k points, 2000 circle culls): `KdTree2` build **8.06 ms** and cull
+  **7.47 ms** — the fastest of both columns, against `QuadTree` 34.10/11.40,
+  `LinearQuadTree` 17.07/12.87 and `MortonGrid` 8.92/16.30 — while k-NN is a hair behind
+  the pointer quadtree (1.50 vs 1.40 ms). Reproduce: `examples/linear_quadtree_bench`.
 - **Integer world (tiles, pixels)?** `IntegerTree` avoids float boundary fuzz entirely.
 - **`item_limit` / `capacity`** is the main tuning knob: smaller = deeper tree, fewer
   per-leaf tests, more nodes; larger = shallower, more brute per leaf. 8–16 is a good

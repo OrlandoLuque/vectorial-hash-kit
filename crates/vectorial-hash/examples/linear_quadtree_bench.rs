@@ -10,7 +10,7 @@
 
 use std::time::Instant;
 use vectorial_hash::linear_quadtree::LinearQuadTree;
-use vectorial_hash::{Circle, MortonGrid, Point, Positioned, QuadTree, Rect};
+use vectorial_hash::{Circle, KdTree2, MortonGrid, Point, Positioned, QuadTree, Rect};
 
 #[derive(Clone, Copy)]
 struct P { p: Point }
@@ -49,12 +49,16 @@ fn main() {
     let t_build_lin = best(5, || { let _ = LinearQuadTree::from_items(world, 32, 18, items.clone()); });
     let t_build_qt = best(5, || { let mut q = QuadTree::new(world, 32); for it in &items { q.insert(*it); } });
     let t_build_mor = best(5, || { let mut g = MortonGrid::new(world, 6); for it in &items { g.insert(*it); } });
+    let t_build_kd = best(5, || { let _ = KdTree2::from_items(32, items.clone()); });
+    #[cfg(feature = "parallel")]
+    let t_build_kd_par = best(5, || { let _ = KdTree2::from_items_par(32, items.clone()); });
 
     let lin = LinearQuadTree::from_items(world, 32, 18, items.clone());
     let mut qt = QuadTree::new(world, 32);
     for it in &items { qt.insert(*it); }
     let mut mor = MortonGrid::new(world, 6);
     for it in &items { mor.insert(*it); }
+    let kd = KdTree2::from_items(32, items.clone());
 
     let mut sink = 0usize;
     let t_cull_lin = best(6, || { for q in &queries { sink += lin.cull(&Circle::new(*q, radius)).len(); } });
@@ -64,11 +68,16 @@ fn main() {
     let t_knn_lin = best(6, || { for q in &queries { sink += lin.knn(*q, 8).len(); } });
     let t_knn_qt = best(6, || { for q in &queries { sink += qt.knn(*q, 8).len(); } });
     let t_knn_mor = best(6, || { for q in &queries { sink += mor.knn(*q, 8).len(); } });
+    let t_cull_kd = best(6, || { for q in &queries { sink += kd.cull(&Circle::new(*q, radius)).len(); } });
+    let t_knn_kd = best(6, || { for q in &queries { sink += kd.knn(*q, 8).len(); } });
 
     println!("structure       build(ms)   cull {nq}q(ms)   knn {nq}q(ms)   leaves/cells   depth");
     println!("LinearQuadTree  {t_build_lin:8.2}   {t_cull_lin:11.2}   {t_knn_lin:10.2}   {:>12}   {}", lin.leaf_count(), lin.depth());
     println!("QuadTree        {t_build_qt:8.2}   {t_cull_qt:11.2}   {t_knn_qt:10.2}   {:>12}   —", "—");
     println!("MortonGrid      {t_build_mor:8.2}   {t_cull_mor:11.2}   {t_knn_mor:10.2}   {:>12}   1 (flat)", mor.cell_count());
+    println!("KdTree2 median  {t_build_kd:8.2}   {t_cull_kd:11.2}   {t_knn_kd:10.2}   {:>12}   {}", kd.node_count(), kd.depth());
+    #[cfg(feature = "parallel")]
+    println!("  KdTree2 parallel build {t_build_kd_par:.2} ms ({:.2}x, {} threads)", t_build_kd / t_build_kd_par, rayon::current_num_threads());
     println!("\ncull speed   vs QuadTree {:.2}x   vs Morton {:.2}x", t_cull_qt / t_cull_lin, t_cull_mor / t_cull_lin);
     println!("knn  speed   vs QuadTree {:.2}x   vs Morton {:.2}x", t_knn_qt / t_knn_lin, t_knn_mor / t_knn_lin);
 
