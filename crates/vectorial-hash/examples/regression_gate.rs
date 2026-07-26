@@ -23,7 +23,7 @@
 
 use std::hint::black_box;
 use std::time::Instant;
-use vectorial_hash::{Aabb, MortonGrid3, Octree3, Point3, Positioned3, Sphere3, Tree3};
+use vectorial_hash::{Aabb, KdTree3, LinearOctree3, MortonGrid3, Octree3, Point3, Positioned3, Sphere3, Tree3};
 
 const WORLD: f64 = 512.0;
 const N: usize = 20_000;
@@ -113,6 +113,10 @@ fn measure() -> Vec<(&'static str, f64)> {
     out.push(("build_tree3", bench(|| { let mut t = Tree3::<C3>::new(aabb, IL); for it in &its { t.insert(*it); } t.item_count() as u64 })));
     out.push(("build_octree3", bench(|| { let mut t = Octree3::<C3>::new(aabb, IL); for it in &its { t.insert(*it); } t.item_count() as u64 })));
     out.push(("build_morton3", bench(|| { let mut t = MortonGrid3::<C3>::new(aabb, levels); for it in &its { t.insert(*it); } t.item_count() as u64 })));
+    // The two build-once structures: they have no incremental-insert story to defend, so
+    // they are gated on the build the caller actually uses (bulk) plus their queries.
+    out.push(("build_kdtree3", bench(|| KdTree3::from_items(IL, its.clone()).item_count() as u64)));
+    out.push(("build_linear_octree3", bench(|| LinearOctree3::from_items(aabb, IL, 12, its.clone()).item_count() as u64)));
 
     let mut tree3 = Tree3::<C3>::new(aabb, IL); for it in &its { tree3.insert(*it); }
     let mut octree3 = Octree3::<C3>::new(aabb, IL); for it in &its { octree3.insert(*it); }
@@ -121,9 +125,15 @@ fn measure() -> Vec<(&'static str, f64)> {
     out.push(("cull_tree3_x64", bench(|| { let mut n = 0u64; for s in &qs { n += tree3.cull(s).len() as u64; } n })));
     out.push(("cull_octree3_x64", bench(|| { let mut n = 0u64; for s in &qs { n += octree3.cull(s).len() as u64; } n })));
     out.push(("cull_morton3_x64", bench(|| { let mut n = 0u64; for s in &qs { n += morton3.cull(s).len() as u64; } n })));
+    let kd3 = KdTree3::from_items(IL, its.clone());
+    let lo3 = LinearOctree3::from_items(aabb, IL, 12, its.clone());
+    out.push(("cull_kdtree3_x64", bench(|| { let mut n = 0u64; for s in &qs { n += kd3.cull(s).len() as u64; } n })));
+    out.push(("cull_linear_octree3_x64", bench(|| { let mut n = 0u64; for s in &qs { n += lo3.cull(s).len() as u64; } n })));
 
     let qp: Vec<Point3> = { let mut r = Rng::new(7); (0..256).map(|_| Point3::new(r.range(0.0, WORLD), r.range(0.0, WORLD), r.range(0.0, WORLD))).collect() };
     out.push(("knn_tree3_k16_x256", bench(|| { let mut n = 0u64; for q in &qp { n += tree3.knn(*q, 16).len() as u64; } n })));
+    out.push(("knn_kdtree3_k16_x256", bench(|| { let mut n = 0u64; for q in &qp { n += kd3.knn(*q, 16).len() as u64; } n })));
+    out.push(("knn_linear_octree3_k16_x256", bench(|| { let mut n = 0u64; for q in &qp { n += lo3.knn(*q, 16).len() as u64; } n })));
 
     // update: one frame of N relocations, predicate vs ItemRef.
     {
