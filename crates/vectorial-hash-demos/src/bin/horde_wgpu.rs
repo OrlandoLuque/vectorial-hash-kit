@@ -554,11 +554,17 @@ struct State {
     cam_pos: glam::Vec3,
     mv: [bool; 6],
     skin_instances: Vec<SkinInstance>,
+    /// Device-pixel ratio of the surface. The HUD is drawn in PHYSICAL pixels, so on a
+    /// phone (dpr 2–3) text sized for a desktop came out ~3× too small to read (user
+    /// 2026-07-26). Scaling the glyph size by it keeps the HUD the same apparent size
+    /// everywhere; desktop (dpr 1) is unchanged.
+    dpr: f32,
 }
 
 impl State {
     async fn new(window: Option<Arc<winit::window::Window>>, size_hint: (u32, u32)) -> State {
         let size = match &window { Some(w) => w.inner_size(), None => winit::dpi::PhysicalSize::new(size_hint.0, size_hint.1) };
+        let dpr = window.as_ref().map(|w| w.scale_factor() as f32).unwrap_or(1.0);
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
         let surface = window.map(|w| instance.create_surface(w).expect("surface"));
         let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, compatible_surface: surface.as_ref(), force_fallback_adapter: false }).await.expect("adapter");
@@ -861,6 +867,7 @@ impl State {
             terrain_pipeline, terrain_vbuf, terrain_ibuf, terrain_nidx: ti.len() as u32,
             cam_buf, cam_bg, depth,
             sim, seed, pop,
+            dpr,
             paused: false, frustum_cull: true, lod: std::env::var("HORDE_NOLOD").is_err(), fps: 0.0, last: Instant::now(),
             yaw: 0.9, pitch: 0.7, dist: 820.0, dragging: false, last_mouse: (0.0, 0.0),
             free_cam: false, cam_pos: glam::Vec3::ZERO, mv: [false; 6],
@@ -1128,7 +1135,11 @@ impl State {
             let (x, y, zz) = (z.p.x as f32, z.p.y as f32, z.p.z as f32);
             let scale = zscale(z.class);
             if do_cull && !sphere_in_frustum(&planes, glam::Vec3::new(x, y, zz), scale * 1.6) { continue; }
-            let yaw = (z.vel.1 as f32).atan2(z.vel.0 as f32);
+            // Face the heading it actually TRAVELLED (`z.face`), not its instantaneous
+            // velocity: a unit stopped to swing has vel≈0, whose atan2 is meaningless —
+            // that's what made a pack of slimes each face a different way (user
+            // 2026-07-26). Only never-woken sleepers get the varied id-based pose.
+            let yaw = z.face;
             let d2 = (Vec3::new(x, y, zz) - eye).length_squared();
             if self.lod && d2 > LOD_DIST * LOD_DIST {
                 // Far: a walking impostor (photo billboard, animated in-shader).
@@ -1150,7 +1161,9 @@ impl State {
             let phase = (i as u32 % 8) as f32 / 8.0; // per-instance anim jitter
             let frame = if idle { (((now as f32 * 0.7 + phase) * nf as f32) as u32) % nf }
                 else { (((now as f32 * 1.6 + phase) * nf as f32) as u32) % nf };
-            let rot = if idle { i as f32 * 2.399963 + tw_yaw } else { -yaw + std::f32::consts::FRAC_PI_2 + tw_yaw };
+            // Pose: dormant sleepers keep their scattered id-based facing; anything
+            // awake (walking OR stalled mid-fight) faces its travelled heading.
+            let rot = if dormant { i as f32 * 2.399963 + tw_yaw } else { -yaw + std::f32::consts::FRAC_PI_2 + tw_yaw };
             let model = Mat4::from_translation(Vec3::new(x, y, zz)) * Mat4::from_rotation_y(rot) * Mat4::from_scale(Vec3::splat(scale * tw_scale));
             let inst = SkinInstance { model: model.to_cols_array_2d(), color: ztint(z.class, dormant), frame_base: frame * m.num_joints, _pad: [0; 3] };
             if idle { idle_buckets[mi].push(inst); } else { buckets[mi].push(inst); }
@@ -1220,12 +1233,42 @@ impl State {
         let mut building_ranges = [(0u32, 0u32); 5];
         let (ccx, ccz) = (WORLD as f32 * 0.5, WORLD as f32 * 0.5);
         let wound = [0.85, 0.16, 0.10];
+        // A tower renders far wider than its 8-wu ring slot, so the wall segments on
+        // either side of one grew straight through it (user 2026-07-26). Hide just
+        // those two — RENDER-ONLY: the sim keeps every segment, so ring HP, breaches
+        // and the measured balance are untouched, and the wall model's own decorative
+        // overhang is wide enough that the line still reads continuous into the tower.
+        // The ring is the leading run of Wall/Gate/Tower in `structures` (build_base).
+        let ring_n = self.sim.structures.iter()
+            .take_while(|s| matches!(s.kind, SKind::Wall | SKind::Gate | SKind::Tower))
+            .count();
+        // Ring segments render at a SMOOTHED height — a moving average of their
+        // neighbours' terrain y. On the raw (gently rolling) heightfield adjacent
+        // wall models, which are far wider than the 8-wu slot, stepped up and down
+        // over little rises and dips and visibly stopped meeting (user 2026-07-26).
+        // Averaging follows the broad terrain but kills the segment-to-segment jitter
+        // — a real rampart's levelled course. RENDER-ONLY: the sim keeps the exact
+        // terrain (flattening it there measurably changed the tuned balance).
+        let ring_y: Vec<f32> = (0..ring_n).map(|i| {
+            let w = 4i32;
+            let acc: f32 = (-w..=w).map(|d| {
+                let j = (i as i32 + d).rem_euclid(ring_n as i32) as usize;
+                self.sim.structures[j].p.y as f32
+            }).sum();
+            acc / (2 * w + 1) as f32
+        }).collect();
+        let tower_at = |i: usize| self.sim.structures[i].kind == SKind::Tower;
+        let shadowed_by_tower = |i: usize| ring_n > 2 && i < ring_n
+            && self.sim.structures[i].kind == SKind::Wall
+            && (tower_at((i + 1) % ring_n) || tower_at((i + ring_n - 1) % ring_n));
         for (bi, kind) in [SKind::Wall, SKind::Gate, SKind::Tower, SKind::House, SKind::Storehouse].into_iter().enumerate() {
             let start = building_inst.len() as u32;
             let (sc, yaw, yo) = building_tweak(kind);
-            for s in &self.sim.structures {
+            for (si, s) in self.sim.structures.iter().enumerate() {
                 if s.kind != kind { continue; }
-                let (x, y, zz) = (s.p.x as f32, s.p.y as f32, s.p.z as f32);
+                if shadowed_by_tower(si) { continue; }
+                let (x, mut y, zz) = (s.p.x as f32, s.p.y as f32, s.p.z as f32);
+                if si < ring_n { y = ring_y[si]; } // levelled course (see ring_y)
                 let frac = (s.hp / s.kind.max_hp()).clamp(0.0, 1.0) as f32;
                 let ang = (zz - ccz).atan2(x - ccx);
                 let destroyed = s.hp <= 0.0;
@@ -1339,18 +1382,26 @@ impl State {
         tris += (self.box_model.nidx as u64 / 3) * box_n as u64 + (self.cannon_model.nidx as u64 / 3) * cannon_n as u64 + self.castle_model.nidx as u64 / 3;
         tris += 2 * (self.dormant_n + self.corpse_n + proxy_n) as u64; // impostor quads
         let white = [0.92, 0.94, 0.98, 1.0];
-        let hx = sw - 170.0;
+        // The stat block is drawn in PHYSICAL pixels, so on a phone (dpr 2–3) a
+        // desktop-sized glyph is ~3× too small to read (user 2026-07-26). Size the
+        // glyph — and therefore the column width and line pitch — by the device pixel
+        // ratio, so the HUD keeps the same apparent size on every screen (desktop dpr
+        // 1 renders exactly as before).
+        let tp = 3.0 * self.dpr.clamp(1.0, 3.0);       // glyph pixel
+        let lh = 6.0 * tp;                              // line pitch (was 18 at tp=3)
+        let hx = sw - 58.0 * tp;                        // right column (was sw-170)
+        let ly = |n: f32| 4.0 * tp + n * lh;            // nth line's baseline
         let (wave_k, announced, wdir, eta) = self.sim.wave_info();
-        push_text(&mut ui, hx, 12.0, 3.0, white, &format!("FPS {:.0}", self.fps), sw, sh);
-        push_text(&mut ui, hx, 30.0, 3.0, [0.55, 0.95, 0.60, 1.0], &format!("SLP {dormant}"), sw, sh);
-        push_text(&mut ui, hx, 48.0, 3.0, [1.0, 0.55, 0.45, 1.0], &format!("ACT {active}/{}", self.sim.active_cap.min(self.pop)), sw, sh);
-        push_text(&mut ui, hx, 66.0, 3.0, white, &format!("KIL {}", self.sim.kills), sw, sh);
-        push_text(&mut ui, hx, 84.0, 3.0, white, &format!("RUN {}", self.sim.run), sw, sh);
-        push_text(&mut ui, hx, 102.0, 3.0, white, &tri_label(tris), sw, sh);
+        push_text(&mut ui, hx, ly(0.0), tp, white, &format!("FPS {:.0}", self.fps), sw, sh);
+        push_text(&mut ui, hx, ly(1.0), tp, [0.55, 0.95, 0.60, 1.0], &format!("SLP {dormant}"), sw, sh);
+        push_text(&mut ui, hx, ly(2.0), tp, [1.0, 0.55, 0.45, 1.0], &format!("ACT {active}/{}", self.sim.active_cap.min(self.pop)), sw, sh);
+        push_text(&mut ui, hx, ly(3.0), tp, white, &format!("KIL {}", self.sim.kills), sw, sh);
+        push_text(&mut ui, hx, ly(4.0), tp, white, &format!("RUN {}", self.sim.run), sw, sh);
+        push_text(&mut ui, hx, ly(5.0), tp, white, &tri_label(tris), sw, sh);
         #[cfg(not(target_arch = "wasm32"))]
-        push_text(&mut ui, hx, 120.0, 3.0, white, &format!("THR {}", self.n_threads), sw, sh);
+        push_text(&mut ui, hx, ly(6.0), tp, white, &format!("THR {}", self.n_threads), sw, sh);
         let mode = if self.sim.tower_threat_mode { "T: THREAT" } else { "T: NEAR" };
-        push_text(&mut ui, hx, 138.0, 3.0, [0.9, 0.85, 0.5, 1.0], mode, sw, sh);
+        push_text(&mut ui, hx, ly(7.0), tp, [0.9, 0.85, 0.5, 1.0], mode, sw, sh);
         // Ring integrity: average HP of the wall line (walls+gates+towers).
         let (mut got_hp, mut max_hp) = (0.0f64, 0.0f64);
         for s in &self.sim.structures {
@@ -1358,7 +1409,7 @@ impl State {
         }
         let wal = (got_hp / max_hp.max(1.0) * 100.0) as u32;
         let walc = if wal > 70 { [0.55, 1.0, 0.60, 1.0] } else if wal > 35 { [1.0, 0.85, 0.4, 1.0] } else { [1.0, 0.45, 0.35, 1.0] };
-        push_text(&mut ui, hx, 156.0, 3.0, walc, &format!("WAL {wal}"), sw, sh);
+        push_text(&mut ui, hx, ly(8.0), tp, walc, &format!("WAL {wal}"), sw, sh);
         // North compass (user 2026-07-23): project the world cardinals through the
         // camera so the letters track where each direction is on screen as you orbit;
         // north = −Z (matches the wave banner's FROM-N). N is highlighted.
@@ -1367,7 +1418,7 @@ impl State {
             let c = Vec3::new(WORLD as f32 * 0.5, 30.0, WORLD as f32 * 0.5);
             let scr = |p: Vec3| -> glam::Vec2 { let q = vpm * p.extend(1.0); glam::Vec2::new(q.x / q.w, -q.y / q.w) };
             let c0 = scr(c);
-            let (ccx, ccy, r) = (sw - 44.0, 212.0, 18.0f32);
+            let (ccx, ccy, r) = (sw - 15.0 * tp, ly(9.0) + 6.0 * tp, 6.0 * tp);
             push_quad(&mut ui, ccx - r - 5.0, ccy - r - 5.0, (r + 5.0) * 2.0, (r + 5.0) * 2.0, [0.06, 0.08, 0.14, 0.5], sw, sh);
             for (dir, lbl, col) in [
                 (Vec3::new(0.0, 0.0, -1.0), "N", [1.0, 0.5, 0.45, 1.0]),

@@ -111,6 +111,10 @@ pub struct Zombie {
     pub groan_t: f64,
     /// Attack swing timer (Attacking state).
     pub swing_t: f64,
+    /// Last heading actually travelled (radians, atan2(dz, dx)). Renderers face the
+    /// unit by this instead of by `vel`, which goes to zero the moment it stops to
+    /// swing — that made stalled units snap to an arbitrary pose (user 2026-07-26).
+    pub face: f32,
     /// A sleeper this mover shoved this frame (u32::MAX = none): contact wakes
     /// — the wave shakes the carpet awake instead of jamming against it.
     bump: u32,
@@ -708,15 +712,21 @@ fn build_base(rng: &mut Rng, seed: f64, sc: Scenario) -> Vec<Structure> {
         let kind = if gates.contains(&i) { SKind::Gate } else if i % 6 == 3 { SKind::Tower } else { SKind::Wall };
         s.push(Structure { kind, p: at(x, z), hp: kind.max_hp(), pop: 0 });
     }
-    // Houses: rejection-sampled so no two buildings interpenetrate (≥16 wu
-    // between houses, ≥26 wu clear of the Command Center / storehouse spots).
+    // Houses: rejection-sampled so no two buildings interpenetrate (≥16 wu between
+    // houses). The inner radius clears the CASTLE model, not just the CC's point: the
+    // keep renders at scale 40, so houses sampled from r=34 grew straight through it
+    // (user 2026-07-26) — start at 58 (and pull the outer edge in to 104, so moving them out
+    // doesn't hand the horde easier targets near the wall) and stay off the storehouses.
+    let stores: Vec<(f64, f64)> = (0..2)
+        .map(|q| { let a = q as f64 * std::f64::consts::PI + 0.7; (cx + a.cos() * 40.0, cz + a.sin() * 40.0) })
+        .collect();
     let mut placed: Vec<(f64, f64)> = Vec::new();
     let mut tries = 0;
-    while placed.len() < 28 && tries < 600 {
+    while placed.len() < 28 && tries < 900 {
         tries += 1;
-        let (a, r) = (rng.range(0.0, std::f64::consts::TAU), rng.range(34.0, 110.0));
+        let (a, r) = (rng.range(0.0, std::f64::consts::TAU), rng.range(58.0, 104.0));
         let (x, z) = (cx + a.cos() * r, cz + a.sin() * r);
-        if r < 26.0 { continue; }
+        if stores.iter().any(|(px, pz)| { let (dx, dz) = (x - px, z - pz); dx * dx + dz * dz < 22.0 * 22.0 }) { continue; }
         if placed.iter().any(|(px, pz)| { let (dx, dz) = (x - px, z - pz); dx * dx + dz * dz < 16.0 * 16.0 }) { continue; }
         placed.push((x, z));
         s.push(Structure { kind: SKind::House, p: at(x, z), hp: SKind::House.max_hp(), pop: 5 + (rng.unit() * 15.0) as u32 });
@@ -767,7 +777,7 @@ fn spawn_field_at(rng: &mut Rng, pop: usize, seed: f64, sc: Scenario, centers: &
         // (harpy → runner) so the funnel actually holds (user 2026-07-22).
         let class = if roll < 0.70 { ZClass::Walker } else if roll < 0.85 { ZClass::Runner } else if roll < 0.91 { ZClass::Chubby } else if roll < 0.96 { ZClass::Venom } else if sc == Scenario::Patches { ZClass::Runner } else { ZClass::Harpy };
         let y = terrain_h(x, z, seed, sc) + class.altitude();
-        units.push(Zombie { class, p: Point3::new(x, y, z), vel: (0.0, 0.0), state: ZState::Dormant, hp: class.max_hp(), heard: 0.0, linger: 0.0, groan_t: rng.range(0.5, 2.0), swing_t: 0.0, bump: u32::MAX, moved: false });
+        units.push(Zombie { class, p: Point3::new(x, y, z), vel: (0.0, 0.0), state: ZState::Dormant, hp: class.max_hp(), heard: 0.0, linger: 0.0, groan_t: rng.range(0.5, 2.0), swing_t: 0.0, face: units.len() as f32 * 2.399963, bump: u32::MAX, moved: false });
     }
     units
 }
@@ -1076,7 +1086,7 @@ impl Horde {
     pub fn spawn_zombie(&mut self, class: ZClass, x: f64, z: f64, state: ZState) {
         if state == ZState::Dormant { self.dormant_epoch += 1; } else { self.active_n += 1; } // wave/infection marchers count against the front
         let y = terrain_h(x, z, self.seed, self.scenario) + class.altitude();
-        let z0 = Zombie { class, p: Point3::new(x, y, z), vel: (0.0, 0.0), state, hp: class.max_hp(), heard: 0.0, linger: 0.0, groan_t: 1.0, swing_t: 0.5, bump: u32::MAX, moved: false };
+        let z0 = Zombie { class, p: Point3::new(x, y, z), vel: (0.0, 0.0), state, hp: class.max_hp(), heard: 0.0, linger: 0.0, groan_t: 1.0, swing_t: 0.5, face: 0.0, bump: u32::MAX, moved: false };
         match self.free_slots.pop() {
             Some(slot) => { self.units[slot as usize] = z0; } // handle is None (freed at death) → sync inserts
             None => { self.units.push(z0); self.handles.push(None); }
@@ -1486,6 +1496,10 @@ impl Horde {
                     else { nx = z.p.x; nz = z.p.z; }
                 }
                 if nx != z.p.x || nz != z.p.z {
+                    // Remember the heading we actually travelled: an awake unit that
+                    // stalls (attacking, jostled, blocked) must KEEP facing this way —
+                    // deriving the yaw from a ~zero velocity spins it randomly.
+                    z.face = ((nz - z.p.z) as f32).atan2((nx - z.p.x) as f32);
                     z.p = Point3::new(nx, terrain_h(nx, nz, self.seed, sc) + z.class.altitude(), nz);
                     z.moved = true;
                 }
