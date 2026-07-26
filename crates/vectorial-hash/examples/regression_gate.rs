@@ -23,13 +23,18 @@
 
 use std::hint::black_box;
 use std::time::Instant;
-use vectorial_hash::{Aabb, KdTree3, LinearOctree3, MortonGrid3, Octree3, Point3, Positioned3, Sphere3, Tree3};
+use vectorial_hash::{Aabb, Circle, KdTree3, LinearOctree3, LinearQuadTree, MortonGrid3, Octree3, Point, Point3, Positioned, Positioned3, QuadTree, Rect, Sphere3, Tree, Tree3};
 
 const WORLD: f64 = 512.0;
 const N: usize = 20_000;
 const IL: usize = 8;
 const VISION: f64 = 36.0;
 const N_QUERY: usize = 64;
+/// 2D query radius. NOT the same as the 3D one on purpose: at r=36 a disc over 20k
+/// points in a 512x512 world holds ~310 of them while a sphere in 512^3 holds ~29, so a
+/// shared radius would make the 2D ops measure result-vector growth (and be ~15% noisy
+/// run to run) instead of the descent the 3D ops measure. r=12 puts both at ~30 hits.
+const VISION_2D: f64 = 12.0;
 const MARGIN: f64 = 4.0;
 const REPS: usize = 40;
 const BASELINE: &str = "crates/vectorial-hash/benches/baseline.tsv";
@@ -58,6 +63,19 @@ fn queries() -> Vec<Sphere3> {
     let mut r = Rng::new(99);
     (0..N_QUERY).map(|_| Sphere3::new(r.range(0.0, WORLD), r.range(0.0, WORLD), r.range(0.0, WORLD), VISION)).collect()
 }
+#[derive(Clone, Copy)]
+struct C2 { id: u32, p: Point }
+impl Positioned for C2 { fn position(&self) -> Point { self.p } }
+
+fn items2() -> Vec<C2> {
+    let mut r = Rng::new(3);
+    (0..N).map(|id| C2 { id: id as u32, p: Point::new(r.range(MARGIN, WORLD - MARGIN), r.range(MARGIN, WORLD - MARGIN)) }).collect()
+}
+fn queries2() -> Vec<Circle> {
+    let mut r = Rng::new(101);
+    (0..N_QUERY).map(|_| Circle::new(Point::new(r.range(0.0, WORLD), r.range(0.0, WORLD)), VISION_2D)).collect()
+}
+
 #[inline]
 fn step(p: &mut Point3, v: &mut (f64, f64, f64)) -> Point3 {
     let dt = 1.0 / 60.0;
@@ -149,6 +167,22 @@ fn measure() -> Vec<(&'static str, f64)> {
         let mut vel = vels();
         out.push(("update_ref_frame", bench(|| { for id in 0..N { let np = step(&mut pos[id], &mut vel[id]); t.update_ref(refs[id], |c| c.p = np); } 0 })));
     }
+
+    // ---- 2D. The gate was 3D-only, so a 2D-side regression (the `Tree`/`QuadTree`
+    // descent, or the linear quadtree) could not be caught at all.
+    let rect = Rect::new(0.0, 0.0, WORLD, WORLD);
+    let its2 = items2();
+    let qs2 = queries2();
+    out.push(("build_tree2", bench(|| { let mut t = Tree::<C2>::new(rect, IL); for it in &its2 { t.insert(*it); } t.item_count() as u64 })));
+    out.push(("build_quadtree2", bench(|| { let mut t = QuadTree::<C2>::new(rect, IL); for it in &its2 { t.insert(*it); } t.item_count() as u64 })));
+    out.push(("build_linear_quadtree", bench(|| LinearQuadTree::from_items(rect, IL, 14, its2.clone()).item_count() as u64)));
+
+    let mut tree2 = Tree::<C2>::new(rect, IL); for it in &its2 { tree2.insert(*it); }
+    let mut quad2 = QuadTree::<C2>::new(rect, IL); for it in &its2 { quad2.insert(*it); }
+    let lq2 = LinearQuadTree::from_items(rect, IL, 14, its2.clone());
+    out.push(("cull_tree2_x64", bench(|| { let mut n = 0u64; for s in &qs2 { n += tree2.cull(s).len() as u64; } n })));
+    out.push(("cull_quadtree2_x64", bench(|| { let mut n = 0u64; for s in &qs2 { n += quad2.cull(s).len() as u64; } n })));
+    out.push(("cull_linear_quadtree_x64", bench(|| { let mut n = 0u64; for s in &qs2 { n += lq2.cull(s).len() as u64; } n })));
     out
 }
 

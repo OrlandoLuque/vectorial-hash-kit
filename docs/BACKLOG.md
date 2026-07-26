@@ -55,8 +55,10 @@ All three landed on `main`, published to the site, docs written in-step:
   baseline, not fifteen simultaneous optimisations.
 
 **Follow-ups queued:**
-- **LinearQuadTree is still ungated** in the regression gate — the gate has no 2D section
-  at all (its whole item set is `C3`). Adding one is a real change, not a line.
+- ~~LinearQuadTree ungated~~ **done the same night**: the gate now has a 2D section
+  (`Tree` / `QuadTree` / `LinearQuadTree`, build + cull) with its own query radius —
+  sharing the 3D radius made the 2D culls return ~310 hits vs ~29 and measure result-
+  vector growth instead of the descent (±17% run-to-run; now −2…+5%).
 - Impostor/LOD for the point cloud at 1M+ points; stealth guard AI (investigate a lost
   sighting) if the user wants it to be more of a game; a 3D variant of the fluid.
 - The point-cloud `probe_n` clippy `unused_assignments` warning is a false-ish positive
