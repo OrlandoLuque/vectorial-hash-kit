@@ -996,7 +996,11 @@ impl State {
     fn update_and_render(&mut self) {
         let dt = { let d = self.last.elapsed().as_secs_f64().min(0.05); self.last = Instant::now(); d };
         if self.free_cam {
-            let fwd = self.forward();
+            // W/S/A/D move PARALLEL TO THE GROUND: the forward vector is flattened
+            // onto the XZ plane, so looking down no longer drives the camera into the
+            // terrain (user 2026-07-26) — Q/E own the vertical axis. The look
+            // direction itself still uses the full pitch, of course.
+            let fwd = { let f = self.forward(); Vec3::new(f.x, 0.0, f.z).normalize_or_zero() };
             let right = fwd.cross(Vec3::Y).normalize_or_zero();
             let sp = 500.0 * dt as f32;
             let mut d = Vec3::ZERO;

@@ -722,7 +722,10 @@ impl State {
         };
         // Free-fly camera: move the eye by the held WASD / Q-E keys (native).
         if self.free_cam {
-            let fwd = self.forward();
+            // W/S/A/D move PARALLEL TO THE GROUND (forward flattened onto XZ), so
+            // looking down doesn't drive the camera into the terrain; Q/E own the
+            // vertical axis (user 2026-07-26). The look direction keeps the pitch.
+            let fwd = { let f = self.forward(); Vec3::new(f.x, 0.0, f.z).normalize_or_zero() };
             let right = fwd.cross(Vec3::Y).normalize_or_zero();
             let sp = 500.0 * dt as f32;
             let mut d = Vec3::ZERO;
