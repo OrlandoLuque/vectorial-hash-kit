@@ -66,6 +66,15 @@ All three landed on `main`, published to the site, docs written in-step:
 - **Measure the fluid's actual relocation rate** (`update_ref_tracked` -> `Crossing::Moved`)
   and check it against `advisor::HIGH_RELOCATION`: the fluid is the first workload where
   keeping the index LOSES the frame, and the advisor's churn rule should have predicted it.
+- **Isolate each timed measurement**: measuring the same cull three ways in one process
+  reports 1.89x or 2.45x depending on where in the run it lands — cache state and run
+  order outweigh the choice of clock at this scale. Options: one measurement per process
+  invocation (bench-runner already spawns per bench, so it needs a --only-metric flag in
+  the benches), or A/B/B/A interleaving to cancel first-order drift. Until then, quote
+  `work_counters` for algorithmic claims and timings only with their spread.
+- **Headless mode for the three wgpu demos**, so their sim cost can be measured with no
+  render at all (siege and horde already have this via `siege_cpu_bench`/`horde_bench`;
+  the fluid solver would need lifting out of the binary the way `siege_sim` was).
 - Impostor/LOD for the point cloud at 1M+ points; stealth guard AI (investigate a lost
   sighting) if the user wants it to be more of a game; a 3D variant of the fluid.
 - The point-cloud `probe_n` clippy `unused_assignments` warning is a false-ish positive
