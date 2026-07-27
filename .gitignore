@@ -19,3 +19,4 @@ crates/vectorial-hash-demos/assets/siege/Fish.zip
 # Loose root-level .glb downloads — the ones we use are extracted into models/.
 crates/vectorial-hash-demos/assets/siege/*.glb
 bench-results/
+vh-calibration.txt
