@@ -63,6 +63,9 @@ All three landed on `main`, published to the site, docs written in-step:
   vector growth instead of the descent (±17% run-to-run; now −2…+5%).
 - **`KdTree2` landed too** (the 2D median-split twin, 11th structure) — fastest build AND
   cull of the 2D set on clustered data; see the crate README row.
+- **Measure the fluid's actual relocation rate** (`update_ref_tracked` -> `Crossing::Moved`)
+  and check it against `advisor::HIGH_RELOCATION`: the fluid is the first workload where
+  keeping the index LOSES the frame, and the advisor's churn rule should have predicted it.
 - Impostor/LOD for the point cloud at 1M+ points; stealth guard AI (investigate a lost
   sighting) if the user wants it to be more of a game; a 3D variant of the fluid.
 - The point-cloud `probe_n` clippy `unused_assignments` warning is a false-ish positive

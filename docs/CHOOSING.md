@@ -104,7 +104,20 @@ repeated passes** on an idle machine, via `cargo run -p bench-runner --release`:
   report the scan winning at small N. Don't index 40 guards.
 - **Relocating everything every frame?** Hold the `ItemRef` that `insert_ref` returns and
   call `update_ref` — it skips the predicate's leaf scan and is the single biggest
-  maintain win (the decision map flipped on it). One extra field per entity.
+  **maintain** win (the decision map flipped on it). One extra field per entity.
+  **But maintain is not the frame.** Measured on two workloads that both relocate
+  everything:
+
+  | | maintain | query | verdict |
+  | --- | --- | --- | --- |
+  | siege (20k units, modest culls) | keep 3–5× cheaper | ~unchanged | **keep wins 1.05×→1.50×** (1→16 threads) |
+  | fluid (2.2k particles, one neighbour query *per particle*) | keep 3.5–3.9× cheaper | keep **+22%** | **rebuild wins the frame by 16%** |
+
+  The difference is how far items move *relative to their leaf* and how query-heavy the
+  frame is. A kept tree drifts from the ideal partition as the data sloshes; a rebuild is
+  always perfectly fitted. When the query dominates (SPH), that drift costs more than the
+  relocation saves — which is exactly what `advisor::HIGH_RELOCATION` exists to flag.
+  See [`FLUID.md`](FLUID.md) and [`PARALLEL.md`](PARALLEL.md) § the per-frame index.
 - **Rebuilding from scratch each frame** (no persistent handles, uniform dense field)?
   `MortonGrid3` has the cheapest build and cull — there's nothing to maintain, you refill
   it. If the field is *skewed* rather than uniform, try `LinearOctree3` /

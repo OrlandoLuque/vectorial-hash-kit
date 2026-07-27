@@ -46,6 +46,15 @@ The query dominates the frame in every mode, which is the honest headline: in an
 sim the *neighbour search is the simulation cost*, and the physics is comparatively
 cheap arithmetic.
 
+**This is the kit's first measured counterexample to "keep the index".** The siege demo
+relocates 20 000 units per frame and keeping the index wins 1.05× (1 thread) → 1.50×
+(16). Here every particle also relocates every step — and keeping loses the frame by 16%.
+The two differ in how far an item moves relative to its leaf, and in how query-heavy the
+frame is: SPH runs a neighbour query *per particle*, so partition drift is paid 2 200
+times a step while the relocation saving is paid once. The advisor's `HIGH_RELOCATION`
+rule points the same way; wiring the fluid's actual relocation rate through
+`update_ref_tracked` to confirm it is queued in the backlog.
+
 ## Physics: PBF, not the textbook EOS
 
 The demo solves **density constraints** (Macklin & Müller 2013) rather than the
