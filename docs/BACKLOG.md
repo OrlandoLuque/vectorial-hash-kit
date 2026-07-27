@@ -59,6 +59,8 @@ All three landed on `main`, published to the site, docs written in-step:
   (`Tree` / `QuadTree` / `LinearQuadTree`, build + cull) with its own query radius —
   sharing the 3D radius made the 2D culls return ~310 hits vs ~29 and measure result-
   vector growth instead of the descent (±17% run-to-run; now −2…+5%).
+- **`KdTree2` landed too** (the 2D median-split twin, 11th structure) — fastest build AND
+  cull of the 2D set on clustered data; see the crate README row.
 - Impostor/LOD for the point cloud at 1M+ points; stealth guard AI (investigate a lost
   sighting) if the user wants it to be more of a game; a 3D variant of the fluid.
 - The point-cloud `probe_n` clippy `unused_assignments` warning is a false-ish positive
