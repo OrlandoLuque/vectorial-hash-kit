@@ -99,5 +99,21 @@ fn main() {
     println!("\nmaintain, relocate all {n}/frame:  QuadTree keep-index {t_maint_qt:7.2} ms | Morton rebuild {t_maint_mor:7.2} ms | LinearQuadTree rebuild {t_maint_lin:7.2} ms");
     println!("  → the 2D echo of the 3D decision map: the keep-index QuadTree beats the LinearQuadTree rebuild {:.2}× on relocate-all", t_maint_lin / t_maint_qt);
     println!("    (so on MOVING data prefer the kept tree; LinearQuadTree's edge is STATIC/rebuild-often skewed data — cheap build, adaptive query)");
+    // Machine-readable lines for `bench-runner`.
+    println!("#M build_kdtree2 {t_build_kd:.3} ms");
+    println!("#M build_quadtree {t_build_qt:.3} ms");
+    println!("#M build_linear_quadtree {t_build_lin:.3} ms");
+    println!("#M build_morton {t_build_mor:.3} ms");
+    println!("#M cull_kdtree2 {t_cull_kd:.3} ms");
+    println!("#M cull_quadtree {t_cull_qt:.3} ms");
+    println!("#M cull_linear_quadtree {t_cull_lin:.3} ms");
+    println!("#M cull_morton {t_cull_mor:.3} ms");
+    println!("#M knn_kdtree2 {t_knn_kd:.3} ms");
+    println!("#M knn_quadtree {t_knn_qt:.3} ms");
+    println!("#M cull_ratio_kd2_over_quadtree {:.3} x", t_cull_qt / t_cull_kd);
+    println!("#M maintain_quadtree_keep {t_maint_qt:.3} ms");
+    println!("#M maintain_linear_rebuild {t_maint_lin:.3} ms");
+    #[cfg(feature = "parallel")]
+    println!("#M build_kdtree2_speedup {:.3} x", t_build_kd / t_build_kd_par);
     if sink == usize::MAX { println!("{sink}"); }
 }

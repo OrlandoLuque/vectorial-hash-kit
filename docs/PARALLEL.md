@@ -286,14 +286,15 @@ an id shift — so the parallel build produces a **node-for-node identical** tre
 what the test asserts (same node count, same leaf boxes and ranges, same depth, same cull
 and k-NN answers) rather than merely an equivalent one.
 
-200 000 points, 16 threads, min-of-5, release:
+200 000 points, 16 threads, min-of-5 inside the bench, **median of 3 passes** of it:
 
 | build | serial | parallel | speed-up |
 | --- | ---: | ---: | ---: |
-| `KdTree3` uniform | 20.47 ms | **6.29 ms** | **3.25×** |
-| `KdTree3` clustered | 20.06 ms | **6.02 ms** | **3.33×** |
-| `Tree3::bulk_load` uniform | 41.87 ms | 25.29 ms | 1.66× |
-| `Tree3::bulk_load` clustered | 56.17 ms | 27.73 ms | 2.03× |
+| `KdTree3` uniform | 20.13 ms | **6.03 ms** | **3.35×** |
+| `KdTree3` clustered | 20.57 ms | **6.02 ms** | **3.38×** |
+| `Tree3::bulk_load` uniform | 40.49 ms | 25.77 ms | 1.56× |
+| `Tree3::bulk_load` clustered | 55.86 ms | 29.98 ms | 1.86× |
+| `KdTree2` (2D, clustered) | 7.96 ms | **2.85 ms** | **2.79×** |
 
 **The median split parallelises better than the midpoint split, and it's not an accident.**
 `rayon::join` is only as fast as its slower half, so a fan-out is worth what its *load
@@ -308,10 +309,11 @@ So the structure whose build is the expensive one (the median selection) is also
 that recovers the most from threads. Note the end state: the parallel k-d build (6.0 ms)
 is **faster than `LinearOctree3`'s serial build** (13.6 ms), which is the fastest serial
 build in the comparison — "the k-d tree builds slowly" stops being true once you have
-cores to spend, while its query advantage on clustered data (cull 3.1×, k-NN 1.65× vs
-`Tree3`) is unchanged. Reproduce with:
+cores to spend, while its query advantage on clustered data (cull 2.2–2.5×, k-NN 1.67×
+vs `Tree3`) is unchanged. Reproduce with:
 
 ```bash
+cargo run -p bench-runner --release -- --group kd --repeat 3   # both benches, 3 passes
 cargo run -p vectorial-hash --example kdtree3_bench --release --features parallel
 ```
 

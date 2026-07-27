@@ -18,19 +18,24 @@ pressing `M` rebuilds on another structure and re-runs the whole pass.
 
 ## Measured (120 000 points, k = 16, release)
 
-| structure | build | k-NN over **all** points | per query |
-| --- | ---: | ---: | ---: |
-| **`KdTree3`** (median split) | 11 ms | **195 ms** | **1.63 µs** |
-| `Octree3` (midpoint split) | 19 ms | 218 ms | 1.82 µs |
-| `MortonGrid3` (flat grid) | **6 ms** | 329 ms | 2.74 µs |
+Median of **7 passes**, machine-idle gated (`cargo run -p bench-runner --release --
+--group demos --only pointcloud --repeat 7`):
 
-- **The k-d tree answers k-NN 1.68× faster than the flat grid** and 1.12× faster than the
-  pointer octree. Balancing by point *count* keeps its depth at ~log₂(n/leaf) however the
-  points clump, so a query descends straight to the neighbourhood; the grid's ring-shell
-  expansion has to wade through cells that are empty because the scene is mostly air.
-- **It also builds 1.7× faster than the octree** — the midpoint octree keeps subdividing
-  empty space, the median split never does.
-- **The grid still builds fastest** (6 ms): if you rebuild constantly and query rarely,
+| structure | build | k-NN over **all** points | per query | spread |
+| --- | ---: | ---: | ---: | ---: |
+| **`KdTree3`** (median split) | 11.0 ms | 214.0 ms | **1.78 µs** | 16% |
+| `Octree3` (midpoint split) | 18.5 ms | 215.8 ms | 1.80 µs | 3% |
+| `MortonGrid3` (flat grid) | **6.3 ms** | 322.3 ms | 2.69 µs | 2% |
+
+- **Both trees answer k-NN ~1.5× faster than the flat grid.** Balancing by point *count*
+  (or by space) keeps a query descending straight to the neighbourhood; the grid's
+  ring-shell expansion wades through cells that are empty because the scene is mostly air.
+- **The k-d tree and the pointer octree are tied on k-NN here** — 214.0 vs 215.8 ms, well
+  inside the k-d tree's own 16% run-to-run spread. An earlier single run had the k-d tree
+  1.12× ahead; repeated passes do not support that. Its clear win over `Octree3` on this
+  data is the **build: 1.7× faster** (11.0 vs 18.5 ms), because the midpoint octree keeps
+  subdividing empty space and the median split never does.
+- **The grid still builds fastest** (6.3 ms): if you rebuild constantly and query rarely,
   that's the trade. Here you build once and query 120 000 times.
 
 The probe sphere you sweep with the mouse is the same story at a single-query scale

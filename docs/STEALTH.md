@@ -32,24 +32,29 @@ constructor recovers an axis-aligned box's six faces, so no special case is need
 
 Every frame the *same* cones are also resolved by a **linear scan** of every agent
 against the same six half-spaces, the two answers are compared, and both costs go on the
-HUD. Per frame, 9 guards, 90 crates (sampled at the end of a 900-frame run):
+HUD. Per frame, 9 guards, 90 crates — **mean over 600 stepped frames, median of 3 passes**:
 
 | crowd | index cull | linear scan | winner |
 | ---: | ---: | ---: | :--- |
-| 40 | 3 µs | **1 µs** | scan, 3× |
-| 160 | 7 µs | **2 µs** | scan, 3.5× |
-| 640 | 21 µs | **11 µs** | scan, 1.9× |
-| 2 560 | **87 µs** | 218 µs | index, 2.5× |
-| 10 240 | **306 µs** | 908 µs | index, 3.0× |
-| 40 000 | **467 µs** | 3 328 µs | index, **7.1×** |
+| 40 | 3.1 µs | **1.1 µs** | scan, 2.7× |
+| 160 | 7.6 µs | **3.7 µs** | scan, 2.1× |
+| 640 | 22.8 µs | **16.8 µs** | scan, 1.4× |
+| 2 560 | **92.0 µs** | 224.4 µs | index, 2.4× |
+| 10 240 | **226.8 µs** | 934.8 µs | index, 4.1× |
+| 40 000 | **514.4 µs** | 3 431.7 µs | index, **6.7×** |
+
+Reproduce with `cargo run -p bench-runner --release -- --group demos --only stealth
+--repeat 3`. The demo reports **means over the run**, not the last frame's reading: an
+early version printed one frame, and in a batch of three passes one of them landed on a
+frame that had not stepped and reported a clean, plausible-looking **zero**.
 
 **The crossover is around a thousand agents.** Below it the tree is honestly slower: a
 `contains_point` against 6 planes is a handful of multiply-adds, and at 40 agents the
 traversal costs more than just looking at all of them. Above it the index pulls away and
-keeps pulling — 7× by 40 000. If your game has 30 guards and 200 NPCs, a loop is the
+keeps pulling — 6.7× by 40 000. If your game has 30 guards and 200 NPCs, a loop is the
 right answer, and this demo says so on screen rather than pretending otherwise.
 
-Note what dominates at scale: **exact LoS** (8 ms at 40 000) swamps both, because it runs
+Note what dominates at scale: **exact LoS** (7.6 ms at 40 000) swamps both, because it runs
 per *candidate*. Cheapening the broadphase matters far less than keeping the candidate
 set small — which is the argument for the cone being a tight frustum in the first place.
 

@@ -149,6 +149,9 @@ struct World {
     // per-frame query costs (µs)
     cone_us: f32, los_us: f32, brute_us: f32,
     agree: bool, mismatch: (usize, usize), bad_frames: u32,
+    // Running sums, because a single frame's reading is not a measurement: if the last
+    // frame happens not to step, "the number" is 0. (It did, once, in a batch run.)
+    acc_cone: f64, acc_brute: f64, acc_los: f64, acc_seen: f64, acc_frames: u32,
 }
 
 impl World {
@@ -172,7 +175,8 @@ impl World {
             Vec3::new(r.r(40.0, WORLD - 40.0), 7.0, r.r(40.0, WORLD - 40.0)),
             Vec3::new(r.r(-26.0, 26.0), 0.0, r.r(-26.0, 26.0)),
         )).collect();
-        World { crates, occ, occ_r, guards, civs, player: Vec3::new(40.0, 7.0, 40.0), goal: Vec3::new(WORLD - 60.0, 7.0, WORLD - 60.0), caught: 0.0, escaped: false, seen_now: 0, cone_us: 0.0, los_us: 0.0, brute_us: 0.0, agree: true, mismatch: (0, 0), bad_frames: 0 }
+        World { crates, occ, occ_r, guards, civs, player: Vec3::new(40.0, 7.0, 40.0), goal: Vec3::new(WORLD - 60.0, 7.0, WORLD - 60.0), caught: 0.0, escaped: false, seen_now: 0, cone_us: 0.0, los_us: 0.0, brute_us: 0.0, agree: true, mismatch: (0, 0), bad_frames: 0,
+            acc_cone: 0.0, acc_brute: 0.0, acc_los: 0.0, acc_seen: 0.0, acc_frames: 0 }
     }
 
     /// The guard's view cone as a frustum: a near quad just in front of the eye and a
@@ -289,6 +293,11 @@ impl World {
             }
         }
         self.los_us = (Instant::now() - t1).as_secs_f32() * 1e6;
+        self.acc_cone += self.cone_us as f64;
+        self.acc_brute += self.brute_us as f64;
+        self.acc_los += self.los_us as f64;
+        self.acc_seen += self.seen_now as f64;
+        self.acc_frames += 1;
 
         // alert meter + win/lose
         self.caught = (self.caught + if exposed { SPOT_RATE * dt } else { -CALM_RATE * dt }).clamp(0.0, 1.0);
@@ -522,9 +531,21 @@ async fn run() {
 
                 if let Some(max) = smoke {
                     if frame >= max {
-                        println!("stealth_wgpu: {} guards / {} crowd / {} crates - cones: index cull {:.0} us vs linear scan {:.0} us (agree over the whole run {}) - exact LoS {:.0} us - seen now {} - alert {:.2} - {:.0} fps",
-                            w.guards.len(), w.civs.len(), w.crates.len(), w.cone_us, w.brute_us, w.bad_frames == 0, w.los_us, w.seen_now, w.caught, fps);
+                        // MEANS over every stepped frame, not the last frame's values.
+                        let n = w.acc_frames.max(1) as f64;
+                        let (cone, brute, los, seen) = (w.acc_cone / n, w.acc_brute / n, w.acc_los / n, w.acc_seen / n);
+                        println!("stealth_wgpu: {} guards / {} crowd / {} crates over {} stepped frames - cones: index cull {:.1} us vs linear scan {:.1} us (agree every frame: {}) - exact LoS {:.1} us - seen {:.0} - {:.0} fps  [means]",
+                            w.guards.len(), w.civs.len(), w.crates.len(), w.acc_frames, cone, brute, los, w.bad_frames == 0, seen, fps);
                         if w.bad_frames > 0 { println!("  MISMATCH on {} frames - last index {} vs scan {}", w.bad_frames, w.mismatch.0, w.mismatch.1); }
+                        // machine-readable for `bench-runner`; keyed by crowd size so a
+                        // sweep produces the index-vs-scan crossover table directly.
+                        let tag = w.civs.len();
+                        println!("#M crowd{tag}.index_cull {cone:.2} us");
+                        println!("#M crowd{tag}.linear_scan {brute:.2} us");
+                        println!("#M crowd{tag}.scan_over_index {:.3} x", brute / cone.max(1e-9));
+                        println!("#M crowd{tag}.exact_los {los:.2} us");
+                        println!("#M crowd{tag}.stepped_frames {} n", w.acc_frames);
+                        println!("#M crowd{tag}.agree {} bool", if w.bad_frames == 0 { 1 } else { 0 });
                         elwt.exit();
                     }
                 }

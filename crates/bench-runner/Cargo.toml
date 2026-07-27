@@ -1,0 +1,17 @@
+[package]
+name = "bench-runner"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+description = "Runs the kit's benchmarks back to back on a quiet machine and writes result tables"
+
+[[bin]]
+name = "bench-runner"
+path = "src/main.rs"
+
+# Deliberately no dependencies: this tool must build instantly and never be the reason a
+# benchmark run is delayed (or a lockfile churns).
+[dependencies]

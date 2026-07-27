@@ -5,6 +5,7 @@ members = [
     "crates/vectorial-hash-templates",
     "crates/vectorial-hash-cli",
     "crates/vectorial-hash-demos",
+    "crates/bench-runner",
 ]
 
 [workspace.package]

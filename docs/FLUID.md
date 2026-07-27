@@ -16,25 +16,31 @@ Env: `FLUID_N` (particles), `FLUID_INDEX=morton|keep|linear`, `FLUID_MAX_FRAMES`
 
 ## The measured head-to-head
 
-2 200 particles, 420 frames, release build, one PBF step per frame (3 constraint
-iterations), RTX-class box — **per frame**:
+2 200 particles, 420 frames, one PBF step per frame (3 constraint iterations) — **per
+frame**, median of 3 passes:
 
 | index | maintain | query | physics | fps |
 | --- | ---: | ---: | ---: | ---: |
-| `MortonGrid` (rebuilt each step) | 0.21 ms | 1.90 ms | 1.82 ms | 254 |
-| `Tree` + `ItemRef` (kept, relocated in place) | **0.06 ms** | 2.22 ms | 1.76 ms | 253 |
-| `LinearQuadTree` (rebuilt each step) | 0.21 ms | **1.84 ms** | 1.40 ms | **269** |
+| `MortonGrid` (rebuilt each step) | 0.107 ms | **1.541 ms** | 1.082 ms | **337** |
+| `Tree` + `ItemRef` (kept, relocated in place) | **0.031 ms** | 1.884 ms | 1.095 ms | 306 |
+| `LinearQuadTree` (rebuilt each step) | 0.121 ms | 1.620 ms | 1.077 ms | 327 |
+
+Numbers are the **median of repeated passes** taken by `bench-runner`, which waits for
+the machine to be idle before each one (`cargo run -p bench-runner --release -- --group demos --repeat 3`).
 
 Two things worth reading off that table:
 
-- **The keep-index tree's maintain is ~3.5× cheaper than either rebuild** — the
-  `ItemRef` thesis, on a workload where *every* particle moves every step. It gives
-  part of it back in query (a kept tree drifts from the ideal partition as the fluid
-  sloshes, while a rebuild is always perfectly fitted).
-- **The adaptive `LinearQuadTree` wins the query.** This is its measured niche —
-  skewed data you rebuild often — showing up on a real workload rather than a
-  synthetic bench: the fluid is dense where the water is and empty everywhere else,
-  which is exactly what a uniform grid can't exploit.
+- **The keep-index tree's maintain is 3.5–3.9× cheaper than either rebuild** — the
+  `ItemRef` thesis, on a workload where *every* particle moves every step. It gives more
+  than that back in query (+22%): a kept tree drifts from the ideal partition as the
+  fluid sloshes, while a rebuild is always perfectly fitted. On this workload the trade
+  is a losing one, and the demo says so.
+- **The rebuilt structures are within 5% of each other on query**, with the flat
+  `MortonGrid` marginally ahead of the adaptive `LinearQuadTree`. An earlier run of this
+  table had the linear quadtree ahead; repeated passes on an idle machine do not support
+  that — at this particle count the fluid's density is not skewed enough for adaptivity
+  to pay for itself. (`LinearQuadTree`'s measured win is on the *static skewed* sets in
+  `linear_quadtree_bench`, not here.)
 
 The query dominates the frame in every mode, which is the honest headline: in an SPH
 sim the *neighbour search is the simulation cost*, and the physics is comparatively

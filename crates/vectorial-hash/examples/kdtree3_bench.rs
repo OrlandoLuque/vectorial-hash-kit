@@ -57,6 +57,26 @@ fn run(name: &str, items: &[P], queries: &[Point3], radius: f64) {
     println!("  build par  KdTree3 {t_b_kd_par:6.2} ({:.2}x) | Tree3 {t_b_bin_par:6.2} ({:.2}x)   [{} threads]", t_b_kd / t_b_kd_par, t_b_bin / t_b_bin_par, rayon::current_num_threads());
     println!("  cull  ms   KdTree3 {t_c_kd:6.2} | Tree3 {t_c_bin:6.2} | Octree3 {t_c_oct:6.2} | LinearOct {t_c_lin:6.2}   (kd vs Tree3 {:.2}×)", t_c_bin / t_c_kd);
     println!("  knn   ms   KdTree3 {t_k_kd:6.2} | Tree3 {t_k_bin:6.2}                                    (kd vs Tree3 {:.2}×)", t_k_bin / t_k_kd);
+    // Machine-readable lines for `bench-runner` (it aggregates min/median/max/spread
+    // across repeated passes). Key is prefixed by the scenario so UNIFORM and CLUSTERED
+    // do not collide.
+    let tag = if name.starts_with("UNIFORM") { "uniform" } else { "clustered" };
+    println!("#M {tag}.build_kdtree3 {t_b_kd:.3} ms");
+    println!("#M {tag}.build_tree3 {t_b_bin:.3} ms");
+    println!("#M {tag}.build_octree3 {t_b_oct:.3} ms");
+    println!("#M {tag}.build_linear_octree3 {t_b_lin:.3} ms");
+    println!("#M {tag}.cull_kdtree3 {t_c_kd:.3} ms");
+    println!("#M {tag}.cull_tree3 {t_c_bin:.3} ms");
+    println!("#M {tag}.cull_ratio_kd_over_tree3 {:.3} x", t_c_bin / t_c_kd);
+    println!("#M {tag}.knn_kdtree3 {t_k_kd:.3} ms");
+    println!("#M {tag}.knn_ratio_kd_over_tree3 {:.3} x", t_k_bin / t_k_kd);
+    #[cfg(feature = "parallel")]
+    {
+        println!("#M {tag}.build_kdtree3_par {t_b_kd_par:.3} ms");
+        println!("#M {tag}.build_kdtree3_speedup {:.3} x", t_b_kd / t_b_kd_par);
+        println!("#M {tag}.build_tree3_par {t_b_bin_par:.3} ms");
+        println!("#M {tag}.build_tree3_speedup {:.3} x", t_b_bin / t_b_bin_par);
+    }
     if s == usize::MAX { println!("{s}"); }
 }
 

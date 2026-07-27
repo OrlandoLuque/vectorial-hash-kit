@@ -19,9 +19,11 @@ All three landed on `main`, published to the site, docs written in-step:
   paper's relaxation ε is unit-dependent; position-based solvers inject energy through
   `v = (q−p)/dt`). → `docs/FLUID.md`
 - **`pointcloud_wgpu`** — a large static, strongly skewed scanned cloud coloured by local
-  density, i.e. **one k-NN query per point**. `KdTree3` answers k-NN **1.68× faster than
-  the flat grid** and builds **1.7× faster than the midpoint octree**; the grid still wins
-  the build outright. Where the median split earns its keep. → `docs/POINTCLOUD.md`
+  density, i.e. **one k-NN query per point**. Both trees answer k-NN **~1.5× faster than
+  the flat grid**, and `KdTree3` **builds 1.7× faster than the midpoint octree** while
+  tying it on query; the grid still wins the build outright. → `docs/POINTCLOUD.md`
+  *(numbers re-measured 2026-07-27 with `bench-runner`; the first pass overstated the
+  k-d tree's k-NN edge over the octree.)*
 - **`stealth_wgpu`** — guards whose **view cone is a real frustum cull** and whose **line
   of sight is a real segment↔solid test** (capsule broadphase → `segment_hit`). Races the
   index against a linear scan every frame: **crossover ~1000 agents** — below it a plain
@@ -45,8 +47,8 @@ All three landed on `main`, published to the site, docs written in-step:
   Tree3 — that verb had no fuzz coverage and it is what the stealth cones run on.
   Checked the properties are **not vacuous** (12.3 items found per cone on average,
   max 66; the standalone `frustum_check` example finds 77820 over 400 cones).
-- **`KdTree3::from_items_par`** — **3.3× on 16 threads** (200k points, 20.1 → 6.0 ms) vs
-  `Tree3::bulk_load_par`'s 1.7–2.0×, and **node-for-node identical** to the serial build
+- **`KdTree3::from_items_par`** — **3.4× on 16 threads** (200k points, 20.1 → 6.0 ms) vs
+  `Tree3::bulk_load_par`'s 1.6–1.9×, and **node-for-node identical** to the serial build
   (tested). The reason is structural: a median split hands each fork exactly n/2 points,
   a midpoint split can hand one side almost everything. Threaded, the k-d build beats
   every serial build in the table.

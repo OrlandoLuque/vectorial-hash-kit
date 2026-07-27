@@ -614,6 +614,13 @@ async fn run() {
                             let inside = fluid.px.iter().zip(fluid.py.iter()).filter(|(x, y)| **x >= 0.0 && **x <= WW && **y >= 0.0 && **y <= WH).count();
                             println!("fluid_wgpu end-to-end: {:.1} fps avg ({} drops, {}, maintain {:.2} ms / query {:.2} ms / physics {:.2} ms per frame)",
                                 fps, fluid.n(), kind.label(), maint_us / 1000.0, query_us / 1000.0, phys_us / 1000.0);
+                            // machine-readable for `bench-runner` (keyed by index, so a
+                            // sweep over FLUID_INDEX lands in one comparable table)
+                            let tag = kind.label().split_whitespace().next().unwrap_or("?").to_lowercase();
+                            println!("#M {tag}.maintain {:.4} ms", maint_us / 1000.0);
+                            println!("#M {tag}.query {:.4} ms", query_us / 1000.0);
+                            println!("#M {tag}.physics {:.4} ms", phys_us / 1000.0);
+                            println!("#M {tag}.fps {fps:.1} fps");
                             println!("  sim health: density {mean:.2}x rest (peak {hi:.2}x) - vmax {vmax:.0} - in-tank {inside}/{} - finite {}",
                                 fluid.n(), !bad);
                             elwt.exit();

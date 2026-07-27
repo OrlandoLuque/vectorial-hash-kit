@@ -61,8 +61,8 @@ Three cross-cutting choices that sit on top of the above:
   `cull_many` / `cull_many_par` (feature `parallel`). The crossover is in
   [`PARALLEL.md`](PARALLEL.md).
 - **Building once, with cores to spare?** `Tree3::bulk_load_par` and
-  `KdTree3::from_items_par`. The k-d tree recovers the most from threads (**3.3× on 16**
-  vs the binary tree's 1.7–2.0×) because a median split hands each fork exactly half the
+  `KdTree3::from_items_par`. The k-d tree recovers the most from threads (**3.4× on 16**
+  vs the binary tree's 1.6–1.9×) because a median split hands each fork exactly half the
   points; a midpoint split can hand one side almost everything.
 
 ## Summary table
@@ -76,21 +76,23 @@ Three cross-cutting choices that sit on top of the above:
 | **`Octree3`** | 3D | yes | 3D with locally varying density | adaptive (8-way) | strong |
 | **`MortonGrid`** | 2D | rebuild | dense + uniform 2D, refilled each frame | **cheapest** | **cheapest** when uniform |
 | **`MortonGrid3`** | 3D | rebuild | dense + uniform 3D, refilled each frame | **cheapest** | cheap; loses on skew |
-| **`KdTree3`** | 3D | static | **skewed/clustered, query-heavy** | median select (**3.3× on 16 threads**) | **best cull + k-NN on clusters** |
+| **`KdTree3`** | 3D | static | **skewed/clustered, query-heavy** | median select (**3.4× on 16 threads**) | **cull 2.2–2.5× `Tree3` on clusters**, k-NN 1.67× |
 | **`LinearOctree3`** | 3D | static | skewed data you **rebuild often** | ~2.1× faster than `Octree3` | loses cull ~1.3× to `Octree3` |
 | **`LinearQuadTree`** | 2D | static | skewed 2D you rebuild often | fast | **won the fluid's neighbour query** |
-| **`KdTree2`** | 2D | static | **skewed/clustered 2D, query-heavy** | **fastest of the 2D builds** (3.1× on 16 threads) | **cull 1.53× the pointer quadtree** |
+| **`KdTree2`** | 2D | static | **skewed/clustered 2D, query-heavy** | **fastest of the 2D builds** (2.8× on 16 threads) | **cull 1.54× the pointer quadtree** |
 
-The three headline measurements behind the right-hand column:
+The three headline measurements behind the right-hand column — every one the **median of
+repeated passes** on an idle machine, via `cargo run -p bench-runner --release`:
 
-- **Point cloud** (150k static points, k-NN per point): `KdTree3` is **1.68×** the flat
-  grid and 1.12× the pointer octree on k-NN, and builds 1.7× faster than `Octree3` — but
-  `MortonGrid3` still builds fastest of all. → [`POINTCLOUD.md`](POINTCLOUD.md)
-- **Fluid** (every particle relocates every step): kept `Tree`+`ItemRef` maintains ~3.5×
-  cheaper than either rebuild, while `LinearQuadTree` **wins the neighbour query** on the
-  same data. → [`FLUID.md`](FLUID.md)
+- **Point cloud** (120k static points, one k-NN per point): both trees answer k-NN **~1.5×
+  faster than the flat grid**, and `KdTree3` **builds 1.7× faster than `Octree3`** while
+  tying it on query; `MortonGrid3` still builds fastest of all.
+  → [`POINTCLOUD.md`](POINTCLOUD.md)
+- **Fluid** (every particle relocates every step): kept `Tree`+`ItemRef` maintains **3.5–
+  3.9× cheaper** than either rebuild — and gives more than that back on query (+22%), so
+  on *this* workload the rebuild wins the frame. → [`FLUID.md`](FLUID.md)
 - **Stealth** (frustum culls per guard): an index only beats a linear scan **above ~1000
-  agents** — 7.1× by 40 000, but honestly *slower* at 40. → [`STEALTH.md`](STEALTH.md)
+  agents** — 6.7× by 40 000, but honestly *slower* at 40. → [`STEALTH.md`](STEALTH.md)
 
 ## Rules of thumb
 
@@ -110,10 +112,11 @@ The three headline measurements behind the right-hand column:
 - **Static and query-heavy, especially clustered?** `KdTree3` in 3D, `KdTree2` in 2D. The median split keeps
   depth at ~log₂(n/leaf) however the points clump, and its tight per-node boxes prune
   harder. It's also the structure that gains most from a parallel build. Measured on a
-  clustered 2D set (200k points, 2000 circle culls): `KdTree2` build **8.06 ms** and cull
-  **7.47 ms** — the fastest of both columns, against `QuadTree` 34.10/11.40,
-  `LinearQuadTree` 17.07/12.87 and `MortonGrid` 8.92/16.30 — while k-NN is a hair behind
-  the pointer quadtree (1.50 vs 1.40 ms). Reproduce: `examples/linear_quadtree_bench`.
+  clustered 2D set (200k points, 2000 circle culls, median of 3): `KdTree2` build **7.96
+  ms** and cull **7.42 ms** — the fastest of both columns, against `QuadTree` 33.50/11.45,
+  `LinearQuadTree` 16.17/12.76 and `MortonGrid` 8.96/15.23 — while k-NN is a hair behind
+  the pointer quadtree (1.47 vs 1.39 ms).
+  Reproduce: `cargo run -p bench-runner --release -- --group kd --repeat 3`.
 - **Integer world (tiles, pixels)?** `IntegerTree` avoids float boundary fuzz entirely.
 - **`item_limit` / `capacity`** is the main tuning knob: smaller = deeper tree, fewer
   per-leaf tests, more nodes; larger = shallower, more brute per leaf. 8–16 is a good

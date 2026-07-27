@@ -449,6 +449,11 @@ async fn run() {
                         }
                         println!("pointcloud_wgpu: {} pts, {} - build {:.0} ms - knn(k={}) over ALL points {:.0} ms ({:.2} us/query) - probe cull {} hits in {:.0} us - {:.0} fps",
                             n, kind.label(), build_ms, k, knn_ms, knn_ms * 1000.0 / n as f32, probe_n, probe_us, fps);
+                            let tag = kind.label().split_whitespace().next().unwrap_or("?").to_lowercase();
+                            println!("#M {tag}.build {build_ms:.3} ms");
+                            println!("#M {tag}.knn_all {knn_ms:.3} ms");
+                            println!("#M {tag}.knn_per_query {:.4} us", knn_ms * 1000.0 / n as f32);
+                            println!("#M {tag}.fps {fps:.1} fps");
                         println!("  check: probe {} vs brute {} ({}) - nonfinite {} - bounds x[{:.1},{:.1}] y[{:.1},{:.1}] z[{:.1},{:.1}]",
                             probe_n, brute, if probe_n == brute { "MATCH" } else { "MISMATCH" }, nonfinite,
                             lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]);
