@@ -134,10 +134,21 @@ repeated passes** on an idle machine, via `cargo run -p bench-runner --release`:
 - **`item_limit` / `capacity`** is the main tuning knob: smaller = deeper tree, fewer
   per-leaf tests, more nodes; larger = shallower, more brute per leaf. 8–16 is a good
   default; profile with the Criterion suite / regression gate (`benches/README.md`).
-- **Measure your workload.** The decision maps rank the structures head-to-head on a
-  moving-points sim: `examples/decision2d.rs` (2D) and `critters3d_headless --sweep` (3D).
-  Rough 2D read: **QuadTree** is the all-rounder; **MortonGrid** (rebuilt each frame) wins
-  **dense + high-churn** scenes where the trees' `update` split/merge churn dominates.
+- **Measure your workload, and at YOUR population.** The decision maps rank the structures
+  head-to-head on a moving-points sim: `examples/decision2d.rs` (2D, knobs `D2_POP` etc.)
+  and `critters3d_headless --sweep` (3D). The winner moves with population, and the two
+  dimensions do not agree:
+
+  | moving points, per-frame total | 500 | 2 000 | 10 000 | 50 000 |
+  | --- | --- | --- | --- | --- |
+  | **2D** winner | QuadTree 1.06x | QuadTree 1.04x | QuadTree 1.09x | **MortonGrid 1.32x** |
+  | **3D** winner | `Tree3`+`ItemRef` 4.0x | `Tree3`+`ItemRef` 3.6x | `Tree3`+`ItemRef` ~4x | `Tree3`+`ItemRef` 2.2-7.6x |
+
+  In **3D the kept binary tree dominates maintain** (15 of 16 sweep configs, 1.6-7.6x over
+  the runner-up) and ties for best cull. In **2D it is consistently 4-10% behind the
+  QuadTree** — the 4-way split halves the depth, so `locate` is cheaper — and at 50k the
+  Morton rebuild takes both columns. Same handle layer, opposite verdict, purely because
+  of dimension.
 - **Don't reach for threads first.** Reads parallelise (`cull_many_par`), writes don't —
   the lever for write-heavy loops is `update_ref` + the right structure, not rayon. See
   [`PARALLEL.md`](PARALLEL.md).

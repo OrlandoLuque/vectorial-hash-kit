@@ -156,7 +156,16 @@ fn main() {
         run_sweep();
         return;
     }
-    let cfg = Cfg { world: 1024.0, pop: 50_000, item_limit: 8, vision: 24.0, speed: 240.0, n_cull: 16, frames: 90, warmup: 20, dt: 1.0 / 60.0, seed: 42 };
+    // Knobs, because the answer moves with population: the 2D demos run hundreds to a
+    // few thousand critters, not the 50k this used to hardcode, and the winner is not the
+    // same at both ends. Sweep with `bench-runner --group sweeps`.
+    let env = |k: &str, d: f64| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+    let cfg = Cfg {
+        world: env("D2_WORLD", 1024.0), pop: env("D2_POP", 50_000.0) as usize,
+        item_limit: env("D2_IL", 8.0) as usize, vision: env("D2_R", 24.0),
+        speed: env("D2_SPEED", 240.0), n_cull: env("D2_CULLS", 16.0) as usize,
+        frames: 90, warmup: 20, dt: 1.0 / 60.0, seed: 42,
+    };
     println!("2D decision map | world={}² | pop={} | item_limit={} | vision r={} | {} culls/frame | {} frames (+{} warmup)",
         cfg.world, cfg.pop, cfg.item_limit, cfg.vision, cfg.n_cull, cfg.frames, cfg.warmup);
     let (m, c, agree) = measure(&cfg);
