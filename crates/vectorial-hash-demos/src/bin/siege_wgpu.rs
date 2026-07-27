@@ -400,6 +400,7 @@ struct State {
     red: usize,  // live Red units (for the window-title HUD)
     blue: usize, // live Blue units
     fps: f32,    // smoothed frames/second
+    dpr: f32,    // device pixel ratio, so the HUD text stays readable on a phone
     smooth: bool, // terrain mode: false = voxel (default), true = smooth heightfield
     pop: usize,  // army size per side (live, via the [ ] keys)
     craters: Craters, // shared alterable-terrain state (units sink, mesh deforms)
@@ -423,6 +424,9 @@ impl State {
     // present) for the FPS benchmark; `headless_size` is the render resolution.
     async fn new(window: Option<Arc<winit::window::Window>>, headless_size: (u32, u32)) -> State {
         let size = match &window { Some(w) => w.inner_size(), None => winit::dpi::PhysicalSize::new(headless_size.0, headless_size.1) };
+        // Device pixel ratio: the HUD is drawn in PHYSICAL pixels, so on a phone (dpr 2-3)
+        // text sized for a desktop comes out 2-3x too small to read. Same fix as horde.
+        let dpr = window.as_ref().map(|w| w.scale_factor() as f32).unwrap_or(1.0);
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
         let surface = window.map(|w| instance.create_surface(w).expect("surface"));
         let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, compatible_surface: surface.as_ref(), force_fallback_adapter: false }).await.expect("adapter");
@@ -641,7 +645,7 @@ impl State {
             cam_buf, cam_bg, depth, units, index, handles: Vec::new(),
             smoke: Vec::new(), effects: Vec::new(), projectiles: Vec::new(),
             volcano: Volcano::new(), sep: SepTables::new(&default_body_radius()), paused: false,
-            red: 0, blue: 0, fps: 0.0, smooth, pop, craters, rebuild_t: 0.0,
+            red: 0, blue: 0, fps: 0.0, dpr, smooth, pop, craters, rebuild_t: 0.0,
             rng, now: 0.0, last: Instant::now(),
             yaw: 0.9, pitch: 0.7, dist: 760.0, dragging: false, last_mouse: (0.0, 0.0),
             free_cam: false, cam_pos: glam::Vec3::ZERO, mv: [false; 6],
@@ -917,26 +921,32 @@ impl State {
             let label = if running { "PAUSE" } else { "PLAY" };
             push_text(&mut ui, px + 8.0, py + 9.0, 3.0, [0.92, 0.94, 0.98, 1.0], label, sw, sh);
         }
-        // Numeric HUD — a labelled column top-right (wgpu has no text; 3x5 font).
+        // Numeric HUD — a labelled column top-right (wgpu has no text; 3x5 font). Sized
+        // in physical pixels * dpr so a phone reads it at the same apparent size as a
+        // desktop; at dpr 1 the layout is unchanged. The BUTTONS/SLIDERS are deliberately
+        // NOT scaled: the same constants drive their touch hit-testing, and that pairing
+        // wants a real device to validate (BACKLOG task 83).
         let white = [0.92, 0.94, 0.98, 1.0];
         let redc = [1.0, 0.50, 0.44, 1.0];
         let bluec = [0.55, 0.68, 1.0, 1.0];
-        let hx = sw - 150.0;
-        push_text(&mut ui, hx, 12.0, 3.0, white, &format!("FPS {:.0}", self.fps), sw, sh);
-        push_text(&mut ui, hx, 30.0, 3.0, redc, &format!("RED {}", self.red), sw, sh);
-        push_text(&mut ui, hx, 48.0, 3.0, bluec, &format!("BLU {}", self.blue), sw, sh);
-        push_text(&mut ui, hx, 66.0, 3.0, white, &format!("POP {}", self.pop), sw, sh);
-        push_text(&mut ui, hx, 84.0, 3.0, white, &tri_label(tris), sw, sh);
+        let ds = self.dpr.clamp(1.0, 3.0);
+        let (tp, row, top) = (3.0 * ds, 18.0 * ds, 12.0 * ds);
+        let hx = sw - 150.0 * ds;
+        push_text(&mut ui, hx, top, tp, white, &format!("FPS {:.0}", self.fps), sw, sh);
+        push_text(&mut ui, hx, top + row, tp, redc, &format!("RED {}", self.red), sw, sh);
+        push_text(&mut ui, hx, top + 2.0 * row, tp, bluec, &format!("BLU {}", self.blue), sw, sh);
+        push_text(&mut ui, hx, top + 3.0 * row, tp, white, &format!("POP {}", self.pop), sw, sh);
+        push_text(&mut ui, hx, top + 4.0 * row, tp, white, &tri_label(tris), sw, sh);
         // Collision (separation) state — green = on, red = off (toggle with C).
         let col_on = vectorial_hash_demos::siege_sim::separation_on();
         let colc = if col_on { [0.55, 1.0, 0.60, 1.0] } else { [1.0, 0.55, 0.40, 1.0] };
-        push_text(&mut ui, hx, 102.0, 3.0, colc, "COL", sw, sh);
+        push_text(&mut ui, hx, top + 5.0 * row, tp, colc, "COL", sw, sh);
         // Thread count driving the parallel `decide` pass (wasm has no threads → 1).
         #[cfg(not(target_arch = "wasm32"))]
         let thr = self.n_threads;
         #[cfg(target_arch = "wasm32")]
         let thr = 1usize;
-        push_text(&mut ui, hx, 120.0, 3.0, white, &format!("THR {thr}"), sw, sh);
+        push_text(&mut ui, hx, top + 6.0 * row, tp, white, &format!("THR {thr}"), sw, sh);
         ui.truncate(16384); // never exceed the ui buffer (guards write_buffer)
         self.queue.write_buffer(&self.ui_buf, 0, bytemuck::cast_slice(&ui));
         let ui_n = ui.len() as u32;
