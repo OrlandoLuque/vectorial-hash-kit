@@ -61,3 +61,19 @@ web-time = { version = "1", optional = true }
 getrandom = { version = "0.2", features = ["js"], optional = true }
 js-sys = { version = "0.3", optional = true }
 web-sys = { version = "0.3", optional = true, features = ["Document", "Window", "Element", "HtmlCanvasElement", "Request", "RequestInit", "Response"] }
+
+# The siege CPU bench drives the parallel rebuild path (`Tree3::bulk_load_par`, a
+# `parallel`-gated API) and a sized rayon pool, so it cannot build without the feature.
+# Declaring that here is what makes a bare `cargo test --workspace` work: cargo skips it
+# instead of failing to compile it.
+[[example]]
+name = "siege_cpu_bench"
+required-features = ["parallel"]
+
+[[example]]
+name = "bulk_load_bench"
+required-features = ["parallel"]
+
+[[example]]
+name = "gpu_lbvh_query_bench"
+required-features = ["parallel"]
