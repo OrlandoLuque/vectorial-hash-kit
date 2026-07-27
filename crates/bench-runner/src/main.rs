@@ -33,32 +33,68 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------- the plan
 
+#[derive(Clone, Copy)]
 enum Target { Example(&'static str), Bin(&'static str) }
 impl Target {
     fn name(&self) -> &'static str { match self { Target::Example(n) | Target::Bin(n) => n } }
     fn flag(&self) -> &'static str { match self { Target::Example(_) => "--example", Target::Bin(_) => "--bin" } }
 }
 
+/// What a bench's numbers actually measure. Mixing the two in one table is how you end
+/// up comparing an algorithm against a frame that also had to draw 200 000 points.
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    /// Headless: the reported numbers are timed around the operation itself, no window,
+    /// no GPU, no present. These are the ones to compare algorithms with.
+    Algorithm,
+    /// A real application loop, render included. Its per-operation metrics are still
+    /// timed around the operation (so they are comparable), but anything frame-level
+    /// (`fps`) includes drawing and is NOT an algorithmic measurement.
+    EndToEnd,
+}
+
+#[derive(Clone)]
 struct Bench {
     pkg: &'static str,
     target: Target,
     features: &'static str,
-    env: &'static [(&'static str, &'static str)],
+    env: Vec<(String, String)>,
     note: &'static str,
     args: &'static [&'static str],
+    kind: Kind,
     /// Minutes, not seconds. Skipped unless `--include-slow`, so the default run stays
     /// something you will actually re-run before quoting a number.
     slow: bool,
 }
 
 /// Terser constructors — the plan below is a table, and should read like one.
-const fn b(pkg: &'static str, target: Target, features: &'static str, note: &'static str) -> Bench {
-    Bench { pkg, target, features, env: &[], args: &[], note, slow: false }
+fn b(pkg: &'static str, target: Target, features: &'static str, note: &'static str) -> Bench {
+    Bench { pkg, target, features, env: Vec::new(), args: &[], note, kind: Kind::Algorithm, slow: false }
 }
-const fn ba(pkg: &'static str, target: Target, features: &'static str, args: &'static [&'static str], note: &'static str) -> Bench {
-    Bench { pkg, target, features, env: &[], args, note, slow: false }
+fn ba(pkg: &'static str, target: Target, features: &'static str, args: &'static [&'static str], note: &'static str) -> Bench {
+    Bench { pkg, target, features, env: Vec::new(), args, note, kind: Kind::Algorithm, slow: false }
 }
-const fn slow(mut x: Bench) -> Bench { x.slow = true; x }
+fn slow(mut x: Bench) -> Bench { x.slow = true; x }
+fn e2e(mut x: Bench) -> Bench { x.kind = Kind::EndToEnd; x }
+fn env(mut x: Bench, kv: &[(&str, &str)]) -> Bench {
+    x.env.extend(kv.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+    x
+}
+
+/// Expand a bench over a **grid** of environment values — the other dimensions a
+/// comparison has besides "method A vs method B": population, distribution, radius,
+/// thread count. One entry in, the cartesian product out, each labelled by its cell.
+fn matrix(base: Bench, dims: &[(&str, &[&str])]) -> Vec<Bench> {
+    let mut out = vec![base];
+    for (key, values) in dims {
+        let mut next = Vec::with_capacity(out.len() * values.len());
+        for b in &out {
+            for v in *values { next.push(env(b.clone(), &[(key, v)])); }
+        }
+        out = next;
+    }
+    out
+}
 
 fn plan(group: &str) -> Vec<Bench> {
     use Target::{Bin, Example};
@@ -113,20 +149,42 @@ fn plan(group: &str) -> Vec<Bench> {
         slow(b(DEMOS, Example("horde_balance"), PAR, "horde balance sweep across seeds (long)")),
     ];
     // --- the three application demos, swept over the structures they compare -----
-    let demos = || vec![
-        Bench { env: &[("FLUID_MAX_FRAMES", "420"), ("FLUID_INDEX", "morton")], ..b(DEMOS, Bin("fluid_wgpu"), "", "fluid neighbours: MortonGrid rebuild") },
-        Bench { env: &[("FLUID_MAX_FRAMES", "420"), ("FLUID_INDEX", "keep")], ..b(DEMOS, Bin("fluid_wgpu"), "", "fluid neighbours: kept Tree + ItemRef") },
-        Bench { env: &[("FLUID_MAX_FRAMES", "420"), ("FLUID_INDEX", "linear")], ..b(DEMOS, Bin("fluid_wgpu"), "", "fluid neighbours: LinearQuadTree rebuild") },
-        Bench { env: &[("CLOUD_MAX_FRAMES", "240"), ("CLOUD_INDEX", "kd")], ..b(DEMOS, Bin("pointcloud_wgpu"), "", "point cloud k-NN: KdTree3") },
-        Bench { env: &[("CLOUD_MAX_FRAMES", "240"), ("CLOUD_INDEX", "octree")], ..b(DEMOS, Bin("pointcloud_wgpu"), "", "point cloud k-NN: Octree3") },
-        Bench { env: &[("CLOUD_MAX_FRAMES", "240"), ("CLOUD_INDEX", "morton")], ..b(DEMOS, Bin("pointcloud_wgpu"), "", "point cloud k-NN: MortonGrid3") },
-        Bench { env: &[("STEALTH_MAX_FRAMES", "600"), ("STEALTH_CIVS", "40")], ..b(DEMOS, Bin("stealth_wgpu"), "", "stealth crossover: 40 agents") },
-        Bench { env: &[("STEALTH_MAX_FRAMES", "600"), ("STEALTH_CIVS", "160")], ..b(DEMOS, Bin("stealth_wgpu"), "", "stealth crossover: 160 agents") },
-        Bench { env: &[("STEALTH_MAX_FRAMES", "600"), ("STEALTH_CIVS", "640")], ..b(DEMOS, Bin("stealth_wgpu"), "", "stealth crossover: 640 agents") },
-        Bench { env: &[("STEALTH_MAX_FRAMES", "600"), ("STEALTH_CIVS", "2560")], ..b(DEMOS, Bin("stealth_wgpu"), "", "stealth crossover: 2560 agents") },
-        Bench { env: &[("STEALTH_MAX_FRAMES", "600"), ("STEALTH_CIVS", "10240")], ..b(DEMOS, Bin("stealth_wgpu"), "", "stealth crossover: 10240 agents") },
-        Bench { env: &[("STEALTH_MAX_FRAMES", "600"), ("STEALTH_CIVS", "40000")], ..b(DEMOS, Bin("stealth_wgpu"), "", "stealth crossover: 40000 agents") },
-    ];
+    // Marked END-TO-END: their per-operation metrics are timed around the operation and
+    // are comparable, but their `fps` includes drawing and is not an algorithm number.
+    let demos = || {
+        let fluid = |idx: &str, note: &'static str| e2e(env(b(DEMOS, Bin("fluid_wgpu"), "", note), &[("FLUID_MAX_FRAMES", "420"), ("FLUID_INDEX", idx)]));
+        let cloud = |idx: &str, note: &'static str| e2e(env(b(DEMOS, Bin("pointcloud_wgpu"), "", note), &[("CLOUD_MAX_FRAMES", "240"), ("CLOUD_INDEX", idx)]));
+        let sneak = |n: &str, note: &'static str| e2e(env(b(DEMOS, Bin("stealth_wgpu"), "", note), &[("STEALTH_MAX_FRAMES", "600"), ("STEALTH_CIVS", n)]));
+        vec![
+            fluid("morton", "fluid neighbours: MortonGrid rebuild"),
+            fluid("keep", "fluid neighbours: kept Tree + ItemRef"),
+            fluid("linear", "fluid neighbours: LinearQuadTree rebuild"),
+            cloud("kd", "point cloud k-NN: KdTree3"),
+            cloud("octree", "point cloud k-NN: Octree3"),
+            cloud("morton", "point cloud k-NN: MortonGrid3"),
+            sneak("40", "stealth crossover: 40 agents"),
+            sneak("160", "stealth crossover: 160 agents"),
+            sneak("640", "stealth crossover: 640 agents"),
+            sneak("2560", "stealth crossover: 2560 agents"),
+            sneak("10240", "stealth crossover: 10240 agents"),
+            sneak("40000", "stealth crossover: 40000 agents"),
+        ]
+    };
+    // --- sweet spots: the tuning knobs, over the OTHER dimensions too --------------
+    // A comparison is not just method A vs method B: the answer moves with population,
+    // distribution and query radius, so the knob sweep is run across that grid.
+    let sweeps = || {
+        let mut v = matrix(b(VH, Example("knob_sweep"), "", "leaf-size / depth / levels optimum"), &[
+            ("KS_N", &["50000", "200000"]),
+            ("KS_DIST", &["clustered", "uniform"]),
+            ("KS_R", &["8", "30"]),
+        ]);
+        v.push(b(VH, Example("threshold_bench"), "", "index-vs-brute crossover by N"));
+        v.push(b(VH, Example("churn_relocation_bench"), "", "keep-index cost by relocation rate"));
+        v.push(b(DEMOS, Example("siege_cpu_bench"), PAR, "siege: keep vs rebuild by THREAD COUNT"));
+        v.push(b(DEMOS, Example("horde_bench"), PAR, "horde: cost by POPULATION and awake fraction"));
+        v
+    };
     // --- the template/CLI benchmarks behind the paper's early sections ------------
     let cli = || vec![
         ba(CLI, Bin("vh"), "", &["bench"], "single fixed template, tree vs quadtree"),
@@ -154,16 +212,17 @@ fn plan(group: &str) -> Vec<Bench> {
     match group {
         "core" => core(), "query" => query(), "gpu" => gpu(), "sim" => sim(),
         "demos" => demos(), "cli" => cli(), "cold" => cold(), "gate" => gate(), "kd" => kd(),
+        "sweeps" => sweeps(),
         "all" => {
             let mut v = core();
-            for g in [query(), gpu(), sim(), demos(), cli(), cold(), gate()] { v.extend(g); }
+            for g in [query(), gpu(), sim(), demos(), sweeps(), cli(), cold(), gate()] { v.extend(g); }
             v
         }
         _ => Vec::new(),
     }
 }
 
-const GROUPS: &[&str] = &["core", "query", "gpu", "sim", "demos", "cli", "cold", "gate", "kd", "all"];
+const GROUPS: &[&str] = &["core", "query", "gpu", "sim", "demos", "sweeps", "cli", "cold", "gate", "kd", "all"];
 
 // ------------------------------------------------------- is the machine free?
 
@@ -198,6 +257,70 @@ fn wait_for_idle(base: Duration, tolerance: f64, max_wait: Duration, quiet: bool
     }
 }
 
+
+// ------------------------------------------------------------- processor time
+
+/// Per-process **CPU time** (user + kernel), which is what you actually want to compare:
+/// wall-clock time says how long the bench took to finish, CPU time says how much
+/// processing it took. If another process steals the machine, wall time inflates and CPU
+/// time does not — so `cpu/wall` is also a free honesty check on every measurement.
+///
+/// No crates: the two OS calls are declared here directly (kernel32 on Windows, libc's
+/// getrusage elsewhere). This is why the runner executes the built artifact instead of
+/// `cargo run` — CPU time is per process and is NOT inherited from a child, so measuring
+/// `cargo` would measure the wrong process.
+#[cfg(windows)]
+mod cpu {
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Child;
+
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct FileTime { low: u32, high: u32 }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetProcessTimes(h: std::os::windows::raw::HANDLE, creation: *mut FileTime, exit: *mut FileTime,
+                           kernel: *mut FileTime, user: *mut FileTime) -> i32;
+    }
+
+    /// Kernel + user seconds the child burned. Valid after it exits, as long as the
+    /// handle is still open (i.e. before the `Child` is dropped).
+    pub fn child_cpu_secs(child: &Child) -> Option<f64> {
+        let (mut c, mut e, mut k, mut u) = (FileTime::default(), FileTime::default(), FileTime::default(), FileTime::default());
+        let ok = unsafe { GetProcessTimes(child.as_raw_handle(), &mut c, &mut e, &mut k, &mut u) };
+        if ok == 0 { return None; }
+        // FILETIME counts 100-nanosecond ticks.
+        let secs = |f: FileTime| (((f.high as u64) << 32) | f.low as u64) as f64 * 1e-7;
+        Some(secs(k) + secs(u))
+    }
+    pub fn children_cpu_secs() -> Option<f64> { None } // unix path only
+}
+
+#[cfg(unix)]
+mod cpu {
+    use std::process::Child;
+
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct TimeVal { sec: i64, usec: i64 }
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct RUsage { utime: TimeVal, stime: TimeVal, rest: [i64; 14] }
+
+    unsafe extern "C" { fn getrusage(who: i32, usage: *mut RUsage) -> i32; }
+    const RUSAGE_CHILDREN: i32 = -1;
+
+    /// Cumulative CPU seconds of all reaped children; the runner takes the delta around a
+    /// run (it never runs two benches at once, so the delta is that bench).
+    pub fn children_cpu_secs() -> Option<f64> {
+        let mut u = RUsage::default();
+        if unsafe { getrusage(RUSAGE_CHILDREN, &mut u) } != 0 { return None; }
+        Some(u.utime.sec as f64 + u.utime.usec as f64 * 1e-6 + u.stime.sec as f64 + u.stime.usec as f64 * 1e-6)
+    }
+    pub fn child_cpu_secs(_child: &Child) -> Option<f64> { None } // windows path only
+}
+
 // ----------------------------------------------------------------- metrics
 
 #[derive(Default)]
@@ -226,13 +349,13 @@ fn parse_metric(line: &str) -> Option<(String, f64, String)> {
 
 // -------------------------------------------------------------------- run
 
-struct Pass { bench: String, pass: usize, ok: bool, seconds: f64, busy: bool, load: f64 }
+struct Pass { bench: String, pass: usize, ok: bool, seconds: f64, cpu: Option<f64>, busy: bool, load: f64 }
 
 /// `stealth_wgpu [STEALTH_CIVS=640]` / `vh [bench-walk]` — the same binary run several
 /// ways needs the variant in its name, in the table and in the metric keys alike.
 fn label(b: &Bench) -> String {
     let mut bits: Vec<String> = Vec::new();
-    for (k, v) in b.env { if !k.ends_with("MAX_FRAMES") { bits.push(format!("{k}={v}")); } }
+    for (k, v) in &b.env { if !k.ends_with("MAX_FRAMES") { bits.push(format!("{k}={v}")); } }
     for a in b.args { bits.push(a.trim_start_matches("--").to_string()); }
     if bits.is_empty() { b.target.name().to_string() } else { format!("{} [{}]", b.target.name(), bits.join(" ")) }
 }
@@ -333,14 +456,18 @@ fn main() {
             if gave_up { println!("    STILL BUSY ({load:.2}x) — running anyway; this pass is marked noisy"); }
             else if idle_wait { println!("    machine free ({load:.2}x baseline)"); }
 
-            let mut args: Vec<String> = vec!["run".into(), "-q".into(), "-p".into(), b.pkg.into(), b.target.flag().into(), name.into(), "--release".into()];
-            if !b.features.is_empty() { args.push("--features".into()); args.push(b.features.into()); }
-            let extra: Vec<&str> = b.args.iter().copied().chain(if flag("--save") && name == "regression_gate" { Some("--save") } else { None }).collect();
-            if !extra.is_empty() { args.push("--".into()); args.extend(extra.iter().map(|s| s.to_string())); }
+            // Execute the built artifact directly: cargo's own startup would land in the
+            // wall time, and CPU time is per process (a parent does not accumulate its
+            // child's), so timing `cargo` would time the wrong process entirely.
+            let exe = artifact_path(b);
+            let mut args: Vec<String> = b.args.iter().map(|s| s.to_string()).collect();
+            if flag("--save") && name == "regression_gate" { args.push("--save".into()); }
 
+            let cpu_before = cpu::children_cpu_secs();
             let t = Instant::now();
-            let mut child = Command::new("cargo").args(&args).envs(b.env.iter().copied())
-                .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("spawn cargo");
+            let mut child = Command::new(&exe).args(&args).envs(b.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
+                .unwrap_or_else(|e| panic!("cannot run {}: {e}", exe.display()));
             let stdout = child.stdout.take().expect("stdout");
             raw.push_str(&format!("\n### {label} pass {pass}\n\n```\n"));
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
@@ -353,10 +480,17 @@ fn main() {
                 raw.push_str(&line); raw.push('\n');
             }
             let st = child.wait().expect("wait");
-            raw.push_str("```\n");
             let secs = t.elapsed().as_secs_f64();
-            println!("  -> {} in {secs:.1}s", if st.success() { "ok" } else { "FAILED" });
-            passes.push(Pass { bench: label, pass, ok: st.success(), seconds: secs, busy: gave_up, load });
+            // Windows: ask the (exited but still open) handle. Unix: delta of the reaped
+            // children's rusage. Either way this is CPU burned, not time elapsed.
+            let cpu_secs = cpu::child_cpu_secs(&child)
+                .or_else(|| Some(cpu::children_cpu_secs()? - cpu_before?));
+            raw.push_str("```\n");
+            match cpu_secs {
+                Some(c) => println!("  -> {} in {secs:.1}s wall / {c:.1}s cpu ({:.2}x)", if st.success() { "ok" } else { "FAILED" }, c / secs.max(1e-9)),
+                None => println!("  -> {} in {secs:.1}s", if st.success() { "ok" } else { "FAILED" }),
+            }
+            passes.push(Pass { bench: label, pass, ok: st.success(), seconds: secs, cpu: cpu_secs, busy: gave_up, load });
         }
     }
 
@@ -371,9 +505,10 @@ fn main() {
     md.push_str(&format!("| slow benches | {} |\n", if skipped_slow > 0 { format!("{skipped_slow} skipped (--include-slow to run)") } else { "none skipped".into() }));
     md.push_str(&format!("| passes per bench | {repeat} |\n| idle gate | {} |\n\n", if idle_wait { format!("calibration loop within {tolerance:.2}x of {:.1} ms", base.as_secs_f64() * 1e3) } else { "disabled".into() }));
 
-    md.push_str("## Runs\n\n| bench | pass | status | seconds | machine |\n| --- | ---: | --- | ---: | --- |\n");
+    md.push_str("## Runs\n\n**cpu s** is processor time (user + kernel) burned by the bench process, which is what to\ncompare: wall time says how long it took, CPU time says how much processing it took, and\nonly wall time inflates when something else is using the machine. `cpu/wall` above 1 means\nthe bench used several cores; well below 1 on a single-threaded bench means it was starved\nor blocked.\n\n| bench | pass | status | wall s | cpu s | cpu/wall | machine |\n| --- | ---: | --- | ---: | ---: | ---: | --- |\n");
     for p in &passes {
-        md.push_str(&format!("| `{}` | {} | {} | {:.1} | {} |\n", p.bench, p.pass, if p.ok { "ok" } else { "**FAILED**" }, p.seconds,
+        let (cpu, ratio) = match p.cpu { Some(c) => (format!("{c:.2}"), format!("{:.2}x", c / p.seconds.max(1e-9))), None => ("—".into(), "—".into()) };
+        md.push_str(&format!("| `{}` | {} | {} | {:.1} | {} | {} | {} |\n", p.bench, p.pass, if p.ok { "ok" } else { "**FAILED**" }, p.seconds, cpu, ratio,
             if p.busy { format!("**busy {:.2}x**", p.load) } else { format!("{:.2}x", p.load) }));
     }
 
@@ -381,6 +516,9 @@ fn main() {
         md.push_str("\n## Metrics\n\nNone: no bench in this group prints `#M <key> <value> [unit]` lines yet.\n");
     } else {
         md.push_str("\n## Metrics\n\nAcross the repeated passes. **Spread** is peak-to-peak over the median — how far a\nsingle reading could have been from the truth.\n\n");
+        if benches.iter().any(|b| b.kind == Kind::EndToEnd) {
+            md.push_str("> This run included **end-to-end** benches (a real application loop). Their\n> per-operation metrics are timed around the operation and are comparable, but any\n> `*.fps` row includes **drawing** and is not an algorithmic measurement — compare\n> algorithms with the headless benches.\n\n");
+        }
         md.push_str("| metric | unit | n | min | median | max | spread |\n| --- | --- | ---: | ---: | ---: | ---: | ---: |\n");
         for (k, s) in &metrics {
             md.push_str(&format!("| `{k}` | {} | {} | {:.3} | **{:.3}** | {:.3} | {:.1}% |\n", s.unit, s.values.len(), s.min(), s.median(), s.max(), s.spread_pct()));
@@ -403,6 +541,15 @@ fn main() {
     println!("report : {stem}.md");
     if !metrics.is_empty() { println!("metrics: {stem}-metrics.csv"); }
     if failed > 0 { std::process::exit(1); }
+}
+
+/// Where cargo put the thing we just built. Examples land in `target/release/examples/`,
+/// binaries directly in `target/release/`.
+fn artifact_path(b: &Bench) -> std::path::PathBuf {
+    let mut p = std::path::PathBuf::from("target/release");
+    if matches!(b.target, Target::Example(_)) { p.push("examples"); }
+    p.push(format!("{}{}", b.target.name(), std::env::consts::EXE_SUFFIX));
+    p
 }
 
 fn capture(cmd: &str, args: &[&str]) -> Option<String> {

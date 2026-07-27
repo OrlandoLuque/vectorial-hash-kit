@@ -8,7 +8,10 @@
 //! cargo run -p vectorial-hash --example kdtree3_bench --release
 //! ```
 //! Env: `KD_N` (points), `KD_Q` (queries), `KD_R` (cull radius).
+#[allow(unused_imports)]
 use std::time::Instant;
+#[path = "common/mod.rs"]
+mod common;
 use vectorial_hash::{Aabb, KdTree3, LinearOctree3, Octree3, Point3, Positioned3, Sphere3, Tree3};
 
 #[derive(Clone, Copy)]
@@ -20,20 +23,27 @@ impl Lcg {
     fn f(&mut self) -> f64 { self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (self.0 >> 11) as f64 / (1u64 << 53) as f64 }
     fn r(&mut self, a: f64, b: f64) -> f64 { a + (b - a) * self.f() }
 }
-fn best<F: FnMut()>(runs: usize, mut f: F) -> f64 {
-    let mut lo = f64::INFINITY;
-    for _ in 0..runs { let t = Instant::now(); f(); lo = lo.min(t.elapsed().as_secs_f64()); }
-    lo * 1e3
-}
+/// Min-of-N **processor** milliseconds: a competing process does not add to CPU time, so
+/// these numbers survive you using the machine while they run. Parallel builds are the
+/// exception below — a speed-up is by definition about elapsed time.
+fn best<F: FnMut()>(runs: usize, f: F) -> f64 { common::cpu_ms(runs, f) }
+/// Cycles per call (frequency-invariant, overhead-corrected) for the same operation.
+fn best_cycles<F: FnMut()>(runs: usize, f: F) -> f64 { common::measure(runs, f).cycles }
+/// Elapsed milliseconds, for the parallel comparisons (CPU time would sum over threads).
+fn best_wall<F: FnMut()>(runs: usize, f: F) -> f64 { common::wall_ms(runs, f) }
 
 fn run(name: &str, items: &[P], queries: &[Point3], radius: f64) {
     let world = Aabb::new(0.0, 0.0, 0.0, 1000.0, 300.0, 1000.0);
     let v: Vec<P> = items.to_vec();
     let t_b_kd = best(5, || { let _ = KdTree3::from_items(16, v.clone()); });
     #[cfg(feature = "parallel")]
-    let t_b_kd_par = best(5, || { let _ = KdTree3::from_items_par(16, v.clone()); });
+    let t_b_kd_wall = best_wall(5, || { let _ = KdTree3::from_items(16, v.clone()); });
     #[cfg(feature = "parallel")]
-    let t_b_bin_par = best(5, || { let _ = Tree3::bulk_load_par(world, 16, v.clone()); });
+    let t_b_bin_wall = best_wall(5, || { let _ = Tree3::bulk_load(world, 16, v.clone()); });
+    #[cfg(feature = "parallel")]
+    let t_b_kd_par = best_wall(5, || { let _ = KdTree3::from_items_par(16, v.clone()); });
+    #[cfg(feature = "parallel")]
+    let t_b_bin_par = best_wall(5, || { let _ = Tree3::bulk_load_par(world, 16, v.clone()); });
     let t_b_bin = best(5, || { let _ = Tree3::bulk_load(world, 16, v.clone()); });
     let t_b_oct = best(5, || { let _ = Octree3::bulk_load(world, 16, v.clone()); });
     let t_b_lin = best(5, || { let _ = LinearOctree3::from_items(world, 16, 18, v.clone()); });
@@ -44,6 +54,9 @@ fn run(name: &str, items: &[P], queries: &[Point3], radius: f64) {
     let lin = LinearOctree3::from_items(world, 16, 18, v.clone());
 
     let mut s = 0usize;
+    let cyc_kd = best_cycles(4, || { let mut n = 0usize; for q in queries { n += kd.cull(&Sphere3::new(q.x, q.y, q.z, radius)).len(); } s += n; });
+    let cyc_bin = best_cycles(4, || { let mut n = 0usize; for q in queries { n += bin.cull(&Sphere3::new(q.x, q.y, q.z, radius)).len(); } s += n; });
+    let t_c_kd_wall = best_wall(6, || { let mut n = 0usize; for q in queries { n += kd.cull(&Sphere3::new(q.x, q.y, q.z, radius)).len(); } s += n; });
     let t_c_kd = best(6, || { for q in queries { s += kd.cull(&Sphere3::new(q.x, q.y, q.z, radius)).len(); } });
     let t_c_bin = best(6, || { for q in queries { s += bin.cull(&Sphere3::new(q.x, q.y, q.z, radius)).len(); } });
     let t_c_oct = best(6, || { for q in queries { s += oct.cull(&Sphere3::new(q.x, q.y, q.z, radius)).len(); } });
@@ -54,7 +67,7 @@ fn run(name: &str, items: &[P], queries: &[Point3], radius: f64) {
     println!("── {name} ──   (KdTree3 depth {}, {} nodes | Tree3 {} nodes | Octree3 {} nodes)", kd.depth(), kd.node_count(), bin.node_count(), oct.node_count());
     println!("  build ms   KdTree3 {t_b_kd:6.2} | Tree3 {t_b_bin:6.2} | Octree3 {t_b_oct:6.2} | LinearOct {t_b_lin:6.2}");
     #[cfg(feature = "parallel")]
-    println!("  build par  KdTree3 {t_b_kd_par:6.2} ({:.2}x) | Tree3 {t_b_bin_par:6.2} ({:.2}x)   [{} threads]", t_b_kd / t_b_kd_par, t_b_bin / t_b_bin_par, rayon::current_num_threads());
+    println!("  build par  KdTree3 {t_b_kd_par:6.2} ({:.2}x) | Tree3 {t_b_bin_par:6.2} ({:.2}x)   [{} threads, WALL clock]", t_b_kd_wall / t_b_kd_par, t_b_bin_wall / t_b_bin_par, rayon::current_num_threads());
     println!("  cull  ms   KdTree3 {t_c_kd:6.2} | Tree3 {t_c_bin:6.2} | Octree3 {t_c_oct:6.2} | LinearOct {t_c_lin:6.2}   (kd vs Tree3 {:.2}×)", t_c_bin / t_c_kd);
     println!("  knn   ms   KdTree3 {t_k_kd:6.2} | Tree3 {t_k_bin:6.2}                                    (kd vs Tree3 {:.2}×)", t_k_bin / t_k_kd);
     // Machine-readable lines for `bench-runner` (it aggregates min/median/max/spread
@@ -66,6 +79,11 @@ fn run(name: &str, items: &[P], queries: &[Point3], radius: f64) {
     println!("#M {tag}.build_octree3 {t_b_oct:.3} ms");
     println!("#M {tag}.build_linear_octree3 {t_b_lin:.3} ms");
     println!("#M {tag}.cull_kdtree3 {t_c_kd:.3} ms");
+    // Same operation on the WALL clock, so a run under load shows what each clock does.
+    println!("#M {tag}.cull_kdtree3_wallclock {t_c_kd_wall:.3} ms");
+    println!("#M {tag}.cull_kdtree3_cycles {:.0} cycles", cyc_kd);
+    println!("#M {tag}.cull_tree3_cycles {:.0} cycles", cyc_bin);
+    println!("#M {tag}.cull_ratio_cycles {:.3} x", cyc_bin / cyc_kd);
     println!("#M {tag}.cull_tree3 {t_c_bin:.3} ms");
     println!("#M {tag}.cull_ratio_kd_over_tree3 {:.3} x", t_c_bin / t_c_kd);
     println!("#M {tag}.knn_kdtree3 {t_k_kd:.3} ms");
@@ -73,9 +91,9 @@ fn run(name: &str, items: &[P], queries: &[Point3], radius: f64) {
     #[cfg(feature = "parallel")]
     {
         println!("#M {tag}.build_kdtree3_par {t_b_kd_par:.3} ms");
-        println!("#M {tag}.build_kdtree3_speedup {:.3} x", t_b_kd / t_b_kd_par);
+        println!("#M {tag}.build_kdtree3_speedup {:.3} x", t_b_kd_wall / t_b_kd_par);
         println!("#M {tag}.build_tree3_par {t_b_bin_par:.3} ms");
-        println!("#M {tag}.build_tree3_speedup {:.3} x", t_b_bin / t_b_bin_par);
+        println!("#M {tag}.build_tree3_speedup {:.3} x", t_b_bin_wall / t_b_bin_par);
     }
     if s == usize::MAX { println!("{s}"); }
 }
