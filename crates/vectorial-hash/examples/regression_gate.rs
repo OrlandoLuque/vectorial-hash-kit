@@ -64,12 +64,12 @@ fn queries() -> Vec<Sphere3> {
     (0..N_QUERY).map(|_| Sphere3::new(r.range(0.0, WORLD), r.range(0.0, WORLD), r.range(0.0, WORLD), VISION)).collect()
 }
 #[derive(Clone, Copy)]
-struct C2 { id: u32, p: Point }
+struct C2 { p: Point }
 impl Positioned for C2 { fn position(&self) -> Point { self.p } }
 
 fn items2() -> Vec<C2> {
     let mut r = Rng::new(3);
-    (0..N).map(|id| C2 { id: id as u32, p: Point::new(r.range(MARGIN, WORLD - MARGIN), r.range(MARGIN, WORLD - MARGIN)) }).collect()
+    (0..N).map(|_| C2 { p: Point::new(r.range(MARGIN, WORLD - MARGIN), r.range(MARGIN, WORLD - MARGIN)) }).collect()
 }
 fn queries2() -> Vec<Circle> {
     let mut r = Rng::new(101);
