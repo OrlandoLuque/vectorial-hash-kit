@@ -18,6 +18,7 @@ use vectorial_hash::{
     Aabb, IPoint, IPositioned, IRect, IntegerTree, Octree3, Point, Point3, Positioned,
     Positioned3, QuadTree, Rect, Shape, Shape3, Sphere3, Tree, Tree3, ItemRef, MortonGrid, MortonGrid3,
     KdTree3, LinearOctree3, LinearQuadTree, Polyhedron3,
+    AdaptiveIndex, Backend, Slot, Thresholds,
 };
 
 const W: f64 = 256.0;
@@ -346,5 +347,133 @@ proptest! {
             prop_assert_eq!(got.len(), brute.len(), "linear_quadtree knn count k={}", k);
             for (a, b) in got.iter().zip(brute.iter()) { prop_assert!((a - b).abs() <= 1e-6 * (1.0 + b), "linear_quadtree knn dist {} != brute {}", a, b); }
         }
+    }
+}
+
+/// Cull against every probe sphere and compare with brute force over the model. Shared so
+/// the adaptive property can re-check after each forced migration without repeating itself.
+fn check_cull_matches(ix: &mut AdaptiveIndex<M3>, live: &[Point3]) -> Result<(), TestCaseError> {
+    for (cx, cy, cz, rr) in SPHERES {
+        let s = Sphere3::new(cx, cy, cz, rr);
+        let mut want: Vec<(u64, u64, u64)> = live.iter()
+            .filter(|p| { let (dx, dy, dz) = (p.x - cx, p.y - cy, p.z - cz); dx * dx + dy * dy + dz * dz <= rr * rr })
+            .map(|p| (p.x.to_bits(), p.y.to_bits(), p.z.to_bits())).collect();
+        let mut got: Vec<(u64, u64, u64)> = ix.cull(&s).iter()
+            .map(|m| (m.p.x.to_bits(), m.p.y.to_bits(), m.p.z.to_bits())).collect();
+        want.sort(); got.sort();
+        prop_assert_eq!(&want, &got, "cull != brute on backend {:?}", ix.backend());
+    }
+    Ok(())
+}
+
+// ============================ AdaptiveIndex (migrations included) ============================
+// The point of this structure is that it CHANGES underneath the caller, so the property is
+// not "does this tree answer correctly" but "does the answer stay correct across a change
+// of backend the test did not choose and cannot see". Everything is checked against the
+// same brute-force model regardless of which structure the policy happens to be holding.
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(24))]
+
+    #[test]
+    fn adaptive_answers_match_brute_across_migrations(ops in ops()) {
+        // Thresholds tuned so migrations actually happen inside a short op sequence: the
+        // shipped defaults need hundreds of ticks to move, which would make this test
+        // exercise one backend and prove nothing.
+        let th = Thresholds { brute_max: 40, static_ticks: 6, hold_ticks: 2, cooldown: 0, ..Default::default() };
+        let mut ix = AdaptiveIndex::with_thresholds(Aabb::new(0.0, 0.0, 0.0, W, W, W), 6, th);
+        let mut live: Vec<Point3> = Vec::new();
+        let mut backends: Vec<Backend> = vec![ix.backend()];
+
+        for (n, op) in ops.iter().enumerate() {
+            match *op {
+                Op::Ins(x, y, z) => { let p = Point3::new(x, y, z); ix.insert(M3 { p }); live.push(p); }
+                Op::Rem(i) => {
+                    // No remove on AdaptiveIndex yet: spend the op on a query instead, which
+                    // keeps the op mix (and the query-per-item rate the policy reads) honest.
+                    if !live.is_empty() {
+                        let q = live[i % live.len()];
+                        let _ = ix.cull(&Sphere3::new(q.x, q.y, q.z, 20.0));
+                    }
+                }
+                Op::Upd(i, x, y, z) => {
+                    if !live.is_empty() {
+                        let j = i % live.len();
+                        let np = Point3::new(x, y, z);
+                        ix.update(Slot(j as u32), |m| m.p = np);
+                        live[j] = np;
+                    }
+                }
+            }
+            if n % 3 == 0 { ix.tick(); backends.push(ix.backend()); }
+
+            // The invariant that must hold after EVERY op, whatever backend is loaded.
+            prop_assert_eq!(ix.len(), live.len(), "item count drifted on backend {:?}", ix.backend());
+        }
+
+        for (cx, cy, cz, rr) in SPHERES {
+            let s = Sphere3::new(cx, cy, cz, rr);
+            let mut want: Vec<(u64, u64, u64)> = live.iter()
+                .filter(|p| { let (dx, dy, dz) = (p.x - cx, p.y - cy, p.z - cz); dx * dx + dy * dy + dz * dz <= rr * rr })
+                .map(|p| (p.x.to_bits(), p.y.to_bits(), p.z.to_bits())).collect();
+            let mut got: Vec<(u64, u64, u64)> = ix.cull(&s).iter()
+                .map(|m| (m.p.x.to_bits(), m.p.y.to_bits(), m.p.z.to_bits())).collect();
+            want.sort(); got.sort();
+            prop_assert_eq!(&want, &got, "cull != brute on backend {:?} after {} switches", ix.backend(), ix.switch_count());
+        }
+
+        // The random op mix only ever reaches Brute and KeepTree — instrumented, 12 of 24
+        // cases migrated and every one of them stopped there. So the other two backends are
+        // driven deliberately, and asserted, rather than hoped for: a property that never
+        // executes half the code under test is a property about the other half.
+        // Above the WIDENED brute edge: brute_max 40 with margin 0.25 keeps the policy on
+        // the scan up to 50 items, so a guard of >40 leaves it there and the phase never
+        // fires. The hysteresis is behaving; the guard was wrong.
+        if live.len() > 80 {
+            // Query-heavy: one cull per item per tick is the regime where rebuilding wins.
+            for _ in 0..40 {
+                for p in live.iter().take(60) { let _ = ix.cull(&Sphere3::new(p.x, p.y, p.z, 8.0)); }
+                ix.update(Slot(0), |m| m.p = m.p);
+                ix.tick();
+            }
+            prop_assert_eq!(ix.backend(), Backend::Grid, "query-heavy phase did not reach the grid");
+            check_cull_matches(&mut ix, &live)?;
+
+            // Then everything settles: no movement at all.
+            for _ in 0..40 { let _ = ix.cull(&Sphere3::new(60.0, 60.0, 60.0, 30.0)); ix.tick(); }
+            prop_assert_eq!(ix.backend(), Backend::Static, "settled phase did not reach the build-once backend");
+            check_cull_matches(&mut ix, &live)?;
+        }
+
+        for k in KS {
+            let q = Point3::new(120.0, 120.0, 120.0);
+            let mut brute: Vec<f64> = live.iter()
+                .map(|p| { let (dx, dy, dz) = (p.x - q.x, p.y - q.y, p.z - q.z); dx * dx + dy * dy + dz * dz }).collect();
+            brute.sort_by(|a, b| a.total_cmp(b)); brute.truncate(k);
+            let got: Vec<f64> = ix.knn(q, k).iter().map(|(d, _)| d * d).collect();
+            prop_assert_eq!(got.len(), brute.len(), "knn count k={} on backend {:?}", k, ix.backend());
+            for (a, b) in got.iter().zip(brute.iter()) {
+                prop_assert!((a - b).abs() <= 1e-6 * (1.0 + b), "knn dist {} != brute {}", a, b);
+            }
+        }
+    }
+
+    /// The guarantee hysteresis exists to give: a workload that is not changing must not
+    /// keep paying for migrations. Without the hold and the cooldown this flaps every tick
+    /// and loses to both candidates.
+    #[test]
+    fn adaptive_does_not_migrate_under_a_stationary_workload(seed in 0u64..64, pop in 60usize..300) {
+        let th = Thresholds { brute_max: 40, hold_ticks: 4, cooldown: 20, ..Default::default() };
+        let mut ix = AdaptiveIndex::with_thresholds(Aabb::new(0.0, 0.0, 0.0, W, W, W), 6, th);
+        let mut x = seed | 1;
+        let mut rnd = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; ((x >> 40) as f64) / (1u64 << 24) as f64 * W };
+        for _ in 0..pop { ix.insert(M3 { p: Point3::new(rnd(), rnd(), rnd()) }); }
+        // Steady state: same small movement, same query load, every tick.
+        for t in 0..200 {
+            ix.update(Slot((t % pop) as u32), |m| m.p = Point3::new(m.p.x, m.p.y, (m.p.z + 0.01).min(W)));
+            let _ = ix.cull(&Sphere3::new(50.0, 50.0, 50.0, 25.0));
+            ix.tick();
+        }
+        prop_assert!(ix.switch_count() <= 2,
+            "stationary workload migrated {} times (pop {})", ix.switch_count(), pop);
     }
 }
