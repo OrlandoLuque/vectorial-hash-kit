@@ -18,6 +18,15 @@
 //!    with no test at all.
 //! 4. **spans + chunk skip** — the same, but the world is 16³ chunks carrying a "uniform"
 //!    flag, so a chunk that is entirely air is skipped whole and never touched.
+//! 5. **section classify** — before touching a section at all, classify the whole 16³ box
+//!    against the sphere: nearest point beyond `r` → skip it; farthest corner within `r`
+//!    → every block in it is inside, so walk it with no sphere test at all; otherwise fall
+//!    back to spans. This is exactly `Sphere3::classify_aabb` applied at section
+//!    granularity rather than tree-node granularity.
+//!
+//! Each is measured twice: over a **flat array**, and over a **bit-packed palette** (4-bit
+//! indices, 16³ per section) — how a real block game stores chunks, where every access
+//! costs a shift and a mask instead of a load. The ranking is not the same under both.
 //!
 //! ```bash
 //! cargo run -p vectorial-hash --example voxel_select_bench --release
@@ -33,6 +42,8 @@ const CHUNK: usize = 16;
 
 /// One selection strategy: world, sphere centre, radius -> how many solid blocks.
 type Method<'a> = dyn Fn(&World, (i64, i64, i64), i64) -> usize + 'a;
+/// The same, over the packed-palette world.
+type PackedMethod<'a> = dyn Fn(&Packed, (i64, i64, i64), i64) -> usize + 'a;
 
 struct Lcg(u64);
 impl Lcg {
@@ -78,7 +89,24 @@ impl World {
     }
 }
 
-// ---------------------------------------------------------------- the four methods
+/// Nearest point of a box to `c`, and its farthest corner — the exact sphere/box
+/// classification (the same one `Sphere3::classify_aabb` runs on tree nodes). The nearest
+/// point is found by CLAMPING rather than by picking a corner: a box's closest point to an
+/// outside centre can lie on a face or an edge, which is exactly the case a corner-only
+/// test misses (a sphere grazing a face while all eight corners are outside).
+#[derive(PartialEq, Debug)]
+enum Cell { Out, Inside, Partial }
+
+fn classify(c: (i64, i64, i64), r: i64, lo: (i64, i64, i64), hi: (i64, i64, i64)) -> Cell {
+    let near = |ci: i64, l: i64, h: i64| { let n = ci.clamp(l, h); (n - ci) * (n - ci) };
+    let d2 = near(c.0, lo.0, hi.0) + near(c.1, lo.1, hi.1) + near(c.2, lo.2, hi.2);
+    if d2 > r * r { return Cell::Out; }
+    let far = |ci: i64, l: i64, h: i64| { let a = (ci - l).abs().max((ci - h).abs()); a * a };
+    let f2 = far(c.0, lo.0, hi.0) + far(c.1, lo.1, hi.1) + far(c.2, lo.2, hi.2);
+    if f2 <= r * r { Cell::Inside } else { Cell::Partial }
+}
+
+// ---------------------------------------------------------------- the methods
 
 fn naive(w: &World, c: (i64, i64, i64), r: i64) -> usize {
     let (x0, x1, y0, y1, z0, z1) = w.clamp_box(c, r);
@@ -183,6 +211,106 @@ fn spans_skip(w: &World, c: (i64, i64, i64), r: i64, sp: &Spans) -> usize {
     n
 }
 
+/// Section-granularity classification first; spans only where a section is partial.
+fn sections(w: &World, c: (i64, i64, i64), r: i64, sp: &Spans) -> usize {
+    let s = w.side as i64 - 1;
+    let mut n = 0;
+    let cl = |v: i64| (v.clamp(0, s) as usize) / CHUNK;
+    for cz in cl(c.2 - r)..=cl(c.2 + r) { for cy in cl(c.1 - r)..=cl(c.1 + r) { for cx in cl(c.0 - r)..=cl(c.0 + r) {
+        if w.chunk_is_empty(cx, cy, cz) { continue; }
+        let lo = ((cx * CHUNK) as i64, (cy * CHUNK) as i64, (cz * CHUNK) as i64);
+        let hi = (lo.0 + CHUNK as i64 - 1, lo.1 + CHUNK as i64 - 1, lo.2 + CHUNK as i64 - 1);
+        match classify(c, r, lo, hi) {
+            Cell::Out => continue,
+            Cell::Inside => {
+                // Every block here is inside the sphere: no span lookup, no distance test.
+                for z in lo.2..=hi.2.min(s) { for y in lo.1..=hi.1.min(s) {
+                    let row = (z as usize * w.side + y as usize) * w.side;
+                    for x in lo.0..=hi.0.min(s) { if w.blocks[row + x as usize] != 0 { n += 1; } }
+                }}
+            }
+            Cell::Partial => {
+                for z in lo.2..=hi.2.min(s) { let dz = z - c.2; if dz.abs() > r { continue; }
+                    for y in lo.1..=hi.1.min(s) { let dy = y - c.1; if dy.abs() > r { continue; }
+                        let hw = sp.half_width(dy, dz); if hw < 0 { continue; }
+                        let rx0 = (c.0 - hw as i64).max(lo.0).max(0);
+                        let rx1 = (c.0 + hw as i64).min(hi.0).min(s);
+                        let row = (z as usize * w.side + y as usize) * w.side;
+                        for x in rx0..=rx1 { if w.blocks[row + x as usize] != 0 { n += 1; } }
+                    }}
+            }
+        }
+    }}}
+    n
+}
+
+/// The same world stored the way a block game stores it: per 16³ section, 4-bit palette
+/// indices packed into u64s, so every access is a shift and a mask.
+struct Packed { side: usize, cs: usize, data: Vec<u64>, empty: Vec<bool> }
+impl Packed {
+    const PER_SECTION: usize = CHUNK * CHUNK * CHUNK / 16; // 16 nibbles per u64
+    fn from(w: &World) -> Packed {
+        let cs = w.chunk_side;
+        let mut data = vec![0u64; cs * cs * cs * Self::PER_SECTION];
+        for z in 0..w.side { for y in 0..w.side { for x in 0..w.side {
+            if w.at(x, y, z) == 0 { continue; }
+            let sec = ((z / CHUNK) * cs + (y / CHUNK)) * cs + (x / CHUNK);
+            let within = ((z % CHUNK) * CHUNK + (y % CHUNK)) * CHUNK + (x % CHUNK);
+            data[sec * Self::PER_SECTION + within / 16] |= 1u64 << ((within % 16) * 4);
+        }}}
+        Packed { side: w.side, cs, data, empty: w.chunk_empty.clone() }
+    }
+    #[inline] fn at(&self, x: usize, y: usize, z: usize) -> u8 {
+        let sec = ((z / CHUNK) * self.cs + (y / CHUNK)) * self.cs + (x / CHUNK);
+        let within = ((z % CHUNK) * CHUNK + (y % CHUNK)) * CHUNK + (x % CHUNK);
+        ((self.data[sec * Self::PER_SECTION + within / 16] >> ((within % 16) * 4)) & 0xF) as u8
+    }
+    #[inline] fn chunk_is_empty(&self, cx: usize, cy: usize, cz: usize) -> bool {
+        self.empty[(cz * self.cs + cy) * self.cs + cx]
+    }
+}
+
+fn naive_packed(p: &Packed, c: (i64, i64, i64), r: i64) -> usize {
+    let s = p.side as i64 - 1;
+    let r2 = r * r;
+    let mut n = 0;
+    for z in (c.2 - r).max(0)..=(c.2 + r).min(s) { let dz = z - c.2;
+        for y in (c.1 - r).max(0)..=(c.1 + r).min(s) { let dy = y - c.1;
+            for x in (c.0 - r).max(0)..=(c.0 + r).min(s) { let dx = x - c.0;
+                if dx * dx + dy * dy + dz * dz <= r2 && p.at(x as usize, y as usize, z as usize) != 0 { n += 1; }
+            }}}
+    n
+}
+
+/// Section classify + spans over the packed palette — the shape a mod would ship.
+fn sections_packed(p: &Packed, c: (i64, i64, i64), r: i64, sp: &Spans) -> usize {
+    let s = p.side as i64 - 1;
+    let mut n = 0;
+    let cl = |v: i64| (v.clamp(0, s) as usize) / CHUNK;
+    for cz in cl(c.2 - r)..=cl(c.2 + r) { for cy in cl(c.1 - r)..=cl(c.1 + r) { for cx in cl(c.0 - r)..=cl(c.0 + r) {
+        if p.chunk_is_empty(cx, cy, cz) { continue; }
+        let lo = ((cx * CHUNK) as i64, (cy * CHUNK) as i64, (cz * CHUNK) as i64);
+        let hi = (lo.0 + CHUNK as i64 - 1, lo.1 + CHUNK as i64 - 1, lo.2 + CHUNK as i64 - 1);
+        match classify(c, r, lo, hi) {
+            Cell::Out => continue,
+            Cell::Inside => {
+                for z in lo.2..=hi.2.min(s) { for y in lo.1..=hi.1.min(s) { for x in lo.0..=hi.0.min(s) {
+                    if p.at(x as usize, y as usize, z as usize) != 0 { n += 1; }
+                }}}
+            }
+            Cell::Partial => {
+                for z in lo.2..=hi.2.min(s) { let dz = z - c.2; if dz.abs() > r { continue; }
+                    for y in lo.1..=hi.1.min(s) { let dy = y - c.1; if dy.abs() > r { continue; }
+                        let hw = sp.half_width(dy, dz); if hw < 0 { continue; }
+                        for x in (c.0 - hw as i64).max(lo.0).max(0)..=(c.0 + hw as i64).min(hi.0).min(s) {
+                            if p.at(x as usize, y as usize, z as usize) != 0 { n += 1; }
+                        }}}
+            }
+        }
+    }}}
+    n
+}
+
 fn main() {
     let side: usize = std::env::var("VS_SIDE").ok().and_then(|s| s.parse().ok()).unwrap_or(256);
     let nq: usize = std::env::var("VS_Q").ok().and_then(|s| s.parse().ok()).unwrap_or(64);
@@ -198,11 +326,14 @@ fn main() {
     let mut r = Lcg(0x5EED);
     let centres: Vec<(i64, i64, i64)> = (0..nq).map(|_| (r.range(0, side) as i64, r.range(0, side) as i64, r.range(0, side) as i64)).collect();
 
+    let mut packed_rows: Vec<(i64, f64, f64)> = Vec::new();
     let mut bitmaps: HashMap<i64, Bitmap> = HashMap::new();
     let mut spanmaps: HashMap<i64, Spans> = HashMap::new();
     for &rad in &radii { bitmaps.insert(rad, Bitmap::new(rad)); spanmaps.insert(rad, Spans::new(rad)); }
 
-    println!("  {:>6} {:>12} {:>12} {:>12} {:>12}   {:>10}", "radius", "naive us", "bitmap us", "spans us", "spans+skip", "vs naive");
+    let packed = Packed::from(&w);
+    println!("FLAT ARRAY (a load per block)");
+    println!("  {:>6} {:>10} {:>10} {:>10} {:>11} {:>11}", "radius", "naive", "bitmap", "spans", "spans+skip", "sections");
     for &rad in &radii {
         let bm = &bitmaps[&rad];
         let sp = &spanmaps[&rad];
@@ -210,7 +341,8 @@ fn main() {
         let (a, b, c, d): (usize, usize, usize, usize) = centres.iter().fold((0, 0, 0, 0), |acc, &ct| {
             (acc.0 + naive(&w, ct, rad), acc.1 + bitmap(&w, ct, rad, bm), acc.2 + spans(&w, ct, rad, sp), acc.3 + spans_skip(&w, ct, rad, sp))
         });
-        assert!(a == b && b == c && c == d, "methods disagree at r={rad}: {a} {b} {c} {d}");
+        let e: usize = centres.iter().map(|&ct| sections(&w, ct, rad, sp)).sum();
+        assert!(a == b && b == c && c == d && d == e, "methods disagree at r={rad}: {a} {b} {c} {d} {e}");
 
         let per = |f: &Method| {
             common::measure(5, || { let mut acc = 0; for &ct in &centres { acc += f(&w, ct, rad); } std::hint::black_box(acc); }).ms * 1e3 / nq as f64
@@ -219,8 +351,20 @@ fn main() {
         let t_bm = per(&|w, c, r| bitmap(w, c, r, bm));
         let t_sp = per(&|w, c, r| spans(w, c, r, sp));
         let t_sk = per(&|w, c, r| spans_skip(w, c, r, sp));
-        println!("  {:>6} {:>12.2} {:>12.2} {:>12.2} {:>12.2}   spans {:.2}x, +skip {:.2}x",
-            rad, t_naive, t_bm, t_sp, t_sk, t_naive / t_sp, t_naive / t_sk);
+        let t_se = per(&|w, c, r| sections(w, c, r, sp));
+        println!("  {:>6} {:>10.2} {:>10.2} {:>10.2} {:>11.2} {:>11.2}", rad, t_naive, t_bm, t_sp, t_sk, t_se);
+        println!("#M r{rad}.sections {t_se:.4} us");
+        // the same again through a bit-packed palette, which is how a block game stores it
+        let pk = |f: &PackedMethod| {
+            common::measure(5, || { let mut acc = 0; for &ct in &centres { acc += f(&packed, ct, rad); } std::hint::black_box(acc); }).ms * 1e3 / nq as f64
+        };
+        let (pa, pb): (usize, usize) = centres.iter().fold((0, 0), |a, &ct| (a.0 + naive_packed(&packed, ct, rad), a.1 + sections_packed(&packed, ct, rad, sp)));
+        assert!(pa == a && pb == a, "packed methods disagree at r={rad}: {pa} {pb} vs {a}");
+        let t_pn = pk(&|p, c, r| naive_packed(p, c, r));
+        let t_ps = pk(&|p, c, r| sections_packed(p, c, r, sp));
+        packed_rows.push((rad, t_pn, t_ps));
+        println!("#M r{rad}.packed_naive {t_pn:.4} us");
+        println!("#M r{rad}.packed_sections {t_ps:.4} us");
         println!("#M r{rad}.naive {t_naive:.4} us");
         println!("#M r{rad}.bitmap {t_bm:.4} us");
         println!("#M r{rad}.spans {t_sp:.4} us");
@@ -228,10 +372,22 @@ fn main() {
         println!("#M r{rad}.spans_speedup {:.3} x", t_naive / t_sp);
     }
 
-    println!("\nreading: the bitmap is the kit's voxel-raster idea in a block world — it replaces");
-    println!("arithmetic with a lookup, which is a bad trade when the arithmetic is three multiplies");
-    println!("and the lookup is a cache miss. Spans delete the per-block question entirely: a sphere");
-    println!("meets each row in ONE contiguous run, so the table is O(r²) and the inner loop is a");
-    println!("straight walk over adjacent memory. Chunk skipping then removes the blocks you were");
-    println!("never going to want.");
+    println!("
+BIT-PACKED PALETTE (a shift and a mask per block, as a block game stores it)");
+    println!("  {:>6} {:>10} {:>12} {:>12}", "radius", "naive", "sections", "speedup");
+    for (rad, pn, ps) in &packed_rows {
+        println!("  {:>6} {:>10.2} {:>12.2} {:>11.2}x", rad, pn, ps, pn / ps);
+    }
+
+    println!("
+reading:");
+    println!("- The BITMAP (the kit's voxel-raster idea in a block world) loses to the naive");
+    println!("  loop: it trades three multiplies for a lookup that misses cache.");
+    println!("- SPANS win because a sphere meets each row in ONE contiguous run: the table is");
+    println!("  O(r^2) instead of O(r^3) and the inner loop has no per-block question at all.");
+    println!("- SECTION CLASSIFY flips with the storage, which is why both are measured. On a");
+    println!("  flat array it LOSES: it chops the long contiguous walk into 16-block pieces for");
+    println!("  a saving that spans already had. Through a packed palette it WINS 1.5-2.7x,");
+    println!("  because staying inside one section keeps the decode local, and a section whose");
+    println!("  farthest corner is within r needs no sphere test at all.");
 }
