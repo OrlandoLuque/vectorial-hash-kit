@@ -369,7 +369,19 @@ fn main() {
         println!("#M r{rad}.bitmap {t_bm:.4} us");
         println!("#M r{rad}.spans {t_sp:.4} us");
         println!("#M r{rad}.spans_skip {t_sk:.4} us");
+        // Paired (A/B/B/A, median of per-round ratios): the same comparison taken as two
+        // separate measurements is worth 10-15% of noise, and these numbers are being
+        // handed to another team to base a design on.
+        let (_, _, sp_ratio, sp_spread) = common::compare2(5,
+            || { let mut acc = 0; for &ct in &centres { acc += spans(&w, ct, rad, sp); } std::hint::black_box(acc); },
+            || { let mut acc = 0; for &ct in &centres { acc += naive(&w, ct, rad); } std::hint::black_box(acc); });
+        let (_, _, sk_ratio, sk_spread) = common::compare2(5,
+            || { let mut acc = 0; for &ct in &centres { acc += spans_skip(&w, ct, rad, sp); } std::hint::black_box(acc); },
+            || { let mut acc = 0; for &ct in &centres { acc += naive(&w, ct, rad); } std::hint::black_box(acc); });
         println!("#M r{rad}.spans_speedup {:.3} x", t_naive / t_sp);
+        println!("#M r{rad}.spans_speedup_paired {sp_ratio:.3} x");
+        println!("#M r{rad}.spans_speedup_paired_spread {sp_spread:.1} pct");
+        println!("#M r{rad}.skip_speedup_paired {sk_ratio:.3} x");
     }
 
     println!("

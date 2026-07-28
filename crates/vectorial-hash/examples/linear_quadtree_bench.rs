@@ -9,6 +9,9 @@
 //! Env: `LQ_N` (points), `LQ_Q` (queries), `LQ_R` (cull radius).
 
 use std::time::Instant;
+
+#[path = "common/mod.rs"]
+mod common;
 use vectorial_hash::linear_quadtree::LinearQuadTree;
 use vectorial_hash::{Circle, KdTree2, MortonGrid, Point, Positioned, QuadTree, Rect};
 
@@ -110,7 +113,16 @@ fn main() {
     println!("#M cull_morton {t_cull_mor:.3} ms");
     println!("#M knn_kdtree2 {t_knn_kd:.3} ms");
     println!("#M knn_quadtree {t_knn_qt:.3} ms");
+    // The quoted ratio is measured PAIRED (A/B/B/A, median of per-round ratios): taking
+    // the two culls separately made the equivalent 3D figure swing 1.57-3.28 between runs.
+    let (mut sa, mut sb) = (0usize, 0usize);
+    let (_, _, ratio_kd2, ratio_spread) = common::compare2(7,
+        || { for q in &queries { sa += kd.cull(&Circle::new(*q, radius)).len(); } },
+        || { for q in &queries { sb += qt.cull(&Circle::new(*q, radius)).len(); } });
+    sink += sa + sb;
     println!("#M cull_ratio_kd2_over_quadtree {:.3} x", t_cull_qt / t_cull_kd);
+    println!("#M cull_ratio_kd2_paired {ratio_kd2:.3} x");
+    println!("#M cull_ratio_kd2_paired_spread {ratio_spread:.1} pct");
     println!("#M maintain_quadtree_keep {t_maint_qt:.3} ms");
     println!("#M maintain_linear_rebuild {t_maint_lin:.3} ms");
     #[cfg(feature = "parallel")]
