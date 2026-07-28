@@ -51,9 +51,17 @@ relocates 20 000 units per frame and keeping the index wins 1.05× (1 thread) �
 (16). Here every particle also relocates every step — and keeping loses the frame by 16%.
 The two differ in how far an item moves relative to its leaf, and in how query-heavy the
 frame is: SPH runs a neighbour query *per particle*, so partition drift is paid 2 200
-times a step while the relocation saving is paid once. The advisor's `HIGH_RELOCATION`
-rule points the same way; wiring the fluid's actual relocation rate through
-`update_ref_tracked` to confirm it is queued in the backlog.
+times a step while the relocation saving is paid once. That was measured rather than assumed, and it settled which rule the advisor should
+carry. Instrumented with `update_ref_tracked`, the fluid reports:
+
+| | measured here | threshold | verdict |
+| --- | ---: | ---: | --- |
+| relocation rate (moves that leave their leaf) | **13.6%** | `HIGH_RELOCATION` 30% | would have said **keep** — wrong |
+| queries per item per step | **1.00** | `rebuild_query_ratio` 0.10 | says **rebuild** — right, by 10× |
+
+So the churn rule would have got the repo's only genuine counterexample backwards, and the
+query-intensity rule gets it right. That is why `adaptive::Thresholds` switches on
+`rebuild_query_ratio` and keeps `high_churn` only as a description of the workload.
 
 ## Physics: PBF, not the textbook EOS
 

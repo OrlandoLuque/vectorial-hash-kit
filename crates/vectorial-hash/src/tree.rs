@@ -181,6 +181,18 @@ pub struct Tree<T: Positioned> {
     pub root: NodeId,
 }
 
+/// What [`Tree::update_ref_tracked`] observed about a move. The 2D counterpart of
+/// [`Crossing`](crate::tree3::Crossing).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Crossing2 {
+    /// The item moved but stayed inside the same leaf — the O(1) case.
+    Stayed(NodeId),
+    /// The item crossed into a different leaf: it had to be removed and reinserted.
+    Moved { from: NodeId, to: NodeId },
+    /// The handle was stale, or the new position fell outside the world box.
+    Left,
+}
+
 impl<T: Positioned> Tree<T> {
     pub fn new(bbox: Rect, item_limit: usize) -> Self {
         Self::with_limits(bbox, item_limit, item_limit)
@@ -397,6 +409,30 @@ impl<T: Positioned> Tree<T> {
             return true;
         }
         self.relocate_via_lca(node, slot, np)
+    }
+
+    /// Like [`update_ref`](Self::update_ref), but reports **whether the item left its
+    /// leaf** — the signal a caller needs to know its own relocation rate, which is what
+    /// decides whether keeping an index still beats rebuilding it.
+    ///
+    /// The 3D tree has had this since the decision map was built; 2D did not, which meant
+    /// the one workload in this repo that contradicts "keep the index" (the SPH fluid)
+    /// could not report the number the advisor would have judged it by.
+    pub fn update_ref_tracked<M: FnOnce(&mut T)>(&mut self, r: ItemRef, mutator: M) -> Crossing2 {
+        let Some(loc) = self.live_loc(r) else { return Crossing2::Left }; // stale handle
+        let (node, slot) = (loc.node, loc.slot as usize);
+        mutator(&mut self.get_mut(node).items[slot]);
+        let np = self.get(node).items[slot].position();
+        if self.get(node).bbox.contains(np) { return Crossing2::Stayed(node); }
+        if self.relocate_via_lca(node, slot, np) {
+            // The item now lives wherever its handle points; report where it landed.
+            match self.live_loc(r) {
+                Some(l) => Crossing2::Moved { from: node, to: l.node },
+                None => Crossing2::Left,
+            }
+        } else {
+            Crossing2::Left // fell outside the world box
+        }
     }
 
     /// Remove the item behind a stable [`ItemRef`] in O(1) (no scan).
@@ -1353,6 +1389,48 @@ impl<T: Positioned> Tree<T> {
                 self.get_mut(leaf).ropes[side.index()] = buf;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tracked_tests {
+    use super::*;
+
+    #[derive(Clone, Copy, Debug)]
+    struct P { p: Point }
+    impl Positioned for P { fn position(&self) -> Point { self.p } }
+
+    /// The tracked update must agree with the plain one on the outcome, and its report must
+    /// match reality: a small move stays, a jump across the world does not.
+    #[test]
+    fn reports_stayed_and_moved_correctly() {
+        let mut t = Tree::<P>::new(Rect::new(0.0, 0.0, 256.0, 256.0), 4);
+        let mut refs = Vec::new();
+        for i in 0..200 {
+            let p = Point::new((i * 37 % 251) as f64, (i * 53 % 251) as f64);
+            refs.push(t.insert_ref(P { p }).expect("insert"));
+        }
+        let (mut stayed, mut moved) = (0, 0);
+        for (i, r) in refs.iter().enumerate() {
+            // A nudge far smaller than any leaf: must stay put.
+            let before = t.cull(&crate::Circle::new(Point::new(128.0, 128.0), 400.0)).len();
+            match t.update_ref_tracked(*r, |it| it.p = Point::new(it.p.x + 0.001, it.p.y)) {
+                Crossing2::Stayed(_) => stayed += 1,
+                Crossing2::Moved { .. } => moved += 1,
+                Crossing2::Left => panic!("item {i} left the tree on a 0.001 nudge"),
+            }
+            // nothing lost, whichever branch was taken
+            assert_eq!(t.cull(&crate::Circle::new(Point::new(128.0, 128.0), 400.0)).len(), before);
+        }
+        assert!(stayed > moved, "a 0.001 nudge should almost always stay: {stayed} stayed, {moved} moved");
+
+        // Now teleport everything to the far corner: almost all must be reported as moved.
+        let mut jumped = 0;
+        for r in &refs {
+            if let Crossing2::Moved { .. } = t.update_ref_tracked(*r, |it| it.p = Point::new(250.0, 250.0)) { jumped += 1; }
+        }
+        assert!(jumped > refs.len() / 2, "teleporting reported only {jumped} relocations of {}", refs.len());
+        assert_eq!(t.item_count(), refs.len(), "items lost while relocating");
     }
 }
 

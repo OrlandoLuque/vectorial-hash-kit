@@ -33,6 +33,7 @@ use web_time::Instant;
 use bytemuck::{Pod, Zeroable};
 use glam::Mat4;
 use winit::{event::*, event_loop::EventLoop, keyboard::{KeyCode, PhysicalKey}, window::WindowBuilder};
+use vectorial_hash::tree::Crossing2;
 use vectorial_hash::{Circle, ItemRef, LinearQuadTree, MortonGrid, Point, Positioned, Rect, Tree};
 
 // ---- world -----------------------------------------------------------------
@@ -177,15 +178,20 @@ impl Index {
     }
     /// Bring the index up to date with the new positions — a rebuild, or the O(1)
     /// per-particle relocation for the kept tree. This is the "maintain" bar.
-    fn maintain(&mut self, kind: Idx, px: &[f32], py: &[f32]) {
+    fn maintain(&mut self, kind: Idx, px: &[f32], py: &[f32]) -> (u64, u64) {
         match self {
             Index::Keep { tree, refs } => {
+                // `_tracked` so the demo can report the RELOCATION RATE: how often a move
+                // actually leaves its leaf. This is the workload that contradicts "keep the
+                // index", so the number the advisor would have judged it by is worth having.
+                let mut moved = 0u64;
                 for i in 0..px.len() {
                     let np = Point::new(px[i] as f64, py[i] as f64);
-                    tree.update_ref(refs[i], |it| it.p = np);
+                    if let Crossing2::Moved { .. } = tree.update_ref_tracked(refs[i], |it| it.p = np) { moved += 1; }
                 }
+                (px.len() as u64, moved)
             }
-            _ => *self = Index::build(kind, px, py),
+            _ => { *self = Index::build(kind, px, py); (px.len() as u64, 0) }
         }
     }
     /// Neighbours of `q` within `H`, appended as ids. This is the "query" bar.
@@ -216,6 +222,10 @@ struct Fluid {
     nbr: Vec<u32>, nbr_start: Vec<u32>,   // CSR neighbour lists, rebuilt once per step
     rho0: f32,                        // rest density, DERIVED from the initial packing
     grav: f32,
+    /// Movements and real leaf-crossings, so the demo can report the relocation rate the
+    /// advisor's rule is written in terms of.
+    acc_moves: u64,
+    acc_relocs: u64,
 }
 
 impl Fluid {
@@ -230,7 +240,7 @@ impl Fluid {
             py.push(EPS + 8.0 + cy * SPACING + r.range(-0.3, 0.3));
         }
         let z = vec![0.0; n];
-        let mut f = Fluid {
+        let mut f = Fluid { acc_moves: 0, acc_relocs: 0,
             qx: px.clone(), qy: py.clone(), px, py,
             vx: z.clone(), vy: z.clone(), lam: z.clone(), dx: z.clone(), dy: z.clone(), rho: z,
             nbr: Vec::new(), nbr_start: Vec::new(), rho0: 1.0, grav: GRAV,
@@ -289,7 +299,9 @@ impl Fluid {
 
         // ---- the index sees the PREDICTED positions (that is where contacts happen)
         let t0 = Instant::now();
-        index.maintain(kind, &self.qx, &self.qy);
+        let (moves, relocs) = index.maintain(kind, &self.qx, &self.qy);
+        self.acc_moves += moves;
+        self.acc_relocs += relocs;
         let t1 = Instant::now();
 
         // ---- ONE neighbour pass per step, reused by every solver iteration
@@ -621,6 +633,16 @@ async fn run() {
                             println!("#M {tag}.query {:.4} ms", query_us / 1000.0);
                             println!("#M {tag}.physics {:.4} ms", phys_us / 1000.0);
                             println!("#M {tag}.fps {fps:.1} fps");
+                            // The numbers the advisor's rules are written in terms of, for
+                            // the one workload in this repo where keeping the index loses.
+                            let (mv, rl) = (fluid.acc_moves.max(1), fluid.acc_relocs);
+                            let reloc_rate = rl as f64 / mv as f64;
+                            let q_per_item = 1.0; // PBF asks for the neighbours of every particle, every step
+                            println!("#M {tag}.relocation_rate {reloc_rate:.4} frac");
+                            println!("#M {tag}.queries_per_item {q_per_item:.3} q");
+                            println!("  advisor check: relocation rate {:.1}% (HIGH_RELOCATION {:.0}%) | queries per item {:.2} (rebuild_query_ratio {:.2})",
+                                reloc_rate * 100.0, vectorial_hash::advisor::HIGH_RELOCATION * 100.0,
+                                q_per_item, vectorial_hash::Thresholds::default().rebuild_query_ratio);
                             println!("  sim health: density {mean:.2}x rest (peak {hi:.2}x) - vmax {vmax:.0} - in-tank {inside}/{} - finite {}",
                                 fluid.n(), !bad);
                             elwt.exit();

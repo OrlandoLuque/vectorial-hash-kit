@@ -432,7 +432,9 @@ proptest! {
             // Query-heavy: one cull per item per tick is the regime where rebuilding wins.
             for _ in 0..40 {
                 for p in live.iter().take(60) { let _ = ix.cull(&Sphere3::new(p.x, p.y, p.z, 8.0)); }
-                ix.update(Slot(0), |m| m.p = m.p);
+                // one tiny nudge so the tick sees movement (a static workload would take the
+                // Static branch instead, which is the phase after this one)
+                ix.update(Slot(0), |m| m.p = Point3::new(m.p.x + 0.001, m.p.y, m.p.z));
                 ix.tick();
             }
             prop_assert_eq!(ix.backend(), Backend::Grid, "query-heavy phase did not reach the grid");
