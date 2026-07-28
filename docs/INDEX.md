@@ -22,6 +22,10 @@ This file is the map; everything else is one click away.
 
 ## Empirical results & methodology
 
+**How the numbers are taken — and what that got wrong first:**
+[MEASURING.md](MEASURING.md). Every rule in it replaced an answer that looked right,
+including three published figures that did not survive being re-measured.
+
 **Reproducing any number below:** `cargo run -p bench-runner --release -- --group all`
 (or a single group; `--repeat 3` for anything you intend to quote). It waits for the
 machine to be idle, repeats, and reports the spread — see

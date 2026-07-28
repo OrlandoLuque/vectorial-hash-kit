@@ -1,0 +1,159 @@
+# Measuring — how this repo takes a number, and what it got wrong first
+
+Every rule here replaced a wrong answer that looked right. They are in the order they bite,
+and each one names the measurement that produced it, because a methodology without its
+failures is just an opinion with formatting.
+
+The machinery lives in three places: `crates/vectorial-hash/examples/common/mod.rs` (the
+clock and the comparison harness), `crates/bench-runner` (the runner, the idle gate and the
+ratio gate), and `crates/vectorial-hash/examples/work_counters.rs` (comparing with no clock
+at all).
+
+---
+
+## 1. Wall time answers the wrong question
+
+Wall time says *how long you waited*. When a browser steals a core, it inflates, and the
+benchmark reports a regression that does not exist. A processor clock only ticks while the
+process actually runs.
+
+**But the obvious processor clock is unusable.** `GetProcessTimes` (and `getrusage`) report
+in **system timer ticks — ~15.6 ms on Windows**. A 0.3 ms cull measures as **zero**. That is
+why microbenchmarks reach for the wall clock in the first place, and why "just use CPU time"
+is not the answer it sounds like.
+
+## 2. Scaling the repetition count is the classic fix, and it is not enough here
+
+Repeat the operation until the interval spans hundreds of clock ticks, then divide. Sound,
+and it makes a coarse clock usable — but on a 15.6 ms tick, "hundreds of ticks" is **seconds
+per sample**. Measured: it turned one bench into a **>10-minute run**. It stays in the
+harness for genuinely tiny operations, but it cannot carry the whole job.
+
+## 3. Cycles, and the calibration that betrays you
+
+`QueryProcessCycleTime` (Windows) counts **CPU cycles attributed to this process** at cycle
+resolution; Linux's `CLOCK_PROCESS_CPUTIME_ID` gives nanoseconds. Cycles are also
+**frequency-invariant**, so turbo and thermal drift cannot fake a regression.
+
+Converting cycles to milliseconds needs a rate, and **the rate is the fragile part**.
+Measured over a fixed *wall* interval on a 3×-oversubscribed machine, the process only gets
+a fraction of that interval, the rate reads low, and every converted number inflates by the
+reciprocal: **a 0.37 ms cull was reported as 5.5 ms**. Calibrating as the **best of several
+short trials** fixes it — at least one slice runs on a full core — and ratios never touch
+the rate at all.
+
+## 4. The measurement is not free
+
+Two clock reads plus the repetition loop cost cycles. Both are measured once against an
+empty closure and subtracted. This matters exactly when the operation is small — which is
+when a benchmark is most at risk of reporting its own timing code.
+
+## 5. Cache is a choice, so it is two functions
+
+Repeating an operation leaves its data hot. `measure` reports the **warm** cost (the right
+question for something a frame does thousands of times); `measure_cold` evicts the caches
+between calls and reports **first touch** (the right question for something a frame does
+once), typically several times larger. They are separate names rather than a flag because
+quoting one for the other is a real error, not a nuance.
+
+## 6. Compare in pairs, aggregate the ratios
+
+**The biggest single correction in this repo.** Measuring A fully and then B fully is not a
+fair comparison at this scale: whoever runs second inherits a machine the first one warmed
+or dirtied. The clustered `KdTree3` vs `Tree3` cull ratio, five consecutive runs of the same
+binary on the same machine:
+
+| how it was measured | range across runs |
+| --- | --- |
+| milliseconds, each structure separately | **1.571 – 3.283** |
+| CPU cycles, each structure separately | 2.114 – 2.425 |
+| **interleaved A/B/B/A, median of per-round ratios** | **2.019 – 2.281** |
+
+`common::compare2` runs `A B B A` per round — A's samples straddle B's, so first-order drift
+cancels *within* the round — and reports the **median of the per-round ratios**, plus how
+much those ratios moved. The voxel span-vs-naive ratio behaved the same way: `1.129 – 2.654`
+taken separately, `1.784 – 1.835` paired.
+
+## 7. Pairing does not remove between-process variation
+
+Even paired, the same ratio moves ~20% between separate process invocations. So the honest
+form is a **range**, not a point: the docs say `≈2.0–2.3×`, not `2.2×`.
+
+`bench-runner` enforces this: any metric whose **unit** is `x` and whose spread across
+passes exceeds 15% is flagged, and `--strict` exits non-zero. It is judged by unit, not by
+name — a metric called `..._ratio_paired_spread` is reported in percent and is the
+diagnostic *about* a ratio; flagging it for being variable is circular. (The gate's first
+act was to fail this repo's own published figures. That is what it is for.)
+
+## 8. Best of all: do not use a clock
+
+What differs between a binary tree, an octree, a k-d tree and a grid is **how much work each
+does**: node boxes classified, points tested. Those are integers, and
+`examples/work_counters.rs` counts them by wrapping the query volume in a counter — no
+library change, since `cull` accepts any `Shape`.
+
+**Proven, not asserted**: the whole report is byte-for-byte identical between an idle run and
+one taken with 32 processes burning CPU. Use it for algorithmic claims; use time for the
+constant factors it cannot see (the grid does 30× the point tests in 2D and still wins
+several timed configs — that gap *is* the memory wall, quantified).
+
+## 9. Publish from an idle machine
+
+None of the above removes contention: another process still evicts your cache lines and eats
+memory bandwidth, so under load the same work genuinely costs more cycles (measured: ~1.7×
+under 3× oversubscription, for *both* clocks). `bench-runner` waits for the machine to be
+free before every pass — using a calibration loop rather than OS performance counters, so it
+needs no platform API and no localised counter names.
+
+---
+
+# Four traps that are not about clocks
+
+## An index only knows what it holds
+
+An index and a linear scan disagreed on ~77% of frames in the stealth demo. The library was
+innocent — 400 random frustums × 4000 points, **0 disagreements**. Some agents had drifted
+outside the index's world box, which `bulk_load` correctly drops and a scan still counts.
+Neither side was wrong; they were answering questions about **different sets**. Before
+attributing a difference to the algorithm, verify both sides see the same population.
+
+## A reference that shares the assumption cannot catch the assumption
+
+Golden data generated from the implementation under test validates nothing. The sphere
+reference sets in `_dev/sphere_golden/` are computed by **two independent paths** and emitted
+only when they agree — and they cover three centre-alignment conventions, because a half-block
+shift produces a set that is self-consistent, symmetric, and wrong.
+
+Related: **symmetry is not identity**. A sphere centred at a block centre and one centred at
+a block corner are *both* symmetric and differ by 349 blocks at r=8.
+
+## A set-comparison test cannot catch a performance defect
+
+An implementation that walks the wrong axis *consistently* returns the correct set and is
+merely slow. No golden file detects that. Convert the performance property into a
+deterministic assertion instead — "consecutive blocks in the inner loop have consecutive
+storage indices" — or put a floor under it (the fast path must beat the baseline by a margin).
+
+## Summaries must aggregate over the run, not sample it
+
+The stealth demo reported one frame's values. Across three passes, one landed on a frame that
+had not stepped and printed a clean, plausible **zero**. It reports means over the run now,
+and prints the stepped-frame count so an empty run cannot masquerade as a fast one.
+
+**And check your test is not vacuous.** A set-comparison test that compares two empty sets
+passes forever. The frustum properties were instrumented once to confirm they find 12.3 items
+per cone on average (max 66) before being trusted.
+
+---
+
+# The checklist
+
+1. Is this the bottleneck? Profile before optimising. "No" is a valid, valuable answer.
+2. Are both sides answering the same question, over the same population?
+3. Is the test non-vacuous — does it actually find things?
+4. Warm or cold? Say which.
+5. Comparing two things? Pair them in time and aggregate the ratios.
+6. Repeat, and report the spread. Above ~15% on a ratio, quote a range.
+7. Idle machine for anything you publish (`bench-runner` gates on it).
+8. Can it be counted instead of timed? Then count it.
+9. Quote ratios, not absolutes, unless the environment is pinned in the same table.

@@ -13,6 +13,9 @@ cargo run -p bench-runner --release -- --group all --include-slow --repeat 3
 Output lands in `bench-results/<unix-time>-<group>.md` (environment header, a per-pass
 run table, a metric table, and the full raw output) plus `…-metrics.csv`.
 
+The methodology behind all of this — and the wrong answers it replaced — is
+[`docs/MEASURING.md`](../../docs/MEASURING.md).
+
 ## Why it exists
 
 The numbers in `docs/` used to be taken by hand, one bench at a time, whenever the work
