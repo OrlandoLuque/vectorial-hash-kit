@@ -150,6 +150,12 @@ repeated passes** on an idle machine, via `cargo run -p bench-runner --release`:
   QuadTree** — the 4-way split halves the depth, so `locate` is cheaper — and at 50k the
   Morton rebuild takes both columns. Same handle layer, opposite verdict, purely because
   of dimension.
+
+  **`KdTree2` is in that map too, and loses it.** On moving 2D data (50k, leaf 8) its
+  per-frame rebuild costs 5 628 µs against Morton's 3 551 and QuadTree's 4 895 maintain,
+  and its second-best cull (3.65 µs) does not repay the difference. That is the median
+  split's build cost showing up exactly where the 3D twin never has to pay it — the k-d
+  trees are for data that stops moving.
 - **Don't reach for threads first.** Reads parallelise (`cull_many_par`), writes don't —
   the lever for write-heavy loops is `update_ref` + the right structure, not rayon. See
   [`PARALLEL.md`](PARALLEL.md).

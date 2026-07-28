@@ -18,11 +18,16 @@
 //! all brute-force-gated.
 
 use crate::culling::{Capsule, Shape};
+use crate::serde_io::{corrupt, r_rect, r_u32, r_u8, w_rect, w_u32, w_u8};
+use std::io::{self, Read, Write};
 use crate::geom::{Point, Rect};
 use crate::template::CellState;
 use crate::tree::{knn_offer2, rect_min_dist2, Positioned};
 use crate::tree3::{knn_worst, KnnEntry};
 use std::collections::BinaryHeap;
+
+const KD2_MAGIC: &[u8; 4] = b"KDT2";
+const KD2_VERSION: u8 = 1;
 
 enum Split { Leaf { start: u32, len: u32 }, Internal { left: u32, right: u32 } }
 struct KdNode { bbox: Rect, split: Split }
@@ -222,6 +227,52 @@ impl<T: Positioned> KdTree2<T> {
     pub fn raycast_first(&self, origin: Point, dir: Point, max_dist: f64, radius: f64) -> Option<(f64, &T)> {
         self.raycast(origin, dir, max_dist, radius).into_iter().next()
     }
+
+    /// Serialize the built tree (the node arena + the point-ordered items) to any `Write`.
+    /// Dependency-free; items via a caller closure. Same shape as [`KdTree3`](crate::KdTree3).
+    pub fn serialize<W: Write>(&self, w: &mut W, write_item: impl Fn(&mut W, &T) -> io::Result<()>) -> io::Result<()> {
+        w.write_all(KD2_MAGIC)?;
+        w_u8(w, KD2_VERSION)?;
+        w_u32(w, self.capacity as u32)?;
+        w_u32(w, self.root)?;
+        w_u32(w, self.nodes.len() as u32)?;
+        for nd in &self.nodes {
+            w_rect(w, &nd.bbox)?;
+            match nd.split {
+                Split::Leaf { start, len } => { w_u8(w, 0)?; w_u32(w, start)?; w_u32(w, len)?; }
+                Split::Internal { left, right } => { w_u8(w, 1)?; w_u32(w, left)?; w_u32(w, right)?; }
+            }
+        }
+        w_u32(w, self.items.len() as u32)?;
+        for it in &self.items { write_item(w, it)?; }
+        Ok(())
+    }
+
+    /// Reload a serialized tree — no rebuild. Rejects corrupt input.
+    pub fn deserialize<R: Read>(r: &mut R, read_item: impl Fn(&mut R) -> io::Result<T>) -> io::Result<Self> {
+        let mut magic = [0u8; 4];
+        r.read_exact(&mut magic)?;
+        if &magic != KD2_MAGIC { return Err(corrupt("bad KdTree2 magic")); }
+        if r_u8(r)? != KD2_VERSION { return Err(corrupt("unsupported KdTree2 version")); }
+        let capacity = r_u32(r)? as usize;
+        let root = r_u32(r)?;
+        let nn = r_u32(r)? as usize;
+        let mut nodes = Vec::with_capacity(nn);
+        for _ in 0..nn {
+            let bbox = r_rect(r)?;
+            let split = match r_u8(r)? {
+                0 => Split::Leaf { start: r_u32(r)?, len: r_u32(r)? },
+                1 => Split::Internal { left: r_u32(r)?, right: r_u32(r)? },
+                _ => return Err(corrupt("bad KdTree2 node tag")),
+            };
+            nodes.push(KdNode { bbox, split });
+        }
+        let ni = r_u32(r)? as usize;
+        let mut items = Vec::with_capacity(ni);
+        for _ in 0..ni { items.push(read_item(r)?); }
+        if !nodes.is_empty() && root as usize >= nodes.len() { return Err(corrupt("KdTree2 root out of range")); }
+        Ok(KdTree2 { nodes, items, capacity: capacity.max(1), root })
+    }
 }
 
 #[inline]
@@ -233,6 +284,7 @@ fn rects_overlap(a: &Rect, b: &Rect) -> bool {
 mod tests {
     use super::*;
     use crate::Circle;
+    use std::io::{Read, Write};
 
     #[derive(Clone, Copy)]
     struct P { p: Point }
@@ -249,6 +301,42 @@ mod tests {
         let mut r = Rng(0x2468_ACE1);
         let blobs = [(60.0, 60.0), (400.0, 120.0), (200.0, 380.0), (470.0, 470.0), (120.0, 250.0)];
         (0..n).map(|i| { let b = blobs[i % blobs.len()]; P { p: Point::new(b.0 + r.r(-18.0, 18.0), b.1 + r.r(-18.0, 18.0)) } }).collect()
+    }
+
+    #[test]
+    fn serialize_round_trips_and_rejects_corruption() {
+        let pts = cloud(2000);
+        let t = KdTree2::from_items(8, pts.clone());
+        let mut buf = Vec::new();
+        t.serialize(&mut buf, |w, it| {
+            w.write_all(&it.p.x.to_le_bytes())?;
+            w.write_all(&it.p.y.to_le_bytes())
+        }).expect("serialize");
+        let back = KdTree2::<P>::deserialize(&mut buf.as_slice(), |r| {
+            let mut b = [0u8; 8];
+            r.read_exact(&mut b)?; let x = f64::from_le_bytes(b);
+            r.read_exact(&mut b)?; let y = f64::from_le_bytes(b);
+            Ok(P { p: Point::new(x, y) })
+        }).expect("deserialize");
+
+        assert_eq!(back.item_count(), t.item_count());
+        assert_eq!(back.node_count(), t.node_count());
+        assert_eq!(back.depth(), t.depth());
+        // the reloaded tree must answer identically, not merely hold the same points
+        for (cx, cy, rr) in [(60.0, 60.0, 25.0), (250.0, 250.0, 120.0)] {
+            let c = Circle::new(Point::new(cx, cy), rr);
+            let (mut a, mut b): (Vec<_>, Vec<_>) = (
+                t.cull(&c).iter().map(|m| (m.p.x.to_bits(), m.p.y.to_bits())).collect(),
+                back.cull(&c).iter().map(|m| (m.p.x.to_bits(), m.p.y.to_bits())).collect());
+            a.sort(); b.sort();
+            assert_eq!(a, b, "reloaded tree answers differently");
+        }
+
+        // corruption must be rejected rather than silently mis-parsed
+        let mut bad = buf.clone(); bad[1] = b'X';
+        assert!(KdTree2::<P>::deserialize(&mut bad.as_slice(), |_| unreachable!()).is_err(), "bad magic accepted");
+        let mut old = buf.clone(); old[4] = 99;
+        assert!(KdTree2::<P>::deserialize(&mut old.as_slice(), |_| unreachable!()).is_err(), "bad version accepted");
     }
 
     #[test]

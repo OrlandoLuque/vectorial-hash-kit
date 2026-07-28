@@ -19,7 +19,7 @@
 
 use std::time::Instant;
 
-use vectorial_hash::{CellState, ItemRef, MortonGrid, Point, Positioned, Rect, Shape, Tree, QuadTree};
+use vectorial_hash::{KdTree2, CellState, ItemRef, MortonGrid, Point, Positioned, Rect, Shape, Tree, QuadTree};
 
 struct Rng(u64);
 impl Rng {
@@ -54,12 +54,12 @@ impl Shape for Disc {
 }
 
 const MARGIN: f64 = 4.0;
-const NAMES: [&str; 3] = ["binary", "quad", "morton"];
+const NAMES: [&str; 4] = ["binary", "quad", "morton", "kdtree2"];
 
 struct Cfg { world: f64, pop: usize, item_limit: usize, vision: f64, speed: f64, n_cull: usize, frames: usize, warmup: usize, dt: f64, seed: u64 }
 
 /// Per-structure (maintain µs/frame, cull µs/cull) + whether all culls agreed.
-fn measure(cfg: &Cfg) -> ([f64; 3], [f64; 3], bool) {
+fn measure(cfg: &Cfg) -> ([f64; 4], [f64; 4], bool) {
     let mut rng = Rng::new(cfg.seed);
     let rect = Rect::new(0.0, 0.0, cfg.world, cfg.world);
     let levels = MortonGrid::<C2>::levels_for_cell_size(rect, cfg.vision.max(2.0));
@@ -81,8 +81,8 @@ fn measure(cfg: &Cfg) -> ([f64; 3], [f64; 3], bool) {
         qr.push(quad.insert_ref(C2 { id: id as u32, p }).unwrap());
     }
 
-    let mut mt: [Vec<f64>; 3] = std::array::from_fn(|_| Vec::new());
-    let mut cl: [Vec<f64>; 3] = std::array::from_fn(|_| Vec::new());
+    let mut mt: [Vec<f64>; 4] = std::array::from_fn(|_| Vec::new());
+    let mut cl: [Vec<f64>; 4] = std::array::from_fn(|_| Vec::new());
     let mut blackhole = 0usize;
     let mut agree = true;
 
@@ -112,6 +112,12 @@ fn measure(cfg: &Cfg) -> ([f64; 3], [f64; 3], bool) {
         for id in 0..cfg.pop { morton.insert(C2 { id: id as u32, p: pos[id] }); }
         if measuring { mt[2].push(us(t)); }
 
+        // KdTree2 has no maintain surface at all: it is build-once, so on moving data its
+        // "maintain" is a full rebuild — which is exactly the question this row answers.
+        let t = Instant::now();
+        let kd = KdTree2::from_items(cfg.item_limit, (0..cfg.pop).map(|id| C2 { id: id as u32, p: pos[id] }).collect());
+        if measuring { mt[3].push(us(t)); }
+
         // cull: the same sampled disc centres for all three.
         let ids: Vec<usize> = (0..cfg.n_cull).map(|_| (rng.next() as usize) % cfg.pop).collect();
         let n = ids.len().max(1) as f64;
@@ -125,6 +131,10 @@ fn measure(cfg: &Cfg) -> ([f64; 3], [f64; 3], bool) {
         if measuring { cl[1].push(us(t) / n); }
 
         let t = Instant::now();
+        for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(kd.cull(&Disc { cx: c.x, cy: c.y, r: cfg.vision }).len()); }
+        if measuring { cl[3].push(us(t) / n); }
+
+        let t = Instant::now();
         for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(morton.cull(&Disc { cx: c.x, cy: c.y, r: cfg.vision }).len()); }
         if measuring { cl[2].push(us(t) / n); }
 
@@ -134,8 +144,9 @@ fn measure(cfg: &Cfg) -> ([f64; 3], [f64; 3], bool) {
             let mut a0: Vec<u32> = tree.cull(&s).iter().map(|x| x.id).collect();
             let mut a1: Vec<u32> = quad.cull(&s).iter().map(|x| x.id).collect();
             let mut a2: Vec<u32> = morton.cull(&s).iter().map(|x| x.id).collect();
-            a0.sort_unstable(); a1.sort_unstable(); a2.sort_unstable();
-            if a1 != a0 || a2 != a0 { agree = false; }
+            let mut a3: Vec<u32> = kd.cull(&s).iter().map(|x| x.id).collect();
+            a0.sort_unstable(); a1.sort_unstable(); a2.sort_unstable(); a3.sort_unstable();
+            if a1 != a0 || a2 != a0 || a3 != a0 { agree = false; }
         }
     }
     if blackhole == usize::MAX { println!("unreachable"); }
@@ -170,10 +181,10 @@ fn main() {
         cfg.world, cfg.pop, cfg.item_limit, cfg.vision, cfg.n_cull, cfg.frames, cfg.warmup);
     let (m, c, agree) = measure(&cfg);
     println!("\n{:<8} {:>16} {:>14} {:>18}", "structure", "maintain us/frame", "cull us/cull", "per-frame total us");
-    for k in 0..3 {
+    for k in 0..NAMES.len() {
         println!("{:<8} {:>16.1} {:>14.3} {:>18.1}", NAMES[k], m[k], c[k], m[k] + cfg.n_cull as f64 * c[k]);
     }
-    let total: [f64; 3] = std::array::from_fn(|k| m[k] + cfg.n_cull as f64 * c[k]);
+    let total: [f64; 4] = std::array::from_fn(|k| m[k] + cfg.n_cull as f64 * c[k]);
     let (wm, mm) = winner(&m);
     let (wc, mc) = winner(&c);
     let (wt, mtt) = winner(&total);
