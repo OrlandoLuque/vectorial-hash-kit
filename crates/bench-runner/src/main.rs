@@ -127,6 +127,8 @@ fn plan(group: &str) -> Vec<Bench> {
         b(VH, Example("wide_bvh_bench"), PAR, "wide 8-ary SoA/SIMD BVH node vs the shipping cull"),
         b(VH, Example("compressed_bvh_bench"), "", "quantised (u16) BVH nodes: exact, smaller"),
         b(VH, Example("key_compression_bench"), "", "sorted Morton keys: delta + varint shrink"),
+        b(VH, Example("voxel_select_bench"), "", "block selection: naive vs bitmap vs spans vs chunk-skip"),
+        b(VH, Example("work_counters"), "", "algorithmic work per query, no clock involved"),
     ];
     // --- GPU --------------------------------------------------------------------
     let gpu = || vec![
