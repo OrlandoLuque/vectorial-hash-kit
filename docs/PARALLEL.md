@@ -290,8 +290,8 @@ and k-NN answers) rather than merely an equivalent one.
 
 | build | serial | parallel | speed-up |
 | --- | ---: | ---: | ---: |
-| `KdTree3` uniform | 20.13 ms | **6.03 ms** | **3.35×** |
-| `KdTree3` clustered | 20.57 ms | **6.02 ms** | **3.38×** |
+| `KdTree3` uniform | 20.13 ms | **6.03 ms** | **≈3.4×** |
+| `KdTree3` clustered | 20.57 ms | **6.02 ms** | **≈3.3×** |
 | `Tree3::bulk_load` uniform | 40.49 ms | 25.77 ms | 1.56× |
 | `Tree3::bulk_load` clustered | 55.86 ms | 29.98 ms | 1.86× |
 | `KdTree2` (2D, clustered) | 7.96 ms | **2.85 ms** | **2.79×** |
@@ -309,8 +309,8 @@ So the structure whose build is the expensive one (the median selection) is also
 that recovers the most from threads. Note the end state: the parallel k-d build (6.0 ms)
 is **faster than `LinearOctree3`'s serial build** (13.6 ms), which is the fastest serial
 build in the comparison — "the k-d tree builds slowly" stops being true once you have
-cores to spend, while its query advantage on clustered data (cull **~2.2×**, k-NN 1.67×
-vs `Tree3`) is unchanged. Reproduce with:
+cores to spend, while its query advantage on clustered data (cull **≈2.0–2.3×**, k-NN
+1.67× vs `Tree3`) is unchanged. Reproduce with:
 
 ```bash
 cargo run -p bench-runner --release -- --group kd --repeat 3   # both benches, 3 passes

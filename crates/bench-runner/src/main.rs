@@ -224,6 +224,12 @@ fn plan(group: &str) -> Vec<Bench> {
     }
 }
 
+/// A ratio whose peak-to-peak spread exceeds this is not a number you can quote as if it
+/// were exact. 15% is where this repo's own history puts it: the clustered cull ratio read
+/// 1.57-3.28 across runs before the comparison was paired, and every figure that survived
+/// re-measurement sits well inside this band.
+const RATIO_SPREAD_WARN: f64 = 15.0;
+
 const GROUPS: &[&str] = &["core", "query", "gpu", "sim", "demos", "sweeps", "cli", "cold", "gate", "kd", "all"];
 
 // ------------------------------------------------------- is the machine free?
@@ -374,6 +380,7 @@ fn main() {
         println!("  --list                    print the plan and exit");
         println!("  --include-slow            also run the benches marked slow (minutes each)");
         println!("  --only <substring>        keep only benches whose name or note matches");
+        println!("  --strict                  exit non-zero if a quoted ratio is unstable (>{RATIO_SPREAD_WARN:.0}% spread)");
         println!("  --no-idle-wait            do not wait for the CPU to be free");
         println!("  --tolerance <f>           'idle' means the calibration loop is within this factor (default 1.15)");
         println!("  --out <dir>               where the report goes (default: bench-results)");
@@ -523,7 +530,19 @@ fn main() {
         }
         md.push_str("| metric | unit | n | min | median | max | spread |\n| --- | --- | ---: | ---: | ---: | ---: | ---: |\n");
         for (k, s) in &metrics {
-            md.push_str(&format!("| `{k}` | {} | {} | {:.3} | **{:.3}** | {:.3} | {:.1}% |\n", s.unit, s.values.len(), s.min(), s.median(), s.max(), s.spread_pct()));
+            let flag = if unstable_ratio(k, s) { "  (inestable)" } else { "" };
+            md.push_str(&format!("| `{k}` | {} | {} | {:.3} | **{:.3}** | {:.3} | {:.1}%{flag} |
+", s.unit, s.values.len(), s.min(), s.median(), s.max(), s.spread_pct()));
+        }
+        let shaky: Vec<&String> = metrics.iter().filter(|(k, s)| unstable_ratio(k, s)).map(|(k, _)| k).collect();
+        if !shaky.is_empty() {
+            md.push_str(&format!("
+> **{} ratio(s) moved more than {RATIO_SPREAD_WARN:.0}% between passes.** Quote them as
+> a range or not at all — and consider measuring the pair *interleaved* (`common::compare2`),
+> which is what turned this repo's least stable figure from 1.57-3.28 into 2.02-2.28:
+", shaky.len()));
+            for k in &shaky { md.push_str(&format!("> - `{k}`
+")); }
         }
         let mut csv = String::from("metric,unit,n,min,median,max,spread_pct\n");
         for (k, s) in &metrics {
@@ -536,6 +555,13 @@ fn main() {
     md.push_str(&raw);
     write_file(&format!("{stem}.md"), &md);
 
+    let shaky: Vec<String> = metrics.iter().filter(|(k, s)| unstable_ratio(k, s)).map(|(k, _)| k.clone()).collect();
+    if !shaky.is_empty() {
+        println!("
+{} ratio(s) moved more than {RATIO_SPREAD_WARN:.0}% between passes — quote as a range, or", shaky.len());
+        println!("measure the pair INTERLEAVED (common::compare2) instead of each side separately:");
+        for k in &shaky { println!("  {k}"); }
+    }
     let failed = passes.iter().filter(|p| !p.ok).count();
     let noisy = passes.iter().filter(|p| p.busy).count();
     println!("\n{}", "=".repeat(74));
@@ -543,6 +569,11 @@ fn main() {
     println!("report : {stem}.md");
     if !metrics.is_empty() { println!("metrics: {stem}-metrics.csv"); }
     if failed > 0 { std::process::exit(1); }
+    // --strict makes the methodology enforceable rather than remembered.
+    if flag("--strict") && !shaky.is_empty() {
+        eprintln!("--strict: {} unstable ratio(s); refusing to report them as measurements", shaky.len());
+        std::process::exit(3);
+    }
 }
 
 /// Where cargo put the thing we just built. Examples land in `target/release/examples/`,
@@ -552,6 +583,17 @@ fn artifact_path(b: &Bench) -> std::path::PathBuf {
     if matches!(b.target, Target::Example(_)) { p.push("examples"); }
     p.push(format!("{}{}", b.target.name(), std::env::consts::EXE_SUFFIX));
     p
+}
+
+/// A metric is a ratio if its unit or name says so, and unstable if it moved too much
+/// between passes to be quoted. Ratios get the gate because ratios are what ends up in
+/// documentation.
+fn unstable_ratio(key: &str, s: &Series) -> bool {
+    // Judge by UNIT, not by name: a metric called `cull_ratio_paired_spread` is reported in
+    // percent and is the diagnostic ABOUT a ratio, not a ratio — flagging it for being
+    // variable is circular.
+    let is_ratio = s.unit == "x" && !key.ends_with("_spread");
+    is_ratio && s.values.len() > 1 && s.spread_pct() > RATIO_SPREAD_WARN
 }
 
 fn capture(cmd: &str, args: &[&str]) -> Option<String> {

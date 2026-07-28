@@ -496,8 +496,9 @@ sweep: it **ties `Tree3`+`ItemRef` for the most cull wins, 6 of 16 each** (Morto
 tight per-node boxes prune harder than the midpoint trees', so it's a top-tier cull
 structure whenever a per-frame rebuild is affordable — it does not win *maintain* (still
 `binary-ref` at 15/16; a rebuild can't beat the O(1) handle). On the *clustered* data of
-`examples/kdtree3_bench` the cull gap over `Tree3` widens to **~2.2×** (2.02–2.28 across
-five runs). It was the noisiest figure in the repo — quoted from separately-taken
+`examples/kdtree3_bench` the cull gap over `Tree3` widens to **≈2.0–2.3×**. It is quoted as
+a range on purpose: even measured the careful way, it still moves ~20% between separate
+processes, and `bench-runner` flags it for exactly that. It was the noisiest figure in the repo — quoted from separately-taken
 millisecond timings it swung 1.57–3.28 between runs — until the bench started measuring
 the pair **interleaved (A/B/B/A) in CPU cycles and aggregating the median of per-round
 ratios**. Same code, same machine; the number was an artefact of measuring one structure
