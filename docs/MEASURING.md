@@ -92,6 +92,19 @@ does**: node boxes classified, points tested. Those are integers, and
 `examples/work_counters.rs` counts them by wrapping the query volume in a counter — no
 library change, since `cull` accepts any `Shape`.
 
+`cull` takes a `Shape`, so it is counted by wrapping the query. `knn` and `raycast` take a
+point and a ray — nothing to wrap — so for those the counter goes in the **item**: every
+traversal must ask an item where it is before testing it, so counting `position()` counts leaf
+work across all three verbs with no library change. It is what showed that `KdTree3`'s k-NN
+advantage over `Tree3` is **1.8x on clustered data and 1.06x on uniform** — the median split
+does not beat the binary tree, it beats *skew* — and that a uniform grid's shell expansion
+tests **280x** more points clustered than uniform.
+
+It also checks a guarantee no test covered: the DDA ray walks promise to be a strict *subset*
+of the exact capsule (they visit only leaves the centre ray crosses). Counted: zero invented
+hits, 75% of the hits for 23% of the tests on `Tree3`, 50% for 11% on `Octree3`. A recall
+number is the honest way to describe a cheap approximate query — "faster" alone is not.
+
 **Proven, not asserted**: the whole report is byte-for-byte identical between an idle run and
 one taken with 32 processes burning CPU. Use it for algorithmic claims; use time for the
 constant factors it cannot see (the grid does 30× the point tests in 2D and still wins

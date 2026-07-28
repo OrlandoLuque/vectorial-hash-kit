@@ -1006,10 +1006,14 @@ impl<T: Positioned3> Tree3<T> {
     /// `t`, + stats (`leaves_visited`, `items_tested`). Thin corridor — use
     /// `raycast` / `cull(&Segment3)` for the exact thick band.
     ///
-    /// The `locate` step nudges a hair across the exit face; on a pathologically
-    /// thin neighbour cell a sliver can be skipped (never a false positive — the
-    /// result stays a subset of the exact capsule). A robust 3D Samet/ropes walk
-    /// (no nudge) is future work.
+    /// The step is **nudge-free** (see [`Tree3::ray_step3_lca`]): the face
+    /// neighbour is found by ascending to the least-common-ancestor, so no
+    /// epsilon can skip a thin sliver. What the walk still is, by construction,
+    /// is a **thin corridor**: it visits only the leaves the centre ray crosses,
+    /// so an item within `radius` of the ray but sitting in a leaf the centreline
+    /// misses is not reported. The result is therefore a strict *subset* of the
+    /// exact capsule — never a false positive, and `examples/work_counters.rs`
+    /// checks that subset relation and reports the recall it buys.
     pub fn raycast_dda(&self, origin: Point3, dir: Point3, max_t: f64, radius: f64) -> RaycastOut<'_, T> {
         let mut out = RaycastOut { hits: Vec::new(), leaves_visited: 0, items_tested: 0 };
         let m = (dir.x * dir.x + dir.y * dir.y + dir.z * dir.z).sqrt();

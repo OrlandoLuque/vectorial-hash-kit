@@ -151,6 +151,12 @@ repeated passes** on an idle machine, via `cargo run -p bench-runner --release`:
   Morton rebuild takes both columns. Same handle layer, opposite verdict, purely because
   of dimension.
 
+  And the reason the k-d trees win where they win is countable, with no clock involved
+  (`examples/work_counters.rs`): on **clustered** points a `KdTree3` k-NN query tests 219
+  points to `Tree3`'s 404, but on **uniform** points it is 86.6 to 92.1. The median split is
+  not a faster tree; it is the tree that does not care how the points are distributed. If
+  your data is uniform, the cheaper build wins and the k-d tree has nothing to sell you.
+
   **`KdTree2` is in that map too, and loses it.** On moving 2D data (50k, leaf 8) its
   per-frame rebuild costs 5 628 µs against Morton's 3 551 and QuadTree's 4 895 maintain,
   and its second-best cull (3.65 µs) does not repay the difference. That is the median
