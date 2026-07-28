@@ -114,6 +114,7 @@ fn plan(group: &str) -> Vec<Bench> {
         b(VH, Example("compact_bench"), "", "cache locality of compact()"),
         b(VH, Example("ropes_balance"), "neighbors", "ropes: what the neighbour lists cost to maintain"),
         b(VH, Example("frustum_check"), "", "correctness: frustum cull vs brute force"),
+        b(VH, Example("stencil_vs_golden"), "", "correctness: SphereStencil vs an independently generated reference"),
     ];
     // --- the query verbs --------------------------------------------------------
     let query = || vec![
