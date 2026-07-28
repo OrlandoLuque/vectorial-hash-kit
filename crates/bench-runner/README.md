@@ -24,7 +24,7 @@ When the whole set was finally re-run this way, three published figures did not 
 
 | claim | was | is |
 | --- | ---: | ---: |
-| `KdTree3` cull vs `Tree3`, clustered | 3.06× | 2.2–2.5× |
+| `KdTree3` cull vs `Tree3`, clustered | 3.06× | ≈2.0–2.3× |
 | fluid: which index wins the neighbour query | `LinearQuadTree` | `MortonGrid`, by 5% |
 | point cloud: `KdTree3` k-NN vs `Octree3` | 1.12× | tied (within the k-d tree's own spread) |
 
@@ -44,6 +44,11 @@ CPU. That is the whole argument for this tool.
   the truth. Anything above ~10% is a number you should not quote without saying so.
 - **Records the environment** — rustc version, logical CPUs, git commit, and whether the
   worktree was dirty — because a table of milliseconds without that is folklore.
+- **Flags ratios that moved too much to quote.** Any metric whose *unit* is `x` and whose
+  spread exceeds 15% is marked in the report and listed after the table; `--strict` exits
+  non-zero. Judged by unit and not by name, because a metric called `..._ratio_spread` is
+  reported in percent and is the diagnostic *about* a ratio — flagging it for varying is
+  circular. Its first act was to fail this repo's own published figures.
 
 ## Adding a metric
 
@@ -78,8 +83,12 @@ Benches marked `[slow]` (minutes each) are skipped unless `--include-slow`.
 ## Caveats worth knowing
 
 - A **sub-millisecond** measurement is the noisiest thing in any of these tables. The
-  clustered k-d cull is ~0.39 ms and moves ±7% between passes; treat its ratio as a
-  range, not a figure.
+  clustered k-d cull is ~0.39 ms; treat its ratio as a range, not a figure.
+- **Repeating is not the same as comparing.** Measuring A fully and then B fully lets the
+  second inherit a machine the first warmed: that alone moved one ratio between 1.57 and
+  3.28. Compare with `common::compare2`, which interleaves the pair (`A B B A`) and
+  aggregates the median of per-round ratios. Even then, ~20% of between-process variation
+  remains — hence the ranges.
 - The runner cannot make a *bad* benchmark good. If a demo reports one frame's reading
   rather than a mean over the run, repeating it just gives you three unreliable numbers —
   which is exactly how the stealth demo was caught printing a plausible **zero** for a
