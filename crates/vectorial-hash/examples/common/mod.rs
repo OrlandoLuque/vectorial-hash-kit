@@ -187,6 +187,48 @@ pub fn measure_cold<F: FnMut()>(samples: usize, mut f: F) -> Sample {
     Sample { cycles: per, ms: per / rate() * 1e3, reps: 1 }
 }
 
+/// Two alternatives, measured **interleaved in time**, reported as a ratio.
+///
+/// This exists because measuring A fully and then B fully is not a fair comparison at this
+/// scale: the same cull measured at three different points of one process reported 1.89x
+/// or 2.45x against the same rival, purely from cache state, run order and clock drift.
+/// Whichever runs second inherits a machine the first one warmed (or dirtied).
+///
+/// The fix is to pair them in time and aggregate the RATIOS, not the times. Each round runs
+/// `A B B A` — the palindrome cancels any first-order drift within the round, since A's two
+/// samples straddle B's — and the round yields one ratio. The reported figure is the
+/// **median of the per-round ratios**, which is robust to a slow drift that would move both
+/// absolutes together, and the spread tells you whether the ratio itself was stable or you
+/// are quoting noise.
+///
+/// Returns `(a_cycles, b_cycles, ratio_b_over_a, ratio_spread_pct)`.
+pub fn compare2<A: FnMut(), B: FnMut()>(rounds: usize, mut a: A, mut b: B) -> (f64, f64, f64, f64) {
+    // One warm-up of each, discarded: the first touch of either data set is a different
+    // measurement (see `measure_cold`) and would land entirely on whoever went first.
+    let _ = measure(1, &mut a);
+    let _ = measure(1, &mut b);
+
+    let (mut a_best, mut b_best) = (f64::INFINITY, f64::INFINITY);
+    let mut ratios: Vec<f64> = Vec::with_capacity(rounds.max(1));
+    for _ in 0..rounds.max(1) {
+        let a1 = measure(1, &mut a).cycles;
+        let b1 = measure(1, &mut b).cycles;
+        let b2 = measure(1, &mut b).cycles;
+        let a2 = measure(1, &mut a).cycles;
+        let (ar, br) = (a1.min(a2), b1.min(b2));
+        a_best = a_best.min(ar);
+        b_best = b_best.min(br);
+        if ar > 0.0 { ratios.push(br / ar); }
+    }
+    ratios.sort_by(f64::total_cmp);
+    let median = if ratios.is_empty() { f64::NAN } else { ratios[ratios.len() / 2] };
+    let spread = match (ratios.first(), ratios.last()) {
+        (Some(lo), Some(hi)) if median != 0.0 => (hi - lo) / median * 100.0,
+        _ => f64::NAN,
+    };
+    (a_best, b_best, median, spread)
+}
+
 /// Min-of-`runs` **wall** milliseconds — for anything whose point is elapsed time
 /// (parallel speed-ups, frame budgets), where CPU time would sum over threads.
 pub fn wall_ms<F: FnMut()>(runs: usize, mut f: F) -> f64 {

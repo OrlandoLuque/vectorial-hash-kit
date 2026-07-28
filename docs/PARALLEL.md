@@ -309,7 +309,7 @@ So the structure whose build is the expensive one (the median selection) is also
 that recovers the most from threads. Note the end state: the parallel k-d build (6.0 ms)
 is **faster than `LinearOctree3`'s serial build** (13.6 ms), which is the fastest serial
 build in the comparison — "the k-d tree builds slowly" stops being true once you have
-cores to spend, while its query advantage on clustered data (cull 2.2–2.5×, k-NN 1.67×
+cores to spend, while its query advantage on clustered data (cull **~2.2×**, k-NN 1.67×
 vs `Tree3`) is unchanged. Reproduce with:
 
 ```bash

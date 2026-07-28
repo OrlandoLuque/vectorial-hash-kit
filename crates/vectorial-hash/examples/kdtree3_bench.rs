@@ -27,8 +27,6 @@ impl Lcg {
 /// these numbers survive you using the machine while they run. Parallel builds are the
 /// exception below — a speed-up is by definition about elapsed time.
 fn best<F: FnMut()>(runs: usize, f: F) -> f64 { common::cpu_ms(runs, f) }
-/// Cycles per call (frequency-invariant, overhead-corrected) for the same operation.
-fn best_cycles<F: FnMut()>(runs: usize, f: F) -> f64 { common::measure(runs, f).cycles }
 /// Elapsed milliseconds, for the parallel comparisons (CPU time would sum over threads).
 fn best_wall<F: FnMut()>(runs: usize, f: F) -> f64 { common::wall_ms(runs, f) }
 
@@ -54,8 +52,18 @@ fn run(name: &str, items: &[P], queries: &[Point3], radius: f64) {
     let lin = LinearOctree3::from_items(world, 16, 18, v.clone());
 
     let mut s = 0usize;
-    let cyc_kd = best_cycles(4, || { let mut n = 0usize; for q in queries { n += kd.cull(&Sphere3::new(q.x, q.y, q.z, radius)).len(); } s += n; });
-    let cyc_bin = best_cycles(4, || { let mut n = 0usize; for q in queries { n += bin.cull(&Sphere3::new(q.x, q.y, q.z, radius)).len(); } s += n; });
+    let (mut sink_a, mut sink_b, mut sink_c, mut sink_d) = (0usize, 0usize, 0usize, 0usize);
+    // The headline ratio is measured with A/B/B/A interleaving and aggregated as the
+    // MEDIAN OF PER-ROUND RATIOS, not as a ratio of separately-taken medians. Measuring one
+    // structure fully and then the other reported 1.89x or 2.45x for the same pair,
+    // depending only on where in the run each landed; pairing them in time removes that.
+    let (cyc_kd, cyc_bin, ratio_cull, ratio_spread) = common::compare2(7,
+        || { let mut n = 0usize; for q in queries { n += kd.cull(&Sphere3::new(q.x, q.y, q.z, radius)).len(); } sink_a += n; },
+        || { let mut n = 0usize; for q in queries { n += bin.cull(&Sphere3::new(q.x, q.y, q.z, radius)).len(); } sink_b += n; });
+    let (_, _, ratio_knn, ratio_knn_spread) = common::compare2(7,
+        || { let mut n = 0usize; for q in queries { n += kd.knn(*q, 8).len(); } sink_c += n; },
+        || { let mut n = 0usize; for q in queries { n += bin.knn(*q, 8).len(); } sink_d += n; });
+    s += sink_a + sink_b + sink_c + sink_d;
     let t_c_kd_wall = best_wall(6, || { let mut n = 0usize; for q in queries { n += kd.cull(&Sphere3::new(q.x, q.y, q.z, radius)).len(); } s += n; });
     let t_c_kd = best(6, || { for q in queries { s += kd.cull(&Sphere3::new(q.x, q.y, q.z, radius)).len(); } });
     let t_c_bin = best(6, || { for q in queries { s += bin.cull(&Sphere3::new(q.x, q.y, q.z, radius)).len(); } });
@@ -70,6 +78,7 @@ fn run(name: &str, items: &[P], queries: &[Point3], radius: f64) {
     println!("  build par  KdTree3 {t_b_kd_par:6.2} ({:.2}x) | Tree3 {t_b_bin_par:6.2} ({:.2}x)   [{} threads, WALL clock]", t_b_kd_wall / t_b_kd_par, t_b_bin_wall / t_b_bin_par, rayon::current_num_threads());
     println!("  cull  ms   KdTree3 {t_c_kd:6.2} | Tree3 {t_c_bin:6.2} | Octree3 {t_c_oct:6.2} | LinearOct {t_c_lin:6.2}   (kd vs Tree3 {:.2}×)", t_c_bin / t_c_kd);
     println!("  knn   ms   KdTree3 {t_k_kd:6.2} | Tree3 {t_k_bin:6.2}                                    (kd vs Tree3 {:.2}×)", t_k_bin / t_k_kd);
+    println!("  paired     cull {ratio_cull:.2}× (±{ratio_spread:.0}% entre rondas) | knn {ratio_knn:.2}× (±{ratio_knn_spread:.0}%)   [A/B/B/A, mediana de ratios]");
     // Machine-readable lines for `bench-runner` (it aggregates min/median/max/spread
     // across repeated passes). Key is prefixed by the scenario so UNIFORM and CLUSTERED
     // do not collide.
@@ -84,6 +93,12 @@ fn run(name: &str, items: &[P], queries: &[Point3], radius: f64) {
     println!("#M {tag}.cull_kdtree3_cycles {:.0} cycles", cyc_kd);
     println!("#M {tag}.cull_tree3_cycles {:.0} cycles", cyc_bin);
     println!("#M {tag}.cull_ratio_cycles {:.3} x", cyc_bin / cyc_kd);
+    // The interleaved ratio and how much it moved between rounds. If the spread is large,
+    // the ratio is not a number worth quoting.
+    println!("#M {tag}.cull_ratio_paired {ratio_cull:.3} x");
+    println!("#M {tag}.cull_ratio_paired_spread {ratio_spread:.1} pct");
+    println!("#M {tag}.knn_ratio_paired {ratio_knn:.3} x");
+    println!("#M {tag}.knn_ratio_paired_spread {ratio_knn_spread:.1} pct");
     println!("#M {tag}.cull_tree3 {t_c_bin:.3} ms");
     println!("#M {tag}.cull_ratio_kd_over_tree3 {:.3} x", t_c_bin / t_c_kd);
     println!("#M {tag}.knn_kdtree3 {t_k_kd:.3} ms");
