@@ -432,9 +432,13 @@ proptest! {
             // Query-heavy: one cull per item per tick is the regime where rebuilding wins.
             for _ in 0..40 {
                 for p in live.iter().take(60) { let _ = ix.cull(&Sphere3::new(p.x, p.y, p.z, 8.0)); }
-                // one tiny nudge so the tick sees movement (a static workload would take the
-                // Static branch instead, which is the phase after this one)
-                ix.update(Slot(0), |m| m.p = Point3::new(m.p.x + 0.001, m.p.y, m.p.z));
+                // One tiny nudge so the tick sees movement — a motionless workload would take
+                // the Static branch instead, which is the phase after this one. The MODEL
+                // moves with it: nudging only the index is how the first version of this
+                // test "found" a bug in the grid backend that was a stale reference.
+                let np = Point3::new(live[0].x + 0.001, live[0].y, live[0].z);
+                ix.update(Slot(0), |m| m.p = np);
+                live[0] = np;
                 ix.tick();
             }
             prop_assert_eq!(ix.backend(), Backend::Grid, "query-heavy phase did not reach the grid");
