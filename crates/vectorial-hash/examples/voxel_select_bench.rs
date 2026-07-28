@@ -382,6 +382,7 @@ fn main() {
         println!("#M r{rad}.spans_speedup_paired {sp_ratio:.3} x");
         println!("#M r{rad}.spans_speedup_paired_spread {sp_spread:.1} pct");
         println!("#M r{rad}.skip_speedup_paired {sk_ratio:.3} x");
+        println!("#M r{rad}.skip_speedup_paired_spread {sk_spread:.1} pct");
     }
 
     println!("
