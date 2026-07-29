@@ -4,6 +4,63 @@ Future work queued for review. Nothing here is committed scope — prune,
 reprioritise, or drop freely. Items graduate into the per-crate roadmaps
 (e.g. `crates/vectorial-hash/README.md`) once picked up.
 
+## ★ 2026-07-29 (cooperative night 5) — the measurement night
+
+Nine commits on `main`, CI green. The thread was measurement rigour, and it paid in a way
+that was not planned: a tool built to *describe* the structures found a real defect in one.
+
+**Landed**
+
+- **`KdTree2` serialization**, the last structure without it — with a round-trip test that
+  checks the reloaded tree *answers* identically, not merely that it holds the same points.
+- **`decision2d` gains `KdTree2`** (rebuilt per frame, the honest way to enter a build-once
+  structure into a dynamic comparison). It **loses**: 50k moving points, its rebuild costs
+  5 628 µs against Morton's 3 551 and QuadTree's 4 895 maintain, and its second-best cull
+  does not repay that. The median split's build cost sinks it in 2D exactly where the 3D
+  twin is never asked to pay.
+- **`work_counters` covers k-NN and raycast.** `cull` takes a Shape so the query could be
+  wrapped; `knn`/`raycast` take a point and a ray, so the counter moved into the **item**
+  (`position()` calls) and now works for every verb and every structure.
+- **`tests/work_counts.rs`** — twenty traversal counts gated with `==`, in CI, on every
+  push. Validated on Linux against numbers blessed on Windows: the counts really are
+  platform-independent.
+- **`MortonGrid3::knn` and `MortonGrid::knn` expand per axis** — 2.3–21.2× (3D), 1.9–8.6×
+  (2D). See `docs/THREE_D.md` and `examples/morton_knn_axis_bench`.
+- **`AdaptiveIndex::remove()`** on a slot table with a free list (a swap-remove would
+  silently repoint another caller's handle), plus **`AdaptiveIndex2`**, the 2D twin, held
+  to the 3D policy by an anti-drift test.
+- **The ratio audit**: `linear_octree3_bench`'s four published ratios now go through
+  `compare2`. `decision2d` was audited and deliberately left alone — it is already
+  interleaved inside the frame loop and could not use `compare2` anyway, since maintain is
+  stateful. Documented so nobody "fixes" it into being worse.
+- **Regression gate**: the k-NN ops it was missing (2D entirely, plus the 3D grid and
+  octree). Baseline deliberately *not* regenerated — see the open item below.
+
+**Three lessons, all now written into `docs/MEASURING.md`**
+
+1. **A count only counts what you counted.** Per-axis expansion left the point count on a
+   cubic world unchanged (14 946 → 14 823) while the time fell 2.3×. Every saved cycle went
+   on *cells never visited*, which calls nobody's `position()`. Counts prove an algorithmic
+   change; they do not bound one.
+2. **A ratio is only true while both of its terms stand still.** The docs said the linear
+   octree answered a clustered k-NN ~5× faster than the grid. True when written; the grid
+   got 3.6× faster the same night and the gap is now 1.4–1.7×. Nothing would have caught it
+   if the bench behind the figure were not still runnable — publish the measurement, not
+   only the number.
+3. **A test nobody has watched fail is a comment.** The count gate's first version blessed
+   `tested = 0` for four of five 3D structures, and was only trusted after a deliberate
+   perturbation (leaf 16 → 15) was confirmed to fail it.
+
+**Open, and small**
+
+- **Re-baseline the regression gate on a quiet machine** (`--save`). Seven new k-NN ops sit
+  at "new (not in baseline)" and pass vacuously until recorded. Not done the night they
+  were added because `--save` rewrites *every* op and that machine had been running
+  benchmarks for hours; a tired baseline is worse than a missing one.
+- `MortonGrid` k-NN on clustered data is still the grid's weak verb even after the fix — a
+  blob that lands inside one cell must be scanned whole however you reach it. The advice is
+  unchanged: `KdTree3` / `LinearOctree3` for clustered k-NN.
+
 ## ★ 2026-07-27 (cooperative night 4) — the three-demo night
 
 **The user's ask:** "haz todas" — build all three proposed demos, make one of them
