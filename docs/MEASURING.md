@@ -106,7 +106,16 @@ hits, 75% of the hits for 23% of the tests on `Tree3`, 50% for 11% on `Octree3`.
 number is the honest way to describe a cheap approximate query — "faster" alone is not.
 
 **Proven, not asserted**: the whole report is byte-for-byte identical between an idle run and
-one taken with 32 processes burning CPU. Use it for algorithmic claims; use time for the
+one taken with 32 processes burning CPU.
+
+And because the counts have no variance, they are the only thing here that can be gated with
+`==` rather than a tolerance. `tests/work_counts.rs` is that ratchet: twenty traversal counts,
+checked exactly, in CI, on every push. The timing gate has to pass anything within 25%, which
+is right for a clock and also means a traversal change costing 15% more work sails through it
+looking like noise. This one cannot miss it. Two lessons are baked into the file: the first
+version blessed `tested = 0` for four of five 3D structures (uniform queries mostly land in
+empty space — a ratchet holding nothing), so half the queries now aim at a cluster; and it was
+checked against a deliberate perturbation (leaf 16 → 15) to confirm it actually fails. Use it for algorithmic claims; use time for the
 constant factors it cannot see (the grid does 30× the point tests in 2D and still wins
 several timed configs — that gap *is* the memory wall, quantified).
 
