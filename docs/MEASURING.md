@@ -74,6 +74,13 @@ cancels *within* the round — and reports the **median of the per-round ratios*
 much those ratios moved. The voxel span-vs-naive ratio behaved the same way: `1.129 – 2.654`
 taken separately, `1.784 – 1.835` paired.
 
+**Some benches get the pairing for free.** `examples/decision2d` maintains and culls all four
+2D structures *inside the same frame loop*, so their samples already straddle each other and a
+drift in machine speed lands on all of them alike — the property `compare2` manufactures, here
+provided by the simulation. It also could not use `compare2` if it wanted to: maintain is
+stateful, and running one structure's frame twice would mean moving the points twice, which is
+a different workload. Interleaving is the goal; `compare2` is one way to get it.
+
 ## 7. Pairing does not remove between-process variation
 
 Even paired, the same ratio moves ~20% between separate process invocations. So the honest

@@ -5,7 +5,17 @@
 //!
 //! - **binary** `Tree` — persistent, maintained via the O(1) `update_ref` handle,
 //! - **quad** `QuadTree` — persistent, `update_ref`,
-//! - **morton** `MortonGrid` — pointer-free, **rebuilt every frame** (`clear` + refill).
+//! - **morton** `MortonGrid` — pointer-free, **rebuilt every frame** (`clear` + refill),
+//! - **kdtree2** `KdTree2` — build-once, so its "maintain" is a full rebuild each frame.
+//!
+//! **This bench does not need `common::compare2`, and cannot use it.** Cannot, because
+//! maintain is stateful: you cannot run structure B's frame twice to interleave it without
+//! moving the points twice, which is a different workload. Does not need to, because the
+//! four structures are already interleaved *inside the frame loop* — each one is maintained
+//! and culled once per frame, so every structure's samples straddle every other's, and a
+//! drift in machine speed lands on all four alike. That is the property `compare2` exists to
+//! manufacture for benches that time A to completion and then B; here the simulation
+//! provides it for free. Do not "fix" this by measuring the structures in separate passes.
 //!
 //! Two numbers per structure: **maintain** (per-frame relocate or rebuild) and
 //! **cull** (per-cull). The persistent-vs-rebuilt asymmetry is the headline.
