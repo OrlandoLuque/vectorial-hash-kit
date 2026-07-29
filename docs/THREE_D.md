@@ -708,6 +708,22 @@ one clamps its loops to the grid). It does not change the verdict for clustered 
 tree or `LinearOctree3` still answers a clustered k-NN with far less work, because a blob
 inside one grid cell has to be scanned whole however you reach it.
 
+**The 2D `MortonGrid` had the identical problem on a non-square `Rect`** and got the identical
+fix, measured by the same bench — one fewer axis to over-scan, so the effect is smaller but the
+shape is the same:
+
+| world aspect (h/w) | points tested/query | ms/query | before → after |
+| ---: | ---: | ---: | ---: |
+| 1.00 (square cells) | 11 395 → 11 266 | 0.0261 → 0.0135 | **1.9x** |
+| 0.50 | 19 088 → 9 649 | 0.0373 → 0.0113 | **3.3x** |
+| 0.30 | 28 431 → 9 901 | 0.0592 → 0.0116 | **5.1x** |
+| 0.15 | 34 525 → 9 199 | 0.0660 → 0.0108 | **6.1x** |
+| 0.05 | 40 438 → 8 489 | 0.0912 → 0.0106 | **8.6x** |
+
+The exact gate saw only 5% of that, because its world is square — which is the point of having
+both: the ratchet proves nothing changed for the common case, and the sweep shows what changed
+for the case the ratchet does not cover.
+
 ## Still open
 - ~~**Stable `ItemRef`**~~ — **done** (`Tree3::insert_ref`/`update_ref`/
   `remove_ref`). The sweep predicted it and confirmed it: O(1) handle updates

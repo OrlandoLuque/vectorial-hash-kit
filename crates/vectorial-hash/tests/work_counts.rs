@@ -64,7 +64,7 @@ const EXPECT: &[(&str, u64, u64)] = &[
     ("knn2/quadtree", 0, 2818),
     ("knn2/kdtree2", 0, 3008),
     ("knn2/linear_quadtree", 0, 2818),
-    ("knn2/morton2", 0, 182587),
+    ("knn2/morton2", 0, 173867),
 ];
 
 thread_local! {

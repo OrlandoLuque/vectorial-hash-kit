@@ -262,7 +262,7 @@ impl<T: Positioned> MortonGrid<T> {
     /// max-heap of the k best, and stops once the nearest unscanned point (the
     /// distance from `q` to the scanned square's nearest face — an exact lower
     /// bound) exceeds the k-th best.
-    pub fn knn(&self, q: Point, k: usize) -> Vec<(f64, &T)> {
+    pub fn knn<'a>(&'a self, q: Point, k: usize) -> Vec<(f64, &'a T)> {
         if k == 0 || self.len == 0 {
             return Vec::new();
         }
@@ -270,48 +270,53 @@ impl<T: Positioned> MortonGrid<T> {
         let (cx, cy) = (cx as i64, cy as i64);
         let n = self.cells_per_axis as i64;
         let mut heap: std::collections::BinaryHeap<KnnEntry<T>> = std::collections::BinaryHeap::new();
-        let mut r = 0i64;
-        loop {
-            {
-                let cells = &self.cells;
-                let mut visit = |ix: i64, iy: i64| {
-                    if ix < 0 || iy < 0 || ix >= n || iy >= n {
-                        return;
-                    }
+
+        // **Per-axis expansion** — see [`crate::MortonGrid3::knn`], which this mirrors and
+        // where it was measured. `levels` is one number for both axes, so a world that is not
+        // square does not have square cells, and a ring that grows both radii together is
+        // isotropic in CELL space and anisotropic in WORLD space: it has to over-scan the
+        // wide axis to reach along the narrow one. Growing whichever axis is currently
+        // narrowest in world units keeps the scanned region near-square. The stopping rule is
+        // unchanged and still exact: the region is still a box, so the nearest unscanned point
+        // is still at least `safe` away.
+        let (mut rx, mut ry) = (0i64, 0i64);
+        let cells = &self.cells;
+        let scan = |heap: &mut std::collections::BinaryHeap<KnnEntry<'a, T>>, xs: (i64, i64), ys: (i64, i64)| {
+            for ix in xs.0.max(0)..=xs.1.min(n - 1) {
+                for iy in ys.0.max(0)..=ys.1.min(n - 1) {
                     if let Some(bucket) = cells.get(&morton2(ix as u32, iy as u32)) {
                         for it in bucket {
-                            knn_offer2(&mut heap, k, it, q);
-                        }
-                    }
-                };
-                if r == 0 {
-                    visit(cx, cy);
-                } else {
-                    for d in -r..=r {
-                        if d.abs() == r {
-                            for e in -r..=r {
-                                visit(cx + d, cy + e); // full left/right columns
-                            }
-                        } else {
-                            visit(cx + d, cy - r); // top/bottom caps of the interior columns
-                            visit(cx + d, cy + r);
+                            knn_offer2(heap, k, it, q);
                         }
                     }
                 }
             }
-            let xlo = self.world.x + (cx - r) as f64 * self.cw;
-            let xhi = self.world.x + (cx + r + 1) as f64 * self.cw;
-            let ylo = self.world.y + (cy - r) as f64 * self.ch;
-            let yhi = self.world.y + (cy + r + 1) as f64 * self.ch;
+        };
+        scan(&mut heap, (cx, cx), (cy, cy));
+
+        loop {
+            let xlo = self.world.x + (cx - rx) as f64 * self.cw;
+            let xhi = self.world.x + (cx + rx + 1) as f64 * self.cw;
+            let ylo = self.world.y + (cy - ry) as f64 * self.ch;
+            let yhi = self.world.y + (cy + ry + 1) as f64 * self.ch;
             let safe = (q.x - xlo).min(xhi - q.x).min(q.y - ylo).min(yhi - q.y);
             if heap.len() >= k && safe > 0.0 && safe * safe >= knn_worst(&heap, k) {
                 break;
             }
-            r += 1;
-            if r > n {
+            if rx > n && ry > n {
                 break;
             }
+            if (rx as f64 + 0.5) * self.cw <= (ry as f64 + 0.5) * self.ch {
+                rx += 1;
+                scan(&mut heap, (cx - rx, cx - rx), (cy - ry, cy + ry));
+                scan(&mut heap, (cx + rx, cx + rx), (cy - ry, cy + ry));
+            } else {
+                ry += 1;
+                scan(&mut heap, (cx - rx, cx + rx), (cy - ry, cy - ry));
+                scan(&mut heap, (cx - rx, cx + rx), (cy + ry, cy + ry));
+            }
         }
+
         let mut v: Vec<(f64, &T)> = heap.into_iter().map(|e| (e.d2.sqrt(), e.item)).collect();
         v.sort_by(|a, b| a.0.total_cmp(&b.0));
         v

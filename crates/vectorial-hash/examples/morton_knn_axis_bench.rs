@@ -28,7 +28,7 @@
 mod common;
 
 use std::cell::Cell;
-use vectorial_hash::{Aabb, MortonGrid3, Point3, Positioned3};
+use vectorial_hash::{Aabb, MortonGrid, MortonGrid3, Point, Point3, Positioned, Positioned3, Rect};
 
 thread_local! { static TESTED: Cell<u64> = const { Cell::new(0) }; }
 
@@ -36,6 +36,12 @@ thread_local! { static TESTED: Cell<u64> = const { Cell::new(0) }; }
 struct P { p: Point3 }
 impl Positioned3 for P {
     fn position(&self) -> Point3 { TESTED.with(|c| c.set(c.get() + 1)); self.p }
+}
+
+#[derive(Clone, Copy)]
+struct P2 { p: Point }
+impl Positioned for P2 {
+    fn position(&self) -> Point { TESTED.with(|c| c.set(c.get() + 1)); self.p }
 }
 
 struct Lcg(u64);
@@ -87,6 +93,39 @@ fn main() {
         println!("{aspect:<8.2} {:>10.3} {:>14.1} {:>12.4} {:>11.2}x", (h / cells) / (w / cells), tested, per, rel);
         println!("#M aspect{}.knn_tested_per_query {:.1} n", (aspect * 100.0) as u32, tested);
         println!("#M aspect{}.knn_ms_per_query {:.5} ms", (aspect * 100.0) as u32, per);
+    }
+
+    // The 2D grid has exactly the same shape of problem on a non-square Rect, and the same
+    // fix. Swept here so the claim is not made for one dimension and assumed for the other.
+    println!("\n2D - same sweep, MortonGrid over a Rect");
+    println!("{:<8} {:>10} {:>14} {:>12} {:>12}", "aspect", "cell y/x", "tested/query", "ms/query", "vs square");
+    let mut base2: Option<f64> = None;
+    for aspect in [1.0f64, 0.5, 0.3, 0.15, 0.05] {
+        let (w, h) = (1000.0, 1000.0 * aspect);
+        let world = Rect::new(0.0, 0.0, w, h);
+        let mut r = Lcg(0x5EED_1234);
+        let blobs: Vec<(f64, f64)> = (0..6).map(|_| (r.r(0.1 * w, 0.9 * w), r.r(0.2 * h, 0.8 * h))).collect();
+        let items: Vec<P2> = (0..n).map(|_| {
+            let b = blobs[(r.f() * blobs.len() as f64) as usize % blobs.len()];
+            P2 { p: Point::new((b.0 + r.r(-0.014 * w, 0.014 * w)).clamp(0.0, w), (b.1 + r.r(-0.014 * h, 0.014 * h)).clamp(0.0, h)) }
+        }).collect();
+        let queries: Vec<Point> = (0..nq).map(|_| Point::new(r.r(0.0, w), r.r(0.0, h))).collect();
+        let mut g = MortonGrid::new(world, levels);
+        for it in &items { g.insert(*it); }
+
+        TESTED.with(|c| c.set(0));
+        let mut found = 0usize;
+        for q in &queries { found += g.knn(*q, k).len(); }
+        let tested = TESTED.with(|c| c.get()) as f64 / nq as f64;
+        assert_eq!(found, nq * k.min(n), "2D k-NN did not return k neighbours");
+
+        let s = common::measure(5, || { for q in &queries { std::hint::black_box(g.knn(*q, k).len()); } });
+        let per = s.ms / nq as f64;
+        let cells = (1u32 << levels) as f64;
+        let rel = match base2 { None => { base2 = Some(per); 1.0 } Some(b) => per / b };
+        println!("{aspect:<8.2} {:>10.3} {:>14.1} {:>12.4} {:>11.2}x", (h / cells) / (w / cells), tested, per, rel);
+        println!("#M d2aspect{}.knn_tested_per_query {:.1} n", (aspect * 100.0) as u32, tested);
+        println!("#M d2aspect{}.knn_ms_per_query {:.5} ms", (aspect * 100.0) as u32, per);
     }
 
     println!("\nreading: 'tested/query' is exact and machine-independent — the algorithmic number.");
