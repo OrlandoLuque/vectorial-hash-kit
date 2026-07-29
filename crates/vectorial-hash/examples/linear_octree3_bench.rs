@@ -8,6 +8,9 @@
 //! ```
 //! Env: `LO_N` (points), `LO_Q` (queries), `LO_R` (cull radius).
 
+#[path = "common/mod.rs"]
+mod common;
+
 use std::time::Instant;
 use vectorial_hash::linear_octree3::LinearOctree3;
 use vectorial_hash::{Aabb, MortonGrid3, Octree3, Point3, Positioned3, Sphere3};
@@ -71,11 +74,41 @@ fn main() {
     let t_knn_oct = best(6, || { for q in &queries { sink += oct.knn(*q, 8).len(); } });
     let t_knn_mor = best(6, || { for q in &queries { sink += mor.knn(*q, 8).len(); } });
 
+    // ---- the ratios, measured properly ----
+    // The table above times each structure to completion and then divides, which is the
+    // thing docs/MEASURING.md exists to warn about: whoever runs second inherits a machine
+    // the first one warmed, and the same ratio has moved between 1.57 and 3.28 that way.
+    // These four numbers are the ones quoted in the docs, so they are measured interleaved
+    // (A B B A per round, median of the per-round ratios) and reported with their spread.
+    let rate = common::rate();
+    let pair = |label: &str, key: &str,
+                a: &mut dyn FnMut(), b: &mut dyn FnMut()| {
+        let (a_cy, b_cy, ratio, spread) = common::compare2(7, || a(), || b());
+        println!("  {label:<28} {:>9.3} {:>9.3} {:>8.2}x {:>8.1}%", a_cy / rate * 1e3, b_cy / rate * 1e3, ratio, spread);
+        println!("#M {key} {ratio:.3} x");
+        println!("#M {key}_spread {spread:.1} pct");
+    };
+    println!("\npaired ratios (interleaved, median of per-round ratios — the quotable ones)");
+    println!("  {:<28} {:>9} {:>9} {:>9} {:>9}", "comparison", "lin ms", "rival ms", "speed-up", "spread");
+    pair("cull vs Octree3", "cull_vs_octree3",
+        &mut || { for q in &queries { std::hint::black_box(lin.cull(&Sphere3::new(q.x, q.y, q.z, radius)).len()); } },
+        &mut || { for q in &queries { std::hint::black_box(oct.cull(&Sphere3::new(q.x, q.y, q.z, radius)).len()); } });
+    pair("cull vs MortonGrid3", "cull_vs_morton3",
+        &mut || { for q in &queries { std::hint::black_box(lin.cull(&Sphere3::new(q.x, q.y, q.z, radius)).len()); } },
+        &mut || { for q in &queries { std::hint::black_box(mor.cull(&Sphere3::new(q.x, q.y, q.z, radius)).len()); } });
+    pair("knn vs Octree3", "knn_vs_octree3",
+        &mut || { for q in &queries { std::hint::black_box(lin.knn(*q, 8).len()); } },
+        &mut || { for q in &queries { std::hint::black_box(oct.knn(*q, 8).len()); } });
+    pair("knn vs MortonGrid3", "knn_vs_morton3",
+        &mut || { for q in &queries { std::hint::black_box(lin.knn(*q, 8).len()); } },
+        &mut || { for q in &queries { std::hint::black_box(mor.knn(*q, 8).len()); } });
+
     println!("structure       build(ms)   cull {nq}q(ms)   knn {nq}q(ms)   leaves/cells   depth");
     println!("LinearOctree3   {t_build_lin:8.2}   {t_cull_lin:11.2}   {t_knn_lin:10.2}   {:>12}   {}", lin.leaf_count(), lin.depth());
     println!("Octree3         {t_build_oct:8.2}   {t_cull_oct:11.2}   {t_knn_oct:10.2}   {:>12}   —", "—");
     println!("MortonGrid3     {t_build_mor:8.2}   {t_cull_mor:11.2}   {t_knn_mor:10.2}   {:>12}   1 (flat)", mor.cell_count());
-    println!("\ncull speed   vs Octree3 {:.2}x   vs Morton {:.2}x", t_cull_oct / t_cull_lin, t_cull_mor / t_cull_lin);
-    println!("knn  speed   vs Octree3 {:.2}x   vs Morton {:.2}x", t_knn_oct / t_knn_lin, t_knn_mor / t_knn_lin);
+    println!("\nunpaired, from the table above (kept for comparison with the paired numbers,");
+    println!("NOT for quoting): cull vs Octree3 {:.2}x  vs Morton {:.2}x | knn vs Octree3 {:.2}x  vs Morton {:.2}x",
+        t_cull_oct / t_cull_lin, t_cull_mor / t_cull_lin, t_knn_oct / t_knn_lin, t_knn_mor / t_knn_lin);
     if sink == usize::MAX { println!("{sink}"); } // keep the queries live
 }

@@ -462,16 +462,34 @@ sphere culls r=40 and k-NN k=8, release):
 | `Octree3` (pointer) | 38.4 | **7.56** | **2.85** | — |
 | `MortonGrid3` (uniform) | 16.3 | 11.6 | 17.8 | 28 589 (flat) |
 
-Honest read: the tuned **pointer `Octree3` still wins the queries** (cull 1.3×, knn
-1.2× over the linear octree) — the arena already captures the adaptivity with better
-locality, the same result the wide-BVH probe reached. But `LinearOctree3` has two
-real wins: it **builds ~2.1× faster than `Octree3`** (pointer-free, one bucket pass
-per level — near the uniform grid's build cost) *and* on clustered data its **k-NN is
-~5× faster than `MortonGrid3`** (the uniform grid's ring-shell expansion wades through
-thousands of empty cells; the adaptive tree descends straight to the cluster). So it's
-the pick when the data is **skewed** *and* you **rebuild often** — grid-cheap builds
-without the grid's clustered-kNN cliff. On uniform data or a keep-maintained index,
-`MortonGrid3` / `Tree3`+`ItemRef` remain the calls (see the decision map below).
+**Re-measured 2026-07-29, paired** (`common::compare2`, interleaved A/B/B/A, median of
+per-round ratios, two runs):
+
+| comparison | speed-up for `LinearOctree3` | spread |
+| --- | ---: | ---: |
+| cull vs `Octree3` | **0.79-0.81×** (the pointer octree wins by ~1.25×) | 10-28% |
+| cull vs `MortonGrid3` | **1.34-1.35×** | 11-15% |
+| knn vs `Octree3` | **0.81-0.83×** (the pointer octree wins by ~1.2×) | 5-8% |
+| knn vs `MortonGrid3` | **1.41×** | 15-22% |
+
+Honest read: the tuned **pointer `Octree3` still wins the queries** — the arena already
+captures the adaptivity with better locality, the same result the wide-BVH probe reached.
+`LinearOctree3`'s real win is the **build: ~2.2× faster than `Octree3`** (pointer-free, one
+bucket pass per level — near the uniform grid's build cost), with a modest ~1.35× query edge
+over the uniform grid.
+
+**The clustered-k-NN cliff is gone, and this document used to sell it.** The line here said
+`LinearOctree3`'s clustered k-NN was *~5× faster* than `MortonGrid3`, and it was, until
+`MortonGrid3::knn` was given per-axis expansion (see below): on this bench's 1000×300×1000
+world the grid's k-NN got ~3.6× faster and the gap collapsed from ~5× to **1.41×**. The
+structure did not change; its rival did. Any figure comparing two things is only true for as
+long as *both* of them stand still, which is the argument for keeping the bench that produced
+it runnable rather than only the number it printed.
+
+So the pick is now: **skewed data you rebuild often** → `LinearOctree3` for the build. Query
+performance alone no longer justifies it over either neighbour. On uniform data or a
+keep-maintained index, `MortonGrid3` / `Tree3`+`ItemRef` remain the calls (see the decision
+map below).
 It's selectable live in the `critters3d` demo — `M` cycles to it (after Morton, before KdTree3),
 or `CRITTERS3D_STRUCTURE=linear`; the HUD shows its leaf count and adaptive depth,
 `B` draws its (variably-sized) leaf boxes.
