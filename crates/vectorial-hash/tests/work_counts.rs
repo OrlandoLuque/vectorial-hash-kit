@@ -59,7 +59,7 @@ const EXPECT: &[(&str, u64, u64)] = &[
     ("knn3/octree3", 0, 11522),
     ("knn3/kdtree3", 0, 6824),
     ("knn3/linear_octree3", 0, 11522),
-    ("knn3/morton3", 0, 565120),
+    ("knn3/morton3", 0, 179636),
     ("knn2/tree2", 0, 4281),
     ("knn2/quadtree", 0, 2818),
     ("knn2/kdtree2", 0, 3008),

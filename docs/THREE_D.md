@@ -678,6 +678,36 @@ the cull champion in the deep/dense corner.
   narrowphase, reusing the whole 2D stack with no N³ memory; not competitive on
   this uniform-cube sphere sweep.
 
+## `MortonGrid3::knn` and the shape of the world
+
+`levels` is one number for all three axes, so a world that is not a cube does not have cubic
+cells: the siege/horde worlds (1000 x 300 x 1000 at levels 5) get cells of 31.25 x 9.375 x
+31.25. Any k-NN expansion that grows one radius for all three axes is then isotropic in *cell*
+space and anisotropic in *world* space — to reach 30 units along the short axis it has to drag
+the wide axes out to +-125 and scan everything in between. `knn` therefore grows **each axis
+separately**, always the one whose scanned world half-extent is currently smallest, which
+keeps the scanned region near-cubic in world units. The stopping rule is unchanged and still
+exact: the scanned region is still a box, so the nearest unscanned point is still at least
+`safe` away.
+
+Measured (`examples/morton_knn_axis_bench`, 50k clustered points, k=8, levels=5):
+
+| world aspect (h/w) | points tested/query | ms/query | before → after |
+| ---: | ---: | ---: | ---: |
+| 1.00 (cubic cells) | 14 946 → 14 823 | 0.2012 → 0.0883 | **2.3x** |
+| 0.50 | 33 846 → 14 595 | 0.5713 → 0.0889 | **6.4x** |
+| 0.30 | 41 529 → 12 933 | 1.0779 → 0.0867 | **12.4x** |
+| 0.15 | 45 510 → 11 452 | 1.3533 → 0.0784 | **17.3x** |
+| 0.05 | 48 219 → 10 591 | 1.6112 → 0.0761 | **21.2x** |
+
+Two things worth reading off that table. The flatter the world the bigger the win, which is
+the effect being fixed. And the **cubic** row still improves 2.3x while its point count barely
+moves — that saving is cells never visited, which the point counter cannot see (the old
+enumeration walked the full Chebyshev shell rejecting out-of-grid cells one at a time; the new
+one clamps its loops to the grid). It does not change the verdict for clustered data: a k-d
+tree or `LinearOctree3` still answers a clustered k-NN with far less work, because a blob
+inside one grid cell has to be scanned whole however you reach it.
+
 ## Still open
 - ~~**Stable `ItemRef`**~~ — **done** (`Tree3::insert_ref`/`update_ref`/
   `remove_ref`). The sweep predicted it and confirmed it: O(1) handle updates

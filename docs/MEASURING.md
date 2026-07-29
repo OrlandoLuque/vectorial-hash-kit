@@ -119,6 +119,20 @@ checked against a deliberate perturbation (leaf 16 → 15) to confirm it actuall
 constant factors it cannot see (the grid does 30× the point tests in 2D and still wins
 several timed configs — that gap *is* the memory wall, quantified).
 
+## 8b. A count only counts what you counted
+
+The point counter counts `position()` calls — **leaf work**. For `cull` the descent is counted
+too (`classify_aabb`), but `knn` has no query volume to classify, so **visiting a cell costs
+nothing the counter can see**. That is not academic: rewriting `MortonGrid3::knn` to expand
+per-axis left the points-tested count on a *cubic* world essentially unchanged (14 946 →
+14 823) while the time fell **2.3x**. The saving was entirely in cells never iterated — the old
+enumeration walked the whole Chebyshev shell and rejected out-of-grid cells one at a time,
+the new one clamps its loops to the grid. Real work, invisible to that metric.
+
+The rule: counts prove an algorithmic change; they do not bound one. When a count says
+"nothing changed" and a clock disagrees, the clock may be measuring something you did not
+think to count.
+
 ## 9. Publish from an idle machine
 
 None of the above removes contention: another process still evicts your cache lines and eats
