@@ -463,14 +463,15 @@ sphere culls r=40 and k-NN k=8, release):
 | `MortonGrid3` (uniform) | 16.3 | 11.6 | 17.8 | 28 589 (flat) |
 
 **Re-measured 2026-07-29, paired** (`common::compare2`, interleaved A/B/B/A, median of
-per-round ratios, two runs):
+per-round ratios, three runs — ranges because two of these move more than the 15% the runner
+flags, and a point estimate would be quoting noise):
 
 | comparison | speed-up for `LinearOctree3` | spread |
 | --- | ---: | ---: |
 | cull vs `Octree3` | **0.79-0.81×** (the pointer octree wins by ~1.25×) | 10-28% |
-| cull vs `MortonGrid3` | **1.34-1.35×** | 11-15% |
-| knn vs `Octree3` | **0.81-0.83×** (the pointer octree wins by ~1.2×) | 5-8% |
-| knn vs `MortonGrid3` | **1.41×** | 15-22% |
+| cull vs `MortonGrid3` | **1.33-1.35×** | 11-21% |
+| knn vs `Octree3` | **0.81-0.83×** (the pointer octree wins by ~1.2×) | 5-9% |
+| knn vs `MortonGrid3` | **1.4-1.7×** | 15-30% |
 
 Honest read: the tuned **pointer `Octree3` still wins the queries** — the arena already
 captures the adaptivity with better locality, the same result the wide-BVH probe reached.
@@ -481,7 +482,7 @@ over the uniform grid.
 **The clustered-k-NN cliff is gone, and this document used to sell it.** The line here said
 `LinearOctree3`'s clustered k-NN was *~5× faster* than `MortonGrid3`, and it was, until
 `MortonGrid3::knn` was given per-axis expansion (see below): on this bench's 1000×300×1000
-world the grid's k-NN got ~3.6× faster and the gap collapsed from ~5× to **1.41×**. The
+world the grid's k-NN got ~3.6× faster and the gap collapsed from ~5× to **1.4-1.7×**. The
 structure did not change; its rival did. Any figure comparing two things is only true for as
 long as *both* of them stand still, which is the argument for keeping the bench that produced
 it runnable rather than only the number it printed.

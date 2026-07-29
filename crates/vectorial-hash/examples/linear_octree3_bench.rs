@@ -82,8 +82,8 @@ fn main() {
     // (A B B A per round, median of the per-round ratios) and reported with their spread.
     let rate = common::rate();
     let pair = |label: &str, key: &str,
-                a: &mut dyn FnMut(), b: &mut dyn FnMut()| {
-        let (a_cy, b_cy, ratio, spread) = common::compare2(7, || a(), || b());
+                mut a: &mut dyn FnMut(), mut b: &mut dyn FnMut()| {
+        let (a_cy, b_cy, ratio, spread) = common::compare2(7, &mut a, &mut b);
         println!("  {label:<28} {:>9.3} {:>9.3} {:>8.2}x {:>8.1}%", a_cy / rate * 1e3, b_cy / rate * 1e3, ratio, spread);
         println!("#M {key} {ratio:.3} x");
         println!("#M {key}_spread {spread:.1} pct");
