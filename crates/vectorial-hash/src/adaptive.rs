@@ -23,6 +23,12 @@
 //! and there is a hard [`Thresholds::cooldown`] after every migration. Rebuilding is not
 //! free and the policy is written to respect that.
 //!
+//! **Handles are slots, and they survive removal.** `insert` hands back a [`Slot`] that
+//! stays valid through every migration *and* through other items being removed: the item
+//! list is a slot table with a free list, not a `Vec` that gets swap-removed. Removing item
+//! 7 must not silently repoint whoever held the handle to the last item, so it does not —
+//! slot 7 becomes a hole and the next `insert` gets it back.
+//!
 //! **Thresholds are calibratable.** The defaults are this repo's measurements on one
 //! machine; a different cache hierarchy moves them. [`Thresholds::from_env`] reads a file
 //! written by the `calibrate` example (`VH_CALIBRATION=path`), so a program can ship the
@@ -148,7 +154,17 @@ pub struct Slot(pub u32);
 /// An index that picks its own structure. See the module docs.
 pub struct AdaptiveIndex<T: Positioned3 + Clone> {
     /// The source of truth. Every backend is a view onto this, rebuilt on migration.
-    items: Vec<T>,
+    ///
+    /// A **slot table**, not a list: `Slot` is the index into it, and the type promises that
+    /// handle survives. A swap-remove would keep it dense at the cost of silently moving
+    /// whichever item happened to be last — a different caller's handle. So a removed slot
+    /// becomes a hole, goes on `free`, and is handed back out by the next `insert`.
+    items: Vec<Option<T>>,
+    /// Retired slots, newest first. Reusing them is what keeps the table from growing
+    /// without bound under an insert/remove churn that never changes the live count.
+    free: Vec<u32>,
+    /// Live items. Not `items.len()`, which counts holes — and the policy turns on this one.
+    live: usize,
     world: Aabb,
     leaf: usize,
     held: Held<T>,
@@ -175,7 +191,7 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
 
     pub fn with_thresholds(world: Aabb, leaf: usize, th: Thresholds) -> Self {
         AdaptiveIndex {
-            items: Vec::new(), world, leaf: leaf.max(1), held: Held::Brute,
+            items: Vec::new(), free: Vec::new(), live: 0, world, leaf: leaf.max(1), held: Held::Brute,
             profile: SpatialProfile::default(), th, pending: None, cooling: 0,
             dirty: false, switches: 0, moves: 0, relocations: 0, queries: 0, q_per_item: 0.0,
         }
@@ -187,29 +203,68 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
     }
     /// How many migrations have happened — a flapping policy shows up here.
     pub fn switch_count(&self) -> u32 { self.switches }
-    pub fn len(&self) -> usize { self.items.len() }
-    pub fn is_empty(&self) -> bool { self.items.is_empty() }
+    pub fn len(&self) -> usize { self.live }
+    pub fn is_empty(&self) -> bool { self.live == 0 }
+    /// Slots allocated, holes included. `len()` is what you almost always want; this one is
+    /// here so a caller can see the table is being recycled rather than growing.
+    pub fn slots(&self) -> usize { self.items.len() }
+    /// The item behind a handle, or `None` if that slot is a hole.
+    pub fn get(&self, s: Slot) -> Option<&T> { self.items.get(s.0 as usize).and_then(|o| o.as_ref()) }
     pub fn thresholds(&self) -> &Thresholds { &self.th }
     pub fn profile(&self) -> &SpatialProfile { &self.profile }
     /// Smoothed queries per item per tick — what the keep-vs-rebuild choice turns on.
     pub fn queries_per_item(&self) -> f64 { self.q_per_item }
 
+    /// Add an item, reusing a retired slot if there is one.
     pub fn insert(&mut self, item: T) -> Slot {
-        let slot = Slot(self.items.len() as u32);
+        let slot = match self.free.pop() {
+            Some(i) => i,
+            None => { self.items.push(None); (self.items.len() - 1) as u32 }
+        };
+        let mut stale = false;
         match &mut self.held {
-            Held::Keep(t, refs) => { if let Some(r) = t.insert_ref(item.clone()) { refs.push(r); } else { self.dirty = true; refs.push(ItemRef(u32::MAX)); } }
-            Held::Grid(g) => { if !g.insert(item.clone()) { self.dirty = true; } }
+            Held::Keep(t, refs) => {
+                let r = match t.insert_ref(item.clone()) { Some(r) => r, None => { stale = true; ItemRef(u32::MAX) } };
+                // `refs` is indexed BY SLOT, holes included, so a recycled slot writes in
+                // place rather than pushing and shifting everyone after it.
+                if refs.len() <= slot as usize { refs.resize(slot as usize + 1, ItemRef(u32::MAX)); }
+                refs[slot as usize] = r;
+            }
+            Held::Grid(g) => { if !g.insert(item.clone()) { stale = true; } }
             Held::Brute => {}
-            Held::Static(_) => self.dirty = true, // a build-once backend cannot take one more
+            Held::Static(_) => stale = true, // a build-once backend cannot take one more
         }
-        self.items.push(item);
-        slot
+        self.dirty |= stale;
+        self.items[slot as usize] = Some(item);
+        self.live += 1;
+        Slot(slot)
+    }
+
+    /// Remove the item behind `s` and return it, or `None` if the slot is already empty.
+    /// The slot is retired and a later `insert` may hand it back out; every OTHER handle
+    /// keeps pointing at the same item, which is the property this whole slot table exists
+    /// for. Only the keep-index tree can drop one item in place (`remove_ref`) — the grid
+    /// and the build-once k-d tree have no removal at all, so they are marked stale and
+    /// rebuilt on the next query, exactly as they are for a move.
+    pub fn remove(&mut self, s: Slot) -> Option<T> {
+        let taken = self.items.get_mut(s.0 as usize)?.take()?;
+        self.live -= 1;
+        self.free.push(s.0);
+        match &mut self.held {
+            Held::Keep(t, refs) => match refs.get(s.0 as usize).copied().filter(|r| r.0 != u32::MAX) {
+                Some(r) => { t.remove_ref(r); refs[s.0 as usize] = ItemRef(u32::MAX); }
+                None => self.dirty = true,
+            },
+            Held::Brute => {}
+            _ => self.dirty = true,
+        }
+        Some(taken)
     }
 
     /// Move (or otherwise mutate) one item. The keep-index backend takes the O(1) path;
     /// the rebuild-based ones just note that they are stale.
     pub fn update<F: FnOnce(&mut T)>(&mut self, s: Slot, f: F) {
-        let Some(it) = self.items.get_mut(s.0 as usize) else { return };
+        let Some(it) = self.items.get_mut(s.0 as usize).and_then(|o| o.as_mut()) else { return };
         f(it);
         let item = it.clone();
         self.moves += 1;
@@ -240,7 +295,7 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
         self.queries += 1;
         self.refresh();
         match &self.held {
-            Held::Brute => self.items.iter().filter(|it| shape.contains_point(it.position())).collect(),
+            Held::Brute => self.items.iter().flatten().filter(|it| shape.contains_point(it.position())).collect(),
             Held::Keep(t, _) => t.cull(shape),
             Held::Grid(g) => g.cull(shape),
             Held::Static(k) => k.cull(shape),
@@ -253,7 +308,7 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
         self.refresh();
         match &self.held {
             Held::Brute => {
-                let mut v: Vec<(f64, &T)> = self.items.iter().map(|it| {
+                let mut v: Vec<(f64, &T)> = self.items.iter().flatten().map(|it| {
                     let p = it.position();
                     let (dx, dy, dz) = (p.x - q.x, p.y - q.y, p.z - q.z);
                     ((dx * dx + dy * dy + dz * dz).sqrt(), it)
@@ -271,9 +326,9 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
     /// Close the frame: feed the observed rates to the advisor and migrate if the
     /// workload has genuinely changed. Call once per tick.
     pub fn tick(&mut self) -> Backend {
-        let qpi = if self.items.is_empty() { 0.0 } else { self.queries as f64 / self.items.len() as f64 };
+        let qpi = if self.live == 0 { 0.0 } else { self.queries as f64 / self.live as f64 };
         self.q_per_item += 0.1 * (qpi - self.q_per_item); // same EMA weight the advisor uses
-        self.profile.observe(self.items.len(), self.moves, self.relocations, self.queries);
+        self.profile.observe(self.live, self.moves, self.relocations, self.queries);
         self.moves = 0;
         self.relocations = 0;
         self.queries = 0;
@@ -302,7 +357,7 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
     /// [`Thresholds`] is that a calibration file can override them. Delegating would have
     /// silently ignored the calibration — it did, until a test caught it.
     fn desired(&self) -> Backend {
-        let n = self.items.len() as f64;
+        let n = self.live as f64;
         let m = self.th.margin;
         let cur = self.backend();
         // Leaving brute costs a build, so demand a clearly bigger population than the one
@@ -325,22 +380,27 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
 
     /// Rebuild a backend from the item list. This is the cost hysteresis exists to avoid
     /// paying twice.
-    fn build(to: Backend, items: &[T], world: Aabb, leaf: usize) -> Held<T> {
+    fn build(to: Backend, items: &[Option<T>], world: Aabb, leaf: usize) -> Held<T> {
         match to {
             Backend::Brute => Held::Brute,
             Backend::KeepTree => {
                 let mut t = Tree3::new(world, leaf);
-                let mut refs = Vec::with_capacity(items.len());
-                for it in items { refs.push(t.insert_ref(it.clone()).unwrap_or(ItemRef(u32::MAX))); }
+                // One entry per SLOT, holes carried through as dead refs, so `refs[slot]`
+                // survives a rebuild. Skipping holes here would shift every handle past the
+                // first removal — the exact bug the slot table is built to prevent.
+                let refs = items.iter().map(|o| match o {
+                    Some(it) => t.insert_ref(it.clone()).unwrap_or(ItemRef(u32::MAX)),
+                    None => ItemRef(u32::MAX),
+                }).collect();
                 Held::Keep(Box::new(t), refs)
             }
             Backend::Grid => {
                 let levels = MortonGrid3::<T>::levels_for_cell_size(world, (world.w.max(world.h).max(world.d)) / 64.0);
                 let mut g = MortonGrid3::new(world, levels);
-                for it in items { g.insert(it.clone()); }
+                for it in items.iter().flatten() { g.insert(it.clone()); }
                 Held::Grid(Box::new(g))
             }
-            Backend::Static => Held::Static(Box::new(KdTree3::from_items(leaf, items.to_vec()))),
+            Backend::Static => Held::Static(Box::new(KdTree3::from_items(leaf, items.iter().flatten().cloned().collect()))),
         }
     }
 
@@ -365,6 +425,8 @@ mod tests {
     impl Positioned3 for P { fn position(&self) -> Point3 { self.p } }
 
     fn world() -> Aabb { Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0) }
+    trait Bits3 { fn to_bits3(&self) -> (u64, u64, u64); }
+    impl Bits3 for Point3 { fn to_bits3(&self) -> (u64, u64, u64) { (self.x.to_bits(), self.y.to_bits(), self.z.to_bits()) } }
     fn pt(i: usize) -> Point3 {
         let f = |k: u64| ((i as u64 * k) % 251) as f64;
         Point3::new(f(37), f(53), f(97))
@@ -399,6 +461,112 @@ mod tests {
             want.sort(); got.sort();
             assert_eq!(want, got, "backend {:?} disagreed with brute force", ix.backend());
         }
+    }
+
+    /// Drive the index onto a named backend and assert it got there, so a test about
+    /// removal on the grid cannot quietly pass while sitting on brute force.
+    fn force(ix: &mut AdaptiveIndex<P>, all: &mut [Option<P>], want: Backend) {
+        for t in 0..80 {
+            if ix.backend() == want { return; }
+            // SOMETHING has to move, or `still_ticks` routes every destination to Static —
+            // which is how the first version of this helper "reached" the grid. The
+            // reference moves with it, of course.
+            if want != Backend::Static {
+                if let Some(i) = all.iter().position(|o| o.is_some()) {
+                    let to = scatter(t, i);
+                    ix.update(Slot(i as u32), |c| c.p = to);
+                    all[i] = Some(P { p: to });
+                }
+            }
+            // Query intensity is what buys the grid; one cull per item per tick is well
+            // over any sane rebuild_query_ratio.
+            if want == Backend::Grid { for k in 0..ix.len() { let p = pt(k); let _ = ix.cull(&Sphere3::new(p.x, p.y, p.z, 8.0)); } }
+            ix.tick();
+        }
+        assert_eq!(ix.backend(), want, "could not reach {want:?}");
+    }
+
+    /// Remove on every backend, against brute force, with the reference kept in step. The
+    /// grid and the k-d tree cannot remove at all, so this is really asking whether the
+    /// stale-then-rebuild path notices — and it is the whole reason `remove` exists rather
+    /// than callers being told to rebuild.
+    #[test]
+    fn remove_agrees_with_brute_force_on_every_backend() {
+        for want in [Backend::Brute, Backend::KeepTree, Backend::Grid, Backend::Static] {
+            let th = Thresholds { brute_max: if want == Backend::Brute { 400 } else { 40 },
+                static_ticks: 6, hold_ticks: 1, cooldown: 0, ..Default::default() };
+            let mut ix = AdaptiveIndex::with_thresholds(world(), 8, th);
+            let mut slots = Vec::new();
+            let mut all: Vec<Option<P>> = Vec::new();
+            for i in 0..200 { let it = P { p: pt(i) }; slots.push(ix.insert(it)); all.push(Some(it)); }
+            force(&mut ix, &mut all, want);
+
+            // Every third item, back to front, so the removals interleave with survivors.
+            for i in (0..200).rev().step_by(3) {
+                let got = ix.remove(slots[i]).expect("slot was live");
+                assert_eq!(got.p.to_bits3(), all[i].unwrap().p.to_bits3(), "wrong item returned on {want:?}");
+                all[i] = None;
+                assert_eq!(ix.len(), all.iter().flatten().count(), "len drifted on {want:?}");
+            }
+            let live: Vec<P> = all.iter().flatten().copied().collect();
+            assert_matches_brute(&mut ix, &live);
+            // 199 is the first one the loop above took; asking again must find a hole.
+            assert!(ix.remove(slots[199]).is_none(), "removing a hole twice must be None on {want:?}");
+        }
+    }
+
+    /// The property the slot table exists for. A swap-remove would keep `items` dense and
+    /// silently repoint whichever handle belonged to the last item — so this checks the
+    /// SURVIVORS by handle, which is the thing that would break, not the answer set.
+    #[test]
+    fn removal_does_not_disturb_other_handles_and_recycles_the_slot() {
+        let th = Thresholds { brute_max: 20, hold_ticks: 1, cooldown: 0, ..Default::default() };
+        let mut ix = AdaptiveIndex::with_thresholds(world(), 8, th);
+        let slots: Vec<Slot> = (0..60).map(|i| ix.insert(P { p: pt(i) })).collect();
+        let mut all: Vec<Option<P>> = (0..60).map(|i| Some(P { p: pt(i) })).collect();
+        force(&mut ix, &mut all, Backend::KeepTree);
+        ix.remove(slots[7]);
+        ix.remove(slots[31]);
+        assert_eq!(ix.len(), 58);
+
+        // Every survivor still answers as itself: move it via its handle and find it there.
+        for (i, s) in slots.iter().enumerate() {
+            if i == 7 || i == 31 { continue; }
+            let to = Point3::new(200.0 + (i % 7) as f64, 200.0, 200.0);
+            ix.update(*s, |c| c.p = to);
+            let hit = ix.cull(&Sphere3::new(to.x, to.y, to.z, 0.25));
+            assert!(hit.iter().any(|q| q.p.to_bits3() == to.to_bits3()), "handle {i} lost its item");
+        }
+        // And the retired slots come back rather than the table growing for ever.
+        let before = ix.slots();
+        let a = ix.insert(P { p: pt(500) });
+        let b = ix.insert(P { p: pt(501) });
+        assert_eq!(ix.slots(), before, "recycled inserts should not allocate new slots");
+        assert!([a, b].contains(&slots[7]) && [a, b].contains(&slots[31]), "the freed slots were not reused");
+        assert_eq!(ix.len(), 60);
+    }
+
+    /// Insert/remove churn that never changes the live count must not grow the table, and
+    /// must not confuse the policy: `len()` counts items, not slots.
+    #[test]
+    fn churn_at_a_constant_population_neither_grows_nor_misleads() {
+        let th = Thresholds { brute_max: 20, hold_ticks: 1, cooldown: 0, ..Default::default() };
+        let mut ix = AdaptiveIndex::with_thresholds(world(), 8, th);
+        let mut slots: Vec<Slot> = (0..80).map(|i| ix.insert(P { p: pt(i) })).collect();
+        let mut seed: Vec<Option<P>> = (0..80).map(|i| Some(P { p: pt(i) })).collect();
+        force(&mut ix, &mut seed, Backend::KeepTree);
+        let table = ix.slots();
+        for t in 0..300 {
+            let i = t % slots.len();
+            ix.remove(slots[i]);
+            slots[i] = ix.insert(P { p: scatter(t, i) });
+            if t % 4 == 0 { ix.tick(); }
+        }
+        assert_eq!(ix.len(), 80);
+        assert_eq!(ix.slots(), table, "the slot table grew under constant-population churn");
+        let all: Vec<P> = slots.iter().filter_map(|s| ix.get(*s).copied()).collect();
+        assert_eq!(all.len(), 80);
+        assert_matches_brute(&mut ix, &all);
     }
 
     #[test]

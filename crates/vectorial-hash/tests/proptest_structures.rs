@@ -352,10 +352,10 @@ proptest! {
 
 /// Cull against every probe sphere and compare with brute force over the model. Shared so
 /// the adaptive property can re-check after each forced migration without repeating itself.
-fn check_cull_matches(ix: &mut AdaptiveIndex<M3>, live: &[Point3]) -> Result<(), TestCaseError> {
+fn check_cull_matches(ix: &mut AdaptiveIndex<M3>, live: &[Option<Point3>]) -> Result<(), TestCaseError> {
     for (cx, cy, cz, rr) in SPHERES {
         let s = Sphere3::new(cx, cy, cz, rr);
-        let mut want: Vec<(u64, u64, u64)> = live.iter()
+        let mut want: Vec<(u64, u64, u64)> = live.iter().flatten()
             .filter(|p| { let (dx, dy, dz) = (p.x - cx, p.y - cy, p.z - cz); dx * dx + dy * dy + dz * dz <= rr * rr })
             .map(|p| (p.x.to_bits(), p.y.to_bits(), p.z.to_bits())).collect();
         let mut got: Vec<(u64, u64, u64)> = ix.cull(&s).iter()
@@ -381,38 +381,62 @@ proptest! {
         // exercise one backend and prove nothing.
         let th = Thresholds { brute_max: 40, static_ticks: 6, hold_ticks: 2, cooldown: 0, ..Default::default() };
         let mut ix = AdaptiveIndex::with_thresholds(Aabb::new(0.0, 0.0, 0.0, W, W, W), 6, th);
-        let mut live: Vec<Point3> = Vec::new();
+        // The model is a SLOT TABLE, not a list, because the index's is: after a removal
+        // index j must still mean slot j or the update op would move a different item in
+        // each. `free` mirrors the index's own reuse order so a recycled insert lands in
+        // the same place on both sides.
+        let mut live: Vec<Option<Point3>> = Vec::new();
+        let mut free: Vec<usize> = Vec::new();
         let mut backends: Vec<Backend> = vec![ix.backend()];
 
         for (n, op) in ops.iter().enumerate() {
             match *op {
-                Op::Ins(x, y, z) => { let p = Point3::new(x, y, z); ix.insert(M3 { p }); live.push(p); }
+                Op::Ins(x, y, z) => {
+                    let p = Point3::new(x, y, z);
+                    let s = ix.insert(M3 { p });
+                    match free.pop() { Some(j) => live[j] = Some(p), None => live.push(Some(p)) }
+                    prop_assert_eq!(live[s.0 as usize], Some(p), "insert landed in a different slot than the model");
+                }
                 Op::Rem(i) => {
-                    // No remove on AdaptiveIndex yet: spend the op on a query instead, which
-                    // keeps the op mix (and the query-per-item rate the policy reads) honest.
-                    if !live.is_empty() {
-                        let q = live[i % live.len()];
-                        let _ = ix.cull(&Sphere3::new(q.x, q.y, q.z, 20.0));
+                    // A real removal now. It leaves a HOLE in the slot table, so `live` can
+                    // no longer be a dense list either — index j must keep meaning slot j,
+                    // or the update op below would move a different item in each.
+                    let n_live = live.iter().flatten().count();
+                    if n_live > 0 {
+                        let j = live.iter().enumerate().filter(|(_, o)| o.is_some()).nth(i % n_live).map(|(j, _)| j).unwrap();
+                        let gone = ix.remove(Slot(j as u32));
+                        prop_assert!(gone.is_some(), "remove returned nothing for a live slot");
+                        live[j] = None;
+                        free.push(j);
                     }
                 }
                 Op::Upd(i, x, y, z) => {
-                    if !live.is_empty() {
-                        let j = i % live.len();
+                    // Only a live slot: updating a hole must be a no-op, which is itself
+                    // worth exercising, so every third one is aimed at the table blind.
+                    let n_live = live.iter().flatten().count();
+                    if n_live > 0 {
                         let np = Point3::new(x, y, z);
-                        ix.update(Slot(j as u32), |m| m.p = np);
-                        live[j] = np;
+                        if i % 3 == 0 && !live.is_empty() {
+                            let j = i % live.len();
+                            ix.update(Slot(j as u32), |m| m.p = np);
+                            if live[j].is_some() { live[j] = Some(np); }
+                        } else {
+                            let j = live.iter().enumerate().filter(|(_, o)| o.is_some()).nth(i % n_live).map(|(j, _)| j).unwrap();
+                            ix.update(Slot(j as u32), |m| m.p = np);
+                            live[j] = Some(np);
+                        }
                     }
                 }
             }
             if n % 3 == 0 { ix.tick(); backends.push(ix.backend()); }
 
             // The invariant that must hold after EVERY op, whatever backend is loaded.
-            prop_assert_eq!(ix.len(), live.len(), "item count drifted on backend {:?}", ix.backend());
+            prop_assert_eq!(ix.len(), live.iter().flatten().count(), "item count drifted on backend {:?}", ix.backend());
         }
 
         for (cx, cy, cz, rr) in SPHERES {
             let s = Sphere3::new(cx, cy, cz, rr);
-            let mut want: Vec<(u64, u64, u64)> = live.iter()
+            let mut want: Vec<(u64, u64, u64)> = live.iter().flatten()
                 .filter(|p| { let (dx, dy, dz) = (p.x - cx, p.y - cy, p.z - cz); dx * dx + dy * dy + dz * dz <= rr * rr })
                 .map(|p| (p.x.to_bits(), p.y.to_bits(), p.z.to_bits())).collect();
             let mut got: Vec<(u64, u64, u64)> = ix.cull(&s).iter()
@@ -428,17 +452,19 @@ proptest! {
         // Above the WIDENED brute edge: brute_max 40 with margin 0.25 keeps the policy on
         // the scan up to 50 items, so a guard of >40 leaves it there and the phase never
         // fires. The hysteresis is behaving; the guard was wrong.
-        if live.len() > 80 {
+        if live.iter().flatten().count() > 80 {
+            let first = live.iter().position(|o| o.is_some()).unwrap();
             // Query-heavy: one cull per item per tick is the regime where rebuilding wins.
             for _ in 0..40 {
-                for p in live.iter().take(60) { let _ = ix.cull(&Sphere3::new(p.x, p.y, p.z, 8.0)); }
+                for p in live.iter().flatten().take(60) { let _ = ix.cull(&Sphere3::new(p.x, p.y, p.z, 8.0)); }
                 // One tiny nudge so the tick sees movement — a motionless workload would take
                 // the Static branch instead, which is the phase after this one. The MODEL
                 // moves with it: nudging only the index is how the first version of this
                 // test "found" a bug in the grid backend that was a stale reference.
-                let np = Point3::new(live[0].x + 0.001, live[0].y, live[0].z);
-                ix.update(Slot(0), |m| m.p = np);
-                live[0] = np;
+                let cur = live[first].unwrap();
+                let np = Point3::new(cur.x + 0.001, cur.y, cur.z);
+                ix.update(Slot(first as u32), |m| m.p = np);
+                live[first] = Some(np);
                 ix.tick();
             }
             prop_assert_eq!(ix.backend(), Backend::Grid, "query-heavy phase did not reach the grid");
@@ -452,7 +478,7 @@ proptest! {
 
         for k in KS {
             let q = Point3::new(120.0, 120.0, 120.0);
-            let mut brute: Vec<f64> = live.iter()
+            let mut brute: Vec<f64> = live.iter().flatten()
                 .map(|p| { let (dx, dy, dz) = (p.x - q.x, p.y - q.y, p.z - q.z); dx * dx + dy * dy + dz * dz }).collect();
             brute.sort_by(|a, b| a.total_cmp(b)); brute.truncate(k);
             let got: Vec<f64> = ix.knn(q, k).iter().map(|(d, _)| d * d).collect();
