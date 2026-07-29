@@ -162,6 +162,23 @@ repeated passes** on an idle machine, via `cargo run -p bench-runner --release`:
   and its second-best cull (3.65 µs) does not repay the difference. That is the median
   split's build cost showing up exactly where the 3D twin never has to pay it — the k-d
   trees are for data that stops moving.
+- **Or don't choose at all.** `AdaptiveIndex` (3D) and `AdaptiveIndex2` (2D) own the items
+  and hold whichever structure currently fits, migrating when the workload genuinely
+  changes: a brute scan while the population is small, `Tree3`/`Tree` + `ItemRef` while
+  things move, a rebuilt Morton grid when queries per item get high enough to pay for the
+  rebuild, `KdTree3`/`KdTree2` once nothing has moved for a while. Handles (`Slot`) survive
+  every migration *and* every removal — the item list is a slot table with a free list, not
+  a `Vec` that gets swap-removed, because compacting would silently repoint somebody else's
+  handle. The hysteresis is the hard part and it is deliberate: a candidate must win
+  `hold_ticks` consecutive ticks, boundaries widen by `margin` in the direction of travel,
+  and there is a `cooldown` after each switch — without those it flaps at the boundary and
+  loses to *both* candidates. Thresholds come from `VH_CALIBRATION` if you point it at a
+  file the `calibrate` example wrote, because the defaults are one machine's measurements.
+
+  Worth knowing: **in 2D the margins are thinner**, so it has less to win. The kept binary
+  tree leads by 1.6-7.6x on 3D maintain but trails a `QuadTree` by 4-10% in 2D. The two
+  policies are held identical by a test that runs one script of work through both and
+  compares the sequence of backends they pick.
 - **Don't reach for threads first.** Reads parallelise (`cull_many_par`), writes don't —
   the lever for write-heavy loops is `update_ref` + the right structure, not rayon. See
   [`PARALLEL.md`](PARALLEL.md).

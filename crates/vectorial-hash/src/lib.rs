@@ -45,6 +45,7 @@ pub mod linear_quadtree;
 pub mod morton3;
 pub mod morton;
 pub mod adaptive;
+pub mod adaptive2;
 pub mod advisor;
 
 pub use geom::{Point, Rect};
@@ -57,6 +58,7 @@ pub use tree3::{Aabb, Crossing, ItemRef, Node3, Node3Id, Point3, Polyhedron3, Po
 pub use octree3::{OCrossing, ONode, ONodeId, Octree3};
 pub use stencil::{Alignment, Row, SphereStencil};
 pub use adaptive::{AdaptiveIndex, Backend, Slot, Thresholds};
+pub use adaptive2::AdaptiveIndex2;
 pub use kdtree2::KdTree2;
 pub use kdtree3::KdTree3;
 pub use linear_octree3::LinearOctree3;
