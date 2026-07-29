@@ -727,6 +727,42 @@ one clamps its loops to the grid). It does not change the verdict for clustered 
 tree or `LinearOctree3` still answers a clustered k-NN with far less work, because a blob
 inside one grid cell has to be scanned whole however you reach it.
 
+### Better still: do not build a non-cubic grid
+
+Per-axis expansion makes a non-cubic grid survivable. The other move is to not have one — and
+it costs nothing, because the cell store is a **sparse hash**: declare the world as a cube and
+the cells come out cubic, with the empty layers above the data neither stored nor traversed.
+A 1000×300×1000 world becomes `Aabb::new(0,0,0, 1000,1000,1000)` at the same `levels`.
+
+| data | grid | cell (x,y,z) | used cells | tested/query | ms/query |
+| --- | --- | --- | ---: | ---: | ---: |
+| clustered | anisotropic, L5 | 31.2, 9.4, 31.2 | 38 | 12 933 | 0.0852 |
+| clustered | **cubic (padded), L5** | 31.2³ | 22 | 13 119 | **0.0517** |
+| clustered | cubic, L6 | 15.6³ | 72 | 11 307 | 0.2608 |
+| clustered | cubic, L7 | 7.8³ | 281 | 10 452 | 1.9844 |
+| uniform | anisotropic, L5 | 31.2, 9.4, 31.2 | 25 717 | 79.6 | 0.0021 |
+| uniform | **cubic (padded), L5** | 31.2³ | 10 128 | 119.9 | **0.0010** |
+| uniform | cubic, L6 | 15.6³ | 37 207 | 64.1 | 0.0022 |
+| uniform | cubic, L7 | 7.8³ | 48 125 | 30.0 | 0.0064 |
+
+**Cubic cells win in both distributions — 1.65× clustered, 2.1× uniform — while testing MORE
+points in both.** The saving is cells not visited, which the point counter cannot see; the
+third time in this document that has been the answer.
+
+**And smaller cubes lose, badly.** L7 (7.8³, near the intuitive "just use 10×10×10") is 23×
+slower on clustered data and 6.4× slower on uniform, despite testing 3× fewer points. Every
+cell is a hash lookup, and at 7.8³ this data holds ~0.08 points per cell, so gathering 8
+neighbours means crossing ~100 empty ones. **Size the cell to hold roughly `k` points**, not to
+some notion of resolution: the cubic L5 grid holds ~5 per cell on uniform data, which is why it
+wins. (On clustered data the grid has no good answer at any size — a blob inside one cell must
+be scanned whole. That is what `KdTree3`/`LinearOctree3` are for.)
+
+The one thing padding cannot give you is an arbitrary cell size: the side is
+`largest_axis / 2^levels`, so a 1000-wide world offers 31.25, 15.6, 7.8 — never exactly 10.
+Expressing a true 100×30×100 grid would need a per-axis `cells_per_axis`, which the structure
+does not have. On this evidence it would buy nothing: the padded cube already wins, and the
+finer grids it would enable are the slower ones.
+
 **The 2D `MortonGrid` had the identical problem on a non-square `Rect`** and got the identical
 fix, measured by the same bench — one fewer axis to over-scan, so the effect is smaller but the
 shape is the same:

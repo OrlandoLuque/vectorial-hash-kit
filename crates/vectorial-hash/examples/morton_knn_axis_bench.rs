@@ -128,6 +128,65 @@ fn main() {
         println!("#M d2aspect{}.knn_ms_per_query {:.5} ms", (aspect * 100.0) as u32, per);
     }
 
+    // ---- cell SHAPE, at one fixed world shape ------------------------------------------
+    // The expansion fix makes a non-cubic grid survivable. The other move is to not build one:
+    // `cells_per_axis` is a single number, so the only way to get cubic CELLS out of a
+    // non-cubic WORLD is to declare the world as a cube. The cell store is a sparse hash, so
+    // the empty layers above the data cost nothing to hold - the question is whether the
+    // resulting geometry is actually better, and at which cell size.
+    println!("
+cell shape - same 1000x300x1000 data, four ways to cut it up");
+    println!("{:<28} {:>12} {:>11} {:>14} {:>12}", "grid", "cell (x,y,z)", "used cells", "tested/query", "ms/query");
+    {
+        let (w, h) = (1000.0f64, 300.0f64);
+        let mut r = Lcg(0x5EED_1234);
+        let blobs: Vec<(f64, f64, f64)> = (0..6).map(|_| (r.r(0.1 * w, 0.9 * w), r.r(0.2 * h, 0.8 * h), r.r(0.1 * w, 0.9 * w))).collect();
+        let items: Vec<P> = (0..n).map(|_| {
+            let b = blobs[(r.f() * blobs.len() as f64) as usize % blobs.len()];
+            P { p: Point3::new((b.0 + r.r(-0.014 * w, 0.014 * w)).clamp(0.0, w),
+                (b.1 + r.r(-0.014 * h, 0.014 * h)).clamp(0.0, h),
+                (b.2 + r.r(-0.014 * w, 0.014 * w)).clamp(0.0, w)) }
+        }).collect();
+        let queries: Vec<Point3> = (0..nq).map(|_| Point3::new(r.r(0.0, w), r.r(0.0, h), r.r(0.0, w))).collect();
+
+      for clustered in [true, false] {
+        let items: Vec<P> = if clustered { items.clone() } else {
+            let mut u = Lcg(0xC0FFEE);
+            (0..n).map(|_| P { p: Point3::new(u.r(0.0, w), u.r(0.0, h), u.r(0.0, w)) }).collect()
+        };
+        println!("  -- {} data", if clustered { "clustered (6 tight blobs)" } else { "uniform" });
+        let mut reference: Option<Vec<f64>> = None;
+        for (label, world, lv) in [
+            ("anisotropic cells, L5", Aabb::new(0.0, 0.0, 0.0, w, h, w), 5u32),
+            ("cubic (world padded), L5", Aabb::new(0.0, 0.0, 0.0, w, w, w), 5),
+            ("cubic (world padded), L6", Aabb::new(0.0, 0.0, 0.0, w, w, w), 6),
+            ("cubic (world padded), L7", Aabb::new(0.0, 0.0, 0.0, w, w, w), 7),
+        ] {
+            let mut g = MortonGrid3::new(world, lv);
+            for it in &items { g.insert(*it); }
+            let cells = (1u32 << lv) as f64;
+            let (cx, cy, cz) = (world.w / cells, world.h / cells, world.d / cells);
+
+            TESTED.with(|c| c.set(0));
+            let mut all = Vec::with_capacity(nq * k);
+            for q in &queries { all.extend(g.knn(*q, k).iter().map(|(d, _)| *d)); }
+            let tested = TESTED.with(|c| c.get()) as f64 / nq as f64;
+            // Different granularity must not mean different answers.
+            match &reference {
+                None => reference = Some(all),
+                Some(rf) => assert!(rf.len() == all.len() && rf.iter().zip(&all).all(|(a, b)| (a - b).abs() <= 1e-9 * (1.0 + b.abs())),
+                    "{label} returned different neighbours"),
+            }
+            let s = common::measure(5, || { for q in &queries { std::hint::black_box(g.knn(*q, k).len()); } });
+            println!("{label:<28} {:>12} {:>11} {:>14.1} {:>12.4}",
+                format!("{cx:.1},{cy:.1},{cz:.1}"), g.cell_count(), tested, s.ms / nq as f64);
+            println!("#M shape_{}.knn_tested_per_query {:.1} n", label.replace([' ', ',', '(', ')'], "_"), tested);
+            let tag = if clustered { "cl" } else { "un" };
+            println!("#M shape_{tag}_{}.knn_ms_per_query {:.5} ms", label.replace([' ', ',', '(', ')'], "_"), s.ms / nq as f64);
+        }
+      }
+    }
+
     println!("\nreading: 'tested/query' is exact and machine-independent — the algorithmic number.");
     println!("'vs cubic' is each aspect's time against the cubic world's, which is the control:");
     println!("a flatter world holds the same points in the same clusters, so a big rise there is");
