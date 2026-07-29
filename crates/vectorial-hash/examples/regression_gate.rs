@@ -23,7 +23,7 @@
 
 use std::hint::black_box;
 use std::time::Instant;
-use vectorial_hash::{Aabb, Circle, KdTree3, LinearOctree3, LinearQuadTree, MortonGrid3, Octree3, Point, Point3, Positioned, Positioned3, QuadTree, Rect, Sphere3, Tree, Tree3};
+use vectorial_hash::{Aabb, Circle, KdTree2, KdTree3, LinearOctree3, LinearQuadTree, MortonGrid, MortonGrid3, Octree3, Point, Point3, Positioned, Positioned3, QuadTree, Rect, Sphere3, Tree, Tree3};
 
 const WORLD: f64 = 512.0;
 const N: usize = 20_000;
@@ -152,6 +152,11 @@ fn measure() -> Vec<(&'static str, f64)> {
     out.push(("knn_tree3_k16_x256", bench(|| { let mut n = 0u64; for q in &qp { n += tree3.knn(*q, 16).len() as u64; } n })));
     out.push(("knn_kdtree3_k16_x256", bench(|| { let mut n = 0u64; for q in &qp { n += kd3.knn(*q, 16).len() as u64; } n })));
     out.push(("knn_linear_octree3_k16_x256", bench(|| { let mut n = 0u64; for q in &qp { n += lo3.knn(*q, 16).len() as u64; } n })));
+    // The grid's k-NN was NOT gated, which is how a 2-21x improvement in it (per-axis
+    // expansion, 2026-07-29) passed through this file without leaving a mark. An op nobody
+    // gates is an op nobody notices moving, in either direction.
+    out.push(("knn_morton3_k16_x256", bench(|| { let mut n = 0u64; for q in &qp { n += morton3.knn(*q, 16).len() as u64; } n })));
+    out.push(("knn_octree3_k16_x256", bench(|| { let mut n = 0u64; for q in &qp { n += octree3.knn(*q, 16).len() as u64; } n })));
 
     // update: one frame of N relocations, predicate vs ItemRef.
     {
@@ -183,6 +188,18 @@ fn measure() -> Vec<(&'static str, f64)> {
     out.push(("cull_tree2_x64", bench(|| { let mut n = 0u64; for s in &qs2 { n += tree2.cull(s).len() as u64; } n })));
     out.push(("cull_quadtree2_x64", bench(|| { let mut n = 0u64; for s in &qs2 { n += quad2.cull(s).len() as u64; } n })));
     out.push(("cull_linear_quadtree_x64", bench(|| { let mut n = 0u64; for s in &qs2 { n += lq2.cull(s).len() as u64; } n })));
+
+    // 2D k-NN had NO coverage at all — not one structure. The 2D grid's k-NN changed the same
+    // night as the 3D one and this file would have said nothing either way.
+    let kd2 = KdTree2::from_items(IL, its2.clone());
+    let mlevels = MortonGrid::<C2>::levels_for_cell_size(rect, VISION);
+    let mut morton2 = MortonGrid::<C2>::new(rect, mlevels); for it in &its2 { morton2.insert(*it); }
+    let qp2: Vec<Point> = { let mut r = Rng::new(11); (0..256).map(|_| Point::new(r.range(0.0, WORLD), r.range(0.0, WORLD))).collect() };
+    out.push(("knn_tree2_k16_x256", bench(|| { let mut n = 0u64; for q in &qp2 { n += tree2.knn(*q, 16).len() as u64; } n })));
+    out.push(("knn_quadtree2_k16_x256", bench(|| { let mut n = 0u64; for q in &qp2 { n += quad2.knn(*q, 16).len() as u64; } n })));
+    out.push(("knn_kdtree2_k16_x256", bench(|| { let mut n = 0u64; for q in &qp2 { n += kd2.knn(*q, 16).len() as u64; } n })));
+    out.push(("knn_linear_quadtree_k16_x256", bench(|| { let mut n = 0u64; for q in &qp2 { n += lq2.knn(*q, 16).len() as u64; } n })));
+    out.push(("knn_morton2_k16_x256", bench(|| { let mut n = 0u64; for q in &qp2 { n += morton2.knn(*q, 16).len() as u64; } n })));
     out
 }
 
