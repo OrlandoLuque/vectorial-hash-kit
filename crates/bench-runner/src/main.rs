@@ -130,6 +130,7 @@ fn plan(group: &str) -> Vec<Bench> {
         b(VH, Example("key_compression_bench"), "", "sorted Morton keys: delta + varint shrink"),
         b(VH, Example("voxel_select_bench"), "", "block selection: naive vs bitmap vs spans vs chunk-skip"),
         b(VH, Example("work_counters"), "", "algorithmic work per query, no clock involved"),
+        b(VH, Example("morton_knn_axis_bench"), "", "morton k-NN vs world aspect: what non-cubic cells cost"),
     ];
     // --- GPU --------------------------------------------------------------------
     let gpu = || vec![
