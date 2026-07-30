@@ -124,16 +124,36 @@ fn print_rows(title: &str, rows: &[Row]) {
     }
 }
 
+/// Cells the grids looked up, when built with `--features grid-stats`. Without the feature
+/// there is nothing to report and the column is omitted — the counter genuinely does not exist
+/// in a normal build, which is the point of it being opt-in.
+///
+/// This column is why the feature was added. `cull` could be counted by wrapping the query and
+/// `knn` by wrapping the item, but both measure work done on POINTS, and a grid query that
+/// crosses a hundred empty cells does no work on any point. Three speed-ups this week were
+/// invisible to the point counters for exactly that reason.
+#[cfg(feature = "grid-stats")]
+fn cells_taken() -> Option<f64> { Some(vectorial_hash::morton3::reset_cell_visits() as f64) }
+#[cfg(not(feature = "grid-stats"))]
+fn cells_taken() -> Option<f64> { None }
+
 /// A row for `knn`/`raycast`: no `boxes` column, because neither verb classifies the query
 /// against a node box — they compare distances to it. Leaf work is the whole story here.
-struct QRow { name: String, tested: f64, found: f64 }
+struct QRow { name: String, tested: f64, found: f64, cells: Option<f64> }
 fn print_qrows(title: &str, found_label: &str, rows: &[QRow]) {
     println!("
 {title}");
-    println!("  {:<22} {:>12} {:>12} {:>10}", "structure", "tested/query", found_label, "waste");
+    let cells_col = if rows.first().and_then(|r| r.cells).is_some() { "cells/query" } else { "" };
+    println!("  {:<22} {:>12} {:>12} {:>10} {:>11}", "structure", "tested/query", found_label, "waste", cells_col);
     for r in rows {
         let waste = if r.found > 0.0 { r.tested / r.found } else { f64::NAN };
-        println!("  {:<22} {:>12.1} {:>12.2} {:>9.1}x", r.name, r.tested, r.found, waste);
+        match r.cells {
+            Some(c) => {
+                println!("  {:<22} {:>12.1} {:>12.2} {:>9.1}x {:>11.1}", r.name, r.tested, r.found, waste, c);
+                println!("#M {}.cells_per_query {:.2} n", r.name, c);
+            }
+            None => println!("  {:<22} {:>12.1} {:>12.2} {:>9.1}x", r.name, r.tested, r.found, waste),
+        }
         println!("#M {}.tested_per_query {:.2} n", r.name, r.tested);
         println!("#M {}.waste_ratio {:.3} x", r.name, waste);
     }
@@ -248,11 +268,19 @@ fn main() {
     // neighbours always come back, so `waste` reads directly as "points examined per
     // neighbour delivered" — the cleanest quality number in the file.
     let k: usize = std::env::var("WC_K").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
-    let knn3 = |f: &mut dyn FnMut(Point3) -> Vec<f64>| -> (f64, f64, Vec<Vec<f64>>) {
-        let (mut te, mut fo) = (0u64, 0u64);
+    let knn3 = |f: &mut dyn FnMut(Point3) -> Vec<f64>| -> (f64, f64, f64, Vec<Vec<f64>>) {
+        let (mut te, mut fo, mut ce) = (0u64, 0u64, 0.0f64);
         let mut all = Vec::with_capacity(nq);
-        for q in &q3 { pos_take(); let d = f(*q); te += pos_take(); fo += d.len() as u64; all.push(d); }
-        (te as f64 / nq as f64, fo as f64 / nq as f64, all)
+        for q in &q3 {
+            pos_take();
+            cells_taken();
+            let d = f(*q);
+            te += pos_take();
+            ce += cells_taken().unwrap_or(0.0);
+            fo += d.len() as u64;
+            all.push(d);
+        }
+        (te as f64 / nq as f64, fo as f64 / nq as f64, ce / nq as f64, all)
     };
     let mut rows = Vec::new();
     let (mut ref3, mut bad3): (Option<Vec<Vec<f64>>>, Vec<&str>) = (None, Vec::new());
@@ -263,18 +291,26 @@ fn main() {
         ("knn_linear_octree3", &mut |q| lin3.knn(q, k).iter().map(|(d, _)| *d).collect()),
         ("knn_morton3", &mut |q| mor3.knn(q, k).iter().map(|(d, _)| *d).collect()),
     ] {
-        let (te, fo, all) = knn3(f);
+        let (te, fo, ce, all) = knn3(f);
         match &ref3 { None => ref3 = Some(all), Some(r) if !same_dists(r, &all) => bad3.push(name), _ => {} }
-        rows.push(QRow { name: name.to_string(), tested: te, found: fo });
+        rows.push(QRow { name: name.to_string(), tested: te, found: fo, cells: cells_taken().map(|_| ce) });
     }
     print_qrows(&format!("3D - work per k-NN query (k={k})"), "neighbours", &rows);
     println!("  agreement: {}", if bad3.is_empty() { "EXACT (same k distances everywhere)".to_string() } else { format!("MISMATCH in {bad3:?}") });
 
-    let knn2 = |f: &mut dyn FnMut(Point) -> Vec<f64>| -> (f64, f64, Vec<Vec<f64>>) {
-        let (mut te, mut fo) = (0u64, 0u64);
+    let knn2 = |f: &mut dyn FnMut(Point) -> Vec<f64>| -> (f64, f64, f64, Vec<Vec<f64>>) {
+        let (mut te, mut fo, mut ce) = (0u64, 0u64, 0.0f64);
         let mut all = Vec::with_capacity(nq);
-        for q in &q2 { pos_take(); let d = f(*q); te += pos_take(); fo += d.len() as u64; all.push(d); }
-        (te as f64 / nq as f64, fo as f64 / nq as f64, all)
+        for q in &q2 {
+            pos_take();
+            cells_taken();
+            let d = f(*q);
+            te += pos_take();
+            ce += cells_taken().unwrap_or(0.0);
+            fo += d.len() as u64;
+            all.push(d);
+        }
+        (te as f64 / nq as f64, fo as f64 / nq as f64, ce / nq as f64, all)
     };
     let mut rows = Vec::new();
     let (mut ref2, mut bad2): (Option<Vec<Vec<f64>>>, Vec<&str>) = (None, Vec::new());
@@ -285,9 +321,9 @@ fn main() {
         ("knn_linear_quadtree", &mut |q| lin2.knn(q, k).iter().map(|(d, _)| *d).collect()),
         ("knn_morton2", &mut |q| mor2.knn(q, k).iter().map(|(d, _)| *d).collect()),
     ] {
-        let (te, fo, all) = knn2(f);
+        let (te, fo, ce, all) = knn2(f);
         match &ref2 { None => ref2 = Some(all), Some(r) if !same_dists(r, &all) => bad2.push(name), _ => {} }
-        rows.push(QRow { name: name.to_string(), tested: te, found: fo });
+        rows.push(QRow { name: name.to_string(), tested: te, found: fo, cells: cells_taken().map(|_| ce) });
     }
     print_qrows(&format!("2D - work per k-NN query (k={k})"), "neighbours", &rows);
     println!("  agreement: {}", if bad2.is_empty() { "EXACT (same k distances everywhere)".to_string() } else { format!("MISMATCH in {bad2:?}") });
@@ -333,7 +369,7 @@ fn main() {
         ("ray_morton3", &mut |o, d| srt(mor3.raycast(o, d, 1500.0, ray_r).hits.iter().map(|(t, _)| *t).collect())),
     ] {
         let (te, fo, all) = per_ray(f);
-        rows.push(QRow { name: name.to_string(), tested: te, found: fo });
+        rows.push(QRow { name: name.to_string(), tested: te, found: fo, cells: None });
         got.push((name, all));
     }
     print_qrows(&format!("3D - work per ray (capsule radius {ray_r}, length 1500)"), "hits", &rows);

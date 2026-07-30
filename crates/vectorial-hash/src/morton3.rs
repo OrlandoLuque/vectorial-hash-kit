@@ -122,6 +122,51 @@ pub struct MortonGrid3<T: Positioned3> {
     len: usize,
 }
 
+
+// ---------------------------------------------------------------- cell-visit counter
+
+/// Cells looked up by grid queries on this thread since the last reset — see the `grid-stats`
+/// feature. **Global and per-thread**, not per-grid: a tuning diagnostic, not instrumentation
+/// to build on. A rayon-parallel query spreads its counts over the worker threads, and this
+/// reports only the calling thread's share.
+///
+/// It exists because the repo's clock-free method has a structural blind spot. Wrapping the
+/// query counts `classify_aabb`/`contains_point`; wrapping the ITEM counts `position()`. Both
+/// measure work done on POINTS, so a grid query that crosses a hundred empty cells does no
+/// countable work at all — which is how three separate speed-ups this week landed with the
+/// point count essentially unchanged (`docs/MEASURING.md` § 8b).
+///
+/// Genuinely zero-cost when the feature is off: neither the counter nor the increments exist.
+#[cfg(feature = "grid-stats")]
+mod visits {
+    use std::cell::Cell;
+    thread_local! { pub static N: Cell<u64> = const { Cell::new(0) }; }
+}
+
+/// Cells visited by grid queries on this thread since [`reset_cell_visits`].
+#[cfg(feature = "grid-stats")]
+pub fn cell_visits() -> u64 { visits::N.with(|c| c.get()) }
+
+/// Zero the counter and return what it held.
+#[cfg(feature = "grid-stats")]
+pub fn reset_cell_visits() -> u64 { visits::N.with(|c| c.replace(0)) }
+
+#[cfg(feature = "grid-stats")]
+#[inline]
+pub(crate) fn count_cell() { visits::N.with(|c| c.set(c.get() + 1)); }
+
+#[cfg(not(feature = "grid-stats"))]
+#[inline(always)]
+pub(crate) fn count_cell() {}
+
+/// One cell lookup, counted. Every query path goes through this rather than touching the map
+/// directly, so the counter cannot drift out of step with the traversals it measures.
+#[inline]
+pub(crate) fn bucket_of<T>(cells: &std::collections::HashMap<u64, Vec<T>>, key: u64) -> Option<&Vec<T>> {
+    count_cell();
+    cells.get(&key)
+}
+
 /// What a grid's cells actually hold — the number the query cost turns on.
 ///
 /// A uniform grid is tuned by one knob, `levels`, and the natural way to set it is from a
@@ -320,7 +365,7 @@ impl<T: Positioned3> MortonGrid3<T> {
         for iz in iz0..=iz1 {
             for iy in iy0..=iy1 {
                 for ix in ix0..=ix1 {
-                    let bucket = match self.cells.get(&morton3(ix, iy, iz)) {
+                    let bucket = match bucket_of(&self.cells, morton3(ix, iy, iz)) {
                         Some(b) => b,
                         None => continue,
                     };
@@ -369,7 +414,7 @@ impl<T: Positioned3> MortonGrid3<T> {
         let raster = shape.voxel_raster();
         let mut out = Vec::new();
         let probe = |ix: u32, iy: u32, iz: u32, out: &mut Vec<&'a T>| {
-            let bucket = match self.cells.get(&morton3(ix, iy, iz)) { Some(b) => b, None => return };
+            let bucket = match bucket_of(&self.cells, morton3(ix, iy, iz)) { Some(b) => b, None => return };
             match shape.classify_aabb(&self.cell_box(ix, iy, iz)) {
                 CellState::Out => {}
                 CellState::In => out.extend(bucket.iter()),
@@ -446,7 +491,7 @@ impl<T: Positioned3> MortonGrid3<T> {
             }
             if (0..n).contains(&ix) && (0..n).contains(&iy) && (0..n).contains(&iz) {
                 out.leaves_visited += 1;
-                if let Some(bucket) = self.cells.get(&morton3(ix as u32, iy as u32, iz as u32)) {
+                if let Some(bucket) = bucket_of(&self.cells, morton3(ix as u32, iy as u32, iz as u32)) {
                     for it in bucket {
                         out.items_tested += 1;
                         let p = it.position();
@@ -533,7 +578,7 @@ impl<T: Positioned3> MortonGrid3<T> {
                 }
             }
             if (0..n).contains(&ix) && (0..n).contains(&iy) && (0..n).contains(&iz) {
-                if let Some(bucket) = self.cells.get(&morton3(ix as u32, iy as u32, iz as u32)) {
+                if let Some(bucket) = bucket_of(&self.cells, morton3(ix as u32, iy as u32, iz as u32)) {
                     for it in bucket {
                         let p = it.position();
                         let (apx, apy, apz) = (p.x - origin.x, p.y - origin.y, p.z - origin.z);
@@ -613,7 +658,7 @@ impl<T: Positioned3> MortonGrid3<T> {
             for ix in xs.0.max(0)..=xs.1.min(n - 1) {
                 for iy in ys.0.max(0)..=ys.1.min(n - 1) {
                     for iz in zs.0.max(0)..=zs.1.min(n - 1) {
-                        if let Some(bucket) = cells.get(&morton3(ix as u32, iy as u32, iz as u32)) {
+                        if let Some(bucket) = bucket_of(cells, morton3(ix as u32, iy as u32, iz as u32)) {
                             for it in bucket { knn_offer(heap, k, it, q); }
                         }
                     }

@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 
+use crate::morton3::bucket_of;
 use crate::culling::{collect_matching_items, Shape};
 use crate::geom::{Point, Rect};
 use crate::serde_io::{corrupt, r_rect, r_u32, r_u64, r_u8, w_rect, w_u32, w_u64, w_u8};
@@ -213,7 +214,7 @@ impl<T: Positioned> MortonGrid<T> {
         let iy1 = axis_index_n(bb.y_max(), self.world.y, self.ch, self.cells_per_axis);
         for iy in iy0..=iy1 {
             for ix in ix0..=ix1 {
-                let bucket = match self.cells.get(&morton2(ix, iy)) {
+                let bucket = match bucket_of(&self.cells, morton2(ix, iy)) {
                     Some(b) => b,
                     None => continue,
                 };
@@ -248,7 +249,7 @@ impl<T: Positioned> MortonGrid<T> {
         for &code in self.cells.keys() { coarse.insert(code >> (2 * shift)); }
         let mut out = Vec::new();
         let probe = |ix: u32, iy: u32, out: &mut Vec<&'a T>| {
-            let bucket = match self.cells.get(&morton2(ix, iy)) { Some(b) => b, None => return };
+            let bucket = match bucket_of(&self.cells, morton2(ix, iy)) { Some(b) => b, None => return };
             let cb = self.cell_box(ix, iy);
             let state = shape.classify_box(&cb).unwrap_or(if cb.intersects(&bb) { CellState::Maybe } else { CellState::Out });
             match state { CellState::Out => {}, CellState::In => out.extend(bucket.iter()), CellState::Maybe => collect_matching_items(bucket, shape, &bb, out) }
@@ -297,7 +298,7 @@ impl<T: Positioned> MortonGrid<T> {
         let scan = |heap: &mut std::collections::BinaryHeap<KnnEntry<'a, T>>, xs: (i64, i64), ys: (i64, i64)| {
             for ix in xs.0.max(0)..=xs.1.min(n - 1) {
                 for iy in ys.0.max(0)..=ys.1.min(n - 1) {
-                    if let Some(bucket) = cells.get(&morton2(ix as u32, iy as u32)) {
+                    if let Some(bucket) = bucket_of(cells, morton2(ix as u32, iy as u32)) {
                         for it in bucket {
                             knn_offer2(heap, k, it, q);
                         }
@@ -377,7 +378,7 @@ impl<T: Positioned> MortonGrid<T> {
             }
             if (0..n).contains(&ix) && (0..n).contains(&iy) {
                 out.leaves_visited += 1;
-                if let Some(bucket) = self.cells.get(&morton2(ix as u32, iy as u32)) {
+                if let Some(bucket) = bucket_of(&self.cells, morton2(ix as u32, iy as u32)) {
                     for it in bucket {
                         out.items_tested += 1;
                         let p = it.position();
@@ -451,7 +452,7 @@ impl<T: Positioned> MortonGrid<T> {
                 }
             }
             if (0..n).contains(&ix) && (0..n).contains(&iy) {
-                if let Some(bucket) = self.cells.get(&morton2(ix as u32, iy as u32)) {
+                if let Some(bucket) = bucket_of(&self.cells, morton2(ix as u32, iy as u32)) {
                     for it in bucket {
                         let p = it.position();
                         let (apx, apy) = (p.x - origin.x, p.y - origin.y);

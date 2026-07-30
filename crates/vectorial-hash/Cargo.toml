@@ -20,6 +20,15 @@ neighbors = []
 # serial `cull_many` is always available and rayon stays out of the dependency
 # tree entirely unless this is enabled.
 parallel = ["dep:rayon"]
+# Counts CELLS VISITED by the Morton grids' queries. Off by default and genuinely absent when
+# off: with the feature disabled the counter is not compiled and the hot path is unchanged.
+#
+# It exists because the repo's clock-free method has a structural blind spot. Wrapping the
+# query counts `classify_aabb`/`contains_point`, and wrapping the ITEM counts `position()`, so
+# both measure work done ON POINTS. A grid query that crosses a hundred empty cells does no
+# work on any point and is invisible to both — which is how a 2.3x speed-up landed with the
+# point count essentially unchanged, three separate times (docs/MEASURING.md 8b).
+grid-stats = []
 
 [dependencies]
 # Keep this crate dependency-light on purpose: it is the core algorithm.

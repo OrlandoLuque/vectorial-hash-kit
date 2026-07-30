@@ -140,6 +140,14 @@ The rule: counts prove an algorithmic change; they do not bound one. When a coun
 "nothing changed" and a clock disagrees, the clock may be measuring something you did not
 think to count.
 
+**And then count that too.** The blind spot was structural rather than fundamental, so the
+grids gained a `grid-stats` feature: an opt-in, thread-local counter of cells looked up, routed
+through a single `bucket_of` helper that every query path goes through so it cannot drift out
+of step with the traversals. Off by default and genuinely absent when off — neither the counter
+nor the increments are compiled. `work_counters` grows a `cells/query` column when built with
+it, and the first thing that column said was that a clustered `MortonGrid3` k-NN visits **6 888
+cells to return 8 neighbours** (2D: 203). That number had never appeared in any table here.
+
 ## 9. Publish from an idle machine
 
 None of the above removes contention: another process still evicts your cache lines and eats
