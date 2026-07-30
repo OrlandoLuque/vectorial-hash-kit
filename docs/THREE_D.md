@@ -792,6 +792,18 @@ So the rule is about the **data's** aspect, not the world's:
 Both halves are the same underlying variable — a cell should hold roughly `k` points, and its
 shape should reflect where the points actually are.
 
+`MortonGrid3::occupancy()` / `MortonGrid::occupancy()` report exactly that: non-empty cells,
+items, mean per non-empty cell, and the fullest cell. It is a **diagnostic, not a predictor**,
+and there is deliberately no `levels_for_occupancy` beside `levels_for_cell_size` — the point
+cloud above shows occupancy alone does not decide the winner, since restoring its occupancy
+under cubic cells still left it slower. Measure the grid you built; do not compute it.
+
+One trap, pinned by a test because the obvious reading is wrong: **`max / mean` is not the skew
+signal.** It degenerates precisely when skew is worst — data collapsed into one cell has
+`max == mean` and reads 1.0, the same as a perfectly uniform grid. Read `mean` and `cells`
+instead (measured: 2000 points spread gave `cells 499, mean 4.0`; the same 2000 in one corner
+gave `cells 1, mean 2000`).
+
 **The 2D `MortonGrid` had the identical problem on a non-square `Rect`** and got the identical
 fix, measured by the same bench — one fewer axis to over-scan, so the effect is smaller but the
 shape is the same:
