@@ -453,6 +453,39 @@ impl FlowField {
 
 // ------------------------------------------------------------------ towers
 
+/// World box for the Morton index — **a cube**, not the play area.
+///
+/// `MortonGrid3` derives one cell side from `levels` for all three axes, so the real world
+/// (1800 x 72 x 1800) produced cells of 56.25 x 2.25 x 56.25: slabs. A slab grid needs several
+/// times the cell lookups to cover any query that spans the vertical, and it also pinned
+/// `levels` at 5 — going finer sliced the 72-unit axis into ribbons and made the big rings
+/// three times SLOWER, which is why this was stuck there.
+///
+/// Declaring the world as a cube fixes the cell shape at no cost, because the cell store is a
+/// sparse hash: the layers above the play area are never stored and never traversed. With cubic
+/// cells, `levels` is free to move, and 6 is the measured balance point.
+///
+/// Measured on the real population and query mix (`examples/horde_grid_shape`, 50k units),
+/// against the shipped slab grid at levels 5:
+///
+/// | query | slab L5 | cube L5 | slab L6 | **cube L6** | cube L7 |
+/// | --- | ---: | ---: | ---: | ---: | ---: |
+/// | cull r=3 (separation, once per awake unit) | 1.00x | 1.06x | 1.26x | **1.72x** | 2.17x |
+/// | cull r=55 (guard) | 1.00x | 1.69x | 0.51x | **1.84x** | 1.14x |
+/// | cull r=84 (tower ring) | 1.00x | 2.28x | 0.38x | **1.91x** | 0.79x |
+/// | cull r=110 (sector) | 1.00x | 2.61x | 0.34x | **1.69x** | 0.57x |
+/// | knn k=8 (tower aim) | 1.00x | 1.53x | 1.01x | **1.96x** | 2.48x |
+/// | knn k=48 (commander) | 1.00x | 1.21x | 1.09x | **1.63x** | 1.74x |
+///
+/// Small queries want fine cells and big ones want coarse cells, so most columns win somewhere
+/// and lose somewhere. Cube L6 is the only one that never drops below 1.63x. L7 and L8 win the
+/// tiny separation cull outright and then collapse on the rings (down to 0.09x), which is the
+/// occupancy rule biting from the other side.
+fn zgrid_world() -> Aabb { Aabb::new(0.0, -8.0, 0.0, WORLD, WORLD, WORLD) }
+/// See [`zgrid_world`] — 6 is the measured balance, and it is only reachable because the cells
+/// are cubes.
+const ZGRID_LEVELS: u32 = 6;
+
 pub const TOWER_RANGE: f64 = 84.0; // reach a bit further down the funnel
 pub const TOWER_DMG: f64 = 150.0;
 pub const TOWER_RELOAD: f64 = 0.6; // faster — the towers are the TAB backbone (balance harness)
@@ -977,7 +1010,7 @@ impl Horde {
             // dominant cull) touch ~6k cells instead of the 270k that levels=7
             // costs (the grid splits EVERY axis 2^levels ways — on a 68-wu-tall
             // world the y axis shreds into confetti and big culls pay for it).
-            zmode: ZMode::Tree, zmorton: vectorial_hash::MortonGrid3::new(world, 5),
+            zmode: ZMode::Tree, zmorton: vectorial_hash::MortonGrid3::new(zgrid_world(), ZGRID_LEVELS),
         };
         h.gates = h.structures.iter().enumerate().filter(|(_, s)| s.kind == SKind::Gate).map(|(i, _)| i).collect();
         h.spawn_defenders();
@@ -1230,7 +1263,7 @@ impl Horde {
         let world = Aabb::new(0.0, -8.0, 0.0, WORLD, SKY + 8.0, WORLD);
         self.zindex = Tree3::new(world, 8);
         self.handles = vec![None; self.units.len()];
-        self.zmorton.clear();
+        self.zmorton = vectorial_hash::MortonGrid3::new(zgrid_world(), ZGRID_LEVELS);
         self.sync_index(); // queryable immediately (renderers cull between steps)
     }
 

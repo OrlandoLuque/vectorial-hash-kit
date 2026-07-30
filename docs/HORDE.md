@@ -284,6 +284,44 @@ shaders. Fresh corpses spill **blood pools** and a **kill ring** (ground
 decals, one instanced draw); breaches, wave landings and the run ending
 kick a **trauma camera** (rotational shake ∝ trauma², the GDC rule).
 
+## The `M` toggle's grid: cubic cells, and what the toggle actually shows (2026-07-31)
+
+`M` swaps the zombie index between `Tree3` + `ItemRef` and `MortonGrid3`. The grid was built on
+the play area — 1800 × 72 × 1800 — and since `MortonGrid3` derives one cell side from `levels`
+for all three axes, that produced cells of **56.25 × 2.25 × 56.25**: slabs. Declaring the index
+world as a **cube** instead costs nothing (the cell store is a sparse hash, so the layers above
+the play area are never stored and never traversed) and it frees `levels`, which was pinned at
+5 because finer slabs sliced the 72-unit axis into ribbons.
+
+Measured on the real population and the real query mix (`examples/horde_grid_shape`, 50k units,
+against the shipped slab grid at levels 5):
+
+| query | slab L5 | cube L5 | slab L6 | **cube L6** | cube L7 | cube L8 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| cull r=3 — separation, once per awake unit | 1.00× | 1.06× | 1.26× | **1.72×** | 2.17× | 2.19× |
+| cull r=55 — guard | 1.00× | 1.69× | 0.51× | **1.84×** | 1.14× | 0.27× |
+| cull r=84 — tower ring | 1.00× | 2.28× | 0.38× | **1.91×** | 0.79× | 0.14× |
+| cull r=110 — sector | 1.00× | 2.61× | 0.34× | **1.69×** | 0.57× | 0.09× |
+| k-NN k=8 — tower aim | 1.00× | 1.53× | 1.01× | **1.96×** | 2.48× | 2.29× |
+| k-NN k=48 — commander | 1.00× | 1.21× | 1.09× | **1.63×** | 1.74× | 1.34× |
+
+Small queries want fine cells, big ones want coarse cells, so most columns win somewhere and
+lose somewhere — `cube L6` is the only one that never drops below **1.63×**, and that is what
+ships. The prediction going in was that the radius-3 separation cull would *lose* under cubic
+cells, since one cubic cell holds the whole vertical column where a slab holds a sliver of it.
+It does test more points (316 vs 290 at L5) and it is still faster: the lookups saved outweigh
+the extra distance tests. L7 and L8 win that query outright and then fall off a cliff on the
+rings, down to 0.09×, which is the occupancy rule biting from the other end.
+
+**But the toggle is not a speed option, and the same measurement is what says so.** End to end
+on 50k units the grid path costs **7.31 ms/step against the kept tree's 0.65** — 11× worse —
+and the geometry fix moved it only from 8.41 to 7.31 (1.15×). The grid's problem in this demo
+is not how it answers, it is that `M` mode **rebuilds all 50 000 units every frame** while the
+tree keeps them and skips the sleepers entirely. A 1.9× on the queries cannot pay for that.
+`M` demonstrates the keep-versus-rebuild law the kit is built around; it is not an alternative
+to the default. (The library-side fix that made the queries fast is in
+[`THREE_D.md`](THREE_D.md) § "Better still: do not build a non-cubic grid".)
+
 ## Still queued
 
 The Quaternius Ultimate Fantasy RTS wall/tower models to replace the
