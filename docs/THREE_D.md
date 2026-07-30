@@ -763,6 +763,35 @@ Expressing a true 100×30×100 grid would need a per-axis `cells_per_axis`, whic
 does not have. On this evidence it would buy nothing: the padded cube already wins, and the
 finer grids it would enable are the slower ones.
 
+#### When padding is WRONG — the audit that found the boundary
+
+The table above is measured on data that occupies a **thin slice** of a flat world, and that
+turns out to be the condition, not a detail. Every `MortonGrid` construction in the kit was
+audited against it and only one of four qualified:
+
+| site | world | what the data does | verdict |
+| --- | --- | --- | --- |
+| `horde_sim` | 1800 × 72 × 1800 | units in a ~25-unit band | **padded** — 1.63–1.96× on every query |
+| `pointcloud_wgpu` | 1000 × 400 × 1000 | fills all 400 of y | **left alone** — padding cost 273 → 335–379 ms |
+| `fluid_wgpu` (2D) | 1200 × 780 | fills the tank | **left alone** — query 1.606 → 1.685 ms |
+| `critters3d`, `critters3d_headless` | cubic already | — | nothing to do |
+
+The point cloud is the instructive one. Its slab cells were 15.6 × 6.2 × 15.6, and padding
+coarsened the y side by 2.5× — so each cell swallowed 2.5× more points and the k-NN got
+**slower**, by 1.2–1.4×. Re-picking the level to restore the occupancy did not rescue it
+either. Its anisotropic cells were *already right*, because they matched the anisotropy of the
+data rather than of the world.
+
+So the rule is about the **data's** aspect, not the world's:
+
+> Pad the index world to a cube when the data occupies a thin slice of a non-cubic world —
+> there the slab cells are far finer than they need to be along the short axis and every query
+> pays extra lookups to cross them. Do not pad when the data fills the box: those slabs are
+> proportionate, and squaring them just makes each cell hold more points.
+
+Both halves are the same underlying variable — a cell should hold roughly `k` points, and its
+shape should reflect where the points actually are.
+
 **The 2D `MortonGrid` had the identical problem on a non-square `Rect`** and got the identical
 fix, measured by the same bench — one fewer axis to over-scan, so the effect is smaller but the
 shape is the same:
