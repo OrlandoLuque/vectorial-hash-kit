@@ -175,6 +175,19 @@ impl<T: Positioned> MortonGrid<T> {
     }
 
     pub fn item_count(&self) -> usize { self.len }
+    /// Measure what the cells hold — see [`crate::morton3::Occupancy`]. O(non-empty cells).
+    pub fn occupancy(&self) -> crate::morton3::Occupancy {
+        let mut max = 0usize;
+        for b in self.cells.values() { max = max.max(b.len()); }
+        let cells = self.cells.len();
+        crate::morton3::Occupancy {
+            cells,
+            items: self.len,
+            mean: if cells == 0 { 0.0 } else { self.len as f64 / cells as f64 },
+            max,
+        }
+    }
+
     pub fn cell_count(&self) -> usize { self.cells.len() }
     pub fn levels(&self) -> u32 { self.levels }
 

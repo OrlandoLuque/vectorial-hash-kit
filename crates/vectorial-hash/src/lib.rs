@@ -63,6 +63,6 @@ pub use kdtree2::KdTree2;
 pub use kdtree3::KdTree3;
 pub use linear_octree3::LinearOctree3;
 pub use linear_quadtree::LinearQuadTree;
-pub use morton3::MortonGrid3;
+pub use morton3::{MortonGrid3, Occupancy};
 pub use morton::MortonGrid;
 pub use advisor::{SpatialProfile, StructureHint};

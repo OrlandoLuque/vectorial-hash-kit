@@ -122,6 +122,47 @@ pub struct MortonGrid3<T: Positioned3> {
     len: usize,
 }
 
+/// What a grid's cells actually hold — the number the query cost turns on.
+///
+/// A uniform grid is tuned by one knob, `levels`, and the natural way to set it is from a
+/// length: "make the cell about the size of my query radius". Measured across four workloads
+/// in this repo, length is the wrong variable and **occupancy** is the right one: what decides
+/// the cost of a query is how many points it has to test per cell it visits, and a grid whose
+/// cells hold 0.08 points spends all its time crossing empty ones (23x slower than the same
+/// grid one level coarser — `examples/morton_knn_axis_bench`).
+///
+/// This is deliberately a **diagnostic and not a predictor**. There is no
+/// `levels_for_occupancy` alongside `levels_for_cell_size`, because occupancy alone does not
+/// determine the winner: re-picking the level of a cube-padded point-cloud grid to restore its
+/// original points-per-cell still left it 1.3x slower than the anisotropic grid it replaced
+/// (`docs/POINTCLOUD.md`). Cell *shape* matters too, and it should follow where the points are.
+/// So: measure your grid, do not compute it.
+///
+/// `mean` is over **non-empty** cells, which is the only kind a traversal can pay for, and it
+/// is the number to read first: far above the `k` you ask for means the grid is too coarse for
+/// this data, far below means queries are spending their time crossing empty cells.
+///
+/// For skew, read `mean` and `cells` together rather than `max / mean`. That ratio looks like
+/// the obvious skew signal and **degenerates exactly when skew is worst**: once the data
+/// collapses into a single cell, `max == mean` and it reads 1.0, the same as a perfectly
+/// uniform grid. Measured: 2000 points spread over a world gave `cells: 499, mean: 4.0,
+/// max: 10` (ratio 2.5), and the same 2000 points in one corner gave `cells: 1, mean: 2000,
+/// max: 2000` (ratio 1.0). The collapse is visible in `cells` and in `mean`, not in the
+/// ratio. A `mean` in the hundreds is the signature that sends you to `KdTree3` or
+/// `LinearOctree3` instead.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Occupancy {
+    /// Non-empty cells. Empty ones are not stored (the backing store is a sparse hash) and
+    /// cost nothing to hold — but they still cost a lookup each to cross.
+    pub cells: usize,
+    /// Items in the grid.
+    pub items: usize,
+    /// Items per non-empty cell. Aim for roughly the `k` you ask k-NN for.
+    pub mean: f64,
+    /// The fullest cell. `max / mean` is how skewed the data is.
+    pub max: usize,
+}
+
 impl<T: Positioned3> MortonGrid3<T> {
     /// `levels` sets the resolution: `2^levels` cells per axis (so cell size is
     /// `world_dim / 2^levels`). 1..=21.
@@ -232,6 +273,20 @@ impl<T: Positioned3> MortonGrid3<T> {
     pub fn clear(&mut self) {
         self.cells.clear();
         self.len = 0;
+    }
+
+    /// Measure what the cells hold — see [`Occupancy`]. O(non-empty cells); call it when
+    /// tuning, not per frame.
+    pub fn occupancy(&self) -> Occupancy {
+        let mut max = 0usize;
+        for b in self.cells.values() { max = max.max(b.len()); }
+        let cells = self.cells.len();
+        Occupancy {
+            cells,
+            items: self.len,
+            mean: if cells == 0 { 0.0 } else { self.len as f64 / cells as f64 },
+            max,
+        }
     }
 
     pub fn item_count(&self) -> usize { self.len }
@@ -675,6 +730,57 @@ impl<T: Positioned3> MortonGrid3<T> {
             grid.cells.insert(code, bucket);
         }
         Ok(grid)
+    }
+}
+
+#[cfg(test)]
+mod occupancy_tests {
+    use super::*;
+
+    #[derive(Clone, Copy)]
+    struct P { p: Point3 }
+    impl Positioned3 for P { fn position(&self) -> Point3 { self.p } }
+
+    /// Each field is checked against a layout whose answer is known by construction, because
+    /// "it returns some numbers" is not a test of a diagnostic.
+    #[test]
+    fn occupancy_reports_what_the_cells_actually_hold() {
+        let world = Aabb::new(0.0, 0.0, 0.0, 64.0, 64.0, 64.0);
+        let mut g: MortonGrid3<P> = MortonGrid3::new(world, 2); // 4 cells/axis, side 16
+        assert_eq!(g.occupancy(), Occupancy { cells: 0, items: 0, mean: 0.0, max: 0 }, "empty grid");
+
+        // 5 points inside one cell, 1 in another: 6 items, 2 cells, mean 3, max 5.
+        for i in 0..5 { g.insert(P { p: Point3::new(1.0 + i as f64, 1.0, 1.0) }); }
+        g.insert(P { p: Point3::new(50.0, 50.0, 50.0) });
+        let o = g.occupancy();
+        assert_eq!((o.cells, o.items, o.max), (2, 6, 5));
+        assert!((o.mean - 3.0).abs() < 1e-12, "mean over NON-EMPTY cells, got {}", o.mean);
+
+        // The empty cells are the point: 4^3 = 64 exist geometrically, 2 are stored.
+        assert_eq!(g.cell_count(), 2, "empty cells must not be stored");
+    }
+
+    /// The skew signature the docs tell callers to look for — and, just as importantly, the
+    /// one they are told NOT to use. `max / mean` reads 1.0 for data collapsed into a single
+    /// cell, which is the worst case, so this pins both halves of that claim.
+    #[test]
+    fn clustering_shows_up_in_mean_and_cells_not_in_max_over_mean() {
+        let world = Aabb::new(0.0, 0.0, 0.0, 1000.0, 1000.0, 1000.0);
+        let mut uniform: MortonGrid3<P> = MortonGrid3::new(world, 3);
+        let mut clumped: MortonGrid3<P> = MortonGrid3::new(world, 3);
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; ((x >> 40) as f64) / (1u64 << 24) as f64 };
+        for _ in 0..2000 {
+            uniform.insert(P { p: Point3::new(rnd() * 999.0, rnd() * 999.0, rnd() * 999.0) });
+            clumped.insert(P { p: Point3::new(rnd() * 40.0, rnd() * 40.0, rnd() * 40.0) });
+        }
+        let (u, c) = (uniform.occupancy(), clumped.occupancy());
+        assert!(c.mean > 20.0 * u.mean, "clustering must show up in mean: {c:?} vs {u:?}");
+        assert!(c.cells * 20 < u.cells, "and in the cell count collapsing: {c:?} vs {u:?}");
+        // The trap, asserted so the doc's warning cannot rot: the ratio says the collapsed
+        // grid is LESS skewed than the uniform one.
+        assert!(c.max as f64 / c.mean <= u.max as f64 / u.mean,
+            "max/mean is expected to be useless here — if this ever fails, revisit the docs: {c:?} vs {u:?}");
     }
 }
 
