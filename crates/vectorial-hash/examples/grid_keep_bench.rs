@@ -19,6 +19,7 @@
 #[path = "common/mod.rs"]
 mod common;
 
+use vectorial_hash::linear_octree3::LinearOctree3;
 use vectorial_hash::morton3::Crossed;
 use vectorial_hash::{Aabb, MortonGrid3, Point3, Positioned3};
 
@@ -142,6 +143,74 @@ fn main() {
         println!("#M moving{}.keep_ms {keep_ms:.5} ms", (pct * 10.0) as u32);
         println!("#M moving{}.speedup {:.3} x", (pct * 10.0) as u32, rebuild_ms / keep_ms);
     }
+
+    // ---- the adaptive twin, and the price of keeping an adaptive structure ----------------
+    // LinearOctree3 has the same bucket-hash storage and had the same omission. It also has
+    // something the flat grid does not: adaptive depth. A kept copy holds splits made for a
+    // distribution the points have left and never merges an emptied leaf, so its SHAPE drifts
+    // from a rebuild's. The answers stay identical (tested); the question this measures is
+    // whether the queries stay as fast.
+    println!("\nLinearOctree3 — same sweep, plus what the shape drift costs");
+    println!("{:<10} {:>13} {:>13} {:>11} {:>10} {:>12}", "moving", "keep ms/frame", "rebuild ms", "speed-up", "leaves", "cull vs fresh");
+    for pct in [100.0f64, 10.0, 1.0] {
+        let movers = ((n as f64 * pct / 100.0) as usize).max(1);
+        let mut script = Rng(0xA11CE);
+        let steps: Vec<Point3> = (0..movers * frames)
+            .map(|_| Point3::new(script.r(-40.0, 40.0), script.r(-40.0, 40.0), script.r(-40.0, 40.0)))
+            .collect();
+
+        let mut kept = LinearOctree3::from_items(world, 16, 12, base.clone());
+        let mut pos: Vec<Point3> = base.iter().map(|m| m.p).collect();
+        let keep_ms = common::wall_ms(3, || {
+            for f in 0..frames {
+                for i in 0..movers {
+                    let d = steps[f * movers + i];
+                    let old = pos[i];
+                    let np = Point3::new((old.x + d.x).clamp(0.0, W - 0.1), (old.y + d.y).clamp(0.0, W - 0.1), (old.z + d.z).clamp(0.0, W - 0.1));
+                    let id = i as u32;
+                    kept.update(old, |it| it.id == id, |it| it.p = np);
+                    pos[i] = np;
+                }
+            }
+        }) / frames as f64;
+
+        let mut items = base.clone();
+        let mut rebuild_ms = 0.0;
+        let mut rebuilt = LinearOctree3::from_items(world, 16, 12, items.clone());
+        rebuild_ms += common::wall_ms(3, || {
+            for f in 0..frames {
+                for i in 0..movers {
+                    let d = steps[f * movers + i];
+                    let old = items[i].p;
+                    items[i].p = Point3::new((old.x + d.x).clamp(0.0, W - 0.1), (old.y + d.y).clamp(0.0, W - 0.1), (old.z + d.z).clamp(0.0, W - 0.1));
+                }
+                rebuilt = LinearOctree3::from_items(world, 16, 12, items.clone());
+            }
+        }) / frames as f64;
+
+        // Same answers, still?
+        for (cx, cy, cz, r) in [(200.0, 200.0, 200.0, 60.0), (700.0, 400.0, 300.0, 90.0)] {
+            let s = vectorial_hash::Sphere3::new(cx, cy, cz, r);
+            let mut a: Vec<u32> = kept.cull(&s).iter().map(|m| m.id).collect();
+            let mut b: Vec<u32> = rebuilt.cull(&s).iter().map(|m| m.id).collect();
+            a.sort_unstable(); b.sort_unstable();
+            assert_eq!(a, b, "kept and rebuilt LinearOctree3 disagree at {pct}% moving");
+        }
+
+        // The drift, priced: the same culls against the kept tree and against a fresh one
+        // built from its own current contents.
+        let probes: Vec<Point3> = (0..200).map(|i| pos[(i * 7919) % pos.len()]).collect();
+        let fresh = LinearOctree3::from_items(world, 16, 12, items.clone());
+        let cull_kept = common::wall_ms(5, || { for q in &probes { std::hint::black_box(kept.cull(&vectorial_hash::Sphere3::new(q.x, q.y, q.z, 30.0)).len()); } });
+        let cull_fresh = common::wall_ms(5, || { for q in &probes { std::hint::black_box(fresh.cull(&vectorial_hash::Sphere3::new(q.x, q.y, q.z, 30.0)).len()); } });
+
+        println!("{:<10} {keep_ms:>13.4} {rebuild_ms:>13.4} {:>10.2}x {:>10} {:>11.2}x",
+            format!("{pct}%"), rebuild_ms / keep_ms, kept.leaf_count(), cull_kept / cull_fresh);
+        println!("#M lin_moving{}.speedup {:.3} x", (pct * 10.0) as u32, rebuild_ms / keep_ms);
+        println!("#M lin_moving{}.cull_drift {:.3} x", (pct * 10.0) as u32, cull_kept / cull_fresh);
+    }
+    println!("  (leaves: a rebuild at 100% moving ends with {} — the kept tree's count is the drift.)",
+        LinearOctree3::from_items(world, 16, 12, base.clone()).leaf_count());
 
     println!("\nreading: a rebuild costs the same however few items moved, so the speed-up is roughly");
     println!("the reciprocal of the moving fraction — until the moving fraction is high enough that");

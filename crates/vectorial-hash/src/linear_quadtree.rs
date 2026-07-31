@@ -25,6 +25,7 @@
 //! *template* path the pointer `QuadTree` offers is not wired here; the analytic /
 //! bbox path is exact regardless.)
 
+use crate::morton3::Crossed;
 use crate::culling::{Capsule, Shape};
 use crate::geom::{Point, Rect};
 use crate::serde_io::{corrupt, r_f64, r_u32, r_u64, r_u8, w_f64, w_u32, w_u64, w_u8};
@@ -113,6 +114,61 @@ impl<T: Positioned> LinearQuadTree<T> {
             let items = self.leaves.remove(&key).expect("just inserted");
             self.subdivide(key, rc, items);
         }
+    }
+
+    /// **Move an item that is already in the tree, in place.**
+    ///
+    /// Same bargain as [`crate::MortonGrid::update`]: the caller says where the item *was*,
+    /// so only that one leaf is scanned. If the item has not left its leaf there is nothing to
+    /// do at all; if it has, it is re-inserted through the normal path, which subdivides the
+    /// destination if that tips it over `capacity`.
+    ///
+    /// **This structure drifts in SHAPE, and the grids do not.** A flat grid maintained in
+    /// place is byte-identical to a rebuilt one, because its cells are fixed. This one is
+    /// adaptive: it keeps splits made for a distribution the points have since left, and it
+    /// never merges a leaf that has emptied out. What is guaranteed is that it keeps giving
+    /// the *same answers* as a rebuild — the tests check cull sets and k-NN distances, not
+    /// leaf counts. What is not guaranteed is that it keeps answering them as *fast*: on a
+    /// workload that migrates across the world, rebuild periodically or accept the drift.
+    pub fn update<P, M>(&mut self, old: Point, predicate: P, mutate: M) -> Crossed
+    where
+        P: Fn(&T) -> bool,
+        M: FnOnce(&mut T),
+    {
+        if !self.world.contains(old) { return Crossed::Missing; }
+        let (from, _) = self.leaf_for(old);
+        let (idx, p) = {
+            let Some(bucket) = self.leaves.get_mut(&from) else { return Crossed::Missing };
+            let Some(idx) = bucket.iter().position(&predicate) else { return Crossed::Missing };
+            mutate(&mut bucket[idx]);
+            (idx, bucket[idx].position())
+        };
+        if !self.world.contains(p) {
+            self.take_at(from, idx);
+            return Crossed::Left;
+        }
+        let (to, _) = self.leaf_for(p);
+        if to == from { return Crossed::Stayed; }
+        let item = self.take_at(from, idx);
+        self.insert(item);
+        Crossed::Moved
+    }
+
+    /// **Remove an item, given where it was** — the companion to [`Self::update`].
+    pub fn remove<P: Fn(&T) -> bool>(&mut self, old: Point, predicate: P) -> Option<T> {
+        if !self.world.contains(old) { return None; }
+        let (key, _) = self.leaf_for(old);
+        let idx = self.leaves.get(&key)?.iter().position(&predicate)?;
+        Some(self.take_at(key, idx))
+    }
+
+    /// Pull item `idx` out of leaf `key`, dropping the leaf if that empties it.
+    fn take_at(&mut self, key: u64, idx: usize) -> T {
+        let bucket = self.leaves.get_mut(&key).expect("caller located this leaf");
+        let item = bucket.swap_remove(idx);
+        if bucket.is_empty() { self.leaves.remove(&key); }
+        self.len -= 1;
+        item
     }
 
     /// Cull to a query volume: analytic `classify_box` (green/white/yellow) when the
@@ -460,5 +516,88 @@ mod tests {
         got.sort(); want.sort();
         assert_eq!(got, want, "raycast set != brute capsule");
         assert_eq!(t.raycast_first(origin, dir, max_dist, radius).map(|(_, p)| p.id), hits.first().map(|(_, p)| p.id));
+    }
+}
+
+#[cfg(test)]
+mod keep_tests {
+    use super::*;
+    use crate::Circle;
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct M { id: u32, p: Point }
+    impl Positioned for M { fn position(&self) -> Point { self.p } }
+
+    struct Rng(u64);
+    impl Rng {
+        fn f(&mut self) -> f64 { self.0 ^= self.0 << 13; self.0 ^= self.0 >> 7; self.0 ^= self.0 << 17; ((self.0 >> 40) as f64) / (1u64 << 24) as f64 }
+        fn r(&mut self, a: f64, b: f64) -> f64 { a + (b - a) * self.f() }
+    }
+
+    /// A tree MAINTAINED through thousands of moves must keep giving the same ANSWERS as one
+    /// rebuilt from the same positions.
+    ///
+    /// Note what is deliberately not asserted: the leaf count. This structure is adaptive, so
+    /// a maintained copy keeps splits made for a distribution the points have since left, and
+    /// never merges an emptied leaf — its shape legitimately drifts from a rebuild's. The
+    /// grids can be held to byte-identity because their cells are fixed; this one can only be
+    /// held to answering identically, and asserting shape would be a test that fails for a
+    /// reason which is not a bug.
+    #[test]
+    fn maintained_answers_match_a_rebuild() {
+        let world = Rect::new(0.0, 0.0, 256.0, 256.0);
+        let mut rng = Rng(0x5EED_1234);
+        let n = 600usize;
+        let mut pts: Vec<M> = (0..n).map(|i| M { id: i as u32, p: Point::new(rng.r(0.0, 255.9), rng.r(0.0, 255.9)) }).collect();
+        let mut kept = LinearQuadTree::from_items(world, 8, 12, pts.clone());
+
+        let (mut stayed, mut moved) = (0u32, 0u32);
+        for round in 0..30 {
+            for (i, pt) in pts.iter_mut().enumerate() {
+                let old = pt.p;
+                let step = if (i + round) % 2 == 0 { 1.0 } else { 80.0 };
+                let np = Point::new((old.x + rng.r(-step, step)).clamp(0.0, 255.9), (old.y + rng.r(-step, step)).clamp(0.0, 255.9));
+                let id = pt.id;
+                match kept.update(old, |it| it.id == id, |it| it.p = np) {
+                    Crossed::Stayed => stayed += 1,
+                    Crossed::Moved => moved += 1,
+                    other => panic!("update failed on {id}: {other:?}"),
+                }
+                pt.p = np;
+            }
+            let fresh = LinearQuadTree::from_items(world, 8, 12, pts.clone());
+            assert_eq!(kept.item_count(), fresh.item_count(), "count drifted at round {round}");
+            for s in [Circle::new(Point::new(40.0, 40.0), 30.0), Circle::new(Point::new(128.0, 128.0), 55.0), Circle::new(Point::new(210.0, 60.0), 25.0)] {
+                let mut a: Vec<u32> = kept.cull(&s).iter().map(|m| m.id).collect();
+                let mut b: Vec<u32> = fresh.cull(&s).iter().map(|m| m.id).collect();
+                a.sort_unstable(); b.sort_unstable();
+                assert_eq!(a, b, "maintained != rebuilt at round {round}");
+            }
+            let q = Point::new(90.0, 110.0);
+            let ka: Vec<u64> = kept.knn(q, 10).iter().map(|(d, _)| d.to_bits()).collect();
+            let kb: Vec<u64> = fresh.knn(q, 10).iter().map(|(d, _)| d.to_bits()).collect();
+            assert_eq!(ka, kb, "knn diverged at round {round}");
+        }
+        assert!(stayed > 500 && moved > 500, "both paths must be exercised: stayed {stayed}, moved {moved}");
+    }
+
+    #[test]
+    fn remove_and_the_edges() {
+        let world = Rect::new(0.0, 0.0, 256.0, 256.0);
+        // Capacity 1, so the two points end up in DIFFERENT leaves. At capacity 8 they share
+        // the root leaf, and then a "wrong" old position still locates the right bucket — the
+        // first version of this test asserted Missing and got Stayed, correctly.
+        let mut t = LinearQuadTree::new(world, 1, 12);
+        t.insert(M { id: 1, p: Point::new(10.0, 10.0) });
+        t.insert(M { id: 2, p: Point::new(200.0, 200.0) });
+        assert_eq!(t.item_count(), 2);
+        // a wrong `old` finds nothing rather than corrupting anything
+        assert_eq!(t.update(Point::new(200.0, 200.0), |it| it.id == 1, |_| {}), Crossed::Missing);
+        assert!(t.remove(Point::new(200.0, 200.0), |it| it.id == 1).is_none());
+        // and a real removal is gone from the ANSWERS, not just the count
+        let got = t.remove(Point::new(10.0, 10.0), |it| it.id == 1).expect("was there");
+        assert_eq!(got.id, 1);
+        assert_eq!(t.item_count(), 1);
+        assert!(t.cull(&Circle::new(Point::new(10.0, 10.0), 2.0)).is_empty(), "the vacated leaf still answers");
     }
 }

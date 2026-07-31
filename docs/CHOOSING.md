@@ -200,6 +200,22 @@ repeated passes** on an idle machine, via `cargo run -p bench-runner --release`:
   them each frame. Net, the rebuild still takes the frame. Two different benchmarks, one
   crossover, and neither was fitted to the other.
 
+  **The adaptive linear trees got the same API and a much worse verdict.** `LinearOctree3`
+  and `LinearQuadTree` are the same bucket hash and had the same omission, but their keep path
+  loses far earlier — and it degrades the queries, which the flat grid's does not:
+
+  | fraction moving | keep | rebuild | speed-up | leaves | cull vs a fresh tree |
+  | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 100 % | 13.70 ms | 3.00 ms | **0.22×** | 23 279 | **1.30× slower** |
+  | 10 % | 1.10 ms | 2.62 ms | 2.38× | 13 914 | 1.20× slower |
+  | 1 % | 0.098 ms | 2.20 ms | **22.4×** | 8 670 | 0.99× (none) |
+
+  The extra column is the cost of keeping an *adaptive* structure: it holds splits made for a
+  distribution the points have left and never merges an emptied leaf, so a hard-churned tree
+  ends with **3.4× the leaves** a rebuild would produce and answers 30 % slower. The answers
+  stay exact — that is tested — but the shape does not stay good. Use the keep path on the
+  linear trees when churn is low; rebuild periodically if it is not.
+
   The crossover sits near **70 % moving**, and note the movement here is deliberately harsh —
   40-unit steps against 15.6-unit cells, so 99 % of updates actually re-bucket. A workload
   whose items mostly stay in their cell does even better. It costs O(occupancy of the old

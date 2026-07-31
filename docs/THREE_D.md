@@ -591,6 +591,13 @@ The four structures differ in how they track the moving points:
 | MortonGrid3 | full rebuild (re-bucket all) | rebuilt |
 | projection | rebuild the 2D tree | rebuilt |
 
+> **This table described an API, not a structure, and the sweep below was run at 100 %
+> relocation — the one churn level where that distinction costs nothing.** `MortonGrid3` and
+> the linear trees can all keep in place now (`update`/`remove`, 2026-07); see
+> [`CHOOSING.md`](CHOOSING.md) § "Grids rebuild, trees keep". The measurements here stand,
+> because at full churn a rebuild really is the right call — but they are one point of a
+> curve, not a property.
+
 The intuition — and the first draft of this section — was that the *persistent*
 structures must beat the *rebuilt* ones on build: an incremental `update` sounds
 cheaper than re-inserting everything. **The decision map below shows the
