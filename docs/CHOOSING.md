@@ -193,6 +193,13 @@ repeated passes** on an idle machine, via `cargo run -p bench-runner --release`:
   | 1 % | 0.067 ms | 6.17 ms | 91.9× |
   | 0.1 % | 0.006 ms | 5.96 ms | **938×** |
 
+  **Confirmed independently by the 2D decision map**, which moves *every* point every frame —
+  the far side of that crossover. There the kept grid loses maintain exactly as predicted
+  (50k: 3 715 µs against the rebuild's 2 200) while *winning* the cull by 1.11–1.20×, most
+  likely because its buckets keep their addresses while a rebuild re-allocates every one of
+  them each frame. Net, the rebuild still takes the frame. Two different benchmarks, one
+  crossover, and neither was fitted to the other.
+
   The crossover sits near **70 % moving**, and note the movement here is deliberately harsh —
   40-unit steps against 15.6-unit cells, so 99 % of updates actually re-bucket. A workload
   whose items mostly stay in their cell does even better. It costs O(occupancy of the old

@@ -6,6 +6,9 @@
 //! - **binary** `Tree` — persistent, maintained via the O(1) `update_ref` handle,
 //! - **quad** `QuadTree` — persistent, `update_ref`,
 //! - **morton** `MortonGrid` — pointer-free, **rebuilt every frame** (`clear` + refill),
+//! - **mortonkeep** the same grid **maintained in place** with `update` — added once
+//!   `MortonGrid::update` existed, because until then "rebuilt" was the only thing a grid
+//!   could be, and this map's conclusions were drawn against that limitation,
 //! - **kdtree2** `KdTree2` — build-once, so its "maintain" is a full rebuild each frame.
 //!
 //! **This bench does not need `common::compare2`, and cannot use it.** Cannot, because
@@ -64,12 +67,12 @@ impl Shape for Disc {
 }
 
 const MARGIN: f64 = 4.0;
-const NAMES: [&str; 4] = ["binary", "quad", "morton", "kdtree2"];
+const NAMES: [&str; 5] = ["binary", "quad", "morton", "kdtree2", "mortonkeep"];
 
 struct Cfg { world: f64, pop: usize, item_limit: usize, vision: f64, speed: f64, n_cull: usize, frames: usize, warmup: usize, dt: f64, seed: u64 }
 
 /// Per-structure (maintain µs/frame, cull µs/cull) + whether all culls agreed.
-fn measure(cfg: &Cfg) -> ([f64; 4], [f64; 4], bool) {
+fn measure(cfg: &Cfg) -> ([f64; NAMES.len()], [f64; NAMES.len()], bool) {
     let mut rng = Rng::new(cfg.seed);
     let rect = Rect::new(0.0, 0.0, cfg.world, cfg.world);
     let levels = MortonGrid::<C2>::levels_for_cell_size(rect, cfg.vision.max(2.0));
@@ -91,12 +94,20 @@ fn measure(cfg: &Cfg) -> ([f64; 4], [f64; 4], bool) {
         qr.push(quad.insert_ref(C2 { id: id as u32, p }).unwrap());
     }
 
-    let mut mt: [Vec<f64>; 4] = std::array::from_fn(|_| Vec::new());
-    let mut cl: [Vec<f64>; 4] = std::array::from_fn(|_| Vec::new());
+    // The kept grid lives across frames, like the trees — that is the whole point of it.
+    let mut mkeep = MortonGrid::<C2>::new(rect, levels);
+    for id in 0..cfg.pop { mkeep.insert(C2 { id: id as u32, p: pos[id] }); }
+
+    let mut mt: [Vec<f64>; 5] = std::array::from_fn(|_| Vec::new());
+    let mut cl: [Vec<f64>; 5] = std::array::from_fn(|_| Vec::new());
     let mut blackhole = 0usize;
     let mut agree = true;
 
     for frame in 0..(cfg.warmup + cfg.frames) {
+        // Where everything was before this frame's movement — the kept grid needs it, the same
+        // way `Tree::update_ref` needs a handle. Cloned rather than recomputed so the movement
+        // loop below can stay exactly as it was.
+        let prev = pos.clone();
         for id in 0..cfg.pop {
             let (mut vx, mut vy) = vel[id];
             let mut nx = pos[id].x + vx * cfg.dt;
@@ -121,6 +132,15 @@ fn measure(cfg: &Cfg) -> ([f64; 4], [f64; 4], bool) {
         let mut morton = MortonGrid::<C2>::new(rect, levels);
         for id in 0..cfg.pop { morton.insert(C2 { id: id as u32, p: pos[id] }); }
         if measuring { mt[2].push(us(t)); }
+
+        // The same grid, kept instead of rebuilt. An item that has not left its cell costs
+        // nothing at all here; one that has costs a swap_remove and a push.
+        let t = Instant::now();
+        for id in 0..cfg.pop {
+            let idu = id as u32;
+            mkeep.update(prev[id], |c| c.id == idu, |c| c.p = pos[id]);
+        }
+        if measuring { mt[4].push(us(t)); }
 
         // KdTree2 has no maintain surface at all: it is build-once, so on moving data its
         // "maintain" is a full rebuild — which is exactly the question this row answers.
@@ -148,6 +168,10 @@ fn measure(cfg: &Cfg) -> ([f64; 4], [f64; 4], bool) {
         for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(morton.cull(&Disc { cx: c.x, cy: c.y, r: cfg.vision }).len()); }
         if measuring { cl[2].push(us(t) / n); }
 
+        let t = Instant::now();
+        for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(mkeep.cull(&Disc { cx: c.x, cy: c.y, r: cfg.vision }).len()); }
+        if measuring { cl[4].push(us(t) / n); }
+
         if measuring && !ids.is_empty() {
             let c = pos[ids[0]];
             let s = Disc { cx: c.x, cy: c.y, r: cfg.vision };
@@ -155,8 +179,10 @@ fn measure(cfg: &Cfg) -> ([f64; 4], [f64; 4], bool) {
             let mut a1: Vec<u32> = quad.cull(&s).iter().map(|x| x.id).collect();
             let mut a2: Vec<u32> = morton.cull(&s).iter().map(|x| x.id).collect();
             let mut a3: Vec<u32> = kd.cull(&s).iter().map(|x| x.id).collect();
-            a0.sort_unstable(); a1.sort_unstable(); a2.sort_unstable(); a3.sort_unstable();
-            if a1 != a0 || a2 != a0 || a3 != a0 { agree = false; }
+            // The kept grid is the one that could silently drift, so it is in the check.
+            let mut a4: Vec<u32> = mkeep.cull(&s).iter().map(|x| x.id).collect();
+            a0.sort_unstable(); a1.sort_unstable(); a2.sort_unstable(); a3.sort_unstable(); a4.sort_unstable();
+            if a1 != a0 || a2 != a0 || a3 != a0 || a4 != a0 { agree = false; }
         }
     }
     if blackhole == usize::MAX { println!("unreachable"); }
@@ -194,7 +220,7 @@ fn main() {
     for k in 0..NAMES.len() {
         println!("{:<8} {:>16.1} {:>14.3} {:>18.1}", NAMES[k], m[k], c[k], m[k] + cfg.n_cull as f64 * c[k]);
     }
-    let total: [f64; 4] = std::array::from_fn(|k| m[k] + cfg.n_cull as f64 * c[k]);
+    let total: [f64; NAMES.len()] = std::array::from_fn(|k| m[k] + cfg.n_cull as f64 * c[k]);
     let (wm, mm) = winner(&m);
     let (wc, mc) = winner(&c);
     let (wt, mtt) = winner(&total);
@@ -209,10 +235,10 @@ fn run_sweep() {
     let ils = [8usize, 32];
     let speeds = [(20.0, "slow"), (240.0, "fast")];
     println!("2D structure decision map | world × pop × item_limit × churn | vision r=24 | 16 culls/frame");
-    println!("(maintain = per-frame update[bin/quad] or rebuild[morton]; cull = per-cull. winner = lowest.)\n");
+    println!("(maintain = per-frame update[bin/quad/mortonkeep] or rebuild[morton/kdtree2]; cull = per-cull. winner = lowest.)\n");
     println!("{:>6} {:>7} {:>4} {:>5} | {:<22} | {:<22} | {:<8}", "world", "pop", "il", "churn", "maintain winner", "cull winner", "agree");
-    let mut wins_m = [0u32; 3];
-    let mut wins_c = [0u32; 3];
+    let mut wins_m = [0u32; NAMES.len()];
+    let mut wins_c = [0u32; NAMES.len()];
     let mut all_agree = true;
     for &world in &worlds {
         for &pop in &pops {
@@ -230,7 +256,8 @@ fn run_sweep() {
             }
         }
     }
-    println!("\nmaintain wins: binary {} | quad {} | morton {}", wins_m[0], wins_m[1], wins_m[2]);
-    println!("cull wins:     binary {} | quad {} | morton {}", wins_c[0], wins_c[1], wins_c[2]);
+    let tally = |w: &[u32; NAMES.len()]| NAMES.iter().zip(w).map(|(n, c)| format!("{n} {c}")).collect::<Vec<_>>().join(" | ");
+    println!("\nmaintain wins: {}", tally(&wins_m));
+    println!("cull wins:     {}", tally(&wins_c));
     println!("agreement across all configs: {}", if all_agree { "EXACT" } else { "DISAGREEMENT <-- BUG" });
 }
