@@ -179,6 +179,25 @@ repeated passes** on an idle machine, via `cargo run -p bench-runner --release`:
   tree leads by 1.6-7.6x on 3D maintain but trails a `QuadTree` by 4-10% in 2D. The two
   policies are held identical by a test that runs one script of work through both and
   compares the sequence of backends they pick.
+- **"Grids rebuild, trees keep" was an API limit, not a law.** `MortonGrid3::update` /
+  `MortonGrid::update` move an item in place: told where it *was*, the grid finds it in that
+  one cell, and if it has not left the cell there is nothing to do at all. A rebuild costs the
+  same however few items moved, so the win tracks the moving fraction (50k points, cells
+  holding ~1.1 items):
+
+  | fraction moving per frame | keep | rebuild | speed-up |
+  | ---: | ---: | ---: | ---: |
+  | 100 % | 8.02 ms | 6.08 ms | **0.76×** (rebuild wins) |
+  | 50 % | 3.95 ms | 6.22 ms | 1.57× |
+  | 10 % | 0.78 ms | 6.19 ms | 7.98× |
+  | 1 % | 0.067 ms | 6.17 ms | 91.9× |
+  | 0.1 % | 0.006 ms | 5.96 ms | **938×** |
+
+  The crossover sits near **70 % moving**, and note the movement here is deliberately harsh —
+  40-unit steps against 15.6-unit cells, so 99 % of updates actually re-bucket. A workload
+  whose items mostly stay in their cell does even better. It costs O(occupancy of the old
+  cell), which is one more reason the tuning knob matters ([`Occupancy`]). If everything moves
+  every frame, keep the rebuild.
 - **Don't reach for threads first.** Reads parallelise (`cull_many_par`), writes don't —
   the lever for write-heavy loops is `update_ref` + the right structure, not rayon. See
   [`PARALLEL.md`](PARALLEL.md).

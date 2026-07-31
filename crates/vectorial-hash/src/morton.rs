@@ -189,6 +189,44 @@ impl<T: Positioned> MortonGrid<T> {
         }
     }
 
+    /// **Move an item that is already in the grid, in place** — the 2D twin of
+    /// [`crate::MortonGrid3::update`], where the reasoning and the measurements live.
+    ///
+    /// `old` is where the item was, so it can be found without scanning anything but its own
+    /// cell; `predicate` picks it out of that cell and `mutate` changes it. If it has not left
+    /// the cell there is nothing to do at all.
+    pub fn update<P, M>(&mut self, old: Point, predicate: P, mutate: M) -> crate::morton3::Crossed
+    where
+        P: Fn(&T) -> bool,
+        M: FnOnce(&mut T),
+    {
+        use crate::morton3::Crossed;
+        if !self.world.contains(old) { return Crossed::Missing; }
+        let (ox, oy) = self.cell_of(old);
+        let from = morton2(ox, oy);
+        let (idx, p) = {
+            let Some(bucket) = self.cells.get_mut(&from) else { return Crossed::Missing };
+            let Some(idx) = bucket.iter().position(&predicate) else { return Crossed::Missing };
+            mutate(&mut bucket[idx]);
+            (idx, bucket[idx].position())
+        };
+        if !self.world.contains(p) {
+            let bucket = self.cells.get_mut(&from).expect("bucket was just borrowed");
+            bucket.swap_remove(idx);
+            if bucket.is_empty() { self.cells.remove(&from); }
+            self.len -= 1;
+            return Crossed::Left;
+        }
+        let (nx, ny) = self.cell_of(p);
+        let to = morton2(nx, ny);
+        if to == from { return Crossed::Stayed; }
+        let bucket = self.cells.get_mut(&from).expect("bucket was just borrowed");
+        let item = bucket.swap_remove(idx);
+        if bucket.is_empty() { self.cells.remove(&from); }
+        self.cells.entry(to).or_default().push(item);
+        Crossed::Moved
+    }
+
     pub fn cell_count(&self) -> usize { self.cells.len() }
     pub fn levels(&self) -> u32 { self.levels }
 
@@ -697,5 +735,78 @@ mod tests {
                 _ => panic!("raycast_first / raycast nearest disagree"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod update2_tests {
+    use super::*;
+    use crate::morton3::Crossed;
+    use crate::Circle;
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct M { id: u32, p: Point }
+    impl Positioned for M { fn position(&self) -> Point { self.p } }
+
+    struct Rng(u64);
+    impl Rng {
+        fn f(&mut self) -> f64 { self.0 ^= self.0 << 13; self.0 ^= self.0 >> 7; self.0 ^= self.0 << 17; ((self.0 >> 40) as f64) / (1u64 << 24) as f64 }
+        fn r(&mut self, a: f64, b: f64) -> f64 { a + (b - a) * self.f() }
+    }
+
+    /// Same property as the 3D twin: maintained must answer exactly like rebuilt, after
+    /// thousands of moves of both kinds.
+    #[test]
+    fn maintained_grid_answers_identically_to_a_rebuilt_one() {
+        let world = Rect::new(0.0, 0.0, 256.0, 256.0);
+        let mut rng = Rng(0x5EED_1234);
+        let n = 700usize;
+        let mut pts: Vec<M> = (0..n).map(|i| M { id: i as u32, p: Point::new(rng.r(0.0, 255.9), rng.r(0.0, 255.9)) }).collect();
+        let mut kept: MortonGrid<M> = MortonGrid::new(world, 4);
+        for it in &pts { kept.insert(*it); }
+
+        let (mut stayed, mut moved) = (0u32, 0u32);
+        for round in 0..40 {
+            for (i, pt) in pts.iter_mut().enumerate() {
+                let old = pt.p;
+                let step = if (i + round) % 2 == 0 { 1.0 } else { 90.0 };
+                let np = Point::new((old.x + rng.r(-step, step)).clamp(0.0, 255.9), (old.y + rng.r(-step, step)).clamp(0.0, 255.9));
+                let id = pt.id;
+                match kept.update(old, |it| it.id == id, |it| it.p = np) {
+                    Crossed::Stayed => stayed += 1,
+                    Crossed::Moved => moved += 1,
+                    other => panic!("update failed on {id}: {other:?}"),
+                }
+                pt.p = np;
+            }
+            let mut fresh: MortonGrid<M> = MortonGrid::new(world, 4);
+            for it in &pts { fresh.insert(*it); }
+            assert_eq!(kept.item_count(), fresh.item_count(), "count drifted at round {round}");
+            assert_eq!(kept.cell_count(), fresh.cell_count(), "cell set drifted at round {round}");
+            for (cx, cy, r) in [(40.0, 40.0, 30.0), (128.0, 128.0, 50.0), (210.0, 60.0, 25.0)] {
+                let c = Circle::new(Point::new(cx, cy), r);
+                let mut a: Vec<u32> = kept.cull(&c).iter().map(|m| m.id).collect();
+                let mut b: Vec<u32> = fresh.cull(&c).iter().map(|m| m.id).collect();
+                a.sort_unstable(); b.sort_unstable();
+                assert_eq!(a, b, "maintained != rebuilt at round {round}");
+            }
+            let q = Point::new(90.0, 110.0);
+            let ka: Vec<u64> = kept.knn(q, 12).iter().map(|(d, _)| d.to_bits()).collect();
+            let kb: Vec<u64> = fresh.knn(q, 12).iter().map(|(d, _)| d.to_bits()).collect();
+            assert_eq!(ka, kb, "knn diverged at round {round}");
+        }
+        assert!(stayed > 1000 && moved > 1000, "both paths must be exercised: stayed {stayed}, moved {moved}");
+    }
+
+    #[test]
+    fn update_reports_what_it_did() {
+        let world = Rect::new(0.0, 0.0, 256.0, 256.0);
+        let mut g: MortonGrid<M> = MortonGrid::new(world, 4); // 16 cells/axis, side 16
+        g.insert(M { id: 1, p: Point::new(8.0, 8.0) });
+        assert_eq!(g.update(Point::new(8.0, 8.0), |it| it.id == 1, |it| it.p = Point::new(9.0, 9.0)), Crossed::Stayed);
+        assert_eq!(g.update(Point::new(9.0, 9.0), |it| it.id == 1, |it| it.p = Point::new(100.0, 100.0)), Crossed::Moved);
+        assert_eq!(g.update(Point::new(9.0, 9.0), |it| it.id == 1, |_| {}), Crossed::Missing);
+        assert_eq!(g.update(Point::new(100.0, 100.0), |it| it.id == 1, |it| it.p = Point::new(9999.0, 0.0)), Crossed::Left);
+        assert_eq!(g.item_count(), 0, "an item that left the world must be gone");
     }
 }

@@ -123,6 +123,33 @@ pub struct MortonGrid3<T: Positioned3> {
 }
 
 
+/// What an in-place [`MortonGrid3::update`] did — the grid's counterpart to `Crossing`.
+///
+/// `Stayed` is the case worth building for: the item moved but not out of its cell, so the
+/// grid did nothing at all beyond the lookup.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Crossed {
+    /// Still in the same cell. Nothing was re-bucketed.
+    Stayed,
+    /// Re-bucketed into a different cell.
+    Moved,
+    /// The new position is outside the world box, so the item was dropped — the grid holds
+    /// only what is inside it, exactly as `insert` does.
+    Left,
+    /// Nothing in the old cell matched the predicate. Either the old position was wrong or the
+    /// item was never here.
+    Missing,
+}
+
+/// Set a point-like item's position — for [`MortonGrid3::relocate`] and
+/// [`crate::MortonGrid::relocate`], which are conveniences over the predicate form.
+pub trait SetPosition3: Positioned3 {
+    fn set_position(&mut self, p: Point3);
+}
+
+#[inline]
+fn morton3_of((x, y, z): (u32, u32, u32)) -> u64 { morton3(x, y, z) }
+
 // ---------------------------------------------------------------- cell-visit counter
 
 /// Cells looked up by grid queries on this thread since the last reset — see the `grid-stats`
@@ -273,6 +300,62 @@ impl<T: Positioned3> MortonGrid3<T> {
         self.cells.entry(morton3(ix, iy, iz)).or_default().push(item);
         self.len += 1;
         true
+    }
+
+    /// **Move an item that is already in the grid, in place.** `old` is where it was, so the
+    /// item can be found without scanning anything but its own cell; `predicate` picks it out
+    /// of that cell, `mutate` changes it. Returns `Crossed::Missing` if no item in that cell
+    /// matched.
+    ///
+    /// This is the grid's answer to the tree's `update_ref`, and it exists because "grids are
+    /// rebuild-only" was a property of the API rather than of grids. A uniform grid has no
+    /// handles to maintain and no structure to rebalance: if the item stays in its cell there
+    /// is *nothing to do at all*, and if it leaves, the whole cost is one `swap_remove` and one
+    /// push. What it cannot do is find the item without help, which is why the caller passes
+    /// the old position — the same bargain `Tree3::update` makes with its predicate.
+    ///
+    /// Cost is O(occupancy of the old cell), so it is only a good deal on a grid whose cells
+    /// hold few items — see [`Occupancy`], and note this is another reason the tuning knob
+    /// matters. On a grid holding thousands per cell, `clear` + refill is the better call.
+    pub fn update<P, M>(&mut self, old: Point3, predicate: P, mutate: M) -> Crossed
+    where
+        P: Fn(&T) -> bool,
+        M: FnOnce(&mut T),
+    {
+        if !self.world.contains(old) { return Crossed::Missing; }
+        let from = morton3_of(self.cell_of(old));
+        // The new cell is computed before the mutable borrow is released, so `cell_of` (which
+        // reads `self`) has to happen with the borrow already ended — hence the two phases.
+        let (idx, p) = {
+            let Some(bucket) = self.cells.get_mut(&from) else { return Crossed::Missing };
+            let Some(idx) = bucket.iter().position(&predicate) else { return Crossed::Missing };
+            mutate(&mut bucket[idx]);
+            (idx, bucket[idx].position())
+        };
+        if !self.world.contains(p) {
+            // Left the world: the grid holds only what is inside it, as `insert` promises.
+            let bucket = self.cells.get_mut(&from).expect("bucket was just borrowed");
+            bucket.swap_remove(idx);
+            if bucket.is_empty() { self.cells.remove(&from); }
+            self.len -= 1;
+            return Crossed::Left;
+        }
+        let to = morton3_of(self.cell_of(p));
+        if to == from { return Crossed::Stayed; }
+        let bucket = self.cells.get_mut(&from).expect("bucket was just borrowed");
+        let item = bucket.swap_remove(idx);
+        if bucket.is_empty() { self.cells.remove(&from); }
+        self.cells.entry(to).or_default().push(item);
+        Crossed::Moved
+    }
+
+    /// Convenience over [`MortonGrid3::update`] for the common case of moving a point-like item
+    /// whose identity is decided by comparing positions.
+    pub fn relocate(&mut self, old: Point3, new: Point3) -> Crossed
+    where
+        T: SetPosition3,
+    {
+        self.update(old, |it| it.position() == old, |it| it.set_position(new))
     }
 
     /// Bulk-insert from a parallel iterator (feature `parallel`): each item's
@@ -1076,5 +1159,108 @@ mod tests {
         let cell = 512.0 / cells as f64;
         let half = 512.0 / (cells * 2) as f64;
         assert!(cell >= 16.0 && half < 16.0, "levels={levels} gives cell {cell} (want ≈16)");
+    }
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+    use crate::Sphere3;
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct M { id: u32, p: Point3 }
+    impl Positioned3 for M { fn position(&self) -> Point3 { self.p } }
+    impl SetPosition3 for M { fn set_position(&mut self, p: Point3) { self.p = p; } }
+
+    fn world() -> Aabb { Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0) }
+
+    struct Rng(u64);
+    impl Rng {
+        fn f(&mut self) -> f64 { self.0 ^= self.0 << 13; self.0 ^= self.0 >> 7; self.0 ^= self.0 << 17; ((self.0 >> 40) as f64) / (1u64 << 24) as f64 }
+        fn r(&mut self, a: f64, b: f64) -> f64 { a + (b - a) * self.f() }
+    }
+
+    /// The property the whole feature rests on: a grid MAINTAINED with `update` must answer
+    /// exactly like one REBUILT from the same positions. Not "similar" — the same set, after
+    /// thousands of moves, including moves that cross cells and moves that do not.
+    #[test]
+    fn maintained_grid_answers_identically_to_a_rebuilt_one() {
+        let mut rng = Rng(0x5EED_1234);
+        let n = 800usize;
+        let mut pts: Vec<M> = (0..n).map(|i| M { id: i as u32, p: Point3::new(rng.r(0.0, 255.9), rng.r(0.0, 255.9), rng.r(0.0, 255.9)) }).collect();
+        let mut kept: MortonGrid3<M> = MortonGrid3::new(world(), 4);
+        for it in &pts { kept.insert(*it); }
+
+        let (mut stayed, mut moved) = (0u32, 0u32);
+        for round in 0..40 {
+            for (i, pt) in pts.iter_mut().enumerate() {
+                let old = pt.p;
+                // Half tiny nudges (which should mostly stay), half long jumps (which should
+                // mostly re-bucket) — a test that only did one of the two would miss a path.
+                let step = if (i + round) % 2 == 0 { 1.0 } else { 90.0 };
+                let np = Point3::new(
+                    (old.x + rng.r(-step, step)).clamp(0.0, 255.9),
+                    (old.y + rng.r(-step, step)).clamp(0.0, 255.9),
+                    (old.z + rng.r(-step, step)).clamp(0.0, 255.9));
+                let id = pt.id;
+                match kept.update(old, |it| it.id == id, |it| it.p = np) {
+                    Crossed::Stayed => stayed += 1,
+                    Crossed::Moved => moved += 1,
+                    other => panic!("update failed on item {id}: {other:?}"),
+                }
+                pt.p = np;
+            }
+
+            let mut fresh: MortonGrid3<M> = MortonGrid3::new(world(), 4);
+            for it in &pts { fresh.insert(*it); }
+            assert_eq!(kept.item_count(), fresh.item_count(), "count drifted at round {round}");
+            assert_eq!(kept.cell_count(), fresh.cell_count(), "cell set drifted at round {round} — an emptied bucket was left behind");
+            for (cx, cy, cz, r) in [(40.0, 40.0, 40.0, 30.0), (128.0, 128.0, 128.0, 50.0), (200.0, 60.0, 210.0, 25.0)] {
+                let s = Sphere3::new(cx, cy, cz, r);
+                let mut a: Vec<u32> = kept.cull(&s).iter().map(|m| m.id).collect();
+                let mut b: Vec<u32> = fresh.cull(&s).iter().map(|m| m.id).collect();
+                a.sort_unstable(); b.sort_unstable();
+                assert_eq!(a, b, "maintained != rebuilt at round {round}");
+            }
+            let q = Point3::new(90.0, 110.0, 70.0);
+            let ka: Vec<u64> = kept.knn(q, 12).iter().map(|(d, _)| d.to_bits()).collect();
+            let kb: Vec<u64> = fresh.knn(q, 12).iter().map(|(d, _)| d.to_bits()).collect();
+            assert_eq!(ka, kb, "knn diverged at round {round}");
+        }
+        // Non-vacuous: both branches must have been exercised, or this proves half of it.
+        assert!(stayed > 1000 && moved > 1000, "test did not exercise both paths: stayed {stayed}, moved {moved}");
+    }
+
+    /// The edge cases, each asserted rather than assumed.
+    #[test]
+    fn update_reports_what_it_did() {
+        let mut g: MortonGrid3<M> = MortonGrid3::new(world(), 4); // 16 cells/axis, side 16
+        g.insert(M { id: 1, p: Point3::new(8.0, 8.0, 8.0) });
+        g.insert(M { id: 2, p: Point3::new(200.0, 200.0, 200.0) });
+
+        // within the same cell
+        assert_eq!(g.update(Point3::new(8.0, 8.0, 8.0), |it| it.id == 1, |it| it.p = Point3::new(9.0, 9.0, 9.0)), Crossed::Stayed);
+        // into another cell
+        assert_eq!(g.update(Point3::new(9.0, 9.0, 9.0), |it| it.id == 1, |it| it.p = Point3::new(100.0, 100.0, 100.0)), Crossed::Moved);
+        assert_eq!(g.item_count(), 2);
+        // wrong old position: nothing in that cell matches
+        assert_eq!(g.update(Point3::new(9.0, 9.0, 9.0), |it| it.id == 1, |it| it.p = Point3::new(1.0, 1.0, 1.0)), Crossed::Missing);
+        // out of the world: dropped, exactly as insert would have refused it
+        assert_eq!(g.update(Point3::new(100.0, 100.0, 100.0), |it| it.id == 1, |it| it.p = Point3::new(9999.0, 0.0, 0.0)), Crossed::Left);
+        assert_eq!(g.item_count(), 1, "an item that left the world must be gone, not stale");
+        assert!(g.cull(&Sphere3::new(100.0, 100.0, 100.0, 50.0)).is_empty(), "the vacated cell still answers");
+        // and an old position outside the world is Missing, not a panic
+        assert_eq!(g.update(Point3::new(-5.0, 0.0, 0.0), |_| true, |_| {}), Crossed::Missing);
+    }
+
+    /// `relocate` is the same thing with the predicate written for you.
+    #[test]
+    fn relocate_matches_the_predicate_form() {
+        let mut g: MortonGrid3<M> = MortonGrid3::new(world(), 4);
+        g.insert(M { id: 7, p: Point3::new(20.0, 20.0, 20.0) });
+        assert_eq!(g.relocate(Point3::new(20.0, 20.0, 20.0), Point3::new(150.0, 150.0, 150.0)), Crossed::Moved);
+        let hit = g.cull(&Sphere3::new(150.0, 150.0, 150.0, 1.0));
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].id, 7);
     }
 }
