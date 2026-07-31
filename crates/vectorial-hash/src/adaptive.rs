@@ -123,6 +123,32 @@ pub struct Thresholds {
     pub hold_ticks: u32,
     /// Minimum ticks between migrations, whatever the numbers say.
     pub cooldown: u32,
+    /// **How fast the policy notices the workload changing.** The EMA weight applied to
+    /// queries-per-item and moves-per-item each tick.
+    ///
+    /// Smoothing exists so that one busy frame does not trigger a migration, and that is still
+    /// wanted. At 0.1 the detector needs ~10 ticks to register a change and ~16 to clear the
+    /// decisive threshold, so during a 60-frame query storm the index spends its first quarter
+    /// on the wrong backend.
+    ///
+    /// **Swept, and the obvious cure is not one.** Two runs each on
+    /// `examples/adaptive_vs_pinned`:
+    ///
+    /// | alpha | act 3 (storm) | act 4 (frozen) | total | backends chosen |
+    /// | ---: | ---: | ---: | ---: | --- |
+    /// | 0.1 | 1096-1097 | 82-90 | 1185-1194 | Brute, KeepTree, Grid |
+    /// | 1.0 | 973-1042 | 128-134 | 1108-1185 | Brute, Grid, KeepTree |
+    ///
+    /// Reacting instantly buys ~10 % on the storm and gives most of it back on the frozen act,
+    /// where it never settles on the build-once backend at all. The net is inside the
+    /// run-to-run noise. Left at 0.1, and calibratable for anyone whose phases are longer than
+    /// this script's.
+    ///
+    /// It also corrects an over-claim: with the lag removed entirely, the storm is still ~1.4x
+    /// behind a pinned grid, so the detector's delay was never most of that gap. What remains
+    /// is the frames spent on the previous backend before any detector could have decided, plus
+    /// the migration's own rebuild.
+    pub detector_alpha: f64,
     /// **How far past a boundary counts as decisive enough to skip the hysteresis.**
     ///
     /// `hold_ticks` and `cooldown` exist to stop the policy flapping at a boundary — and at a
@@ -156,6 +182,7 @@ impl Default for Thresholds {
             hold_ticks: 30,
             cooldown: 120,
             decisive_factor: 4.0,
+            detector_alpha: 0.1,
         }
     }
 }
@@ -189,6 +216,7 @@ impl Thresholds {
                 "hold_ticks" => if let Ok(x) = v.parse() { t.hold_ticks = x },
                 "cooldown" => if let Ok(x) = v.parse() { t.cooldown = x },
                 "decisive_factor" => if let Ok(x) = v.parse() { t.decisive_factor = x },
+                "detector_alpha" => if let Ok(x) = v.parse() { t.detector_alpha = x },
                 _ => {}
             }
         }
@@ -207,9 +235,10 @@ impl Thresholds {
             "# vectorial-hash adaptive-index calibration\n\
              brute_max = {}\nhigh_churn = {}\nrebuild_query_ratio = {}\nscan_budget = {}\n\
              static_ticks = {}\nmargin = {}\nhold_ticks = {}\ncooldown = {}\n\
-             decisive_factor = {}\n",
+             decisive_factor = {}\ndetector_alpha = {}\n",
             self.brute_max, self.high_churn, self.rebuild_query_ratio, self.scan_budget,
-            self.static_ticks, self.margin, self.hold_ticks, self.cooldown, self.decisive_factor)
+            self.static_ticks, self.margin, self.hold_ticks, self.cooldown, self.decisive_factor,
+            self.detector_alpha)
     }
 }
 
@@ -449,9 +478,10 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
     /// workload has genuinely changed. Call once per tick.
     pub fn tick(&mut self) -> Backend {
         let qpi = if self.live == 0 { 0.0 } else { self.queries as f64 / self.live as f64 };
-        self.q_per_item += 0.1 * (qpi - self.q_per_item); // same EMA weight the advisor uses
+        let a = self.th.detector_alpha;
+        self.q_per_item += a * (qpi - self.q_per_item); // same EMA weight the advisor uses
         let mpi = if self.live == 0 { 0.0 } else { self.moves as f64 / self.live as f64 };
-        self.m_per_item += 0.1 * (mpi - self.m_per_item);
+        self.m_per_item += a * (mpi - self.m_per_item);
         self.profile.observe(self.live, self.moves, self.relocations, self.queries);
         self.moves = 0;
         self.relocations = 0;
@@ -841,6 +871,7 @@ mod tests {
         let th = Thresholds {
             brute_max: 777, high_churn: 0.42, rebuild_query_ratio: 0.37, scan_budget: 42.0,
             static_ticks: 13, margin: 0.11, hold_ticks: 9, cooldown: 5, decisive_factor: 9.0,
+            detector_alpha: 0.33,
         };
         let parsed = Thresholds::parse(&(th.to_text() + "future_key = 12\n# a comment\n"));
         assert_eq!(parsed.brute_max, th.brute_max);
@@ -850,6 +881,7 @@ mod tests {
             parsed.rebuild_query_ratio, th.rebuild_query_ratio);
         assert!((parsed.scan_budget - th.scan_budget).abs() < 1e-9);
         assert!((parsed.decisive_factor - th.decisive_factor).abs() < 1e-9);
+        assert!((parsed.detector_alpha - th.detector_alpha).abs() < 1e-9);
         assert_eq!(parsed.static_ticks, th.static_ticks);
         assert!((parsed.margin - th.margin).abs() < 1e-9);
         assert_eq!(parsed.hold_ticks, th.hold_ticks);
@@ -860,7 +892,8 @@ mod tests {
             && th.hold_ticks != d.hold_ticks && th.cooldown != d.cooldown
             && (th.rebuild_query_ratio - d.rebuild_query_ratio).abs() > 1e-9
             && (th.scan_budget - d.scan_budget).abs() > 1e-9
-            && (th.decisive_factor - d.decisive_factor).abs() > 1e-9,
+            && (th.decisive_factor - d.decisive_factor).abs() > 1e-9
+            && (th.detector_alpha - d.detector_alpha).abs() > 1e-9,
             "the test values must differ from the defaults or this proves nothing");
     }
 }

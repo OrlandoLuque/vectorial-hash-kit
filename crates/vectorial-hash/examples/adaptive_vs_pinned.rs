@@ -99,8 +99,12 @@ fn run(script: &[Frame], pin: Option<Backend>) -> ([f64; 4], Vec<Backend>, usize
     // `scan_budget: 0.0` on every pinned config: the scan rule was added after this bench and
     // silently un-pinned three of the four baselines, which moved their times by up to 25% and
     // would have made the improvement look like whatever it wanted to look like.
+    // The detector's smoothing weight, swept from the environment so the lag can be priced
+    // rather than argued about. Only the adaptive run is affected; the pinned baselines never
+    // consult it.
+    let alpha: f64 = std::env::var("AV_ALPHA").ok().and_then(|s| s.parse().ok()).unwrap_or(0.1);
     let th = match pin {
-        None => Thresholds::default(),
+        None => Thresholds { detector_alpha: alpha, ..Default::default() },
         Some(Backend::Brute) => Thresholds { brute_max: usize::MAX, ..Default::default() },
         Some(Backend::KeepTree) => Thresholds { brute_max: 0, scan_budget: 0.0, rebuild_query_ratio: f64::MAX, static_ticks: u32::MAX, ..Default::default() },
         Some(Backend::Grid) => Thresholds { brute_max: 0, scan_budget: 0.0, rebuild_query_ratio: 0.0, static_ticks: u32::MAX, ..Default::default() },

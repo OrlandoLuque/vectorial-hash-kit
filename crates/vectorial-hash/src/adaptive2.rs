@@ -218,9 +218,10 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
     /// workload has genuinely changed. Call once per tick.
     pub fn tick(&mut self) -> Backend {
         let qpi = if self.live == 0 { 0.0 } else { self.queries as f64 / self.live as f64 };
-        self.q_per_item += 0.1 * (qpi - self.q_per_item); // same EMA weight the advisor uses
+        let a = self.th.detector_alpha;
+        self.q_per_item += a * (qpi - self.q_per_item); // same EMA weight the advisor uses
         let mpi = if self.live == 0 { 0.0 } else { self.moves as f64 / self.live as f64 };
-        self.m_per_item += 0.1 * (mpi - self.m_per_item);
+        self.m_per_item += a * (mpi - self.m_per_item);
         self.profile.observe(self.live, self.moves, self.relocations, self.queries);
         self.moves = 0;
         self.relocations = 0;
