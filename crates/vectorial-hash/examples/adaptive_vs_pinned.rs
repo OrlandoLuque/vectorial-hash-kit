@@ -96,12 +96,15 @@ fn run(script: &[Frame], pin: Option<Backend>) -> ([f64; 4], Vec<Backend>, usize
     // Pinning is done through the thresholds rather than by adding a "pinned" mode to the
     // index: the point is to compare against the index carrying ONE structure, with the same
     // item storage and the same call path, so the difference is the policy and nothing else.
+    // `scan_budget: 0.0` on every pinned config: the scan rule was added after this bench and
+    // silently un-pinned three of the four baselines, which moved their times by up to 25% and
+    // would have made the improvement look like whatever it wanted to look like.
     let th = match pin {
         None => Thresholds::default(),
         Some(Backend::Brute) => Thresholds { brute_max: usize::MAX, ..Default::default() },
-        Some(Backend::KeepTree) => Thresholds { brute_max: 0, rebuild_query_ratio: f64::MAX, static_ticks: u32::MAX, ..Default::default() },
-        Some(Backend::Grid) => Thresholds { brute_max: 0, rebuild_query_ratio: 0.0, static_ticks: u32::MAX, ..Default::default() },
-        Some(Backend::Static) => Thresholds { brute_max: 0, static_ticks: 0, ..Default::default() },
+        Some(Backend::KeepTree) => Thresholds { brute_max: 0, scan_budget: 0.0, rebuild_query_ratio: f64::MAX, static_ticks: u32::MAX, ..Default::default() },
+        Some(Backend::Grid) => Thresholds { brute_max: 0, scan_budget: 0.0, rebuild_query_ratio: 0.0, static_ticks: u32::MAX, ..Default::default() },
+        Some(Backend::Static) => Thresholds { brute_max: 0, scan_budget: 0.0, static_ticks: 0, ..Default::default() },
     };
     let mut ix: AdaptiveIndex<P> = AdaptiveIndex::with_thresholds(world, 16, th);
     let mut rng = Rng(0x5EED_1234);

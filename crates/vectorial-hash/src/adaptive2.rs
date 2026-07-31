@@ -62,6 +62,8 @@ pub struct AdaptiveIndex2<T: Positioned + Clone> {
     queries: u64,
     /// Smoothed queries per item per tick: the variable the backend choice turns on.
     q_per_item: f64,
+    /// Smoothed moves per item per tick — see the 3D twin.
+    m_per_item: f64,
 }
 
 impl<T: Positioned + Clone> AdaptiveIndex2<T> {
@@ -75,6 +77,7 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
             items: Vec::new(), free: Vec::new(), live: 0, world, leaf: leaf.max(1), held: Held2::Brute,
             profile: SpatialProfile::default(), th, pending: None, cooling: 0,
             dirty: false, switches: 0, moves: 0, relocations: 0, queries: 0, q_per_item: 0.0,
+            m_per_item: 0.0,
         }
     }
 
@@ -209,20 +212,22 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
     pub fn tick(&mut self) -> Backend {
         let qpi = if self.live == 0 { 0.0 } else { self.queries as f64 / self.live as f64 };
         self.q_per_item += 0.1 * (qpi - self.q_per_item); // same EMA weight the advisor uses
+        let mpi = if self.live == 0 { 0.0 } else { self.moves as f64 / self.live as f64 };
+        self.m_per_item += 0.1 * (mpi - self.m_per_item);
         self.profile.observe(self.live, self.moves, self.relocations, self.queries);
         self.moves = 0;
         self.relocations = 0;
         self.queries = 0;
         self.cooling = self.cooling.saturating_sub(1);
 
-        let want = self.desired();
+        let (want, decisive) = self.desired_with_confidence();
         if want == self.backend() { self.pending = None; return self.backend(); }
         let held = match self.pending {
             Some((b, n)) if b == want => n + 1,
             _ => 1,
         };
         self.pending = Some((want, held));
-        if held >= self.th.hold_ticks && self.cooling == 0 {
+        if decisive || (held >= self.th.hold_ticks && self.cooling == 0) {
             self.migrate(want);
             self.pending = None;
             self.cooling = self.th.cooldown;
@@ -237,6 +242,21 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
     /// the advisor carries its own compiled-in constants, and the whole point of
     /// [`Thresholds`] is that a calibration file can override them. Delegating would have
     /// silently ignored the calibration — it did, until a test caught it.
+    /// See the 3D twin — the hysteresis is skipped when the numbers are decisive.
+    fn desired_with_confidence(&self) -> (Backend, bool) {
+        let want = self.desired();
+        if want == self.backend() { return (want, false); }
+        let f = self.th.decisive_factor;
+        let n = self.live as f64;
+        let decisive = match want {
+            Backend::Brute => n * f <= self.th.brute_max as f64 || self.q_per_item * n * f <= self.m_per_item * self.th.scan_budget,
+            Backend::Grid => self.q_per_item >= self.th.rebuild_query_ratio * f,
+            Backend::KeepTree => self.q_per_item * n >= self.m_per_item * self.th.scan_budget * f && n >= self.th.brute_max as f64 * f,
+            Backend::Static => self.profile.still_ticks() as f64 >= self.th.static_ticks as f64 * f,
+        };
+        (want, decisive)
+    }
+
     fn desired(&self) -> Backend {
         let n = self.live as f64;
         let m = self.th.margin;
@@ -245,6 +265,9 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
         // that would have kept us there; entering it demands a clearly smaller one.
         let brute_edge = self.th.brute_max as f64 * if cur == Backend::Brute { 1.0 + m } else { 1.0 - m };
         if n <= brute_edge { return Backend::Brute; }
+        // ...and a scan also wins when nobody is asking much — see the 3D twin's `scan_budget`.
+        let scan_edge = self.m_per_item * self.th.scan_budget * if cur == Backend::Brute { 1.0 + m } else { 1.0 - m };
+        if self.q_per_item * n < scan_edge { return Backend::Brute; }
         if self.profile.still_ticks() >= self.th.static_ticks { return Backend::Static; }
         // Query INTENSITY decides, not churn — measured, see `rebuild_query_ratio`. Same
         // widening: once on the grid, stay until the query load drops well under.
@@ -276,7 +299,11 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
                 Held2::Keep(Box::new(t), refs)
             }
             Backend::Grid => {
-                let levels = MortonGrid::<T>::levels_for_cell_size(world, (world.width.max(world.height)) / 64.0);
+                // Cells sized by occupancy, not by a fixed fraction of the world — see the 3D
+                // twin, where `world_max / 64` meant 0.08 items per cell at 20k population.
+                let live = items.iter().flatten().count().max(1);
+                let per_axis = (live as f64 / crate::adaptive::GRID_TARGET_PER_CELL).sqrt().max(1.0);
+                let levels = (per_axis.log2().round().max(1.0) as u32).min(12);
                 let mut g = MortonGrid::new(world, levels);
                 for it in items.iter().flatten() { g.insert(it.clone()); }
                 Held2::Grid(Box::new(g))
@@ -361,7 +388,13 @@ mod tests {
             }
             // Query intensity is what buys the grid; one cull per item per tick is well
             // over any sane rebuild_query_ratio.
-            if want == Backend::Grid { for k in 0..ix.len() { let p = pt(k); let _ = ix.cull(&Circle::new(Point::new(p.x, p.y), 8.0)); } }
+            // The tree needs query load too, not just population — see the 3D twin's
+            // `scan_budget`: a crowd nobody queries is a crowd a linear scan should serve.
+            match want {
+                Backend::Grid => for k in 0..ix.len() { let p = pt(k); let _ = ix.cull(&Circle::new(Point::new(p.x, p.y), 8.0)); },
+                Backend::KeepTree => for k in 0..2 { let p = pt(k); let _ = ix.cull(&Circle::new(Point::new(p.x, p.y), 8.0)); },
+                _ => {}
+            }
             ix.tick();
         }
         assert_eq!(ix.backend(), want, "could not reach {want:?}");
@@ -466,6 +499,7 @@ mod tests {
             let k = t % 100;
             let p = all[k].p;
             mv(&mut ix, &mut all, k, Point::new(p.x + 0.03, p.y));
+            let _ = ix.cull(&Circle::new(p, 12.0)); // queried, or a scan is the right answer
             ix.tick();
         }
         assert_eq!(ix.backend(), Backend::KeepTree, "400 items should be indexed");
@@ -504,6 +538,7 @@ mod tests {
             let k = t % 300;
             let p = all[k].p;
             mv(&mut ix, &mut all, k, Point::new(p.x + 0.05, p.y));
+            let _ = ix.cull(&Circle::new(p, 12.0)); // queried, or a scan is the right answer
             ix.tick();
         }
         assert_eq!(ix.backend(), Backend::KeepTree);

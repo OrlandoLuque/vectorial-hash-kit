@@ -97,6 +97,23 @@ pub struct Thresholds {
     /// always keeps. That corner is a known, bounded loss of at most ~1.13×, and closing it
     /// would mean a fifth backend whose only difference is a rebuild.
     pub rebuild_query_ratio: f64,
+    /// **How many point-tests a linear scan may cost before an index is worth maintaining**,
+    /// expressed as a multiple of the per-item maintenance cost. This is the variable
+    /// `brute_max` alone was missing.
+    ///
+    /// A scan's cost is per QUERY: `queries x items` point tests a frame. An index's cost is
+    /// per MOVE: it maintains whatever moved, whether you query it once or a thousand times.
+    /// So "is a linear scan good enough" cannot be answered by population alone, and answering
+    /// it that way was measurably wrong — `examples/adaptive_vs_pinned`, act 2: 20 000 items,
+    /// everything moving, but only 8 culls a frame, and a pinned brute scan beat the adaptive
+    /// index **6.7x** (6.9 ms against 46.3) because the index was maintaining 20 000 items to
+    /// serve 8 queries.
+    ///
+    /// The comparison, per item per frame: a scan costs `q_per_item x items` and maintenance
+    /// costs `churn`, so the scan wins while `q_per_item x items < churn x scan_budget`. The
+    /// default is measured on this machine as roughly the ratio between one tree update and
+    /// one distance test.
+    pub scan_budget: f64,
     /// Consecutive tick with no movement at all before the workload counts as static.
     pub static_ticks: u32,
     /// Boundaries are widened by this fraction in the direction of travel, so a workload
@@ -106,6 +123,22 @@ pub struct Thresholds {
     pub hold_ticks: u32,
     /// Minimum ticks between migrations, whatever the numbers say.
     pub cooldown: u32,
+    /// **How far past a boundary counts as decisive enough to skip the hysteresis.**
+    ///
+    /// `hold_ticks` and `cooldown` exist to stop the policy flapping at a boundary — and at a
+    /// boundary, being on the wrong side costs almost nothing, because the two candidates are
+    /// nearly equal there. That reasoning stops applying the moment the workload is nowhere
+    /// near the boundary, and the cost of waiting stops being small with it.
+    ///
+    /// Measured (`examples/adaptive_vs_pinned`): with a flat 120-tick cooldown the index
+    /// entered the brute scan during a quiet act and was still on it through the next act's
+    /// query storm — one cull per item, five times `rebuild_query_ratio` — for **14 834 ms
+    /// against the best fixed choice's 1 000**. It migrated once in 240 frames. A rule meant
+    /// to prevent a cheap oscillation had bought a 14x catastrophe.
+    ///
+    /// So a candidate that is past its boundary by more than this factor migrates at once,
+    /// ignoring both the hold and the cooldown. Set it to `f64::MAX` for the old behaviour.
+    pub decisive_factor: f64,
 }
 
 impl Default for Thresholds {
@@ -117,10 +150,12 @@ impl Default for Thresholds {
             // machine. Was 0.1, which switched to the grid roughly twice as early as the
             // measurement supports.
             rebuild_query_ratio: 0.2,
+            scan_budget: 60.0,
             static_ticks: crate::advisor::STATIC_TICKS,
             margin: 0.25,
             hold_ticks: 30,
             cooldown: 120,
+            decisive_factor: 4.0,
         }
     }
 }
@@ -148,10 +183,12 @@ impl Thresholds {
                 "brute_max" => if let Ok(x) = v.parse() { t.brute_max = x },
                 "high_churn" => if let Ok(x) = v.parse() { t.high_churn = x },
                 "rebuild_query_ratio" => if let Ok(x) = v.parse() { t.rebuild_query_ratio = x },
+                "scan_budget" => if let Ok(x) = v.parse() { t.scan_budget = x },
                 "static_ticks" => if let Ok(x) = v.parse() { t.static_ticks = x },
                 "margin" => if let Ok(x) = v.parse() { t.margin = x },
                 "hold_ticks" => if let Ok(x) = v.parse() { t.hold_ticks = x },
                 "cooldown" => if let Ok(x) = v.parse() { t.cooldown = x },
+                "decisive_factor" => if let Ok(x) = v.parse() { t.decisive_factor = x },
                 _ => {}
             }
         }
@@ -168,12 +205,22 @@ impl Thresholds {
     pub fn to_text(&self) -> String {
         format!(
             "# vectorial-hash adaptive-index calibration\n\
-             brute_max = {}\nhigh_churn = {}\nrebuild_query_ratio = {}\nstatic_ticks = {}\n\
-             margin = {}\nhold_ticks = {}\ncooldown = {}\n",
-            self.brute_max, self.high_churn, self.rebuild_query_ratio, self.static_ticks,
-            self.margin, self.hold_ticks, self.cooldown)
+             brute_max = {}\nhigh_churn = {}\nrebuild_query_ratio = {}\nscan_budget = {}\n\
+             static_ticks = {}\nmargin = {}\nhold_ticks = {}\ncooldown = {}\n\
+             decisive_factor = {}\n",
+            self.brute_max, self.high_churn, self.rebuild_query_ratio, self.scan_budget,
+            self.static_ticks, self.margin, self.hold_ticks, self.cooldown, self.decisive_factor)
     }
 }
+
+/// Items a grid cell should hold, and the reason there is a number here at all.
+///
+/// A uniform grid's cost is decided by occupancy: too many per cell and every query scans a
+/// crowd, too few and it spends its time crossing empty cells looking for anything at all.
+/// Measured across four workloads (docs/THREE_D.md), the sweet spot is "about the k you ask
+/// for", and the failure mode on the thin side is far worse than on the fat side — 23x against
+/// 1.2x. So this sits deliberately on the low-but-not-tiny side of k.
+pub(crate) const GRID_TARGET_PER_CELL: f64 = 8.0;
 
 enum Held<T: Positioned3> {
     Brute,
@@ -229,6 +276,12 @@ pub struct AdaptiveIndex<T: Positioned3 + Clone> {
     queries: u64,
     /// Smoothed queries per item per tick: the variable the backend choice turns on.
     q_per_item: f64,
+    /// Smoothed MOVES per item per tick. Deliberately not `relocation_rate`, which counts
+    /// leaf crossings and is therefore only observable while the tree backend is loaded — a
+    /// policy rule that reads it can never fire on any other backend, which is exactly how the
+    /// first version of the scan rule failed: on the brute scan it saw churn 0, computed a
+    /// scan budget of 0, and could never conclude that the scan was still fine.
+    m_per_item: f64,
 }
 
 impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
@@ -242,6 +295,7 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
             items: Vec::new(), free: Vec::new(), live: 0, world, leaf: leaf.max(1), held: Held::Brute,
             profile: SpatialProfile::default(), th, pending: None, cooling: 0,
             dirty: false, switches: 0, moves: 0, relocations: 0, queries: 0, q_per_item: 0.0,
+            m_per_item: 0.0,
         }
     }
 
@@ -262,6 +316,8 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
     pub fn profile(&self) -> &SpatialProfile { &self.profile }
     /// Smoothed queries per item per tick — what the keep-vs-rebuild choice turns on.
     pub fn queries_per_item(&self) -> f64 { self.q_per_item }
+    /// Smoothed moves per item per tick — what the scan-vs-index choice turns on.
+    pub fn moves_per_item(&self) -> f64 { self.m_per_item }
 
     /// Add an item, reusing a retired slot if there is one.
     pub fn insert(&mut self, item: T) -> Slot {
@@ -387,20 +443,22 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
     pub fn tick(&mut self) -> Backend {
         let qpi = if self.live == 0 { 0.0 } else { self.queries as f64 / self.live as f64 };
         self.q_per_item += 0.1 * (qpi - self.q_per_item); // same EMA weight the advisor uses
+        let mpi = if self.live == 0 { 0.0 } else { self.moves as f64 / self.live as f64 };
+        self.m_per_item += 0.1 * (mpi - self.m_per_item);
         self.profile.observe(self.live, self.moves, self.relocations, self.queries);
         self.moves = 0;
         self.relocations = 0;
         self.queries = 0;
         self.cooling = self.cooling.saturating_sub(1);
 
-        let want = self.desired();
+        let (want, decisive) = self.desired_with_confidence();
         if want == self.backend() { self.pending = None; return self.backend(); }
         let held = match self.pending {
             Some((b, n)) if b == want => n + 1,
             _ => 1,
         };
         self.pending = Some((want, held));
-        if held >= self.th.hold_ticks && self.cooling == 0 {
+        if decisive || (held >= self.th.hold_ticks && self.cooling == 0) {
             self.migrate(want);
             self.pending = None;
             self.cooling = self.th.cooldown;
@@ -415,6 +473,26 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
     /// the advisor carries its own compiled-in constants, and the whole point of
     /// [`Thresholds`] is that a calibration file can override them. Delegating would have
     /// silently ignored the calibration — it did, until a test caught it.
+    /// The backend the numbers argue for, and whether they argue for it **decisively** —
+    /// far enough past the boundary that the hysteresis has nothing to protect against. See
+    /// [`Thresholds::decisive_factor`].
+    fn desired_with_confidence(&self) -> (Backend, bool) {
+        let want = self.desired();
+        if want == self.backend() { return (want, false); }
+        let f = self.th.decisive_factor;
+        let n = self.live as f64;
+        let decisive = match want {
+            // Population, or query load, an order of magnitude clear of the edge.
+            Backend::Brute => n * f <= self.th.brute_max as f64 || self.q_per_item * n * f <= self.m_per_item * self.th.scan_budget,
+            Backend::Grid => self.q_per_item >= self.th.rebuild_query_ratio * f,
+            // Leaving the scan because the queries have arrived, or nothing has moved for many
+            // times longer than the rule asks.
+            Backend::KeepTree => self.q_per_item * n >= self.m_per_item * self.th.scan_budget * f && n >= self.th.brute_max as f64 * f,
+            Backend::Static => self.profile.still_ticks() as f64 >= self.th.static_ticks as f64 * f,
+        };
+        (want, decisive)
+    }
+
     fn desired(&self) -> Backend {
         let n = self.live as f64;
         let m = self.th.margin;
@@ -423,6 +501,10 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
         // that would have kept us there; entering it demands a clearly smaller one.
         let brute_edge = self.th.brute_max as f64 * if cur == Backend::Brute { 1.0 + m } else { 1.0 - m };
         if n <= brute_edge { return Backend::Brute; }
+        // ...and a scan also wins when nobody is asking much, however many items there are:
+        // it costs per query while an index costs per move. See `scan_budget`.
+        let scan_edge = self.m_per_item * self.th.scan_budget * if cur == Backend::Brute { 1.0 + m } else { 1.0 - m };
+        if self.q_per_item * n < scan_edge { return Backend::Brute; }
         if self.profile.still_ticks() >= self.th.static_ticks { return Backend::Static; }
         // Query INTENSITY decides, not churn — measured, see `rebuild_query_ratio`. Same
         // widening: once on the grid, stay until the query load drops well under.
@@ -454,7 +536,16 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
                 Held::Keep(Box::new(t), refs)
             }
             Backend::Grid => {
-                let levels = MortonGrid3::<Tagged<T>>::levels_for_cell_size(world, (world.w.max(world.h).max(world.d)) / 64.0);
+                // Cells sized by OCCUPANCY, not by a fixed fraction of the world. This used to
+                // ask for `world_max / 64`, i.e. 64 cells per axis whatever the population —
+                // 262 144 cells for 20 000 items, or 0.08 items per cell. That is precisely
+                // the pathology measured in docs/THREE_D.md ("size the cell to hold roughly k
+                // points", where 0.08/cell ran 23x slower than a coarser grid), and it made
+                // the grid backend lose to everything in `examples/adaptive_vs_pinned` — which
+                // in turn made the policy look wrong when the geometry was.
+                let live = items.iter().flatten().count().max(1);
+                let per_axis = (live as f64 / GRID_TARGET_PER_CELL).cbrt().max(1.0);
+                let levels = (per_axis.log2().round().max(1.0) as u32).min(10);
                 let mut g = MortonGrid3::new(world, levels);
                 for (slot, it) in items.iter().enumerate() {
                     if let Some(v) = it { g.insert(Tagged { slot: slot as u32, item: v.clone() }); }
@@ -539,9 +630,16 @@ mod tests {
                     all[i] = Some(P { p: to });
                 }
             }
-            // Query intensity is what buys the grid; one cull per item per tick is well
-            // over any sane rebuild_query_ratio.
-            if want == Backend::Grid { for k in 0..ix.len() { let p = pt(k); let _ = ix.cull(&Sphere3::new(p.x, p.y, p.z, 8.0)); } }
+            // Query intensity is what buys an index at all. The grid needs one cull per item
+            // per tick to clear `rebuild_query_ratio`; the TREE needs only a couple, but it
+            // does need some — a population above `brute_max` with nobody querying is a
+            // population a linear scan should keep serving, which is what `scan_budget` says
+            // and what these tests used to assert the opposite of.
+            match want {
+                Backend::Grid => for k in 0..ix.len() { let p = pt(k); let _ = ix.cull(&Sphere3::new(p.x, p.y, p.z, 8.0)); },
+                Backend::KeepTree => for k in 0..2 { let p = pt(k); let _ = ix.cull(&Sphere3::new(p.x, p.y, p.z, 8.0)); },
+                _ => {}
+            }
             ix.tick();
         }
         assert_eq!(ix.backend(), want, "could not reach {want:?}");
@@ -640,15 +738,20 @@ mod tests {
         assert_eq!(ix.backend(), Backend::Brute, "80 items should not be indexed");
         assert_matches_brute(&mut ix, &all);
 
-        // Past the widened boundary it must move to the keep-index tree, and still agree.
+        // Past the widened boundary AND with someone actually querying, it must move to the
+        // keep-index tree. The queries are not decoration: population alone does not make an
+        // index worth maintaining, because a scan costs per query while an index costs per
+        // move (see `Thresholds::scan_budget` — measured at 6.7x for 20 000 items served by 8
+        // culls a frame). This test asserted the population-only rule until that was measured.
         for i in 80..400 { let p = P { p: pt(i) }; all.push(p); ix.insert(p); }
         for t in 0..20 {
             let k = t % 100;
             let p = all[k].p;
             mv(&mut ix, &mut all, k, Point3::new(p.x + 0.03, p.y, p.z));
+            let _ = ix.cull(&Sphere3::new(p.x, p.y, p.z, 12.0));
             ix.tick();
         }
-        assert_eq!(ix.backend(), Backend::KeepTree, "400 items should be indexed");
+        assert_eq!(ix.backend(), Backend::KeepTree, "400 queried items should be indexed");
         assert_matches_brute(&mut ix, &all);
     }
 
@@ -684,6 +787,7 @@ mod tests {
             let k = t % 300;
             let p = all[k].p;
             mv(&mut ix, &mut all, k, Point3::new(p.x + 0.05, p.y, p.z));
+            let _ = ix.cull(&Sphere3::new(p.x, p.y, p.z, 12.0)); // queried, or a scan is right
             ix.tick();
         }
         assert_eq!(ix.backend(), Backend::KeepTree);
@@ -714,9 +818,13 @@ mod tests {
         // three of them, picked by hand — and `rebuild_query_ratio`, the one number the
         // calibrate tool exists to measure, was missing from `to_text` for as long as it had
         // existed. A round-trip test that samples fields tests the fields it samples.
+        // An exhaustive literal on purpose: adding a field to Thresholds must BREAK THIS
+        // TEST rather than silently leave the new field untested. It has already done its job
+        // once — `scan_budget` and `decisive_factor` failed to compile here the moment they
+        // were added, which is how they came to be covered at all.
         let th = Thresholds {
-            brute_max: 777, high_churn: 0.42, rebuild_query_ratio: 0.37,
-            static_ticks: 13, margin: 0.11, hold_ticks: 9, cooldown: 5,
+            brute_max: 777, high_churn: 0.42, rebuild_query_ratio: 0.37, scan_budget: 42.0,
+            static_ticks: 13, margin: 0.11, hold_ticks: 9, cooldown: 5, decisive_factor: 9.0,
         };
         let parsed = Thresholds::parse(&(th.to_text() + "future_key = 12\n# a comment\n"));
         assert_eq!(parsed.brute_max, th.brute_max);
@@ -724,6 +832,8 @@ mod tests {
         assert!((parsed.rebuild_query_ratio - th.rebuild_query_ratio).abs() < 1e-9,
             "rebuild_query_ratio did not survive the round trip: {} != {}",
             parsed.rebuild_query_ratio, th.rebuild_query_ratio);
+        assert!((parsed.scan_budget - th.scan_budget).abs() < 1e-9);
+        assert!((parsed.decisive_factor - th.decisive_factor).abs() < 1e-9);
         assert_eq!(parsed.static_ticks, th.static_ticks);
         assert!((parsed.margin - th.margin).abs() < 1e-9);
         assert_eq!(parsed.hold_ticks, th.hold_ticks);
@@ -732,7 +842,9 @@ mod tests {
         let d = Thresholds::default();
         assert!(th.brute_max != d.brute_max && th.static_ticks != d.static_ticks
             && th.hold_ticks != d.hold_ticks && th.cooldown != d.cooldown
-            && (th.rebuild_query_ratio - d.rebuild_query_ratio).abs() > 1e-9,
+            && (th.rebuild_query_ratio - d.rebuild_query_ratio).abs() > 1e-9
+            && (th.scan_budget - d.scan_budget).abs() > 1e-9
+            && (th.decisive_factor - d.decisive_factor).abs() > 1e-9,
             "the test values must differ from the defaults or this proves nothing");
     }
 }

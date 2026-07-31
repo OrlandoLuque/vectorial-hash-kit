@@ -33,6 +33,7 @@
 //! or the numbers it writes will be pessimistic in ways the policy then bakes in.
 
 use std::time::Instant;
+use vectorial_hash::KdTree3;
 use vectorial_hash::{Aabb, MortonGrid3, Point3, Positioned3, Sphere3, Thresholds, Tree3};
 
 #[path = "common/mod.rs"]
@@ -94,7 +95,7 @@ fn index_beats_scan(n: usize, radius: f64) -> bool {
 /// place, and pricing it as a refill overstates its cost by whatever the refill would have
 /// been — which pushes the crossover the wrong way and makes the policy reach for the grid
 /// later than it should.
-fn frame_costs(n: usize, churn: f64, radius: f64, n_queries: usize) -> (f64, f64, f64) {
+fn frame_costs(n: usize, churn: f64, radius: f64, n_queries: usize) -> (f64, f64, f64, f64) {
     let items = cloud(n, 0xBEEF);
     let mut r = Lcg(11);
     let qs: Vec<Point3> = (0..n_queries).map(|_| Point3::new(r.r(0.0, W), r.r(0.0, W), r.r(0.0, W))).collect();
@@ -133,6 +134,19 @@ fn frame_costs(n: usize, churn: f64, radius: f64, n_queries: usize) -> (f64, f64
         std::hint::black_box(acc);
     }).cycles;
 
+    // The fourth arm, and it should have been here from the start: rebuild a KdTree3. The
+    // policy's `Static` backend does exactly this whenever anything moved, so it is a strategy
+    // the index actually uses — and the threshold that sends query-heavy workloads to the GRID
+    // was derived from a field that did not contain it. Measured in `adaptive_vs_pinned`, at
+    // one cull per item a rebuilt k-d tree beat the kept grid by 3.5x, which the calibration
+    // had no way of noticing.
+    let kd = common::measure(4, || {
+        let t = KdTree3::from_items(8, items.clone());
+        let mut acc = 0usize;
+        for q in &qs { acc += t.cull(&Sphere3::new(q.x, q.y, q.z, radius)).len(); }
+        std::hint::black_box(acc);
+    }).cycles;
+
     let rebuild = common::measure(4, || {
         let mut g = MortonGrid3::new(world(), levels);
         for it in &items { g.insert(*it); }
@@ -140,7 +154,7 @@ fn frame_costs(n: usize, churn: f64, radius: f64, n_queries: usize) -> (f64, f64
         for q in &qs { acc += g.cull(&Sphere3::new(q.x, q.y, q.z, radius)).len(); }
         std::hint::black_box(acc);
     }).cycles;
-    (keep, rebuild, keep_grid)
+    (keep, rebuild, keep_grid, kd)
 }
 
 fn main() {
@@ -171,7 +185,8 @@ fn main() {
     println!("
   churn x queries/frame - winner of the whole frame, and by how much");
     println!("  (each cell names the winner of THREE: keep = tree+ItemRef, REBUILD = refilled grid,");
-    println!("   gridkeep = the same grid maintained in place — the third arm the index now uses)");
+    println!("   gridkeep = the same grid maintained in place, KDTREE = a rebuilt KdTree3,");
+    println!("   which is what the policy calls Static)");
     print!("  {:<8}", "churn");
     for q in query_loads { print!("{:>20}", format!("{q} culls")); }
     println!();
@@ -180,10 +195,11 @@ fn main() {
         let c = step as f64 / 5.0;
         print!("  {:<8.1}", c);
         for q in query_loads {
-            let (keep, rebuild, keep_grid) = frame_costs(N, c, radius, q);
-            // Three strategies now, so the cell names the winner among all three rather than
-            // pretending the grid can only be refilled.
-            let arms = [("keep", keep), ("REBUILD", rebuild), ("gridkeep", keep_grid)];
+            let (keep, rebuild, keep_grid, kd) = frame_costs(N, c, radius, q);
+            // Four strategies. The k-d arm is the one the policy calls `Static` and reaches
+            // only when nothing has moved — which the sweep can now show is the wrong
+            // condition, if it wins cells where things are moving.
+            let arms = [("keep", keep), ("REBUILD", rebuild), ("gridkeep", keep_grid), ("KDTREE", kd)];
             let (who, best) = arms.iter().fold(("", f64::MAX), |acc, &(n, v)| if v < acc.1 { (n, v) } else { acc });
             let runner = arms.iter().map(|&(_, v)| v).filter(|&v| v > best).fold(f64::MAX, f64::min);
             print!("{:>20}", format!("{who} {:.2}x", runner / best.max(1.0)));
@@ -203,8 +219,8 @@ fn main() {
     let mut rebuild_query_ratio = f64::INFINITY;
     let mut old_ratio = f64::INFINITY;
     for q in query_loads {
-        let (keep, rebuild, keep_grid) = frame_costs(N, 1.0, radius, q);
-        if rebuild.min(keep_grid) < keep { rebuild_query_ratio = rebuild_query_ratio.min(q as f64 / N as f64); }
+        let (keep, rebuild, keep_grid, kd) = frame_costs(N, 1.0, radius, q);
+        if rebuild.min(keep_grid).min(kd) < keep { rebuild_query_ratio = rebuild_query_ratio.min(q as f64 / N as f64); }
         // What the two-armed model would have said, kept so the difference is visible rather
         // than asserted.
         if rebuild < keep { old_ratio = old_ratio.min(q as f64 / N as f64); }
