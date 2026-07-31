@@ -13,7 +13,7 @@
 //! | --- | --- | --- |
 //! | brute scan | few items | below ~500-1000 a contiguous scan beats any descent |
 //! | [`Tree3`] + `ItemRef` | items move, moderate churn | O(1) relocation; wins maintain in 15 of 16 sweep configs |
-//! | [`MortonGrid3`] rebuilt | items move a LOT | when relocation dominates, a rebuild is cheaper than fixing the tree (measured on the fluid demo, where keeping the index loses the frame by 16%) |
+//! | [`MortonGrid3`] | items move a LOT | a flat grid answers dense queries with fewer descents; it now **keeps in place** too (`MortonGrid3::update`), so it is no longer paying a full rebuild per mutation |
 //! | [`KdTree3`] | nothing has moved for a while | build-once, best query on skewed data |
 //!
 //! **Hysteresis is the whole difficulty.** A naive "pick the best for the current numbers"
@@ -70,6 +70,15 @@ pub struct Thresholds {
     /// cost and then answers from a perfectly fitted structure, so the more you ask, the
     /// sooner it pays — which is exactly why the fluid demo (one neighbour query PER
     /// PARTICLE) is the one workload in the repo where keeping the index loses the frame.
+    ///
+    /// **This number is now stale in a knowable direction and has NOT been re-derived.** It
+    /// was calibrated when the grid backend could only rebuild, so it prices a full refill
+    /// against every mutation. The grid keeps in place now, so the cost it is guarding
+    /// against is much smaller and the true crossover must be *lower* — the grid should be
+    /// reachable at less query load than 0.1 says. Re-deriving it needs `examples/calibrate`
+    /// to grow a third arm (keep-tree vs rebuild-grid vs keep-grid); until then the default
+    /// is conservative rather than wrong: it reaches for the grid later than it should, never
+    /// earlier.
     pub rebuild_query_ratio: f64,
     /// Consecutive tick with no movement at all before the workload counts as static.
     pub static_ticks: u32,
@@ -143,8 +152,21 @@ impl Thresholds {
 enum Held<T: Positioned3> {
     Brute,
     Keep(Box<Tree3<T>>, Vec<ItemRef>),
-    Grid(Box<MortonGrid3<T>>),
+    Grid(Box<MortonGrid3<Tagged<T>>>),
     Static(Box<KdTree3<T>>),
+}
+
+/// An item in the grid backend, carrying the [`Slot`] it belongs to.
+///
+/// `MortonGrid3::update` finds an item by scanning its old cell for one matching a predicate,
+/// which needs a way to tell two items apart. The tree backend gets that from `ItemRef`; a
+/// uniform grid has no handles, and matching on position alone would move the wrong item
+/// whenever two share a position exactly — rare, and exactly the case a settled fluid produces.
+/// One `u32` per item buys the identity, and the caller never sees it.
+#[derive(Clone)]
+struct Tagged<T> { slot: u32, item: T }
+impl<T: Positioned3> Positioned3 for Tagged<T> {
+    fn position(&self) -> Point3 { self.item.position() }
 }
 
 /// A stable handle into an [`AdaptiveIndex`]. Survives migrations.
@@ -230,7 +252,7 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
                 if refs.len() <= slot as usize { refs.resize(slot as usize + 1, ItemRef(u32::MAX)); }
                 refs[slot as usize] = r;
             }
-            Held::Grid(g) => { if !g.insert(item.clone()) { stale = true; } }
+            Held::Grid(g) => { if !g.insert(Tagged { slot, item: item.clone() }) { stale = true; } }
             Held::Brute => {}
             Held::Static(_) => stale = true, // a build-once backend cannot take one more
         }
@@ -255,6 +277,7 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
                 Some(r) => { t.remove_ref(r); refs[s.0 as usize] = ItemRef(u32::MAX); }
                 None => self.dirty = true,
             },
+            Held::Grid(g) => { g.remove(taken.position(), |c| c.slot == s.0); }
             Held::Brute => {}
             _ => self.dirty = true,
         }
@@ -265,6 +288,8 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
     /// the rebuild-based ones just note that they are stale.
     pub fn update<F: FnOnce(&mut T)>(&mut self, s: Slot, f: F) {
         let Some(it) = self.items.get_mut(s.0 as usize).and_then(|o| o.as_mut()) else { return };
+        // Captured BEFORE the mutation: the grid finds an item by where it used to be.
+        let was = it.position();
         f(it);
         let item = it.clone();
         self.moves += 1;
@@ -281,10 +306,18 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
                     }
                 } else { self.dirty = true; }
             }
-            // Any other backend is stale now — and it cannot tell us whether that move
-            // crossed a leaf, so it must NOT claim one. Reporting every move as a
-            // relocation here made the policy jump to the grid on its very first frame,
-            // before it had ever seen a real crossing. Churn is learned on the tree.
+            // The grid keeps in place too, since `MortonGrid3::update` exists: it does not
+            // need a handle, only where the item was. A `Missing` means the grid and the item
+            // list disagreed, which is recoverable by rebuilding rather than by pretending.
+            Held::Grid(g) => {
+                let slot = s.0;
+                if g.update(was, |c| c.slot == slot, |c| c.item = item).is_missing() { self.dirty = true; }
+            }
+            // Whatever is left cannot be maintained (a build-once k-d tree) or does not need
+            // to be (the brute scan reads `items` directly). It also cannot tell us whether
+            // that move crossed a leaf, so it must NOT claim a relocation: reporting every
+            // move as one made the policy jump to the grid on its very first frame, before it
+            // had ever seen a real crossing. Churn is learned on the tree.
             _ => self.dirty = true,
         }
     }
@@ -297,7 +330,7 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
         match &self.held {
             Held::Brute => self.items.iter().flatten().filter(|it| shape.contains_point(it.position())).collect(),
             Held::Keep(t, _) => t.cull(shape),
-            Held::Grid(g) => g.cull(shape),
+            Held::Grid(g) => g.cull(shape).into_iter().map(|t| &t.item).collect(),
             Held::Static(k) => k.cull(shape),
         }
     }
@@ -318,7 +351,7 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
                 v
             }
             Held::Keep(t, _) => t.knn(q, k),
-            Held::Grid(g) => g.knn(q, k),
+            Held::Grid(g) => g.knn(q, k).into_iter().map(|(d, t)| (d, &t.item)).collect(),
             Held::Static(kd) => kd.knn(q, k),
         }
     }
@@ -395,9 +428,11 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
                 Held::Keep(Box::new(t), refs)
             }
             Backend::Grid => {
-                let levels = MortonGrid3::<T>::levels_for_cell_size(world, (world.w.max(world.h).max(world.d)) / 64.0);
+                let levels = MortonGrid3::<Tagged<T>>::levels_for_cell_size(world, (world.w.max(world.h).max(world.d)) / 64.0);
                 let mut g = MortonGrid3::new(world, levels);
-                for it in items.iter().flatten() { g.insert(it.clone()); }
+                for (slot, it) in items.iter().enumerate() {
+                    if let Some(v) = it { g.insert(Tagged { slot: slot as u32, item: v.clone() }); }
+                }
                 Held::Grid(Box::new(g))
             }
             Backend::Static => Held::Static(Box::new(KdTree3::from_items(leaf, items.iter().flatten().cloned().collect()))),

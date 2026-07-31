@@ -141,6 +141,12 @@ pub enum Crossed {
     Missing,
 }
 
+impl Crossed {
+    /// `true` only for [`Crossed::Missing`] — the one outcome that means the caller's idea of
+    /// where the item was is wrong, and so the only one that needs recovering from.
+    pub fn is_missing(self) -> bool { self == Crossed::Missing }
+}
+
 /// Set a point-like item's position — for [`MortonGrid3::relocate`] and
 /// [`crate::MortonGrid::relocate`], which are conveniences over the predicate form.
 pub trait SetPosition3: Positioned3 {
