@@ -33,6 +33,7 @@ use web_time::Instant;
 use bytemuck::{Pod, Zeroable};
 use glam::Mat4;
 use winit::{event::*, event_loop::EventLoop, keyboard::{KeyCode, PhysicalKey}, window::WindowBuilder};
+use vectorial_hash::{AdaptiveIndex2, Backend, Slot};
 use vectorial_hash::tree::Crossing2;
 use vectorial_hash::{Circle, ItemRef, LinearQuadTree, MortonGrid, Point, Positioned, Rect, Tree};
 
@@ -145,11 +146,11 @@ struct FP { id: u32, p: Point }
 impl Positioned for FP { fn position(&self) -> Point { self.p } }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Idx { Morton, TreeKeep, Linear }
+enum Idx { Morton, TreeKeep, Linear, Adaptive }
 impl Idx {
-    fn next(self) -> Self { match self { Idx::Morton => Idx::TreeKeep, Idx::TreeKeep => Idx::Linear, Idx::Linear => Idx::Morton } }
+    fn next(self) -> Self { match self { Idx::Morton => Idx::TreeKeep, Idx::TreeKeep => Idx::Linear, Idx::Linear => Idx::Adaptive, Idx::Adaptive => Idx::Morton } }
     fn label(self) -> &'static str {
-        match self { Idx::Morton => "MORTONGRID REBUILD", Idx::TreeKeep => "TREE KEEP-INDEX", Idx::Linear => "LINEARQUADTREE REBUILD" }
+        match self { Idx::Morton => "MORTONGRID REBUILD", Idx::TreeKeep => "TREE KEEP-INDEX", Idx::Linear => "LINEARQUADTREE REBUILD", Idx::Adaptive => "ADAPTIVEINDEX2 (picks its own)" }
     }
 }
 
@@ -159,6 +160,11 @@ enum Index {
     Morton(MortonGrid<FP>),
     Keep { tree: Tree<FP>, refs: Vec<ItemRef> },
     Linear(LinearQuadTree<FP>),
+    /// The index that chooses for itself. It is here to be MEASURED against the three fixed
+    /// choices on a workload none of them was tuned for — SPH asks one neighbour query per
+    /// particle per frame, which is five times `rebuild_query_ratio`, so the policy has a real
+    /// decision rather than a foregone one.
+    Adaptive { ix: AdaptiveIndex2<FP>, slots: Vec<Slot> },
 }
 
 impl Index {
@@ -173,6 +179,11 @@ impl Index {
                 let mut tree = Tree::<FP>::new(rect, 12);
                 let refs = items().map(|it| tree.insert_ref(it).expect("in world")).collect();
                 Index::Keep { tree, refs }
+            }
+            Idx::Adaptive => {
+                let mut ix = AdaptiveIndex2::new(rect, 12);
+                let slots = items().map(|it| ix.insert(it)).collect();
+                Index::Adaptive { ix, slots }
             }
         }
     }
@@ -191,7 +202,27 @@ impl Index {
                 }
                 (px.len() as u64, moved)
             }
+            Index::Adaptive { ix, slots } => {
+                for i in 0..px.len() {
+                    let np = Point::new(px[i] as f64, py[i] as f64);
+                    ix.update(slots[i], |it| it.p = np);
+                }
+                ix.tick();
+                (px.len() as u64, 0)
+            }
             _ => { *self = Index::build(kind, px, py); (px.len() as u64, 0) }
+        }
+    }
+
+    /// Which structure the adaptive index is currently holding, for the HUD. `None` for the
+    /// fixed choices, which have nothing to report.
+    fn chosen(&self) -> Option<&'static str> {
+        match self {
+            Index::Adaptive { ix, .. } => Some(match ix.backend() {
+                Backend::Brute => "scan", Backend::KeepTree => "tree",
+                Backend::Grid => "grid", Backend::Static => "kdtree",
+            }),
+            _ => None,
         }
     }
     /// Neighbours of `q` within `H`, appended as ids. This is the "query" bar.
@@ -201,6 +232,21 @@ impl Index {
             Index::Morton(g) => out.extend(g.cull(&c).iter().map(|f| f.id)),
             Index::Keep { tree, .. } => out.extend(tree.cull(&c).iter().map(|f| f.id)),
             Index::Linear(t) => out.extend(t.cull(&c).iter().map(|f| f.id)),
+            // `cull` takes &mut self here because the adaptive index may refresh a stale
+            // backend before answering — the one place its API differs from a fixed structure.
+            Index::Adaptive { .. } => unreachable!("adaptive neighbours go through neighbours_mut"),
+        }
+    }
+
+    /// The adaptive index needs `&mut` to answer (it may rebuild a stale backend first), so it
+    /// gets its own entry point rather than forcing every fixed structure to take `&mut`.
+    fn neighbours_mut(&mut self, q: Point, out: &mut Vec<u32>) {
+        match self {
+            Index::Adaptive { ix, .. } => {
+                let c = Circle::new(q, H as f64);
+                out.extend(ix.cull(&c).iter().map(|f| f.id));
+            }
+            other => other.neighbours(q, out),
         }
     }
 }
@@ -310,7 +356,7 @@ impl Fluid {
         self.nbr_start.reserve(n + 1);
         for i in 0..n {
             self.nbr_start.push(self.nbr.len() as u32);
-            index.neighbours(Point::new(self.qx[i] as f64, self.qy[i] as f64), &mut self.nbr);
+            index.neighbours_mut(Point::new(self.qx[i] as f64, self.qy[i] as f64), &mut self.nbr);
         }
         self.nbr_start.push(self.nbr.len() as u32);
         let t2 = Instant::now();
@@ -453,6 +499,7 @@ async fn run() {
     let mut kind = match std::env::var("FLUID_INDEX").ok().as_deref() {
         Some("keep") | Some("tree") => Idx::TreeKeep,
         Some("linear") | Some("lqt") => Idx::Linear,
+        Some("adaptive") | Some("auto") => Idx::Adaptive,
         _ => Idx::Morton,
     };
     let mut fluid = Fluid::new(n);
@@ -624,8 +671,13 @@ async fn run() {
                             let vmax = fluid.vx.iter().zip(fluid.vy.iter()).map(|(a, b)| (a * a + b * b).sqrt()).fold(0.0f32, f32::max);
                             let bad = fluid.px.iter().chain(fluid.py.iter()).chain(fluid.vx.iter()).any(|v| !v.is_finite());
                             let inside = fluid.px.iter().zip(fluid.py.iter()).filter(|(x, y)| **x >= 0.0 && **x <= WW && **y >= 0.0 && **y <= WH).count();
-                            println!("fluid_wgpu end-to-end: {:.1} fps avg ({} drops, {}, maintain {:.2} ms / query {:.2} ms / physics {:.2} ms per frame)",
-                                fps, fluid.n(), kind.label(), maint_us / 1000.0, query_us / 1000.0, phys_us / 1000.0);
+                            // What the adaptive index settled on. Reporting the choice matters
+                            // as much as the time: an index that picks well once and never
+                            // migrates is a different (and cheaper) claim than one that keeps
+                            // adapting, and only this line tells them apart.
+                            let picked = index.chosen().map(|c| format!(" -> {c}")).unwrap_or_default();
+                            println!("fluid_wgpu end-to-end: {:.1} fps avg ({} drops, {}{}, maintain {:.2} ms / query {:.2} ms / physics {:.2} ms per frame)",
+                                fps, fluid.n(), kind.label(), picked, maint_us / 1000.0, query_us / 1000.0, phys_us / 1000.0);
                             // machine-readable for `bench-runner` (keyed by index, so a
                             // sweep over FLUID_INDEX lands in one comparable table)
                             let tag = kind.label().split_whitespace().next().unwrap_or("?").to_lowercase();
