@@ -23,6 +23,12 @@
 //!   With a handful of culls a frame the kept tree wins at every churn level — writing
 //!   `high_churn = 1` is a real answer meaning "never switch on churn alone here".
 //!
+//!   That was measured when a grid could only be refilled. Since `MortonGrid3::update`, the
+//!   sweep runs **three** arms and churn matters again: the kept grid takes the whole
+//!   zero-churn row and most of the heavy-query column, while a pure rebuild is left with the
+//!   single corner at full churn. The frontier used to be vertical in query load; it is
+//!   diagonal now.
+//!
 //! Both are measured with min-of-N on an otherwise quiet machine; run it on an idle box
 //! or the numbers it writes will be pessimistic in ways the policy then bakes in.
 
@@ -33,7 +39,7 @@ use vectorial_hash::{Aabb, MortonGrid3, Point3, Positioned3, Sphere3, Thresholds
 mod common;
 
 #[derive(Clone, Copy)]
-struct P { p: Point3 }
+struct P { id: u32, p: Point3 }
 impl Positioned3 for P { fn position(&self) -> Point3 { self.p } }
 
 struct Lcg(u64);
@@ -47,7 +53,7 @@ fn world() -> Aabb { Aabb::new(0.0, 0.0, 0.0, W, W, W) }
 
 fn cloud(n: usize, seed: u64) -> Vec<P> {
     let mut r = Lcg(seed);
-    (0..n).map(|_| P { p: Point3::new(r.r(0.0, W), r.r(0.0, W), r.r(0.0, W)) }).collect()
+    (0..n).map(|i| P { id: i as u32, p: Point3::new(r.r(0.0, W), r.r(0.0, W), r.r(0.0, W)) }).collect()
 }
 
 /// Is an index worth it at this population? Compares one indexed cull against one scan,
@@ -80,7 +86,15 @@ fn index_beats_scan(n: usize, radius: f64) -> bool {
 
 /// One frame at a given churn fraction: keep the tree with `update_ref`, or refill a grid.
 /// Returns (keep_ns, rebuild_ns) as cycles.
-fn frame_costs(n: usize, churn: f64, radius: f64, n_queries: usize) -> (f64, f64) {
+/// One frame's cost under each strategy, in cycles: `(keep_tree, rebuild_grid, keep_grid)`.
+///
+/// The third arm is new, and it is the one the index actually uses now. Until `MortonGrid3`
+/// grew `update`, a grid could only be refilled, so a two-armed model was the whole truth and
+/// `rebuild_query_ratio` was derived from it. It is not any more: the grid backend keeps in
+/// place, and pricing it as a refill overstates its cost by whatever the refill would have
+/// been — which pushes the crossover the wrong way and makes the policy reach for the grid
+/// later than it should.
+fn frame_costs(n: usize, churn: f64, radius: f64, n_queries: usize) -> (f64, f64, f64) {
     let items = cloud(n, 0xBEEF);
     let mut r = Lcg(11);
     let qs: Vec<Point3> = (0..n_queries).map(|_| Point3::new(r.r(0.0, W), r.r(0.0, W), r.r(0.0, W))).collect();
@@ -97,6 +111,28 @@ fn frame_costs(n: usize, churn: f64, radius: f64, n_queries: usize) -> (f64, f64
     }).cycles;
 
     let levels = MortonGrid3::<P>::levels_for_cell_size(world(), radius);
+
+    // The grid, kept: only the movers are touched, and only the ones that leave their cell
+    // re-bucket. Built once outside the timed closure, like the tree above.
+    let mut kg = MortonGrid3::new(world(), levels);
+    for it in &items { kg.insert(*it); }
+    let mut kg_pos: Vec<Point3> = items.iter().map(|it| it.p).collect();
+    let mut round = 0usize;
+    let keep_grid = common::measure(4, || {
+        for (j, &i) in movers.iter().enumerate() {
+            // Each repetition must move the item from wherever the last one left it, or the
+            // second repetition would be updating from a stale `old` and measuring Missing.
+            let d = dests[(j + round) % dests.len().max(1)];
+            let old = kg_pos[i];
+            kg.update(old, |c| c.id == i as u32, |c| c.p = d);
+            kg_pos[i] = d;
+        }
+        round += 1;
+        let mut acc = 0usize;
+        for q in &qs { acc += kg.cull(&Sphere3::new(q.x, q.y, q.z, radius)).len(); }
+        std::hint::black_box(acc);
+    }).cycles;
+
     let rebuild = common::measure(4, || {
         let mut g = MortonGrid3::new(world(), levels);
         for it in &items { g.insert(*it); }
@@ -104,7 +140,7 @@ fn frame_costs(n: usize, churn: f64, radius: f64, n_queries: usize) -> (f64, f64
         for q in &qs { acc += g.cull(&Sphere3::new(q.x, q.y, q.z, radius)).len(); }
         std::hint::black_box(acc);
     }).cycles;
-    (keep, rebuild)
+    (keep, rebuild, keep_grid)
 }
 
 fn main() {
@@ -134,6 +170,8 @@ fn main() {
     let query_loads = [16usize, 256, 4096, N / 4];
     println!("
   churn x queries/frame - winner of the whole frame, and by how much");
+    println!("  (each cell names the winner of THREE: keep = tree+ItemRef, REBUILD = refilled grid,");
+    println!("   gridkeep = the same grid maintained in place — the third arm the index now uses)");
     print!("  {:<8}", "churn");
     for q in query_loads { print!("{:>20}", format!("{q} culls")); }
     println!();
@@ -142,10 +180,14 @@ fn main() {
         let c = step as f64 / 5.0;
         print!("  {:<8.1}", c);
         for q in query_loads {
-            let (keep, rebuild) = frame_costs(N, c, radius, q);
-            let (who, by) = if keep <= rebuild { ("keep", rebuild / keep.max(1.0)) } else { ("REBUILD", keep / rebuild.max(1.0)) };
-            print!("{:>20}", format!("{who} {by:.2}x"));
-            if keep > rebuild && high_churn > c { high_churn = c; }
+            let (keep, rebuild, keep_grid) = frame_costs(N, c, radius, q);
+            // Three strategies now, so the cell names the winner among all three rather than
+            // pretending the grid can only be refilled.
+            let arms = [("keep", keep), ("REBUILD", rebuild), ("gridkeep", keep_grid)];
+            let (who, best) = arms.iter().fold(("", f64::MAX), |acc, &(n, v)| if v < acc.1 { (n, v) } else { acc });
+            let runner = arms.iter().map(|&(_, v)| v).filter(|&v| v > best).fold(f64::MAX, f64::min);
+            print!("{:>20}", format!("{who} {:.2}x", runner / best.max(1.0)));
+            if keep > rebuild.min(keep_grid) && high_churn > c { high_churn = c; }
         }
         println!();
     }
@@ -154,15 +196,26 @@ fn main() {
         println!("     load tested, so this machine's policy will not switch to the grid on churn.");
     }
 
-    // The crossover the policy actually uses: queries per item per tick at which the
-    // rebuild takes the frame. Read off the sweep above at the highest churn tested.
+    // The crossover the policy actually uses: queries per item per tick at which the GRID
+    // takes the frame from the kept tree. It is derived from whichever grid strategy is
+    // cheaper, because the index will use that one — pricing the grid as a refill when it
+    // keeps in place is what made the shipped default conservative.
     let mut rebuild_query_ratio = f64::INFINITY;
+    let mut old_ratio = f64::INFINITY;
     for q in query_loads {
-        let (keep, rebuild) = frame_costs(N, 1.0, radius, q);
-        if rebuild < keep { rebuild_query_ratio = rebuild_query_ratio.min(q as f64 / N as f64); }
+        let (keep, rebuild, keep_grid) = frame_costs(N, 1.0, radius, q);
+        if rebuild.min(keep_grid) < keep { rebuild_query_ratio = rebuild_query_ratio.min(q as f64 / N as f64); }
+        // What the two-armed model would have said, kept so the difference is visible rather
+        // than asserted.
+        if rebuild < keep { old_ratio = old_ratio.min(q as f64 / N as f64); }
     }
     if !rebuild_query_ratio.is_finite() { rebuild_query_ratio = f64::MAX; }
-    println!("  -> rebuild takes the frame from {rebuild_query_ratio:.3} queries per item per tick");
+    println!("  -> the grid takes the frame from {rebuild_query_ratio:.3} queries per item per tick");
+    if old_ratio.is_finite() && old_ratio > rebuild_query_ratio {
+        println!("     (the old rebuild-only model said {old_ratio:.3} — it was pricing a refill that no longer happens)");
+    } else if !old_ratio.is_finite() {
+        println!("     (the old rebuild-only model never saw the grid win at all at this radius)");
+    }
 
     let th = Thresholds { brute_max, high_churn, rebuild_query_ratio, ..Thresholds::default() };
     let text = th.to_text();

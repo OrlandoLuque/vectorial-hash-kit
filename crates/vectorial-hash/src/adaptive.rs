@@ -71,14 +71,31 @@ pub struct Thresholds {
     /// sooner it pays — which is exactly why the fluid demo (one neighbour query PER
     /// PARTICLE) is the one workload in the repo where keeping the index loses the frame.
     ///
-    /// **This number is now stale in a knowable direction and has NOT been re-derived.** It
-    /// was calibrated when the grid backend could only rebuild, so it prices a full refill
-    /// against every mutation. The grid keeps in place now, so the cost it is guarding
-    /// against is much smaller and the true crossover must be *lower* — the grid should be
-    /// reachable at less query load than 0.1 says. Re-deriving it needs `examples/calibrate`
-    /// to grow a third arm (keep-tree vs rebuild-grid vs keep-grid); until then the default
-    /// is conservative rather than wrong: it reaches for the grid later than it should, never
-    /// earlier.
+    /// **Re-derived 2026-07-31, and the obvious inference was wrong.** When the grid backend
+    /// gained an in-place `update`, the reasoning written here was: the grid got cheaper to
+    /// maintain, so the crossover must move *down*. It does not. The threshold is read off at
+    /// **maximum churn**, which is precisely the one regime where keeping a grid is worthless
+    /// — at churn 1.0 every item re-buckets and a bulk refill wins. The two-armed and
+    /// three-armed models therefore agree exactly where the number is taken, and the shipped
+    /// 0.1 was simply too low: the three-arm calibration measures **0.205** here, so the old
+    /// default reached for the grid about twice as early as the measurement supports. It was
+    /// aggressive, not conservative. Corrected to 0.2.
+    ///
+    /// **And one scalar no longer describes the boundary.** With the grid rebuilding, the
+    /// frontier was roughly vertical: enough queries and the refill pays for itself whatever
+    /// the churn. With the grid keeping, it is diagonal — measured, 20k items:
+    ///
+    /// | churn ↓ / culls → | 16 | 256 | 4096 | 5000 |
+    /// | --- | --- | --- | --- | --- |
+    /// | 0.0 | grid 1.71× | grid 1.92× | grid 1.57× | grid 1.51× |
+    /// | 0.2 | keep 4.50× | keep 1.55× | grid 1.35× | grid 1.29× |
+    /// | 0.6 | keep 7.56× | keep 2.90× | grid 1.13× | grid 1.13× |
+    /// | 1.0 | keep 5.92× | keep 2.71× | *rebuild* 1.11× | *rebuild* 1.13× |
+    ///
+    /// The grid strategy wins 11 of those 24 cells and a pure rebuild wins 2 — the corner at
+    /// full churn and heavy query load, which this index cannot reach because its grid backend
+    /// always keeps. That corner is a known, bounded loss of at most ~1.13×, and closing it
+    /// would mean a fifth backend whose only difference is a rebuild.
     pub rebuild_query_ratio: f64,
     /// Consecutive tick with no movement at all before the workload counts as static.
     pub static_ticks: u32,
@@ -96,8 +113,10 @@ impl Default for Thresholds {
         Thresholds {
             brute_max: crate::advisor::BRUTE_FORCE_MAX,
             high_churn: crate::advisor::HIGH_RELOCATION,
-            // 20k items, rebuild started winning between 256 and 4096 culls a frame.
-            rebuild_query_ratio: 0.1,
+            // Re-measured with the three-arm calibration (2026-07-31): 0.205 on this
+            // machine. Was 0.1, which switched to the grid roughly twice as early as the
+            // measurement supports.
+            rebuild_query_ratio: 0.2,
             static_ticks: crate::advisor::STATIC_TICKS,
             margin: 0.25,
             hold_ticks: 30,
