@@ -11,10 +11,37 @@
 //!
 //! | backend | chosen when | why |
 //! | --- | --- | --- |
-//! | brute scan | few items | below ~500-1000 a contiguous scan beats any descent |
-//! | [`Tree3`] + `ItemRef` | items move, moderate churn | O(1) relocation; wins maintain in 15 of 16 sweep configs |
-//! | [`MortonGrid3`] | items move a LOT | a flat grid answers dense queries with fewer descents; it now **keeps in place** too (`MortonGrid3::update`), so it is no longer paying a full rebuild per mutation |
+//! | brute scan | few items, **or few queries** | a scan costs per query, an index per move — see [`Thresholds::scan_budget`] |
+//! | [`Tree3`] + `ItemRef` | items move, queries are moderate | O(1) relocation; wins maintain in 15 of 16 sweep configs |
+//! | [`MortonGrid3`] | queries per item are high | a flat grid answers dense queries with fewer descents, and **keeps in place** now, so it no longer pays a rebuild per mutation |
 //! | [`KdTree3`] | nothing has moved for a while | build-once, best query on skewed data |
+//!
+//! ## What it is actually worth — measured, and not flattering everywhere
+//!
+//! Two benchmarks, deliberately asking different questions.
+//!
+//! **`examples/adaptive_vs_pinned`** runs a script whose character changes four times — small
+//! and quiet, growing past the scan edge with everything moving, a query storm at one cull per
+//! item, then frozen — through the adaptive index and through each backend *pinned*. A
+//! stationary workload would just reward whichever fixed structure suited it and prove nothing.
+//! Latest: **0.70× the best pinned choice**. It converts the catastrophic guess (a pinned brute
+//! scan: ~22 000 ms) into ~1 200 ms without being told anything, and gives up ~30 % against the
+//! choice you would have had to know in advance.
+//!
+//! **`fluid_wgpu`**, a real demo with a stationary workload, is the other end: **parity with
+//! the best fixed choice** (347-360 fps against 352), found by itself, and 8-15 % ahead of the
+//! other two. Its maintenance drops to 0.00 ms because it picks the grid and *keeps* it where
+//! the fixed option refills it.
+//!
+//! So: on a workload that does not change, the policy costs nothing and picks correctly. On one
+//! that changes, migrating and noticing are both real costs and it currently loses to the best
+//! fixed choice. The honest pitch is **insurance, not optimisation** — it is worth having when
+//! you cannot know the workload in advance, and worth *not* having when you can.
+//!
+//! Where the remaining loss goes, measured rather than guessed: frames spent on the previous
+//! backend before any detector could have decided, plus the migration's own rebuild. Making the
+//! detector instant ([`Thresholds::detector_alpha`] = 1.0) recovers ~10 % of one act and loses
+//! it again on another.
 //!
 //! **Hysteresis is the whole difficulty.** A naive "pick the best for the current numbers"
 //! flaps: at the boundary it rebuilds every frame and loses to *both* candidates. So a

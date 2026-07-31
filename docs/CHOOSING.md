@@ -179,6 +179,15 @@ repeated passes** on an idle machine, via `cargo run -p bench-runner --release`:
   tree leads by 1.6-7.6x on 3D maintain but trails a `QuadTree` by 4-10% in 2D. The two
   policies are held identical by a test that runs one script of work through both and
   compares the sequence of backends they pick.
+
+  **And it is insurance, not optimisation — measured both ways.** On a *stationary* workload
+  (`fluid_wgpu`, one neighbour query per particle per frame) it reaches **parity with the best
+  fixed choice** — 347-360 fps against 352 — having found that choice itself, and beats the
+  other two by 8-15%. On a workload that *changes character* four times
+  (`examples/adaptive_vs_pinned`) it runs at **0.70× the best pinned backend**, while turning
+  the catastrophic guess into a survivable one: a pinned brute scan takes ~22 000 ms on that
+  script where the adaptive index takes ~1 200. Reach for it when you cannot know the workload
+  in advance; pin the structure when you can.
 - **"Grids rebuild, trees keep" was an API limit, not a law.** `MortonGrid3::update` /
   `MortonGrid::update` move an item in place: told where it *was*, the grid finds it in that
   one cell, and if it has not left the cell there is nothing to do at all. A rebuild costs the
