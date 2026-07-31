@@ -282,6 +282,13 @@ pub struct AdaptiveIndex<T: Positioned3 + Clone> {
     /// first version of the scan rule failed: on the brute scan it saw churn 0, computed a
     /// scan budget of 0, and could never conclude that the scan was still fine.
     m_per_item: f64,
+    /// The live count the grid backend's cell size was derived from.
+    ///
+    /// A grid's levels are chosen when it is built, and with the keep path it is never
+    /// rebuilt — so a grid built for 60 items was still serving 20 000 of them at 2 500 per
+    /// cell, three times slower than it needed to be. Nothing marked it dirty because nothing
+    /// was wrong with its CONTENTS; what had gone stale was its geometry.
+    grid_for: usize,
 }
 
 impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
@@ -295,7 +302,7 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
             items: Vec::new(), free: Vec::new(), live: 0, world, leaf: leaf.max(1), held: Held::Brute,
             profile: SpatialProfile::default(), th, pending: None, cooling: 0,
             dirty: false, switches: 0, moves: 0, relocations: 0, queries: 0, q_per_item: 0.0,
-            m_per_item: 0.0,
+            m_per_item: 0.0, grid_for: 0,
         }
     }
 
@@ -451,6 +458,13 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
         self.queries = 0;
         self.cooling = self.cooling.saturating_sub(1);
 
+        // A grid whose population has drifted far from what its cells were sized for is
+        // stale in geometry rather than in contents, which nothing else would notice. The
+        // rebuild goes through `build`, which re-derives the levels.
+        if self.backend() == Backend::Grid && self.grid_for > 0 {
+            let (a, b) = (self.live.max(1) as f64, self.grid_for as f64);
+            if a / b > 4.0 || b / a > 4.0 { self.dirty = true; self.grid_for = self.live; }
+        }
         let (want, decisive) = self.desired_with_confidence();
         if want == self.backend() { self.pending = None; return self.backend(); }
         let held = match self.pending {
@@ -516,6 +530,7 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
     fn migrate(&mut self, to: Backend) {
         self.switches += 1;
         self.held = Self::build(to, &self.items, self.world, self.leaf);
+        self.grid_for = self.live; // whatever the grid's cells were just sized for
         self.dirty = false;
     }
 
@@ -563,6 +578,7 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
         let b = self.backend();
         if b == Backend::Brute { self.dirty = false; return; }
         self.held = Self::build(b, &self.items, self.world, self.leaf);
+        self.grid_for = self.live;
         self.dirty = false;
     }
 }

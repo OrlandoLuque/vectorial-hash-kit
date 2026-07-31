@@ -95,14 +95,14 @@ fn index_beats_scan(n: usize, radius: f64) -> bool {
 /// place, and pricing it as a refill overstates its cost by whatever the refill would have
 /// been — which pushes the crossover the wrong way and makes the policy reach for the grid
 /// later than it should.
-fn frame_costs(n: usize, churn: f64, radius: f64, n_queries: usize) -> (f64, f64, f64, f64) {
+fn frame_costs(n: usize, churn: f64, radius: f64, n_queries: usize, leaf: usize) -> (f64, f64, f64, f64) {
     let items = cloud(n, 0xBEEF);
     let mut r = Lcg(11);
     let qs: Vec<Point3> = (0..n_queries).map(|_| Point3::new(r.r(0.0, W), r.r(0.0, W), r.r(0.0, W))).collect();
     let movers: Vec<usize> = (0..n).filter(|i| (*i as f64 / n as f64) < churn).collect();
     let dests: Vec<Point3> = movers.iter().map(|_| Point3::new(r.r(0.0, W), r.r(0.0, W), r.r(0.0, W))).collect();
 
-    let mut tree = Tree3::new(world(), 8);
+    let mut tree = Tree3::new(world(), leaf);
     let refs: Vec<_> = items.iter().filter_map(|it| tree.insert_ref(*it)).collect();
     let keep = common::measure(4, || {
         for (j, &i) in movers.iter().enumerate() { tree.update_ref(refs[i], |c| c.p = dests[j]); }
@@ -141,7 +141,7 @@ fn frame_costs(n: usize, churn: f64, radius: f64, n_queries: usize) -> (f64, f64
     // one cull per item a rebuilt k-d tree beat the kept grid by 3.5x, which the calibration
     // had no way of noticing.
     let kd = common::measure(4, || {
-        let t = KdTree3::from_items(8, items.clone());
+        let t = KdTree3::from_items(leaf, items.clone());
         let mut acc = 0usize;
         for q in &qs { acc += t.cull(&Sphere3::new(q.x, q.y, q.z, radius)).len(); }
         std::hint::black_box(acc);
@@ -159,7 +159,11 @@ fn frame_costs(n: usize, churn: f64, radius: f64, n_queries: usize) -> (f64, f64
 
 fn main() {
     let out = std::env::args().nth(1).unwrap_or_else(|| "vh-calibration.txt".into());
-    let radius = 24.0;
+    // Both knobs are env-settable so this sweep can be run at the geometry another bench
+    // uses — the two disagreed about the k-d arm and the first suspect was that they were
+    // simply not measuring the same query.
+    let radius: f64 = std::env::var("CAL_R").ok().and_then(|s| s.parse().ok()).unwrap_or(24.0);
+    let leaf: usize = std::env::var("CAL_LEAF").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
     let t0 = Instant::now();
     println!("calibrating on this machine (keep it idle)…\n");
 
@@ -195,7 +199,7 @@ fn main() {
         let c = step as f64 / 5.0;
         print!("  {:<8.1}", c);
         for q in query_loads {
-            let (keep, rebuild, keep_grid, kd) = frame_costs(N, c, radius, q);
+            let (keep, rebuild, keep_grid, kd) = frame_costs(N, c, radius, q, leaf);
             // Four strategies. The k-d arm is the one the policy calls `Static` and reaches
             // only when nothing has moved — which the sweep can now show is the wrong
             // condition, if it wins cells where things are moving.
@@ -219,7 +223,7 @@ fn main() {
     let mut rebuild_query_ratio = f64::INFINITY;
     let mut old_ratio = f64::INFINITY;
     for q in query_loads {
-        let (keep, rebuild, keep_grid, kd) = frame_costs(N, 1.0, radius, q);
+        let (keep, rebuild, keep_grid, kd) = frame_costs(N, 1.0, radius, q, leaf);
         if rebuild.min(keep_grid).min(kd) < keep { rebuild_query_ratio = rebuild_query_ratio.min(q as f64 / N as f64); }
         // What the two-armed model would have said, kept so the difference is visible rather
         // than asserted.
