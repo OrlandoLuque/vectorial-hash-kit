@@ -159,12 +159,19 @@ impl Thresholds {
     }
 
     /// Serialise, for the `calibrate` example to write.
+    ///
+    /// Every field — and there is a test that checks every field rather than a sample.
+    /// `rebuild_query_ratio` was missing here for as long as it has existed, so `calibrate`
+    /// measured it, printed it to the terminal, and then dropped it on the way to disk:
+    /// anyone pointing `VH_CALIBRATION` at the resulting file got the compiled-in default for
+    /// the one number the tool exists to produce.
     pub fn to_text(&self) -> String {
         format!(
             "# vectorial-hash adaptive-index calibration\n\
-             brute_max = {}\nhigh_churn = {}\nstatic_ticks = {}\nmargin = {}\n\
-             hold_ticks = {}\ncooldown = {}\n",
-            self.brute_max, self.high_churn, self.static_ticks, self.margin, self.hold_ticks, self.cooldown)
+             brute_max = {}\nhigh_churn = {}\nrebuild_query_ratio = {}\nstatic_ticks = {}\n\
+             margin = {}\nhold_ticks = {}\ncooldown = {}\n",
+            self.brute_max, self.high_churn, self.rebuild_query_ratio, self.static_ticks,
+            self.margin, self.hold_ticks, self.cooldown)
     }
 }
 
@@ -703,10 +710,29 @@ mod tests {
 
     #[test]
     fn calibration_round_trips_and_ignores_unknown_keys() {
-        let th = Thresholds { brute_max: 777, high_churn: 0.42, hold_ticks: 9, ..Default::default() };
+        // EVERY field, each set to something no default produces. The first version checked
+        // three of them, picked by hand — and `rebuild_query_ratio`, the one number the
+        // calibrate tool exists to measure, was missing from `to_text` for as long as it had
+        // existed. A round-trip test that samples fields tests the fields it samples.
+        let th = Thresholds {
+            brute_max: 777, high_churn: 0.42, rebuild_query_ratio: 0.37,
+            static_ticks: 13, margin: 0.11, hold_ticks: 9, cooldown: 5,
+        };
         let parsed = Thresholds::parse(&(th.to_text() + "future_key = 12\n# a comment\n"));
-        assert_eq!(parsed.brute_max, 777);
-        assert!((parsed.high_churn - 0.42).abs() < 1e-9);
-        assert_eq!(parsed.hold_ticks, 9);
+        assert_eq!(parsed.brute_max, th.brute_max);
+        assert!((parsed.high_churn - th.high_churn).abs() < 1e-9);
+        assert!((parsed.rebuild_query_ratio - th.rebuild_query_ratio).abs() < 1e-9,
+            "rebuild_query_ratio did not survive the round trip: {} != {}",
+            parsed.rebuild_query_ratio, th.rebuild_query_ratio);
+        assert_eq!(parsed.static_ticks, th.static_ticks);
+        assert!((parsed.margin - th.margin).abs() < 1e-9);
+        assert_eq!(parsed.hold_ticks, th.hold_ticks);
+        assert_eq!(parsed.cooldown, th.cooldown);
+        // None of those may equal the default, or every assertion above passes vacuously.
+        let d = Thresholds::default();
+        assert!(th.brute_max != d.brute_max && th.static_ticks != d.static_ticks
+            && th.hold_ticks != d.hold_ticks && th.cooldown != d.cooldown
+            && (th.rebuild_query_ratio - d.rebuild_query_ratio).abs() > 1e-9,
+            "the test values must differ from the defaults or this proves nothing");
     }
 }
