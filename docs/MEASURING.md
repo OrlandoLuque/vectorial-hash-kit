@@ -158,6 +158,23 @@ Cell counts are as deterministic as point counts, so they are gated the same way
 CI, by a second ratchet in `tests/work_counts.rs` and a CI job that builds with the feature.
 A ratchet nobody's build enables is a ratchet checking nothing.
 
+## 8c. A short window hides a slow leak
+
+The linear trees' keep path was first measured over **20 frames**, and the shape drift looked
+like a mild fixed tax: 1.20x slower culls at 10 % churn, 13 914 leaves. Re-run over **300**, the
+same configuration reads 18 822 leaves and **1.37x, still climbing**. The effect was never a tax;
+it was an accumulation — every frame added subdivisions and none were ever given back.
+
+Twenty frames was plenty to measure a *rate* (maintain cost per frame, stable from the first
+frame) and far too short to measure a *state* that integrates over time. Both numbers came out
+of the same bench in the same run, which is exactly how this hides: the columns look equally
+trustworthy and one of them silently depends on a parameter nobody was varying.
+
+Ask of every column: **is this a rate or an accumulation?** If it accumulates, the run length is
+part of the answer, and one run length is one point of a curve. (The same shape of mistake as
+measuring a grid at 100 % churn and concluding grids must rebuild — § "Grids rebuild, trees
+keep" in CHOOSING.md.)
+
 ## 9. Publish from an idle machine
 
 None of the above removes contention: another process still evicts your cache lines and eats

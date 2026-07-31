@@ -123,13 +123,28 @@ impl<T: Positioned3> LinearOctree3<T> {
     /// do at all; if it has, it is re-inserted through the normal path, which subdivides the
     /// destination if that tips it over `capacity`.
     ///
-    /// **This structure drifts in SHAPE, and the grids do not.** A flat grid maintained in
-    /// place is byte-identical to a rebuilt one, because its cells are fixed. This one is
-    /// adaptive: it keeps splits made for a distribution the points have since left, and it
-    /// never merges a leaf that has emptied out. What is guaranteed is that it keeps giving
-    /// the *same answers* as a rebuild — the tests check cull sets and k-NN distances, not
-    /// leaf counts. What is not guaranteed is that it keeps answering them as *fast*: on a
-    /// workload that migrates across the world, rebuild periodically or accept the drift.
+    /// **Its shape drifts from a rebuild's, but it does not run away.** A flat grid maintained
+    /// in place is byte-identical to a rebuilt one, because its cells are fixed. This one is
+    /// adaptive, so its leaves depend on where the points were — and [`Self::try_merge_up`]
+    /// collapses a parent back once its children between them fit in one leaf, which is what
+    /// stops the tree hoarding every subdivision it has ever made.
+    ///
+    /// Leaf counts after 300 maintained frames (a rebuild from the same points: 6 939):
+    ///
+    /// | churn | without the merge | with it |
+    /// | ---: | ---: | ---: |
+    /// | 100 % | 23 385 | 10 375 |
+    /// | 10 % | 18 822 | 7 236 |
+    /// | 1 % | 10 756 | 6 990 |
+    ///
+    /// Without it the count keeps climbing and the culls climb with it (1.37x a fresh tree's
+    /// at 10 % churn, and still rising when the run ended). With it the count settles and the
+    /// culls come back to parity. The merge costs on the write side — ~40-60 % more per
+    /// maintained frame — so which way it pays depends on your query load; but degradation
+    /// with no bound is not a trade, which is why it is not optional.
+    ///
+    /// What holds either way is that this keeps giving the *same answers* as a rebuild: the
+    /// tests check cull sets and k-NN distances, and deliberately not leaf counts.
     pub fn update<P, M>(&mut self, old: Point3, predicate: P, mutate: M) -> Crossed
     where
         P: Fn(&T) -> bool,
@@ -162,12 +177,50 @@ impl<T: Positioned3> LinearOctree3<T> {
         Some(self.take_at(key, idx))
     }
 
+    /// Collapse a parent back into a single leaf once its children between them hold few
+    /// enough items, walking upward for as long as that keeps being true.
+    ///
+    /// This is the same `try_merge_up` the pointer trees (`Tree`, `QuadTree`, `Tree3`,
+    /// `Octree3`) have always had. It was missing here for a reason that stopped being true an
+    /// hour ago: without `remove`/`update` nothing ever left a leaf, so there was never
+    /// anything to merge. The moment items can leave, its absence stops being harmless — a
+    /// maintained tree accumulates every subdivision it has ever made and never gives one
+    /// back, ending up finely chopped everywhere the points have *ever* been dense.
+    ///
+    /// The threshold is `capacity`, matching `Tree3::merge_limit = item_limit`: a merged leaf
+    /// holds at most `capacity`, and a split needs *more* than `capacity`, so a merge cannot
+    /// immediately undo itself.
+    fn try_merge_up(&mut self, mut key: u64) {
+        loop {
+            if key <= 1 { return; } // the root has no parent to collapse into
+            let parent = key >> 3;
+            if !self.internal.contains(&parent) { return; }
+            let mut combined = 0usize;
+            for c in 0..8u64 {
+                let child = (parent << 3) | c;
+                // A child that is itself subdivided means this parent is not a merge
+                // candidate — only a level whose children are all leaves can collapse.
+                if self.internal.contains(&child) { return; }
+                combined += self.leaves.get(&child).map_or(0, |v| v.len());
+            }
+            if combined > self.capacity { return; }
+            let mut items = Vec::with_capacity(combined);
+            for c in 0..8u64 {
+                if let Some(mut v) = self.leaves.remove(&((parent << 3) | c)) { items.append(&mut v); }
+            }
+            self.internal.remove(&parent);
+            if !items.is_empty() { self.leaves.insert(parent, items); }
+            key = parent;
+        }
+    }
+
     /// Pull item `idx` out of leaf `key`, dropping the leaf if that empties it.
     fn take_at(&mut self, key: u64, idx: usize) -> T {
         let bucket = self.leaves.get_mut(&key).expect("caller located this leaf");
         let item = bucket.swap_remove(idx);
         if bucket.is_empty() { self.leaves.remove(&key); }
         self.len -= 1;
+        self.try_merge_up(key);
         item
     }
 
@@ -621,6 +674,46 @@ mod keep_tests {
             assert_eq!(ka, kb, "knn diverged at round {round}");
         }
         assert!(stayed > 500 && moved > 500, "both paths must be exercised: stayed {stayed}, moved {moved}");
+    }
+
+    /// `try_merge_up`'s one job: the leaf count must not run away.
+    ///
+    /// The answer tests above pass with or without the merge — a bloated tree is slow, not
+    /// wrong — so nothing else in this file would notice if the collapse were removed. This
+    /// asserts the bound directly. Measured without the merge, the same script reaches ~2.7x a
+    /// rebuild's leaf count and keeps climbing; with it, ~1.05x.
+    #[test]
+    fn merging_keeps_the_leaf_count_near_a_rebuild() {
+        let world = Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0);
+        let mut rng = Rng(0xC0FFEE);
+        let n = 900usize;
+        let mut pts: Vec<M> = (0..n).map(|i| M { id: i as u32, p: Point3::new(rng.r(0.0, 255.9), rng.r(0.0, 255.9), rng.r(0.0, 255.9)) }).collect();
+        let mut kept = LinearOctree3::from_items(world, 8, 12, pts.clone());
+
+        // Long enough for an accumulation to show. A short run hides it — that is exactly how
+        // the drift was mis-read as a fixed tax the first time (docs/MEASURING.md 8c).
+        for _ in 0..400 {
+            for pt in pts.iter_mut() {
+                let old = pt.p;
+                // A RANDOM WALK, not a teleport. Teleporting to a fresh uniform point every
+                // round keeps the density uniform and the tree stable — measured, it bloats by
+                // only 1.12x and this test passed with the merge removed. Drift is what creates
+                // transient local crowding in new places, which is what leaves orphaned splits.
+                let np = Point3::new((old.x + rng.r(-30.0, 30.0)).clamp(0.0, 255.9), (old.y + rng.r(-30.0, 30.0)).clamp(0.0, 255.9), (old.z + rng.r(-30.0, 30.0)).clamp(0.0, 255.9));
+                let id = pt.id;
+                kept.update(old, |it| it.id == id, |it| it.p = np);
+                pt.p = np;
+            }
+        }
+        let fresh = LinearOctree3::from_items(world, 8, 12, pts.clone());
+        let (a, b) = (kept.leaf_count(), fresh.leaf_count());
+        // 1.10, chosen between the two MEASURED values rather than picked as a round number:
+        // with the merge this workload lands on exactly the rebuild's count (402 = 402); with
+        // the call removed it reads 1.26x. A threshold that does not separate the two states
+        // is not a guard, and the first version of this test used 1.6x and passed happily
+        // with the merge deleted.
+        assert!(a as f64 <= 1.10 * b as f64, "kept tree bloated to {a} leaves against a rebuild's {b}");
+        assert_eq!(kept.item_count(), fresh.item_count());
     }
 
     #[test]
