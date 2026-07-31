@@ -349,6 +349,23 @@ impl<T: Positioned3> MortonGrid3<T> {
         Crossed::Moved
     }
 
+    /// **Remove an item, given where it was.** The companion to
+    /// [`MortonGrid3::update`]: same bargain (the caller supplies the old position so only one
+    /// cell is scanned), same cost, and the emptied bucket is dropped so the cell set stays
+    /// exactly what a rebuild would produce.
+    ///
+    /// Returns the item, or `None` if nothing in that cell matched.
+    pub fn remove<P: Fn(&T) -> bool>(&mut self, old: Point3, predicate: P) -> Option<T> {
+        if !self.world.contains(old) { return None; }
+        let key = morton3_of(self.cell_of(old));
+        let bucket = self.cells.get_mut(&key)?;
+        let idx = bucket.iter().position(&predicate)?;
+        let item = bucket.swap_remove(idx);
+        if bucket.is_empty() { self.cells.remove(&key); }
+        self.len -= 1;
+        Some(item)
+    }
+
     /// Convenience over [`MortonGrid3::update`] for the common case of moving a point-like item
     /// whose identity is decided by comparing positions.
     pub fn relocate(&mut self, old: Point3, new: Point3) -> Crossed
@@ -1251,6 +1268,36 @@ mod update_tests {
         assert!(g.cull(&Sphere3::new(100.0, 100.0, 100.0, 50.0)).is_empty(), "the vacated cell still answers");
         // and an old position outside the world is Missing, not a panic
         assert_eq!(g.update(Point3::new(-5.0, 0.0, 0.0), |_| true, |_| {}), Crossed::Missing);
+    }
+
+    /// Removal has to leave the grid indistinguishable from one built without the item —
+    /// including the cell set, which is where a forgotten empty bucket would show.
+    #[test]
+    fn remove_leaves_the_grid_as_if_the_item_had_never_been_inserted() {
+        let world = Aabb::new(0.0, 0.0, 0.0, 256.0, 256.0, 256.0);
+        let mut rng = Rng(0xBEEF);
+        let pts: Vec<M> = (0..300).map(|i| M { id: i as u32, p: Point3::new(rng.r(0.0, 255.9), rng.r(0.0, 255.9), rng.r(0.0, 255.9)) }).collect();
+        let mut g: MortonGrid3<M> = MortonGrid3::new(world, 4);
+        for it in &pts { g.insert(*it); }
+
+        let doomed: Vec<usize> = (0..300).step_by(3).collect();
+        for &i in &doomed {
+            let got = g.remove(pts[i].p, |it| it.id == i as u32).expect("item was there");
+            assert_eq!(got.id, i as u32);
+            assert!(g.remove(pts[i].p, |it| it.id == i as u32).is_none(), "removing twice must be None");
+        }
+        let survivors: Vec<M> = pts.iter().enumerate().filter(|(i, _)| !doomed.contains(i)).map(|(_, m)| *m).collect();
+        let mut fresh: MortonGrid3<M> = MortonGrid3::new(world, 4);
+        for it in &survivors { fresh.insert(*it); }
+        assert_eq!(g.item_count(), fresh.item_count());
+        assert_eq!(g.cell_count(), fresh.cell_count(), "an emptied bucket was left behind");
+        for (cx, cy, cz, r) in [(60.0, 60.0, 60.0, 40.0), (180.0, 120.0, 200.0, 55.0)] {
+            let s = Sphere3::new(cx, cy, cz, r);
+            let mut a: Vec<u32> = g.cull(&s).iter().map(|m| m.id).collect();
+            let mut b: Vec<u32> = fresh.cull(&s).iter().map(|m| m.id).collect();
+            a.sort_unstable(); b.sort_unstable();
+            assert_eq!(a, b, "removed grid != rebuilt grid");
+        }
     }
 
     /// `relocate` is the same thing with the predicate written for you.

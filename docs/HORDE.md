@@ -313,14 +313,30 @@ It does test more points (316 vs 290 at L5) and it is still faster: the lookups 
 the extra distance tests. L7 and L8 win that query outright and then fall off a cliff on the
 rings, down to 0.09×, which is the occupancy rule biting from the other end.
 
-**But the toggle is not a speed option, and the same measurement is what says so.** End to end
-on 50k units the grid path costs **7.31 ms/step against the kept tree's 0.65** — 11× worse —
-and the geometry fix moved it only from 8.41 to 7.31 (1.15×). The grid's problem in this demo
-is not how it answers, it is that `M` mode **rebuilds all 50 000 units every frame** while the
-tree keeps them and skips the sleepers entirely. A 1.9× on the queries cannot pay for that.
-`M` demonstrates the keep-versus-rebuild law the kit is built around; it is not an alternative
-to the default. (The library-side fix that made the queries fast is in
-[`THREE_D.md`](THREE_D.md) § "Better still: do not build a non-cubic grid".)
+### And then the grid stopped rebuilding
+
+The paragraph that stood here said the toggle was not a speed option, because `M` mode
+**rebuilt all 50 000 units every frame** while the tree kept them and skipped the sleepers.
+That was true of the code and false of grids: `MortonGrid3::update` now moves an item in place
+given where it was, so the grid gets the same keep path the tree has had all along — a `zlast`
+table of one `Point3` per unit standing in for `ItemRef`, and dormant zombies skipped entirely
+because they never set `moved`.
+
+| 50k units, ms/step | before | after |
+| --- | ---: | ---: |
+| `Tree3` + `ItemRef` (default) | 0.65 | 0.47 |
+| `MortonGrid3` (`M`) | 7.31 | **2.77** |
+
+**2.6× end to end**, on top of the 1.15× the cubic cells bought. The grid is still ~6× the
+tree rather than ~11×, and what remains is now honestly the *queries* — maintenance is no
+longer where the toggle loses. Verified the way the siege keep-index was: a test steps 150
+frames in Morton mode and asserts the maintained grid holds and **answers** exactly what a grid
+rebuilt from the live units would, deaths included. Its first run failed on its own
+non-vacuity guard — nothing had died in 2.5 simulated seconds, so the removal path was never
+reached — which is why it now kills 25 units outright partway through.
+
+The keep/rebuild crossover for a grid sits near **70 % of the population moving per frame**
+(`examples/grid_keep_bench`); the horde is nowhere near it, with almost everything asleep.
 
 ## Still queued
 

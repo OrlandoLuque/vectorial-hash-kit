@@ -19,6 +19,7 @@
 //!
 //! No combat yet (phase 2: towers, wall HP, breaches, infection, waves).
 
+use vectorial_hash::morton3::Crossed;
 use vectorial_hash::{Aabb, ItemRef, Point3, Positioned3, Shape3, Sphere3, Tree3};
 
 pub use crate::siege_sim::Rng;
@@ -708,6 +709,11 @@ pub struct Horde {
     /// rebuilt-per-frame MortonGrid3 — the structure trade-off, live.
     pub zmode: ZMode,
     zmorton: vectorial_hash::MortonGrid3<IZombie>,
+    /// Where each unit currently sits IN THE GRID — the grid's answer to `handles`. A uniform
+    /// grid has nothing to hand back, but `update`/`remove` only need the old position, so one
+    /// `Point3` per unit buys the same keep-in-place path the tree gets from `ItemRef`.
+    /// `None` means "not in the grid" (never inserted, dead, or out of the world box).
+    zlast: Vec<Option<Point3>>,
 }
 
 /// The live index-structure toggle (docs/CHOOSING.md trade-offs, on screen):
@@ -1011,6 +1017,7 @@ impl Horde {
             // costs (the grid splits EVERY axis 2^levels ways — on a 68-wu-tall
             // world the y axis shreds into confetti and big culls pay for it).
             zmode: ZMode::Tree, zmorton: vectorial_hash::MortonGrid3::new(zgrid_world(), ZGRID_LEVELS),
+            zlast: vec![None; pop],
         };
         h.gates = h.structures.iter().enumerate().filter(|(_, s)| s.kind == SKind::Gate).map(|(i, _)| i).collect();
         h.spawn_defenders();
@@ -1238,13 +1245,38 @@ impl Horde {
                     }
                 }
             },
-            // Morton has no in-place handles: its side of the `M` toggle is the
-            // honest rebuild — clear + reinsert every LIVE zombie, every frame.
+            // The grid KEEPS too, now that `MortonGrid3::update` exists. It has no handles,
+            // but it does not need them: given where the unit was, it finds it in that one
+            // cell, and a unit that has not left its cell costs nothing at all. Same shape as
+            // the tree arm above, and the same payoff — dormant zombies never move, so they
+            // are skipped entirely instead of being re-inserted 50 000 times a frame.
             ZMode::Morton => {
-                self.zmorton.clear();
+                if self.zlast.len() != self.units.len() { self.zlast.resize(self.units.len(), None); }
                 for (i, z) in self.units.iter_mut().enumerate() {
-                    z.moved = false;
-                    if z.alive() { self.zmorton.insert(IZombie::of(i, z)); }
+                    let was = self.zlast[i];
+                    if !z.alive() {
+                        // Dead slots leave the index, or the grid answers with corpses.
+                        if let Some(old) = was { self.zmorton.remove(old, |c| c.id == i as u32); self.zlast[i] = None; }
+                        z.moved = false;
+                        continue;
+                    }
+                    match (was, z.moved) {
+                        (None, _) => { if self.zmorton.insert(IZombie::of(i, z)) { self.zlast[i] = Some(z.p); } z.moved = false; }
+                        (Some(_), false) => {}
+                        (Some(old), true) => {
+                            let it = IZombie::of(i, z);
+                            match self.zmorton.update(old, |c| c.id == i as u32, |c| *c = it) {
+                                // Missing means the table and the grid disagreed; Left means the
+                                // unit walked out of the world box. Re-inserting recovers both
+                                // rather than letting the index quietly go stale.
+                                Crossed::Missing | Crossed::Left => {
+                                    self.zlast[i] = if self.zmorton.insert(it) { Some(z.p) } else { None };
+                                }
+                                _ => self.zlast[i] = Some(z.p),
+                            }
+                            z.moved = false;
+                        }
+                    }
                 }
             }
         }
@@ -1264,6 +1296,7 @@ impl Horde {
         self.zindex = Tree3::new(world, 8);
         self.handles = vec![None; self.units.len()];
         self.zmorton = vectorial_hash::MortonGrid3::new(zgrid_world(), ZGRID_LEVELS);
+        self.zlast = vec![None; self.units.len()];
         self.sync_index(); // queryable immediately (renderers cull between steps)
     }
 
@@ -2615,5 +2648,51 @@ mod tests {
             let ho = Horde::with_scenario(7, 3000, sc);
             assert!(ho.los_clear(Point3::new(50.0, 0.0, 50.0), Point3::new(1700.0, 0.0, 1700.0)), "{sc:?}: no canopy, LoS must be clear");
         }
+    }
+
+    /// The keep-path's only real obligation: after every step, the MAINTAINED grid must hold
+    /// exactly what a grid rebuilt from the live units would hold. This is where the horde's
+    /// own bookkeeping lives — the `zlast` table, dead units leaving the index, waves inserting
+    /// new ones — none of which the library's own update tests can see.
+    #[test]
+    fn morton_keep_index_matches_a_rebuild_every_frame() {
+        let mut h = Horde::new(7, 4000);
+        h.step(1.0 / 60.0);
+        h.set_zmode(ZMode::Morton);
+        // Wake and fight, so units move, die, and spawn — a quiet carpet would prove nothing.
+        for k in 0..3 {
+            let p = h.units[k * 977 % h.units.len()].p;
+            h.emit_noise(p, 3000.0);
+        }
+        let mut checked_with_dead = false;
+        for frame in 0..150 {
+            // Kill a few outright partway through. Waiting for combat to do it does not work
+            // at this scale — 150 frames is 2.5 seconds and nothing has walked to the base yet,
+            // which is exactly what the non-vacuity guard below caught on the first run.
+            if frame == 40 {
+                let n = h.units.len(); for k in 0..25 { h.units[k * 97 % n].hp = 0.0; }
+            }
+            h.step(1.0 / 60.0);
+
+            let mut fresh: vectorial_hash::MortonGrid3<IZombie> =
+                vectorial_hash::MortonGrid3::new(zgrid_world(), ZGRID_LEVELS);
+            let mut live = 0usize;
+            for (i, z) in h.units.iter().enumerate() {
+                if z.alive() { fresh.insert(IZombie::of(i, z)); live += 1; }
+            }
+            if live < h.units.len() { checked_with_dead = true; }
+
+            assert_eq!(h.zmorton.item_count(), fresh.item_count(), "frame {frame}: item count drifted");
+            assert_eq!(h.zmorton.cell_count(), fresh.cell_count(), "frame {frame}: cell set drifted");
+            // And it must ANSWER the same, not merely hold the same count.
+            for (cx, cz, r) in [(WORLD * 0.5, WORLD * 0.5, 120.0), (WORLD * 0.25, WORLD * 0.75, 200.0), (60.0, 60.0, 90.0)] {
+                let sph = Sphere3::new(cx, 0.0, cz, r);
+                let mut a: Vec<u32> = h.zmorton.cull(&sph).iter().map(|z| z.id).collect();
+                let mut b: Vec<u32> = fresh.cull(&sph).iter().map(|z| z.id).collect();
+                a.sort_unstable(); b.sort_unstable();
+                assert_eq!(a, b, "frame {frame}: maintained grid answered differently");
+            }
+        }
+        assert!(checked_with_dead, "no unit died in 150 frames — the removal path was never exercised");
     }
 }

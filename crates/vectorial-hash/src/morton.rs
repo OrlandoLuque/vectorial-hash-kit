@@ -227,6 +227,20 @@ impl<T: Positioned> MortonGrid<T> {
         Crossed::Moved
     }
 
+    /// **Remove an item, given where it was** — the 2D twin of
+    /// [`crate::MortonGrid3::remove`].
+    pub fn remove<P: Fn(&T) -> bool>(&mut self, old: Point, predicate: P) -> Option<T> {
+        if !self.world.contains(old) { return None; }
+        let (ox, oy) = self.cell_of(old);
+        let key = morton2(ox, oy);
+        let bucket = self.cells.get_mut(&key)?;
+        let idx = bucket.iter().position(&predicate)?;
+        let item = bucket.swap_remove(idx);
+        if bucket.is_empty() { self.cells.remove(&key); }
+        self.len -= 1;
+        Some(item)
+    }
+
     pub fn cell_count(&self) -> usize { self.cells.len() }
     pub fn levels(&self) -> u32 { self.levels }
 
