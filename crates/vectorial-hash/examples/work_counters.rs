@@ -109,15 +109,22 @@ impl<S: Shape> Shape for Counted2<'_, S> {
     fn classify_box(&self, b: &Rect) -> Option<CellState> { self.t.boxes.set(self.t.boxes.get() + 1); self.inner.classify_box(b) }
 }
 
-struct Row { name: &'static str, boxes: f64, tested: f64, found: f64 }
+struct Row { name: &'static str, boxes: f64, tested: f64, found: f64, cells: f64 }
 fn print_rows(title: &str, rows: &[Row]) {
     println!("\n{title}");
-    println!("  {:<18} {:>10} {:>10} {:>9} {:>8}", "structure", "boxes/q", "tested/q", "found/q", "waste");
+    // The cells column only exists under `grid-stats`; without it there is nothing to show and
+    // the header stays blank rather than printing a column of honest-looking zeros.
+    let cells_col = if cells_taken().is_some() { "cells/q" } else { "" };
+    println!("  {:<18} {:>10} {:>10} {:>9} {:>8} {:>9}", "structure", "boxes/q", "tested/q", "found/q", "waste", cells_col);
     let base = rows.iter().map(|r| r.found).fold(f64::NAN, f64::max);
     for r in rows {
         let waste = if r.found > 0.0 { r.tested / r.found } else { f64::NAN };
         let flag = if (r.found - base).abs() > 1e-9 { "  <-- DIFFERENT RESULT SET" } else { "" };
-        println!("  {:<18} {:>10.1} {:>10.1} {:>9.1} {:>8.2}{flag}", r.name, r.boxes, r.tested, r.found, waste);
+        match cells_taken() {
+            Some(_) => println!("  {:<18} {:>10.1} {:>10.1} {:>9.1} {:>8.2} {:>9.1}{flag}", r.name, r.boxes, r.tested, r.found, waste, r.cells),
+            None => println!("  {:<18} {:>10.1} {:>10.1} {:>9.1} {:>8.2}{flag}", r.name, r.boxes, r.tested, r.found, waste),
+        }
+        if cells_taken().is_some() { println!("#M {}.cells_per_query {:.2} n", r.name, r.cells); }
         println!("#M {}.boxes_per_query {:.2} n", r.name, r.boxes);
         println!("#M {}.tested_per_query {:.2} n", r.name, r.tested);
         println!("#M {}.waste_ratio {:.3} x", r.name, waste);
@@ -212,14 +219,16 @@ fn main() {
 
     let t = Tally::default();
     let per = |f: &mut dyn FnMut(&Counted3<Sphere3>) -> usize| {
-        let (mut bx, mut te, mut fo) = (0u64, 0u64, 0u64);
+        let (mut bx, mut te, mut fo, mut ce) = (0u64, 0u64, 0u64, 0.0f64);
         for q in &q3 {
             t.take();
+            cells_taken();
             let hits = f(&Counted3 { inner: Sphere3::new(q.x, q.y, q.z, radius), t: &t });
             let (b, s) = t.take();
+            ce += cells_taken().unwrap_or(0.0);
             bx += b; te += s; fo += hits as u64;
         }
-        (bx as f64 / nq as f64, te as f64 / nq as f64, fo as f64 / nq as f64)
+        (bx as f64 / nq as f64, te as f64 / nq as f64, fo as f64 / nq as f64, ce / nq as f64)
     };
 
     let tree3 = Tree3::bulk_load(world3, leaf, items3.clone());
@@ -230,22 +239,24 @@ fn main() {
     for it in &items3 { mor3.insert(*it); }
 
     let mut rows = Vec::new();
-    let (b, s, f) = per(&mut |q| tree3.cull(q).len()); rows.push(Row { name: "tree3", boxes: b, tested: s, found: f });
-    let (b, s, f) = per(&mut |q| oct3.cull(q).len()); rows.push(Row { name: "octree3", boxes: b, tested: s, found: f });
-    let (b, s, f) = per(&mut |q| kd3.cull(q).len()); rows.push(Row { name: "kdtree3", boxes: b, tested: s, found: f });
-    let (b, s, f) = per(&mut |q| lin3.cull(q).len()); rows.push(Row { name: "linear_octree3", boxes: b, tested: s, found: f });
-    let (b, s, f) = per(&mut |q| mor3.cull(q).len()); rows.push(Row { name: "morton3", boxes: b, tested: s, found: f });
+    let (b, s, f, c) = per(&mut |q| tree3.cull(q).len()); rows.push(Row { name: "tree3", boxes: b, tested: s, found: f, cells: c });
+    let (b, s, f, c) = per(&mut |q| oct3.cull(q).len()); rows.push(Row { name: "octree3", boxes: b, tested: s, found: f, cells: c });
+    let (b, s, f, c) = per(&mut |q| kd3.cull(q).len()); rows.push(Row { name: "kdtree3", boxes: b, tested: s, found: f, cells: c });
+    let (b, s, f, c) = per(&mut |q| lin3.cull(q).len()); rows.push(Row { name: "linear_octree3", boxes: b, tested: s, found: f, cells: c });
+    let (b, s, f, c) = per(&mut |q| mor3.cull(q).len()); rows.push(Row { name: "morton3", boxes: b, tested: s, found: f, cells: c });
     print_rows("3D — work per sphere cull", &rows);
 
     let per2 = |f: &mut dyn FnMut(&Counted2<Circle>) -> usize| {
-        let (mut bx, mut te, mut fo) = (0u64, 0u64, 0u64);
+        let (mut bx, mut te, mut fo, mut ce) = (0u64, 0u64, 0u64, 0.0f64);
         for q in &q2 {
             t.take();
+            cells_taken();
             let hits = f(&Counted2 { inner: Circle::new(*q, radius), t: &t });
             let (b, s) = t.take();
+            ce += cells_taken().unwrap_or(0.0);
             bx += b; te += s; fo += hits as u64;
         }
-        (bx as f64 / nq as f64, te as f64 / nq as f64, fo as f64 / nq as f64)
+        (bx as f64 / nq as f64, te as f64 / nq as f64, fo as f64 / nq as f64, ce / nq as f64)
     };
 
     let tree2 = { let mut t = Tree::new(world2, leaf); for it in &items2 { t.insert(*it); } t };
@@ -255,11 +266,11 @@ fn main() {
     let mor2 = { let mut g = MortonGrid::new(world2, MortonGrid::<P2>::levels_for_cell_size(world2, radius)); for it in &items2 { g.insert(*it); } g };
 
     let mut rows = Vec::new();
-    let (b, s, f) = per2(&mut |q| tree2.cull(q).len()); rows.push(Row { name: "tree2", boxes: b, tested: s, found: f });
-    let (b, s, f) = per2(&mut |q| quad.cull(q).len()); rows.push(Row { name: "quadtree", boxes: b, tested: s, found: f });
-    let (b, s, f) = per2(&mut |q| kd2.cull(q).len()); rows.push(Row { name: "kdtree2", boxes: b, tested: s, found: f });
-    let (b, s, f) = per2(&mut |q| lin2.cull(q).len()); rows.push(Row { name: "linear_quadtree", boxes: b, tested: s, found: f });
-    let (b, s, f) = per2(&mut |q| mor2.cull(q).len()); rows.push(Row { name: "morton2", boxes: b, tested: s, found: f });
+    let (b, s, f, c) = per2(&mut |q| tree2.cull(q).len()); rows.push(Row { name: "tree2", boxes: b, tested: s, found: f, cells: c });
+    let (b, s, f, c) = per2(&mut |q| quad.cull(q).len()); rows.push(Row { name: "quadtree", boxes: b, tested: s, found: f, cells: c });
+    let (b, s, f, c) = per2(&mut |q| kd2.cull(q).len()); rows.push(Row { name: "kdtree2", boxes: b, tested: s, found: f, cells: c });
+    let (b, s, f, c) = per2(&mut |q| lin2.cull(q).len()); rows.push(Row { name: "linear_quadtree", boxes: b, tested: s, found: f, cells: c });
+    let (b, s, f, c) = per2(&mut |q| mor2.cull(q).len()); rows.push(Row { name: "morton2", boxes: b, tested: s, found: f, cells: c });
     print_rows("2D — work per circle cull", &rows);
 
     // -------------------------------------------------------------- k-NN

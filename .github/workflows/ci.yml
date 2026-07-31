@@ -52,6 +52,12 @@ jobs:
       - name: test (vectorial-hash, parallel feature — gate)
         run: cargo test -p vectorial-hash --features parallel
 
+      - name: Test vectorial-hash (grid-stats — the cell-visit ratchet)
+        # The cell counts are as deterministic as the point counts and are gated with `==`
+        # like them, but they only exist under this feature, so without a job that enables it
+        # the ratchet would sit in the repo checking nothing.
+        run: cargo test -p vectorial-hash --features grid-stats
+
       # Gate: templates + cli tests. The fingerprint-regression test is now
       # portable — it hard-checks determinism + row structure everywhere, and
       # the fixture bytes within a cross-platform tolerance (libm ULPs at tangent

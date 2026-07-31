@@ -101,10 +101,12 @@ impl Lcg {
     fn r(&mut self, a: f64, b: f64) -> f64 { a + (b - a) * self.f() }
 }
 
-#[test]
-fn traversal_work_is_exactly_what_it_was() {
-    // Clustered, because that is where the structures actually differ — on uniform points
-    // four of the five agree to within 20% and the gate would barely be watching anything.
+/// The workload, shared by both ratchets so they cannot drift onto different point sets.
+///
+/// Clustered, because that is where the structures actually differ — on uniform points four of
+/// the five agree to within 20% and the gate would barely be watching anything.
+#[allow(clippy::type_complexity)]
+fn workload() -> (Vec<P3>, Vec<P2>, Vec<Point3>, Vec<Point>, Aabb, Rect) {
     let mut r = Lcg(0x5EED_1234);
     let blobs: Vec<(f64, f64, f64)> = (0..6).map(|_| (r.r(100.0, 900.0), r.r(50.0, 250.0), r.r(100.0, 900.0))).collect();
     let items3: Vec<P3> = (0..N).map(|_| {
@@ -125,6 +127,13 @@ fn traversal_work_is_exactly_what_it_was() {
     let q2: Vec<Point> = q3.iter().map(|p| Point::new(p.x, p.z)).collect();
     let world3 = Aabb::new(0.0, 0.0, 0.0, W, 300.0, W);
     let world2 = Rect::new(0.0, 0.0, W, W);
+
+    (items3, items2, q3, q2, world3, world2)
+}
+
+#[test]
+fn traversal_work_is_exactly_what_it_was() {
+    let (items3, items2, q3, q2, world3, world2) = workload();
 
     let tree3 = Tree3::bulk_load(world3, LEAF, items3.clone());
     let oct3 = Octree3::bulk_load(world3, LEAF, items3.clone());
@@ -227,4 +236,56 @@ fn traversal_work_is_exactly_what_it_was() {
     }
     assert!(bad.is_empty(), "traversal work changed:\n  {}\n\nsee this file's docs: a change here is a real algorithmic change, \
         not noise. Bless with VH_WORK_BLESS=1 once you have decided it is an improvement.", bad.join("\n  "));
+}
+
+/// The same ratchet, for the number the point counters cannot see.
+///
+/// A grid query that crosses empty cells does no work on any point, so `tested` misses it
+/// entirely and `boxes` very nearly does — measured on the cull table, `morton3` classifies
+/// **0.2** boxes per query while looking up **56.8** cells. Cell visits are just as
+/// deterministic as point tests, so they get the same treatment: exact equality, no tolerance.
+///
+/// Only compiled under `grid-stats`, and CI runs one job with it on. Bless with
+/// `VH_WORK_BLESS=1 cargo test -p vectorial-hash --features grid-stats --test work_counts`.
+#[cfg(feature = "grid-stats")]
+#[test]
+fn grid_cell_visits_are_exactly_what_they_were() {
+    // (key, cells visited per query, x100 so the table stays integers)
+    const EXPECT_CELLS: &[(&str, u64)] = &[
+        ("cull3/morton3", 6165),
+        ("cull2/morton2", 850),
+        ("knn3/morton3", 326338),
+        ("knn2/morton2", 9675),
+    ];
+
+    let (items3, items2, q3, q2, world3, world2) = workload();
+    let mor3 = { let mut g = MortonGrid3::new(world3, MortonGrid3::<P3>::levels_for_cell_size(world3, R)); for it in &items3 { g.insert(*it); } g };
+    let mor2 = { let mut g = MortonGrid::new(world2, MortonGrid::<P2>::levels_for_cell_size(world2, R)); for it in &items2 { g.insert(*it); } g };
+
+    let mut got: Vec<(&str, u64)> = Vec::new();
+    vectorial_hash::morton3::reset_cell_visits();
+    for q in &q3 { std::hint::black_box(mor3.cull(&Sphere3::new(q.x, q.y, q.z, R)).len()); }
+    got.push(("cull3/morton3", vectorial_hash::morton3::reset_cell_visits() * 100 / NQ as u64));
+    for q in &q2 { std::hint::black_box(mor2.cull(&Circle::new(*q, R)).len()); }
+    got.push(("cull2/morton2", vectorial_hash::morton3::reset_cell_visits() * 100 / NQ as u64));
+    for q in &q3 { std::hint::black_box(mor3.knn(*q, K).len()); }
+    got.push(("knn3/morton3", vectorial_hash::morton3::reset_cell_visits() * 100 / NQ as u64));
+    for q in &q2 { std::hint::black_box(mor2.knn(*q, K).len()); }
+    got.push(("knn2/morton2", vectorial_hash::morton3::reset_cell_visits() * 100 / NQ as u64));
+
+    if std::env::var("VH_WORK_BLESS").is_ok() {
+        println!("\n    const EXPECT_CELLS: &[(&str, u64)] = &[");
+        for (k, v) in &got { println!("        (\"{k}\", {v}),"); }
+        println!("    ];");
+        panic!("VH_WORK_BLESS set — numbers printed above, nothing was checked");
+    }
+
+    let mut bad = Vec::new();
+    for (k, v) in &got {
+        let Some(&(_, e)) = EXPECT_CELLS.iter().find(|(ek, _)| ek == k) else { bad.push(format!("{k}: not in the blessed table")); continue };
+        if *v != e { bad.push(format!("{k}: cells x100 {e} -> {v}")); }
+    }
+    assert!(bad.is_empty(), "grid cell visits changed:\n  {}", bad.join("\n  "));
+    // Non-vacuous: a grid that visited no cells would pass a table of zeros forever.
+    assert!(got.iter().all(|(_, v)| *v > 0), "some grid reported zero cell visits: {got:?}");
 }

@@ -148,6 +148,16 @@ nor the increments are compiled. `work_counters` grows a `cells/query` column wh
 it, and the first thing that column said was that a clustered `MortonGrid3` k-NN visits **6 888
 cells to return 8 neighbours** (2D: 203). That number had never appeared in any table here.
 
+The `cull` tables carry it too now, and there the column exposed something sharper: on a sphere
+cull `morton3` classifies **0.2 boxes** per query while looking up **56.8 cells**. The `boxes`
+column — the descent counter — was reporting almost nothing for grids, because a grid barely
+classifies anything; it looks things up. Two verbs, one structure, and the existing counter was
+blind to its main cost in both.
+
+Cell counts are as deterministic as point counts, so they are gated the same way: exactly, in
+CI, by a second ratchet in `tests/work_counts.rs` and a CI job that builds with the feature.
+A ratchet nobody's build enables is a ratchet checking nothing.
+
 ## 9. Publish from an idle machine
 
 None of the above removes contention: another process still evicts your cache lines and eats
