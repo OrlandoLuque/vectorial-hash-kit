@@ -33,6 +33,7 @@ use web_time::Instant;
 use bytemuck::{Pod, Zeroable};
 use glam::Mat4;
 use winit::{event::*, event_loop::EventLoop, keyboard::{KeyCode, PhysicalKey}, window::WindowBuilder};
+use vectorial_hash::morton3::Crossed;
 use vectorial_hash::{AdaptiveIndex2, Backend, Slot};
 use vectorial_hash::tree::Crossing2;
 use vectorial_hash::{Circle, ItemRef, LinearQuadTree, MortonGrid, Point, Positioned, Rect, Tree};
@@ -146,11 +147,11 @@ struct FP { id: u32, p: Point }
 impl Positioned for FP { fn position(&self) -> Point { self.p } }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Idx { Morton, TreeKeep, Linear, Adaptive }
+enum Idx { Morton, MortonKeep, TreeKeep, Linear, Adaptive }
 impl Idx {
-    fn next(self) -> Self { match self { Idx::Morton => Idx::TreeKeep, Idx::TreeKeep => Idx::Linear, Idx::Linear => Idx::Adaptive, Idx::Adaptive => Idx::Morton } }
+    fn next(self) -> Self { match self { Idx::Morton => Idx::MortonKeep, Idx::MortonKeep => Idx::TreeKeep, Idx::TreeKeep => Idx::Linear, Idx::Linear => Idx::Adaptive, Idx::Adaptive => Idx::Morton } }
     fn label(self) -> &'static str {
-        match self { Idx::Morton => "MORTONGRID REBUILD", Idx::TreeKeep => "TREE KEEP-INDEX", Idx::Linear => "LINEARQUADTREE REBUILD", Idx::Adaptive => "ADAPTIVEINDEX2 (picks its own)" }
+        match self { Idx::Morton => "MORTONGRID REBUILD", Idx::MortonKeep => "MORTONGRID KEEP", Idx::TreeKeep => "TREE KEEP-INDEX", Idx::Linear => "LINEARQUADTREE REBUILD", Idx::Adaptive => "ADAPTIVEINDEX2 (picks its own)" }
     }
 }
 
@@ -158,6 +159,14 @@ impl Idx {
 /// "maintain" is a full rebuild; the binary tree relocates through its `ItemRef`.
 enum Index {
     Morton(MortonGrid<FP>),
+    /// The same grid, **maintained in place** with `MortonGrid::update`.
+    ///
+    /// It exists because without it this demo's comparison was rigged. The adaptive index
+    /// picks the grid and KEEPS it, and it was being timed against a grid that REBUILDS — so
+    /// the gap it showed was the keep path, not the policy. If a comparison makes the clever
+    /// thing look good by denying the simple thing an optimisation the simple thing could
+    /// have, the comparison is measuring the denial.
+    MortonKeep { g: MortonGrid<FP>, last: Vec<Point> },
     Keep { tree: Tree<FP>, refs: Vec<ItemRef> },
     Linear(LinearQuadTree<FP>),
     /// The index that chooses for itself. It is here to be MEASURED against the three fixed
@@ -172,8 +181,18 @@ impl Index {
         let rect = Rect::new(0.0, 0.0, WW as f64, WH as f64);
         let items = || (0..px.len()).map(|i| FP { id: i as u32, p: Point::new(px[i] as f64, py[i] as f64) });
         match kind {
-            // one grid cell ≈ the kernel radius: the classic SPH bucket size.
+            // one grid cell ≈ the kernel radius: the classic SPH bucket size, and MEASURED
+            // better than the query diameter here (331-336 fps against 291-293) — the obvious
+            // port of the adaptive index'''s apparent choice made things worse, so whatever it
+            // is doing better is not simply a larger cell.
             Idx::Morton => { let lv = MortonGrid::<FP>::levels_for_cell_size(rect, H as f64); let mut g = MortonGrid::new(rect, lv); for it in items() { g.insert(it); } Index::Morton(g) }
+            Idx::MortonKeep => {
+                let lv = MortonGrid::<FP>::levels_for_cell_size(rect, H as f64);
+                let mut g = MortonGrid::new(rect, lv);
+                let mut last = Vec::with_capacity(px.len());
+                for it in items() { last.push(it.p); g.insert(it); }
+                Index::MortonKeep { g, last }
+            }
             Idx::Linear => Index::Linear(LinearQuadTree::from_items(rect, 12, 16, items().collect())),
             Idx::TreeKeep => {
                 let mut tree = Tree::<FP>::new(rect, 12);
@@ -202,6 +221,16 @@ impl Index {
                 }
                 (px.len() as u64, moved)
             }
+            Index::MortonKeep { g, last } => {
+                let mut moved = 0u64;
+                for i in 0..px.len() {
+                    let np = Point::new(px[i] as f64, py[i] as f64);
+                    let id = i as u32;
+                    if let Crossed::Moved = g.update(last[i], |it| it.id == id, |it| it.p = np) { moved += 1; }
+                    last[i] = np;
+                }
+                (px.len() as u64, moved)
+            }
             Index::Adaptive { ix, slots } => {
                 for i in 0..px.len() {
                     let np = Point::new(px[i] as f64, py[i] as f64);
@@ -211,6 +240,22 @@ impl Index {
                 (px.len() as u64, 0)
             }
             _ => { *self = Index::build(kind, px, py); (px.len() as u64, 0) }
+        }
+    }
+
+    /// Does the index still hold every particle? A structure that silently dropped some would
+    /// answer faster and wrongly, and the fps column cannot tell the difference — the trap
+    /// docs/MEASURING.md records from the point-cloud demo ("an index only knows what it
+    /// holds"). Returns (held, expected).
+    fn held(&mut self, n: usize) -> (usize, usize) {
+        // One cull big enough to sweep the whole tank: whatever it returns is what the index
+        // actually holds.
+        let all = Circle::new(Point::new(WW as f64 * 0.5, WH as f64 * 0.5), (WW + WH) as f64);
+        match self {
+            Index::Adaptive { ix, .. } => (ix.cull(&all).len(), n),
+            Index::MortonKeep { g, .. } => (g.item_count(), n),
+            Index::Morton(g) => (g.item_count(), n),
+            _ => (n, n),
         }
     }
 
@@ -231,6 +276,7 @@ impl Index {
         match self {
             Index::Morton(g) => out.extend(g.cull(&c).iter().map(|f| f.id)),
             Index::Keep { tree, .. } => out.extend(tree.cull(&c).iter().map(|f| f.id)),
+            Index::MortonKeep { g, .. } => out.extend(g.cull(&c).iter().map(|f| f.id)),
             Index::Linear(t) => out.extend(t.cull(&c).iter().map(|f| f.id)),
             // `cull` takes &mut self here because the adaptive index may refresh a stale
             // backend before answering — the one place its API differs from a fixed structure.
@@ -500,6 +546,7 @@ async fn run() {
         Some("keep") | Some("tree") => Idx::TreeKeep,
         Some("linear") | Some("lqt") => Idx::Linear,
         Some("adaptive") | Some("auto") => Idx::Adaptive,
+        Some("mortonkeep") | Some("gridkeep") => Idx::MortonKeep,
         _ => Idx::Morton,
     };
     let mut fluid = Fluid::new(n);
@@ -676,6 +723,8 @@ async fn run() {
                             // migrates is a different (and cheaper) claim than one that keeps
                             // adapting, and only this line tells them apart.
                             let picked = index.chosen().map(|c| format!(" -> {c}")).unwrap_or_default();
+                            let (held, want) = index.held(fluid.n());
+                            if held != want { println!("  !! index holds {held} of {want} particles — it is answering about a different set"); }
                             println!("fluid_wgpu end-to-end: {:.1} fps avg ({} drops, {}{}, maintain {:.2} ms / query {:.2} ms / physics {:.2} ms per frame)",
                                 fps, fluid.n(), kind.label(), picked, maint_us / 1000.0, query_us / 1000.0, phys_us / 1000.0);
                             // machine-readable for `bench-runner` (keyed by index, so a

@@ -25,10 +25,19 @@ use crate::morton::MortonGrid;
 use crate::tree::{Crossing2, Tree};
 use crate::{ItemRef, Point, Positioned, Rect, Shape};
 
+/// An item in the grid backend, carrying the [`Slot`] it belongs to — see the 3D twin. A grid
+/// has no handles, so `update` needs a way to tell two items apart, and matching on position
+/// alone would move the wrong one whenever two coincide.
+#[derive(Clone)]
+struct Tagged<T> { slot: u32, item: T }
+impl<T: Positioned> Positioned for Tagged<T> {
+    fn position(&self) -> Point { self.item.position() }
+}
+
 enum Held2<T: Positioned> {
     Brute,
     Keep(Box<Tree<T>>, Vec<ItemRef>),
-    Grid(Box<MortonGrid<T>>),
+    Grid(Box<MortonGrid<Tagged<T>>>),
     Static(Box<KdTree2<T>>),
 }
 
@@ -71,6 +80,19 @@ pub struct AdaptiveIndex2<T: Positioned + Clone> {
     /// cell, three times slower than it needed to be. Nothing marked it dirty because nothing
     /// was wrong with its CONTENTS; what had gone stale was its geometry.
     grid_for: usize,
+    /// Smoothed extent of the query volumes this index is actually being asked for.
+    ///
+    /// A uniform grid's cell size wants to be about the size of a query — that is the classic
+    /// SPH bucket rule, and it is why the fluid demo's hand-built grid asks for
+    /// `levels_for_cell_size(rect, kernel_radius)`. Sizing by occupancy alone instead produced
+    /// cells 3.4x the kernel radius there, which made maintenance cheap and every query sweep a
+    /// far larger area: measured, 1.66-1.91 ms against the hand-sized grid's 1.43-1.56.
+    ///
+    /// The index could not size its cells as well as its caller because it never looked at what
+    /// it was being asked. It does now: `cull` reports the bounding box of every shape, and the
+    /// grid is built for the typical one. Zero until a query has been seen, in which case the
+    /// occupancy rule stands in.
+    q_extent: f64,
 }
 
 impl<T: Positioned + Clone> AdaptiveIndex2<T> {
@@ -84,7 +106,7 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
             items: Vec::new(), free: Vec::new(), live: 0, world, leaf: leaf.max(1), held: Held2::Brute,
             profile: SpatialProfile::default(), th, pending: None, cooling: 0,
             dirty: false, switches: 0, moves: 0, relocations: 0, queries: 0, q_per_item: 0.0,
-            m_per_item: 0.0, grid_for: 0,
+            m_per_item: 0.0, grid_for: 0, q_extent: 0.0,
         }
     }
 
@@ -121,7 +143,7 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
                 if refs.len() <= slot as usize { refs.resize(slot as usize + 1, ItemRef(u32::MAX)); }
                 refs[slot as usize] = r;
             }
-            Held2::Grid(g) => { if !g.insert(item.clone()) { stale = true; } }
+            Held2::Grid(g) => { if !g.insert(Tagged { slot, item: item.clone() }) { stale = true; } }
             Held2::Brute => {}
             Held2::Static(_) => stale = true, // a build-once backend cannot take one more
         }
@@ -146,6 +168,7 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
                 Some(r) => { t.remove_ref(r); refs[s.0 as usize] = ItemRef(u32::MAX); }
                 None => self.dirty = true,
             },
+            Held2::Grid(g) => { g.remove(taken.position(), |c| c.slot == s.0); }
             Held2::Brute => {}
             _ => self.dirty = true,
         }
@@ -156,6 +179,8 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
     /// the rebuild-based ones just note that they are stale.
     pub fn update<F: FnOnce(&mut T)>(&mut self, s: Slot, f: F) {
         let Some(it) = self.items.get_mut(s.0 as usize).and_then(|o| o.as_mut()) else { return };
+        // Captured BEFORE the mutation: the grid finds an item by where it used to be.
+        let was = it.position();
         f(it);
         let item = it.clone();
         self.moves += 1;
@@ -172,10 +197,16 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
                     }
                 } else { self.dirty = true; }
             }
-            // Any other backend is stale now — and it cannot tell us whether that move
-            // crossed a leaf, so it must NOT claim one. Reporting every move as a
-            // relocation here made the policy jump to the grid on its very first frame,
-            // before it had ever seen a real crossing. Churn is learned on the tree.
+            // The grid keeps in place too. This arm existed only in the 3D twin until the
+            // fluid demo made the difference visible: the anti-drift test compares the
+            // BACKENDS CHOSEN, so a divergence inside a backend is invisible to it.
+            Held2::Grid(g) => {
+                let slot = s.0;
+                if g.update(was, |c| c.slot == slot, |c| c.item = item).is_missing() { self.dirty = true; }
+            }
+            // Whatever is left cannot be maintained (a build-once k-d tree) or does not need
+            // to be (the brute scan reads `items`). It also cannot tell us whether that move
+            // crossed a leaf, so it must NOT claim a relocation. Churn is learned on the tree.
             _ => self.dirty = true,
         }
     }
@@ -184,11 +215,15 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
     /// a partially-updated index.
     pub fn cull<S: Shape>(&mut self, shape: &S) -> Vec<&T> {
         self.queries += 1;
+        // What is this caller actually asking for? The grid's cells want to be about this big.
+        let b = shape.bounding_box();
+        let e = b.width.max(b.height);
+        self.q_extent = if self.q_extent == 0.0 { e } else { self.q_extent + 0.1 * (e - self.q_extent) };
         self.refresh();
         match &self.held {
             Held2::Brute => self.items.iter().flatten().filter(|it| shape.contains_point(it.position())).collect(),
             Held2::Keep(t, _) => t.cull(shape),
-            Held2::Grid(g) => g.cull(shape),
+            Held2::Grid(g) => g.cull(shape).into_iter().map(|t| &t.item).collect(),
             Held2::Static(k) => k.cull(shape),
         }
     }
@@ -209,7 +244,7 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
                 v
             }
             Held2::Keep(t, _) => t.knn(q, k),
-            Held2::Grid(g) => g.knn(q, k),
+            Held2::Grid(g) => g.knn(q, k).into_iter().map(|(d, t)| (d, &t.item)).collect(),
             Held2::Static(kd) => kd.knn(q, k),
         }
     }
@@ -293,14 +328,14 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
 
     fn migrate(&mut self, to: Backend) {
         self.switches += 1;
-        self.held = Self::build(to, &self.items, self.world, self.leaf);
+        self.held = Self::build(to, &self.items, self.world, self.leaf, self.q_extent);
         self.grid_for = self.live; // whatever the grid's cells were just sized for
         self.dirty = false;
     }
 
     /// Rebuild a backend from the item list. This is the cost hysteresis exists to avoid
     /// paying twice.
-    fn build(to: Backend, items: &[Option<T>], world: Rect, leaf: usize) -> Held2<T> {
+    fn build(to: Backend, items: &[Option<T>], world: Rect, leaf: usize, q_extent: f64) -> Held2<T> {
         match to {
             Backend::Brute => Held2::Brute,
             Backend::KeepTree => {
@@ -318,10 +353,16 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
                 // Cells sized by occupancy, not by a fixed fraction of the world — see the 3D
                 // twin, where `world_max / 64` meant 0.08 items per cell at 20k population.
                 let live = items.iter().flatten().count().max(1);
-                let per_axis = (live as f64 / crate::adaptive::GRID_TARGET_PER_CELL).sqrt().max(1.0);
-                let levels = (per_axis.log2().round().max(1.0) as u32).min(12);
+                let levels = if q_extent > 0.0 {
+                    MortonGrid::<Tagged<T>>::levels_for_cell_size(world, q_extent)
+                } else {
+                    let per_axis = (live as f64 / crate::adaptive::GRID_TARGET_PER_CELL).sqrt().max(1.0);
+                    (per_axis.log2().round().max(1.0) as u32).min(12)
+                };
                 let mut g = MortonGrid::new(world, levels);
-                for it in items.iter().flatten() { g.insert(it.clone()); }
+                for (slot, it) in items.iter().enumerate() {
+                    if let Some(v) = it { g.insert(Tagged { slot: slot as u32, item: v.clone() }); }
+                }
                 Held2::Grid(Box::new(g))
             }
             Backend::Static => Held2::Static(Box::new(KdTree2::from_items(leaf, items.iter().flatten().cloned().collect()))),
@@ -334,7 +375,7 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
         if !self.dirty { return; }
         let b = self.backend();
         if b == Backend::Brute { self.dirty = false; return; }
-        self.held = Self::build(b, &self.items, self.world, self.leaf);
+        self.held = Self::build(b, &self.items, self.world, self.leaf, self.q_extent);
         self.grid_for = self.live;
         self.dirty = false;
     }

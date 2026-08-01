@@ -345,6 +345,19 @@ pub struct AdaptiveIndex<T: Positioned3 + Clone> {
     /// cell, three times slower than it needed to be. Nothing marked it dirty because nothing
     /// was wrong with its CONTENTS; what had gone stale was its geometry.
     grid_for: usize,
+    /// Smoothed extent of the query volumes this index is actually being asked for.
+    ///
+    /// A uniform grid's cell size wants to be about the size of a query — that is the classic
+    /// SPH bucket rule, and it is why the fluid demo's hand-built grid asks for
+    /// `levels_for_cell_size(rect, kernel_radius)`. Sizing by occupancy alone instead produced
+    /// cells 3.4x the kernel radius there, which made maintenance cheap and every query sweep a
+    /// far larger area: measured, 1.66-1.91 ms against the hand-sized grid's 1.43-1.56.
+    ///
+    /// The index could not size its cells as well as its caller because it never looked at what
+    /// it was being asked. It does now: `cull` reports the bounding box of every shape, and the
+    /// grid is built for the typical one. Zero until a query has been seen, in which case the
+    /// occupancy rule stands in.
+    q_extent: f64,
 }
 
 impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
@@ -358,7 +371,7 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
             items: Vec::new(), free: Vec::new(), live: 0, world, leaf: leaf.max(1), held: Held::Brute,
             profile: SpatialProfile::default(), th, pending: None, cooling: 0,
             dirty: false, switches: 0, moves: 0, relocations: 0, queries: 0, q_per_item: 0.0,
-            m_per_item: 0.0, grid_for: 0,
+            m_per_item: 0.0, grid_for: 0, q_extent: 0.0,
         }
     }
 
@@ -471,6 +484,10 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
     /// a partially-updated index.
     pub fn cull<S: Shape3>(&mut self, shape: &S) -> Vec<&T> {
         self.queries += 1;
+        // What is this caller actually asking for? The grid's cells want to be about this big.
+        let b = shape.bounding_box();
+        let e = b.w.max(b.h).max(b.d);
+        self.q_extent = if self.q_extent == 0.0 { e } else { self.q_extent + 0.1 * (e - self.q_extent) };
         self.refresh();
         match &self.held {
             Held::Brute => self.items.iter().flatten().filter(|it| shape.contains_point(it.position())).collect(),
@@ -586,14 +603,14 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
 
     fn migrate(&mut self, to: Backend) {
         self.switches += 1;
-        self.held = Self::build(to, &self.items, self.world, self.leaf);
+        self.held = Self::build(to, &self.items, self.world, self.leaf, self.q_extent);
         self.grid_for = self.live; // whatever the grid's cells were just sized for
         self.dirty = false;
     }
 
     /// Rebuild a backend from the item list. This is the cost hysteresis exists to avoid
     /// paying twice.
-    fn build(to: Backend, items: &[Option<T>], world: Aabb, leaf: usize) -> Held<T> {
+    fn build(to: Backend, items: &[Option<T>], world: Aabb, leaf: usize, q_extent: f64) -> Held<T> {
         match to {
             Backend::Brute => Held::Brute,
             Backend::KeepTree => {
@@ -616,8 +633,14 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
                 // the grid backend lose to everything in `examples/adaptive_vs_pinned` — which
                 // in turn made the policy look wrong when the geometry was.
                 let live = items.iter().flatten().count().max(1);
-                let per_axis = (live as f64 / GRID_TARGET_PER_CELL).cbrt().max(1.0);
-                let levels = (per_axis.log2().round().max(1.0) as u32).min(10);
+                // A cell about the size of a typical query, when one has been seen; the
+                // occupancy rule only as a fallback for a grid built before any query.
+                let levels = if q_extent > 0.0 {
+                    MortonGrid3::<Tagged<T>>::levels_for_cell_size(world, q_extent)
+                } else {
+                    let per_axis = (live as f64 / GRID_TARGET_PER_CELL).cbrt().max(1.0);
+                    (per_axis.log2().round().max(1.0) as u32).min(10)
+                };
                 let mut g = MortonGrid3::new(world, levels);
                 for (slot, it) in items.iter().enumerate() {
                     if let Some(v) = it { g.insert(Tagged { slot: slot as u32, item: v.clone() }); }
@@ -634,7 +657,7 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
         if !self.dirty { return; }
         let b = self.backend();
         if b == Backend::Brute { self.dirty = false; return; }
-        self.held = Self::build(b, &self.items, self.world, self.leaf);
+        self.held = Self::build(b, &self.items, self.world, self.leaf, self.q_extent);
         self.grid_for = self.live;
         self.dirty = false;
     }
