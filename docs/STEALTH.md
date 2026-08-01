@@ -48,6 +48,29 @@ Reproduce with `cargo run -p bench-runner --release -- --group demos --only stea
 early version printed one frame, and in a batch of three passes one of them landed on a
 frame that had not stepped and reported a clean, plausible-looking **zero**.
 
+### What that table was quietly not charging for
+
+Those columns are **cull only**, and until 2026-08-01 the demo rebuilt its agent index from
+scratch every frame, outside every timer. So the index raced a linear scan that has no
+maintenance at all, while its own maintenance was free by omission — the comparison measured
+half of one side. The index is **kept** now (`update_ref`, O(1) while an agent stays in its
+leaf), and both halves are on the clock. `$STEALTH_REBUILD=1` restores the old path so the
+difference is reproducible rather than asserted:
+
+| crowd | kept: maintain + cull = total | rebuilt: maintain + cull = total | scan | scan ÷ total, kept |
+| ---: | ---: | ---: | ---: | ---: |
+| 200 | 1.4 + 9.8 = **11.2 µs** | 25.5 + 9.1 = 34.6 µs | 4.5 µs | 0.40× (scan wins) |
+| 2 000 | 15.2 + 78.9 = **94.1 µs** | 339.7 + 80.0 = 419.7 µs | 151.4 µs | **1.61×** |
+| 20 000 | 296.8 + 351.0 = **647.8 µs** | 4 903.0 + 354.0 = 5 257.0 µs | 1 760.2 µs | **2.72×** |
+
+Keeping the index is **18–22× cheaper than rebuilding it** at every size. The load-bearing
+consequence is the verdict, not the ratio: charged for a per-frame rebuild the index **never
+wins at any size measured** (0.14×, 0.40×, 0.35× — every one below 1.0), and a demo whose
+whole point is "does the index pay here?" would have been answering *no* for the wrong reason.
+Charged for a keep, the crossover on honest total cost sits at **~1 100 agents**, barely above
+the cull-only ~1 000, because keeping costs so little. Maintenance is still 46 % of the index's
+total at 20 000 — visible, but no longer decisive.
+
 **The crossover is around a thousand agents.** Below it the tree is honestly slower: a
 `contains_point` against 6 planes is a handful of multiply-adds, and at 40 agents the
 traversal costs more than just looking at all of them. Above it the index pulls away and

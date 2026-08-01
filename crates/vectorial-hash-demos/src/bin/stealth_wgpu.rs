@@ -37,9 +37,14 @@ use web_time::Instant;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use winit::{event::*, event_loop::EventLoop, keyboard::{KeyCode, PhysicalKey}, window::WindowBuilder};
-use vectorial_hash::{Aabb, Point3, Polyhedron3, Positioned3, Segment3, Shape3, Tree3};
+use vectorial_hash::{Aabb, ItemRef, Point3, Polyhedron3, Positioned3, Segment3, Shape3, Tree3};
 
 const WORLD: f32 = 900.0;
+
+/// The box the agent index covers. An agent outside it is dropped by the index while a linear
+/// scan still counts it, which is exactly the disagreement documented in STEALTH.md — so the
+/// box is defined once, here, rather than spelled out at each construction site.
+fn agents_world() -> Aabb { Aabb::new(-10.0, -10.0, -10.0, (WORLD + 20.0) as f64, 220.0, (WORLD + 20.0) as f64) }
 const EYE_H: f32 = 9.0;        // guard eye height
 const FOV: f32 = 1.15;         // view cone half-angle is FOV/2 (radians)
 const SIGHT: f32 = 300.0;      // cone length
@@ -141,17 +146,26 @@ struct World {
     occ_r: f32,          // capsule radius that covers any crate from its centre
     guards: Vec<Guard>,
     civs: Vec<(Vec3, Vec3)>, // position, velocity
+    // The agent index, KEPT rather than rebuilt. It used to be `Tree3::bulk_load`ed from
+    // scratch every frame, which is the thing this kit exists to avoid: `update_ref` is O(1)
+    // when an agent stays in its leaf, and at 52 units/s over a ~1/60 s frame nearly all of
+    // them do. Worse, the rebuild was not inside any timer, so the index raced the linear scan
+    // without being charged for existing. Both halves are timed now — see `maint_us`.
+    agents: Tree3<Agent>,
+    refs: Vec<ItemRef>,
+    all: Vec<Agent>,     // the same set, flat, for the linear scan to sweep
+    rebuild: bool,       // $STEALTH_REBUILD=1 restores the old per-frame rebuild, to measure it
     player: Vec3,
     goal: Vec3,
     caught: f32,         // 0..1 detection meter
     escaped: bool,
     seen_now: usize,
     // per-frame query costs (µs)
-    cone_us: f32, los_us: f32, brute_us: f32,
+    cone_us: f32, los_us: f32, brute_us: f32, maint_us: f32,
     agree: bool, mismatch: (usize, usize), bad_frames: u32,
     // Running sums, because a single frame's reading is not a measurement: if the last
     // frame happens not to step, "the number" is 0. (It did, once, in a batch run.)
-    acc_cone: f64, acc_brute: f64, acc_los: f64, acc_seen: f64, acc_frames: u32,
+    acc_cone: f64, acc_brute: f64, acc_los: f64, acc_seen: f64, acc_maint: f64, acc_frames: u32,
 }
 
 impl World {
@@ -171,12 +185,22 @@ impl World {
             let wps: Vec<Vec3> = (0..3).map(|_| Vec3::new(r.r(70.0, WORLD - 70.0), EYE_H, r.r(70.0, WORLD - 70.0))).collect();
             Guard { p: wps[0], face: 0.0, wps, wp: 1, alert: 0.0 }
         }).collect();
-        let civs = (0..n_civs).map(|_| (
+        let civs: Vec<(Vec3, Vec3)> = (0..n_civs).map(|_| (
             Vec3::new(r.r(40.0, WORLD - 40.0), 7.0, r.r(40.0, WORLD - 40.0)),
             Vec3::new(r.r(-26.0, 26.0), 0.0, r.r(-26.0, 26.0)),
         )).collect();
-        World { crates, occ, occ_r, guards, civs, player: Vec3::new(40.0, 7.0, 40.0), goal: Vec3::new(WORLD - 60.0, 7.0, WORLD - 60.0), caught: 0.0, escaped: false, seen_now: 0, cone_us: 0.0, los_us: 0.0, brute_us: 0.0, agree: true, mismatch: (0, 0), bad_frames: 0,
-            acc_cone: 0.0, acc_brute: 0.0, acc_los: 0.0, acc_seen: 0.0, acc_frames: 0 }
+        let player = Vec3::new(40.0, 7.0, 40.0);
+        // Built ONCE. Agent 0 is the player, 1.. are the civilians; that ordering is what lets
+        // `refs[i]` and `all[i]` index in lockstep with `civs[i - 1]`.
+        let mut all = Vec::with_capacity(1 + civs.len());
+        all.push(Agent { id: 0, p: Point3::new(player.x as f64, player.y as f64, player.z as f64) });
+        for (i, (p, _)) in civs.iter().enumerate() { all.push(Agent { id: 1 + i as u32, p: Point3::new(p.x as f64, p.y as f64, p.z as f64) }); }
+        let mut agents = Tree3::new(agents_world(), 8);
+        let refs = all.iter().map(|a| agents.insert_ref(*a).expect("agent starts inside the world box")).collect();
+        World { crates, occ, occ_r, guards, civs, agents, refs, all,
+            rebuild: std::env::var("STEALTH_REBUILD").ok().as_deref() == Some("1"),
+            player, goal: Vec3::new(WORLD - 60.0, 7.0, WORLD - 60.0), caught: 0.0, escaped: false, seen_now: 0, cone_us: 0.0, los_us: 0.0, brute_us: 0.0, maint_us: 0.0, agree: true, mismatch: (0, 0), bad_frames: 0,
+            acc_cone: 0.0, acc_brute: 0.0, acc_los: 0.0, acc_seen: 0.0, acc_maint: 0.0, acc_frames: 0 }
     }
 
     /// The guard's view cone as a frustum: a near quad just in front of the eye and a
@@ -225,7 +249,7 @@ impl World {
         true
     }
 
-    fn step(&mut self, dt: f32, agents: &Tree3<Agent>, all: &[Agent], draw_lines: bool, lines: &mut Vec<LineV>) {
+    fn step(&mut self, dt: f32, draw_lines: bool, lines: &mut Vec<LineV>) {
         // guards patrol their loop
         for g in self.guards.iter_mut() {
             let tgt = g.wps[g.wp];
@@ -251,6 +275,23 @@ impl World {
             p.z = p.z.clamp(20.0, WORLD - 20.0);
         }
 
+        // ---- maintain the index. This is the half the old code never paid for out loud: it
+        // rebuilt the tree outside every timer, so the index appeared to cost only its culls
+        // while the linear scan it races has no maintenance at all. `update_ref` is O(1) when
+        // the agent has not left its leaf, which at these speeds is nearly always.
+        let t_m = Instant::now();
+        self.all[0].p = Point3::new(self.player.x as f64, self.player.y as f64, self.player.z as f64);
+        for (i, (p, _)) in self.civs.iter().enumerate() { self.all[1 + i].p = Point3::new(p.x as f64, p.y as f64, p.z as f64); }
+        if self.rebuild {
+            self.agents = Tree3::bulk_load(agents_world(), 8, self.all.clone());
+        } else {
+            for i in 0..self.all.len() {
+                let p = self.all[i].p;
+                self.agents.update_ref(self.refs[i], |a| a.p = p);
+            }
+        }
+        self.maint_us = (Instant::now() - t_m).as_secs_f32() * 1e6;
+
         // ---- detection: one frustum cull per guard, then exact LoS on the hits
         let mut exposed = false;
         self.seen_now = 0;
@@ -258,7 +299,7 @@ impl World {
         let t0 = Instant::now();
         let mut candidates: Vec<(usize, Vec<u32>)> = Vec::with_capacity(self.guards.len());
         for (gi, cone) in cones.iter().enumerate() {
-            let ids: Vec<u32> = agents.cull(cone).iter().map(|a| a.id).collect();
+            let ids: Vec<u32> = self.agents.cull(cone).iter().map(|a| a.id).collect();
             candidates.push((gi, ids));
         }
         self.cone_us = (Instant::now() - t0).as_secs_f32() * 1e6;
@@ -269,7 +310,7 @@ impl World {
         let t_b = Instant::now();
         let mut brute_total = 0usize;
         for cone in &cones {
-            for a in all.iter() { if cone.contains_point(a.p) { brute_total += 1; } }
+            for a in self.all.iter() { if cone.contains_point(a.p) { brute_total += 1; } }
         }
         self.brute_us = (Instant::now() - t_b).as_secs_f32() * 1e6;
         let idx_total = candidates.iter().map(|(_, v)| v.len()).sum::<usize>();
@@ -296,6 +337,7 @@ impl World {
         self.acc_cone += self.cone_us as f64;
         self.acc_brute += self.brute_us as f64;
         self.acc_los += self.los_us as f64;
+        self.acc_maint += self.maint_us as f64;
         self.acc_seen += self.seen_now as f64;
         self.acc_frames += 1;
 
@@ -337,7 +379,6 @@ async fn run() {
 
     let mut n_civs: usize = std::env::var("STEALTH_CIVS").ok().and_then(|s| s.parse().ok()).unwrap_or(CIVS);
     let mut w = World::new(n_civs);
-    let agents_world = Aabb::new(-10.0, -10.0, -10.0, (WORLD + 20.0) as f64, 220.0, (WORLD + 20.0) as f64);
 
     // ---- pipelines: instanced cubes, world-space lines, screen-space UI
     let cam_b = device.create_buffer(&wgpu::BufferDescriptor { label: Some("cam"), size: std::mem::size_of::<Cam>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
@@ -450,13 +491,7 @@ async fn run() {
                     for e in 0..4 { seg(4 + e, 4 + (e + 1) % 4); }         // the far face
                 }
                 if !paused {
-                    // The agent index is rebuilt each frame (a few dozen movers) and is
-                    // what every view cone culls.
-                    let mut items = Vec::with_capacity(1 + w.civs.len());
-                    items.push(Agent { id: 0, p: Point3::new(w.player.x as f64, w.player.y as f64, w.player.z as f64) });
-                    for (i, (p, _)) in w.civs.iter().enumerate() { items.push(Agent { id: 1 + i as u32, p: Point3::new(p.x as f64, p.y as f64, p.z as f64) }); }
-                    let agents = Tree3::bulk_load(agents_world, 8, items.clone());
-                    w.step(dt, &agents, &items, draw_lines, &mut lines);
+                    w.step(dt, draw_lines, &mut lines);
                 }
 
                 // ---- scene
@@ -492,8 +527,8 @@ async fn run() {
                 push_quad(&mut ui, pad, pad, 150.0 * tp, 41.0 * tp, [0.03, 0.05, 0.10, 0.66], sw, sh);
                 push_text(&mut ui, pad + 3.0 * tp, pad + 2.0 * tp, tp, [0.92, 0.95, 1.0, 1.0], &format!("STEALTH - {:.0} FPS", fps), sw, sh);
                 push_text(&mut ui, pad + 3.0 * tp, pad + 9.0 * tp, tp * 0.8, [0.75, 0.82, 0.95, 0.95], &format!("{} GUARDS - {} CROWD - {} SEEN", w.guards.len(), w.civs.len(), w.seen_now), sw, sh);
-                let (fast, col) = if w.cone_us <= w.brute_us { ("INDEX", [0.45, 1.0, 0.6, 1.0]) } else { ("SCAN", [1.0, 0.75, 0.35, 1.0]) };
-                push_text(&mut ui, pad + 3.0 * tp, pad + 16.0 * tp, tp * 0.8, col, &format!("CONES: CULL {:.0}US VS SCAN {:.0}US - {} WINS", w.cone_us, w.brute_us, fast), sw, sh);
+                let (fast, col) = if w.cone_us + w.maint_us <= w.brute_us { ("INDEX", [0.45, 1.0, 0.6, 1.0]) } else { ("SCAN", [1.0, 0.75, 0.35, 1.0]) };
+                push_text(&mut ui, pad + 3.0 * tp, pad + 16.0 * tp, tp * 0.8, col, &format!("CONES: CULL {:.0}+KEEP {:.0}US VS SCAN {:.0}US - {} WINS", w.cone_us, w.maint_us, w.brute_us, fast), sw, sh);
                 push_text(&mut ui, pad + 3.0 * tp, pad + 23.0 * tp, tp * 0.8, [0.55, 0.85, 1.0, 0.95], &format!("EXACT LOS {:.0}US - AGREE {}", w.los_us, if w.agree { "YES" } else { "NO" }), sw, sh);
                 push_text(&mut ui, pad + 3.0 * tp, pad + 30.0 * tp, tp * 0.8, [0.8, 0.8, 0.9, 0.9], "WASD MOVE - BRACKETS CROWD - L LINES", sw, sh);
                 // detection meter
@@ -534,8 +569,18 @@ async fn run() {
                         // MEANS over every stepped frame, not the last frame's values.
                         let n = w.acc_frames.max(1) as f64;
                         let (cone, brute, los, seen) = (w.acc_cone / n, w.acc_brute / n, w.acc_los / n, w.acc_seen / n);
+                        // The index costs maintenance; the scan costs nothing to maintain. Comparing
+                        // culls alone flatters the index, so the crossover is quoted on the TOTAL.
+                        let maint = w.acc_maint / n;
+                        let total = cone + maint;
                         println!("stealth_wgpu: {} guards / {} crowd / {} crates over {} stepped frames - cones: index cull {:.1} us vs linear scan {:.1} us (agree every frame: {}) - exact LoS {:.1} us - seen {:.0} - {:.0} fps  [means]",
-                            w.guards.len(), w.civs.len(), w.crates.len(), w.acc_frames, cone, brute, los, w.bad_frames == 0, seen, fps);
+                            // `los` and the agree flag were swapped here from the day this was
+                            // written, and it COMPILED: `bool` honours a precision, so `{:.1}`
+                            // printed `true` as "t" and the LoS microseconds landed in the
+                            // agreement slot. The `#M` lines below were right, so no gate ever
+                            // saw it - only the sentence a human reads was wrong.
+                            w.guards.len(), w.civs.len(), w.crates.len(), w.acc_frames, cone, brute, w.bad_frames == 0, los, seen, fps);
+                        println!("  index maintenance {:.1} us ({}) - TOTAL index {:.1} us vs scan {:.1} us", maint, if w.rebuild { "rebuilt" } else { "kept" }, total, brute);
                         if w.bad_frames > 0 { println!("  MISMATCH on {} frames - last index {} vs scan {}", w.bad_frames, w.mismatch.0, w.mismatch.1); }
                         // machine-readable for `bench-runner`; keyed by crowd size so a
                         // sweep produces the index-vs-scan crossover table directly.
@@ -543,6 +588,9 @@ async fn run() {
                         println!("#M crowd{tag}.index_cull {cone:.2} us");
                         println!("#M crowd{tag}.linear_scan {brute:.2} us");
                         println!("#M crowd{tag}.scan_over_index {:.3} x", brute / cone.max(1e-9));
+                        println!("#M crowd{tag}.index_maintain {maint:.2} us");
+                        println!("#M crowd{tag}.index_total {total:.2} us");
+                        println!("#M crowd{tag}.scan_over_total {:.3} x", brute / total.max(1e-9));
                         println!("#M crowd{tag}.exact_los {los:.2} us");
                         println!("#M crowd{tag}.stepped_frames {} n", w.acc_frames);
                         println!("#M crowd{tag}.agree {} bool", if w.bad_frames == 0 { 1 } else { 0 });
