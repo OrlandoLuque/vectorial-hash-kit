@@ -473,6 +473,32 @@ impl<T: Positioned3> MortonGrid3<T> {
         }
     }
 
+    /// Every item in the grid, in unspecified (hash) order.
+    ///
+    /// The grid could report how many items it held and draw its own cells, but there was no
+    /// way to get the items back out of it — so it could be built and queried and never
+    /// *read*, which quietly blocks anything that wants to hand its contents to another
+    /// structure.
+    pub fn iter(&self) -> impl Iterator<Item = &T> { self.cells.values().flat_map(|b| b.iter()) }
+
+    /// Every item, cell by cell in **Z-order** (ascending Morton code) — the order the grid
+    /// has effectively already sorted them into.
+    ///
+    /// This is what makes a *warm-start migration* expressible: a structure being replaced can
+    /// hand its successor a spatially coherent sequence instead of an arbitrary one. Whether
+    /// that is worth doing is a separate, measured question, and the answer is yes — see
+    /// `examples/migration_warm_start` (50 000 items): building the successor from Z-order
+    /// rather than insertion order is **1.42× on a `KdTree3`, 1.81× on `Tree3` inserts, 1.26×
+    /// on `Tree3::bulk_load`** and 1.07× on another grid.
+    ///
+    /// Sorting the cell keys costs an allocation and O(cells log cells); [`Self::iter`] is the
+    /// cheaper call when order does not matter.
+    pub fn iter_z_order(&self) -> impl Iterator<Item = &T> {
+        let mut keys: Vec<u64> = self.cells.keys().copied().collect();
+        keys.sort_unstable();
+        keys.into_iter().flat_map(move |k| self.cells[&k].iter())
+    }
+
     /// Same cull contract as [`crate::Tree3::cull`]: every item inside `shape`.
     /// Visits only the cells overlapping the shape's bounding box; a cell fully
     /// inside short-circuits (all points, no test), a straddling cell runs the

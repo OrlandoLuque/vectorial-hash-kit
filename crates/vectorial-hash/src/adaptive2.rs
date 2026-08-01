@@ -328,25 +328,49 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
 
     fn migrate(&mut self, to: Backend) {
         self.switches += 1;
-        self.held = Self::build(to, &self.items, self.world, self.leaf, self.q_extent);
+        let order = self.warm_order();
+        self.held = Self::build_ordered(to, &self.items, self.world, self.leaf, self.q_extent, &order);
         self.grid_for = self.live; // whatever the grid's cells were just sized for
         self.dirty = false;
     }
 
+    /// The slot order the outgoing backend already had, so its successor is built from a
+    /// spatially coherent sequence. See [`crate::AdaptiveIndex::warm_order`] — same reasoning,
+    /// same "only the grid can supply it for free" restriction.
+    fn warm_order(&self) -> Vec<u32> {
+        match &self.held {
+            Held2::Grid(g) => g.iter_z_order().map(|t| t.slot).collect(),
+            _ => Vec::new(),
+        }
+    }
+
     /// Rebuild a backend from the item list. This is the cost hysteresis exists to avoid
-    /// paying twice.
-    fn build(to: Backend, items: &[Option<T>], world: Rect, leaf: usize, q_extent: f64) -> Held2<T> {
+    /// paying twice. `order` is a performance hint only: an empty, partial or stale one costs
+    /// speed, never contents, because every slot it does not mention is still visited after it.
+    fn build_ordered(to: Backend, items: &[Option<T>], world: Rect, leaf: usize, q_extent: f64, order: &[u32]) -> Held2<T> {
+        let mut seen = vec![false; if order.is_empty() { 0 } else { items.len() }];
+        let slots: Vec<usize> = if order.is_empty() { Vec::new() } else {
+            let mut v = Vec::with_capacity(items.len());
+            for &s in order { let s = s as usize; if s < items.len() && !seen[s] { seen[s] = true; v.push(s); } }
+            for (s, hit) in seen.iter().enumerate() { if !hit { v.push(s); } }
+            v
+        };
+        let visit: Box<dyn Iterator<Item = usize>> = if slots.is_empty() { Box::new(0..items.len()) } else { Box::new(slots.into_iter()) };
         match to {
-            Backend::Brute => Held2::Brute,
+            Backend::Brute => { let _ = visit; Held2::Brute }
             Backend::KeepTree => {
                 let mut t = Tree::new(world, leaf);
                 // One entry per SLOT, holes carried through as dead refs, so `refs[slot]`
                 // survives a rebuild. Skipping holes here would shift every handle past the
                 // first removal — the exact bug the slot table is built to prevent.
-                let refs = items.iter().map(|o| match o {
-                    Some(it) => t.insert_ref(it.clone()).unwrap_or(ItemRef(u32::MAX)),
-                    None => ItemRef(u32::MAX),
-                }).collect();
+                // `refs` is written BY slot, never appended, which is what lets the visit
+                // order differ from slot order without disturbing a single handle.
+                let mut refs = vec![ItemRef(u32::MAX); items.len()];
+                for slot in visit {
+                    if let Some(it) = &items[slot] {
+                        refs[slot] = t.insert_ref(it.clone()).unwrap_or(ItemRef(u32::MAX));
+                    }
+                }
                 Held2::Keep(Box::new(t), refs)
             }
             Backend::Grid => {
@@ -360,12 +384,13 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
                     (per_axis.log2().round().max(1.0) as u32).min(12)
                 };
                 let mut g = MortonGrid::new(world, levels);
-                for (slot, it) in items.iter().enumerate() {
-                    if let Some(v) = it { g.insert(Tagged { slot: slot as u32, item: v.clone() }); }
+                for slot in visit {
+                    if let Some(v) = &items[slot] { g.insert(Tagged { slot: slot as u32, item: v.clone() }); }
                 }
                 Held2::Grid(Box::new(g))
             }
-            Backend::Static => Held2::Static(Box::new(KdTree2::from_items(leaf, items.iter().flatten().cloned().collect()))),
+            Backend::Static => Held2::Static(Box::new(KdTree2::from_items(leaf,
+                visit.filter_map(|slot| items[slot].clone()).collect()))),
         }
     }
 
@@ -375,7 +400,8 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
         if !self.dirty { return; }
         let b = self.backend();
         if b == Backend::Brute { self.dirty = false; return; }
-        self.held = Self::build(b, &self.items, self.world, self.leaf, self.q_extent);
+        let order = self.warm_order();
+        self.held = Self::build_ordered(b, &self.items, self.world, self.leaf, self.q_extent, &order);
         self.grid_for = self.live;
         self.dirty = false;
     }

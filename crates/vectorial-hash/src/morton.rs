@@ -242,6 +242,20 @@ impl<T: Positioned> MortonGrid<T> {
     }
 
     pub fn cell_count(&self) -> usize { self.cells.len() }
+
+    /// Every item in the grid, in unspecified (hash) order. The 2D twin of
+    /// [`crate::MortonGrid3::iter`].
+    pub fn iter(&self) -> impl Iterator<Item = &T> { self.cells.values().flat_map(|b| b.iter()) }
+
+    /// Every item, cell by cell in **Z-order** — what a *warm-start migration* hands the
+    /// structure replacing this one. See [`crate::MortonGrid3::iter_z_order`] for the measured
+    /// case; sorting the cell keys costs an allocation, so prefer [`Self::iter`] when order
+    /// does not matter.
+    pub fn iter_z_order(&self) -> impl Iterator<Item = &T> {
+        let mut keys: Vec<u64> = self.cells.keys().copied().collect();
+        keys.sort_unstable();
+        keys.into_iter().flat_map(move |k| self.cells[&k].iter())
+    }
     pub fn levels(&self) -> u32 { self.levels }
 
     /// Visit each occupied cell's box and item count (for visualisation).

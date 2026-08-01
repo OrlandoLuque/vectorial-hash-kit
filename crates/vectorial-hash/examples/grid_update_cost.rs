@@ -53,9 +53,8 @@ fn main() {
         // find-it-and-write-it. This is the floor every keep-based caller pays per item per
         // frame whether or not anything moved.
         let t = Instant::now();
-        for i in 0..N {
+        for (i, &p) in pos.iter().enumerate() {
             let cid = i as u32;
-            let p = pos[i];
             g.update(p, |c| c.id == cid, |c| c.p = p);
         }
         let stay = t.elapsed().as_secs_f64() * 1e9 / N as f64;
@@ -74,9 +73,7 @@ fn main() {
         let mut fresh = MortonGrid3::<P>::new(world, levels);
         for (i, p) in pos.iter().enumerate() { fresh.insert(P { id: i as u32, p: *p }); }
         let rebuild = t.elapsed().as_secs_f64() * 1e9 / N as f64;
-        // (`MortonGrid3` has no public `len()` — noted as a capability hole; `occupancy`
-        // reports the same number.)
-        assert_eq!(fresh.occupancy().items, occ.items, "the two paths must hold the same number of items");
+        assert_eq!(fresh.item_count(), occ.items, "the two paths must hold the same number of items");
 
         println!("{:>6} {:>10} {:>9.1} {:>12.1} {:>12.1} {:>12.1} {:>12.2}",
             levels, occ.cells, occ.mean, stay, cross, rebuild, stay / rebuild);
