@@ -6,6 +6,10 @@
 //! - **binary** `Tree3` — persistent, predicate `update` (ascend-to-LCA),
 //! - **octree** `Octree3` — persistent, predicate `update`,
 //! - **morton** `MortonGrid3` — pointer-free, **rebuilt every frame**,
+//! - **morton-keep** — the same grid maintained in place (`update`). It LOSES here, and
+//!   the reason is worth knowing: `update` costs about what an insert costs, so keeping
+//!   only pays when the caller can skip it for items that did not move. At 100% churn
+//!   there are none. See THREE_D.md § "Why a rebuild wins at full churn".
 //! - **projection** — a 2D `Tree` on xy **rebuilt every frame** + disc cull,
 //!   z-slab reject, exact 3D narrowphase,
 //! - **binary-ref** — the binary `Tree3` maintained via the stable `ItemRef`
@@ -34,8 +38,8 @@ use vectorial_hash::{
 const MARGIN: f64 = 4.0;
 // "binary-ref" is the binary Tree3 maintained through the stable ItemRef handle
 // (O(1) update_ref) instead of the predicate update — the Stable-ItemRef test.
-const NAMES: [&str; 7] = ["binary", "octree", "morton", "projection", "binary-ref", "linear-octree", "kd-tree"];
-const SHORT: [&str; 7] = ["bin", "oct", "mor", "prj", "binR", "lin", "kd"];
+const NAMES: [&str; 9] = ["binary", "octree", "morton", "projection", "binary-ref", "linear-octree", "kd-tree", "morton-keep", "linear-keep"];
+const SHORT: [&str; 9] = ["bin", "oct", "mor", "prj", "binR", "lin", "kd", "morK", "linK"];
 
 struct Args {
     sweep: bool,
@@ -119,7 +123,7 @@ struct Cfg { world: f64, pop: usize, item_limit: usize, vision: f64, speed: f64,
 /// Run the deterministic sim with all four structures maintained on the same
 /// positions; return per-structure (maintain µs/frame, cull µs/cull) and
 /// whether all four culls agreed.
-fn measure(cfg: &Cfg) -> ([f64; 7], [f64; 7], bool) {
+fn measure(cfg: &Cfg) -> ([f64; 9], [f64; 9], bool) {
     let mut rng = Rng::new(cfg.seed);
     let world = Aabb::new(0.0, 0.0, 0.0, cfg.world, cfg.world, cfg.world);
     let rect = Rect::new(0.0, 0.0, cfg.world, cfg.world);
@@ -145,8 +149,18 @@ fn measure(cfg: &Cfg) -> ([f64; 7], [f64; 7], bool) {
     }
     let levels = MortonGrid3::<C3>::levels_for_cell_size(world, cfg.vision.max(4.0));
 
-    let mut mt: [Series; 7] = std::array::from_fn(|_| Series::new());
-    let mut cl: [Series; 7] = std::array::from_fn(|_| Series::new());
+    // The KEPT twins of the two structures this sweep used to rebuild unconditionally.
+    // Until `MortonGrid3::update` / `LinearOctree3::update` existed they had no choice, and
+    // this table is where "grids always rebuild" came from: it measured them at 100% per-frame
+    // relocation, the one churn level where the missing feature costs nothing, against trees
+    // that keep. Both strategies are legitimate, so both are rows now — but the comparison is
+    // no longer between a structure and a handicap.
+    let mut morton_k = MortonGrid3::<C3>::new(world, levels);
+    for id in 0..cfg.pop { morton_k.insert(C3 { id: id as u32, p: pos[id] }); }
+    let mut linear_k = LinearOctree3::<C3>::from_items(world, cfg.item_limit, 12, (0..cfg.pop).map(|id| C3 { id: id as u32, p: pos[id] }).collect());
+
+    let mut mt: [Series; 9] = std::array::from_fn(|_| Series::new());
+    let mut cl: [Series; 9] = std::array::from_fn(|_| Series::new());
     let mut blackhole = 0usize;
     let mut agree = true;
 
@@ -185,6 +199,21 @@ fn measure(cfg: &Cfg) -> ([f64; 7], [f64; 7], bool) {
         let mut morton = MortonGrid3::<C3>::new(world, levels);
         for id in 0..cfg.pop { morton.insert(C3 { id: id as u32, p: pos[id] }); }
         if measuring { mt[2].push(us(t)); }
+
+        // the same grid, KEPT: told where the item was, it re-buckets only the ones that
+        // actually crossed a cell boundary. No handle layer — a grid has no `ItemRef` — so it
+        // pays a predicate scan of the one cell, which is what makes this a real contest
+        // rather than a foregone one.
+        let t = Instant::now();
+        for id in 0..cfg.pop { let cid = id as u32; morton_k.update(old_pos[id], |c| c.id == cid, |c| c.p = pos[id]); }
+        if measuring { mt[7].push(us(t)); }
+
+        // and the linear octree kept, which additionally has to merge leaves back up as the
+        // cloud thins — keeping an ADAPTIVE structure drifts its shape, keeping a flat one
+        // cannot.
+        let t = Instant::now();
+        for id in 0..cfg.pop { let cid = id as u32; linear_k.update(old_pos[id], |c| c.id == cid, |c| c.p = pos[id]); }
+        if measuring { mt[8].push(us(t)); }
 
         // linear octree: adaptive, pointer-free, rebuilt each frame (its "maintain"
         // is a full build, like morton/projection — no in-place handle path).
@@ -231,6 +260,14 @@ fn measure(cfg: &Cfg) -> ([f64; 7], [f64; 7], bool) {
         if measuring { cl[6].push(us(t) / n); }
 
         let t = Instant::now();
+        for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(morton_k.cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); }
+        if measuring { cl[7].push(us(t) / n); }
+
+        let t = Instant::now();
+        for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(linear_k.cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); }
+        if measuring { cl[8].push(us(t) / n); }
+
+        let t = Instant::now();
         for &id in &ids {
             let c = pos[id];
             let cand = proj.cull(&Disc { cx: c.x, cy: c.y, r: cfg.vision });
@@ -260,8 +297,13 @@ fn measure(cfg: &Cfg) -> ([f64; 7], [f64; 7], bool) {
             let mut a4: Vec<u32> = tree_h.cull(&s).iter().map(|x| x.id).collect();
             let mut a5: Vec<u32> = linear.cull(&s).iter().map(|x| x.id).collect();
             let mut a6: Vec<u32> = kd.cull(&s).iter().map(|x| x.id).collect();
-            a0.sort_unstable(); a1.sort_unstable(); a2.sort_unstable(); a3.sort_unstable(); a4.sort_unstable(); a5.sort_unstable(); a6.sort_unstable();
-            if a1 != a0 || a2 != a0 || a3 != a0 || a4 != a0 || a5 != a0 || a6 != a0 { agree = false; }
+            // The kept pair matter MOST here: a rebuilt structure cannot drift, but one
+            // maintained in place for thousands of frames can lose an item and still answer
+            // plausibly. This is the gate that would catch it.
+            let mut a7: Vec<u32> = morton_k.cull(&s).iter().map(|x| x.id).collect();
+            let mut a8: Vec<u32> = linear_k.cull(&s).iter().map(|x| x.id).collect();
+            a0.sort_unstable(); a1.sort_unstable(); a2.sort_unstable(); a3.sort_unstable(); a4.sort_unstable(); a5.sort_unstable(); a6.sort_unstable(); a7.sort_unstable(); a8.sort_unstable();
+            if a1 != a0 || a2 != a0 || a3 != a0 || a4 != a0 || a5 != a0 || a6 != a0 || a7 != a0 || a8 != a0 { agree = false; }
         }
     }
     if blackhole == usize::MAX { println!("unreachable"); }
@@ -297,11 +339,11 @@ fn main() {
         cfg.world, cfg.pop, cfg.item_limit, cfg.vision, cfg.speed, cfg.n_cull, cfg.frames, cfg.warmup, cfg.seed);
     let (maintain, cull, agree) = measure(&cfg);
     println!("\n{:<12} {:>16} {:>14} {:>20}", "structure", "maintain us/frame", "cull us/cull", "per-frame total us");
-    for k in 0..7 {
+    for k in 0..9 {
         let total = maintain[k] + cfg.n_cull as f64 * cull[k];
         println!("{:<14} {:>16.1} {:>14.3} {:>20.1}", NAMES[k], maintain[k], cull[k], total);
     }
-    let total: [f64; 7] = std::array::from_fn(|k| maintain[k] + cfg.n_cull as f64 * cull[k]);
+    let total: [f64; 9] = std::array::from_fn(|k| maintain[k] + cfg.n_cull as f64 * cull[k]);
     let (wm, mm) = winner(&maintain);
     let (wc, mc) = winner(&cull);
     let (wt, mt) = winner(&total);
@@ -331,8 +373,8 @@ fn run_sweep(args: &Args) {
     println!("(maintain = per-frame update[bin/oct] or rebuild[mor/prj]; cull = per-cull. winner = lowest, margin = 2nd/1st.)\n");
     println!("{:>6} {:>7} {:>4} {:>5} | {:<24} | {:<24} | {:<10}", "world", "pop", "il", "churn", "maintain winner", "cull winner", "agree");
 
-    let mut wins_m = [0u32; 7];
-    let mut wins_c = [0u32; 7];
+    let mut wins_m = [0u32; 9];
+    let mut wins_c = [0u32; 9];
     let mut all_agree = true;
     let mut n = 0;
     for &world in &worlds {

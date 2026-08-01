@@ -314,15 +314,34 @@ impl<T: Positioned3> MortonGrid3<T> {
     /// matched.
     ///
     /// This is the grid's answer to the tree's `update_ref`, and it exists because "grids are
-    /// rebuild-only" was a property of the API rather than of grids. A uniform grid has no
-    /// handles to maintain and no structure to rebalance: if the item stays in its cell there
-    /// is *nothing to do at all*, and if it leaves, the whole cost is one `swap_remove` and one
-    /// push. What it cannot do is find the item without help, which is why the caller passes
-    /// the old position — the same bargain `Tree3::update` makes with its predicate.
+    /// rebuild-only" was a property of the API rather than of grids. What it cannot do is find
+    /// the item without help, which is why the caller passes the old position — the same
+    /// bargain `Tree3::update` makes with its predicate.
     ///
-    /// Cost is O(occupancy of the old cell), so it is only a good deal on a grid whose cells
-    /// hold few items — see [`Occupancy`], and note this is another reason the tuning knob
-    /// matters. On a grid holding thousands per cell, `clear` + refill is the better call.
+    /// # It is not free when nothing moved, and that decides when to use it
+    ///
+    /// An earlier version of this comment claimed that an item staying in its cell means
+    /// "nothing to do at all". That is wrong, and `examples/grid_update_cost` is the
+    /// correction: the call still has to *find* the item, and finding costs about what
+    /// inserting it would. Measured at 20 000 items, the same calls at five cell sizes:
+    ///
+    /// | mean items/cell | 39.1 | 4.9 | 1.3 | 1.0 |
+    /// | --- | ---: | ---: | ---: | ---: |
+    /// | stayed-in-cell, ns/item | 92.4 | 72.5 | 100.8 | 98.5 |
+    /// | rebuild (insert), ns/item | 80.5 | 94.7 | 148.4 | 136.1 |
+    ///
+    /// Occupancy changes by 39× and the cost barely moves — so the O(occupancy) predicate scan
+    /// is *not* where the time goes (it is visible only in the 39-items-per-cell column, 92 vs
+    /// 72). The hash lookup is, and no handle layer could remove it, because a handle would
+    /// still have to reach the bucket.
+    ///
+    /// The consequence is the rule worth remembering: **this method saves the calls you do not
+    /// make, not the calls you do.** Per item it is roughly a wash against a rebuild
+    /// (0.54–1.15×). It wins — hugely — when the caller can skip it for items that did not
+    /// move: 7.98× at 10 % moving and 938× at 0.1 % (`examples/grid_keep_bench`), which is why
+    /// the horde's sleeping dead cost nothing to index. On a workload where *everything* moves
+    /// every frame, `clear` + refill is the better call and the 3D decision map says so
+    /// (`morton` 1 063 µs against `morton-keep` 1 566 µs).
     pub fn update<P, M>(&mut self, old: Point3, predicate: P, mutate: M) -> Crossed
     where
         P: Fn(&T) -> bool,

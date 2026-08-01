@@ -598,6 +598,43 @@ The four structures differ in how they track the moving points:
 > because at full churn a rebuild really is the right call — but they are one point of a
 > curve, not a property.
 
+#### Why a rebuild wins at full churn — the mechanism, measured
+
+The sweep now runs `morton-keep` and `linear-keep` as their own rows, and at the default
+(everything moving, every frame) **they lose**: `morton` 1 063 µs against `morton-keep`
+1 566 µs, `linear-octree` 1 388 µs against `linear-keep` 3 861 µs. The tempting explanation is
+that re-bucketing is expensive. It is not, and the giveaway is that **`morton-keep`'s cost does
+not move when the critters slow down 120×** (speed 120 → 1: 1 522 → 1 506 µs). If crossing
+cells were the expense it would collapse as almost nobody crosses.
+
+`examples/grid_update_cost` isolates it by holding the item count fixed and changing `levels`,
+so only cell occupancy moves:
+
+| mean items/cell | 39.1 | 4.9 | 1.3 | 1.0 | 1.0 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| stayed in its cell, ns/item | 92.4 | 72.5 | 100.8 | 98.5 | 99.3 |
+| crossed a cell, ns/item | 128.5 | 142.9 | 145.8 | 204.3 | 246.6 |
+| rebuild (one insert), ns/item | 80.5 | 94.7 | 148.4 | 136.1 | 183.8 |
+
+Occupancy changes 39× and the stayed-cost is flat — so the O(occupancy) predicate scan is
+**not** where the time goes (it is visible only in the 39-per-cell column: 92 against 72). The
+**hash lookup** is, and that is the part a handle layer could not remove, because a handle
+still has to reach the bucket. The `ItemRef` trick that makes `Tree3` 5.75× cheaper to maintain
+than its own predicate `update` has no grid equivalent for this reason, and that asymmetry is
+real rather than an omission.
+
+**The rule that follows: `update` saves the calls you do not make, not the calls you do.** Per
+call it is a wash against a rebuild (0.54–1.15×). It wins enormously when the caller can skip
+it — 7.98× at 10 % moving, 938× at 0.1 % (`examples/grid_keep_bench`), which is exactly why the
+horde's sleeping dead cost nothing to index. Call it unconditionally for every item every
+frame and you have bought a slower rebuild.
+
+One thing in those rows is *not* explained: `morton-keep` **culls 1.18× faster** than the
+rebuilt grid (1.526 against 1.797 µs) with an identical world and identical `levels`. That is
+the same unexplained query advantage as the adaptive index's grid (#136), reproducing in a
+completely independent setting — which upgrades it from a quirk of one bench to a real effect
+with no explanation yet.
+
 The intuition — and the first draft of this section — was that the *persistent*
 structures must beat the *rebuilt* ones on build: an incremental `update` sounds
 cheaper than re-inserting everything. **The decision map below shows the
