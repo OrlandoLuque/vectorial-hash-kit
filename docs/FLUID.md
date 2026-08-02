@@ -63,6 +63,38 @@ So the churn rule would have got the repo's only genuine counterexample backward
 query-intensity rule gets it right. That is why `adaptive::Thresholds` switches on
 `rebuild_query_ratio` and keeps `high_churn` only as a description of the workload.
 
+## Running it without a screen
+
+`$FLUID_HEADLESS=<frames>` runs the simulation with no window, no GPU and no wgpu adapter, then
+prints the same per-phase split the HUD draws. The five-way index race was previously observable
+only by a human watching bars move, which meant it could not run in CI, on a machine without a
+display, or across a sweep of populations — a comparison this repo leans on quite hard for
+something nobody could reproduce automatically.
+
+```bash
+FLUID_HEADLESS=400 FLUID_INDEX=adaptive cargo run -p vectorial-hash-demos --bin fluid_wgpu --release
+```
+
+2 200 particles, 400 frames after a warm-up, means over the run (`#M` lines are emitted for
+`bench-runner`):
+
+| index | maintain µs | query µs | physics µs | frame µs | sim fps |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| MortonGrid rebuild | 117.9 | 1 525.5 | 1 098.3 | 2 741.6 | 365 |
+| MortonGrid keep | 130.2 | 1 554.1 | 1 098.6 | 2 782.8 | 359 |
+| Tree + `ItemRef` keep | **45.9** | 1 876.7 | 1 107.3 | 3 029.9 | 330 |
+| LinearQuadTree rebuild | 151.4 | 1 616.0 | 1 111.1 | 2 878.6 | 347 |
+| **AdaptiveIndex2** (picks the grid) | 135.9 | **1 360.5** | 1 104.9 | **2 601.2** | **384** |
+
+It shares `Fluid::step` with the interactive path rather than reimplementing the loop — a
+headless mode that reimplements the simulation measures the reimplementation. The warm-up is not
+decoration either: the first frame pays for every bucket the index has never allocated, which is
+a build cost wearing a maintain cost's clothes.
+
+**The first version of this printed 3 420 ms per frame** and did not complain. `Fluid::step`
+returns microseconds; the labels said milliseconds. Nothing in the code could have caught it —
+only reading the number and knowing the demo runs at ~350 fps.
+
 ## Physics: PBF, not the textbook EOS
 
 The demo solves **density constraints** (Macklin & Müller 2013) rather than the

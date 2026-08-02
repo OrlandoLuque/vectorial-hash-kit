@@ -512,7 +512,74 @@ impl Fluid {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn main() { pollster::block_on(run()); }
+fn main() {
+    // `$FLUID_HEADLESS=<frames>` runs the simulation with no window, no GPU and no wgpu adapter
+    // at all, then prints the same per-phase costs the HUD shows. The point is that this demo's
+    // `M` key races five neighbour indexes against each other on a real workload, and that
+    // comparison was only observable by a human watching a HUD — so it could not be run in CI,
+    // on a machine without a display, or over a sweep of populations.
+    //
+    // It shares the exact simulation path (`Fluid::step`), not a copy of it: a headless mode
+    // that reimplements the loop measures the reimplementation.
+    if let Some(frames) = std::env::var("FLUID_HEADLESS").ok().and_then(|s| s.parse::<usize>().ok()) {
+        headless(frames);
+        return;
+    }
+    pollster::block_on(run());
+}
+
+/// Run `frames` simulation steps with no renderer and report the per-phase means.
+///
+/// Reports **means over the run, not the last frame** — the stealth demo learned that the hard
+/// way, when a batch of three passes landed one reading on a frame that had not stepped and
+/// printed a clean, plausible zero.
+#[cfg(not(target_arch = "wasm32"))]
+fn headless(frames: usize) {
+    let n = std::env::var("FLUID_N").ok().and_then(|s| s.parse().ok()).unwrap_or(2200usize).min(MAX_N);
+    let kind = match std::env::var("FLUID_INDEX").ok().as_deref() {
+        Some("keep") | Some("tree") => Idx::TreeKeep,
+        Some("linear") | Some("lqt") => Idx::Linear,
+        Some("adaptive") | Some("auto") => Idx::Adaptive,
+        Some("mortonkeep") | Some("gridkeep") => Idx::MortonKeep,
+        _ => Idx::Morton,
+    };
+    let mut fluid = Fluid::new(n);
+    let mut index = Index::build(kind, &fluid.px, &fluid.py);
+
+    // A few unmeasured steps first: the first frame pays for every bucket the index has never
+    // allocated, which is a build cost wearing a maintain cost's clothes.
+    let warmup = (frames / 10).clamp(1, 60);
+    for _ in 0..warmup { fluid.step(&mut index, kind); }
+
+    let (mut acc_m, mut acc_q, mut acc_p) = (0.0f64, 0.0f64, 0.0f64);
+    for _ in 0..frames {
+        let (m, q, p) = fluid.step(&mut index, kind);
+        acc_m += m as f64; acc_q += q as f64; acc_p += p as f64;
+    }
+    let f = frames.max(1) as f64;
+    let (m, q, p) = (acc_m / f, acc_q / f, acc_p / f);
+    let picked = index.chosen().map(|c| format!(" -> {c}")).unwrap_or_default();
+    println!("fluid headless | {n} particles | {frames} frames (+{warmup} warmup) | index: {}{picked}", kind.label());
+    // `Fluid::step` reports MICROSECONDS (see its `us` closure) — labelling these ms was the
+    // first thing this mode got wrong, and it read as 3 420 ms per frame without complaining.
+    let frame_us = m + q + p;
+    println!("  maintain {m:.1} us | query {q:.1} us | physics {p:.1} us | frame {frame_us:.1} us ({:.0} fps sim-only)",
+        1e6 / frame_us.max(1e-9));
+    // A stable machine-readable key per arm, so a sweep over `FLUID_INDEX` produces one row
+    // per index rather than five rows all called "fluid".
+    let tag = match kind {
+        Idx::Morton => "morton", Idx::MortonKeep => "mortonkeep", Idx::TreeKeep => "treekeep",
+        Idx::Linear => "linear", Idx::Adaptive => "adaptive",
+    };
+    println!("#M fluid_{tag}.maintain_us {m:.2} us");
+    println!("#M fluid_{tag}.query_us {q:.2} us");
+    println!("#M fluid_{tag}.physics_us {p:.2} us");
+    println!("#M fluid_{tag}.frame_us {frame_us:.2} us");
+    println!("#M fluid_{tag}.sim_fps {:.0} n", 1e6 / frame_us.max(1e-9));
+}
+
+#[cfg(target_arch = "wasm32")]
+fn headless(_frames: usize) {}
 
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen::prelude::wasm_bindgen(start)]
