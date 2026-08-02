@@ -153,22 +153,33 @@ fn plan(group: &str) -> Vec<Bench> {
         slow(b(DEMOS, Example("horde_balance"), PAR, "horde balance sweep across seeds (long)")),
     ];
     // --- the three application demos, swept over the structures they compare -----
-    // Marked END-TO-END: their per-operation metrics are timed around the operation and
-    // are comparable, but their `fps` includes drawing and is not an algorithm number.
+    //
+    // **Headless since 2026-08-03.** These entries exist to compare INDEXES, and they used to
+    // run the demos with a window and a GPU, so every number also contained a renderer. Two
+    // consequences, both real: the group could not run on a machine without a display (i.e. any
+    // CI runner), and the measurement moved with what the renderer was doing — the stealth
+    // crossover reads ~1 350 agents headless against ~1 100 with drawing, because a linear scan
+    // gains more from an idle machine than a pointer-chasing index does.
+    //
+    // So these are sim-only now, and the `fps` figures they emit are simulation rates rather
+    // than frame rates. That is a deliberate change in what is measured, not a tidy-up: if you
+    // want to know whether a demo *renders* fast enough, run it and look at it.
     let demos = || {
-        let fluid = |idx: &str, note: &'static str| e2e(env(b(DEMOS, Bin("fluid_wgpu"), "", note), &[("FLUID_MAX_FRAMES", "420"), ("FLUID_INDEX", idx)]));
-        let cloud = |idx: &str, note: &'static str| e2e(env(b(DEMOS, Bin("pointcloud_wgpu"), "", note), &[("CLOUD_MAX_FRAMES", "240"), ("CLOUD_INDEX", idx)]));
-        let sneak = |n: &str, note: &'static str| e2e(env(b(DEMOS, Bin("stealth_wgpu"), "", note), &[("STEALTH_MAX_FRAMES", "600"), ("STEALTH_CIVS", n)]));
+        let fluid = |idx: &str, note: &'static str| e2e(env(b(DEMOS, Bin("fluid_wgpu"), "", note), &[("FLUID_HEADLESS", "420"), ("FLUID_INDEX", idx)]));
+        let cloud = |note: &'static str| e2e(env(b(DEMOS, Bin("pointcloud_wgpu"), "", note), &[("CLOUD_HEADLESS", "1"), ("CLOUD_N", "120000")]));
+        let sneak = |n: &str, note: &'static str| e2e(env(b(DEMOS, Bin("stealth_wgpu"), "", note), &[("STEALTH_HEADLESS", "600"), ("STEALTH_CIVS", n)]));
         vec![
             fluid("morton", "fluid neighbours: MortonGrid rebuild"),
+            fluid("mortonkeep", "fluid neighbours: MortonGrid kept in place"),
             fluid("keep", "fluid neighbours: kept Tree + ItemRef"),
             fluid("linear", "fluid neighbours: LinearQuadTree rebuild"),
-            cloud("kd", "point cloud k-NN: KdTree3"),
-            cloud("octree", "point cloud k-NN: Octree3"),
-            cloud("morton", "point cloud k-NN: MortonGrid3"),
+            fluid("adaptive", "fluid neighbours: AdaptiveIndex2 picks its own"),
+            // one run covers all three structures and cross-checks their k-NN distances
+            cloud("point cloud k-NN: KdTree3 vs Octree3 vs MortonGrid3"),
             sneak("40", "stealth crossover: 40 agents"),
             sneak("160", "stealth crossover: 160 agents"),
             sneak("640", "stealth crossover: 640 agents"),
+            sneak("1400", "stealth crossover: 1400 agents (near the crossover)"),
             sneak("2560", "stealth crossover: 2560 agents"),
             sneak("10240", "stealth crossover: 10240 agents"),
             sneak("40000", "stealth crossover: 40000 agents"),
