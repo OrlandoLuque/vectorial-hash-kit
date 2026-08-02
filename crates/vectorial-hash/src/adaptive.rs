@@ -64,6 +64,32 @@
 //! a keep-tree cannot supply an order — its items are bare `T` and the slot→handle table does
 //! not invert.
 //!
+//! ## Why the linear trees are not backends
+//!
+//! `LinearOctree3` and `LinearQuadTree` gained `update`/`remove`/`try_merge_up` at the same time
+//! the grids did, which raised the obvious question: should the policy be able to reach for one?
+//! The answer is **no**, and it is not a close call — they are dominated on *both* axes by
+//! backends already here. From the 3D decision map at its default config (20 000 points, 512³,
+//! 16 culls/frame, 100 measured frames):
+//!
+//! | structure | maintain µs/frame | cull µs |
+//! | --- | ---: | ---: |
+//! | `Tree3` + `ItemRef` (the `KeepTree` backend) | **616** | 3.37 |
+//! | `MortonGrid3` (the `Grid` backend) | 1 351 | **1.77** |
+//! | `KdTree3` rebuilt (the `Static` backend) | 3 072 | 2.72 |
+//! | `LinearOctree3` rebuilt | 1 785 | 4.52 |
+//! | `LinearOctree3` kept | 5 158 | 4.32 |
+//!
+//! Rebuilt, it maintains 2.9× slower than the keep-tree and culls 2.6× slower than the grid.
+//! Kept, it is worse still — keeping an *adaptive* structure in place also drifts its shape, so
+//! it needs `try_merge_up` running just to stay as good as a rebuild would have been. There is
+//! no cell of the workload space where it would be chosen, so adding it would cost a fifth
+//! `Held` variant, a fifth migration path and a fifth set of tests to never fire.
+//!
+//! Its real niche is the **build** (~2.2× `Octree3`), and the build-once slot is already taken
+//! by `KdTree3`, which builds slower but queries better — the right trade when the whole point
+//! of that backend is that nothing is moving. Closed as evidence, not as an opinion.
+//!
 //! **Hysteresis is the whole difficulty.** A naive "pick the best for the current numbers"
 //! flaps: at the boundary it rebuilds every frame and loses to *both* candidates. So a
 //! switch needs the new choice to hold for [`Thresholds::hold_ticks`] consecutive ticks,
