@@ -132,6 +132,34 @@ pub struct IntegerTree<T: IPositioned> {
 }
 
 impl<T: IPositioned> IntegerTree<T> {
+    /// Every item within `radius` of the ray, sorted by distance along it.
+    ///
+    /// A capsule cull plus a sort — the same shape as [`crate::LinearQuadTree::raycast`], and
+    /// deliberately not a DDA walk. The binary `Tree` can walk neighbour-to-neighbour because it
+    /// carries ropes (feature `neighbors`); a quadtree has none, and a capsule cull already
+    /// prunes by the segment's own bound at every node.
+    ///
+    /// `t` is the distance along the ray of each item's closest approach, clamped to
+    /// `[0, max_dist]`, so an item beside the origin reports 0 rather than a negative.
+    pub fn raycast(&self, origin: Point, dir: Point, max_dist: f64, radius: f64) -> Vec<(f64, &T)> {
+        let m = (dir.x * dir.x + dir.y * dir.y).sqrt();
+        if m == 0.0 { return Vec::new(); }
+        let (ux, uy) = (dir.x / m, dir.y / m);
+        let end = Point::new(origin.x + ux * max_dist, origin.y + uy * max_dist);
+        let mut hits: Vec<(f64, &T)> = self.cull(&crate::Capsule::new(origin, end, radius)).into_iter().map(|it| {
+            let p = { let ip = it.position(); Point::new(ip.x as f64, ip.y as f64) };
+            let t = ((p.x - origin.x) * ux + (p.y - origin.y) * uy).clamp(0.0, max_dist);
+            (t, it)
+        }).collect();
+        hits.sort_by(|a, b| a.0.total_cmp(&b.0));
+        hits
+    }
+
+    /// The nearest item along the ray (smallest `t`), if any.
+    pub fn raycast_first(&self, origin: Point, dir: Point, max_dist: f64, radius: f64) -> Option<(f64, &T)> {
+        self.raycast(origin, dir, max_dist, radius).into_iter().next()
+    }
+
     /// Read an item through its stable [`ItemRef`] — `None` if the handle has been retired by
     /// `remove_ref`.
     ///

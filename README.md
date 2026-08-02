@@ -114,7 +114,7 @@ structure. Publishing the grid makes the next one visible without a grep.
 | `insert_ref` / `update_ref` / `get_ref` | ● | ● | ● | ● | ● | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `cull` / `cull_many` / `cull_many_par` | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● |
 | `knn` / `knn_many` / `knn_many_par` | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● |
-| `raycast` | ● | ○ | ○ | ● | ● | ● | ● | ● | ● | ● | ● |
+| `raycast` | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● |
 | `compact` | ● | ● | ● | ● | ● | – | – | – | – | – | – |
 | `occupancy` | – | – | – | – | – | ● | ● | ● | ● | – | – |
 | `iter` / `iter_z_order` | – | – | – | – | – | ● | ● | ● | ● | – | – |

@@ -195,3 +195,58 @@ fn linear_tree_occupancy_and_iteration_are_honest() {
     let again: Vec<u32> = t.iter_z_order().map(|x| x.id).collect();
     assert_eq!(z_order, again, "iter_z_order must be deterministic");
 }
+
+/// The two new 2D raycasts must agree with brute force on *which* items are within `radius` of
+/// the ray, and must return them ordered by distance along it.
+///
+/// Brute force is the referee: distance from a point to a segment, computed independently of
+/// the capsule cull the implementation uses. Comparing against the linear quadtree's raycast
+/// would only prove the two share an idea.
+#[test]
+fn quadtree_and_integertree_raycast_agree_with_brute_force() {
+    fn seg_dist2(p: Point, a: Point, b: Point) -> f64 {
+        let (dx, dy) = (b.x - a.x, b.y - a.y);
+        let len2 = dx * dx + dy * dy;
+        let t = if len2 == 0.0 { 0.0 } else { (((p.x - a.x) * dx + (p.y - a.y) * dy) / len2).clamp(0.0, 1.0) };
+        let (cx, cy) = (a.x + t * dx, a.y + t * dy);
+        (p.x - cx) * (p.x - cx) + (p.y - cy) * (p.y - cy)
+    }
+
+    let items = pts(900);
+    let t = QuadTree::<P>::bulk_load(rect(), 8, items.clone());
+    let (origin, dir, max_dist, radius) = (Point::new(10.0, 10.0), Point::new(1.0, 0.9), 260.0, 9.0);
+    let end = {
+        let m = (dir.x * dir.x + dir.y * dir.y).sqrt();
+        Point::new(origin.x + dir.x / m * max_dist, origin.y + dir.y / m * max_dist)
+    };
+
+    let hits = t.raycast(origin, dir, max_dist, radius);
+    let mut got: Vec<u32> = hits.iter().map(|(_, it)| it.id).collect();
+    let mut want: Vec<u32> = items.iter()
+        .filter(|it| seg_dist2(it.p, origin, end) <= radius * radius).map(|it| it.id).collect();
+    got.sort_unstable(); want.sort_unstable();
+    assert_eq!(got, want, "QuadTree::raycast disagrees with brute force");
+    assert!(want.len() > 3, "the ray must hit several items ({})", want.len());
+
+    // ordered by distance along the ray, and `raycast_first` is that first element
+    for w in hits.windows(2) { assert!(w[0].0 <= w[1].0, "raycast returned out of order"); }
+    assert_eq!(t.raycast_first(origin, dir, max_dist, radius).map(|(_, it)| it.id), hits.first().map(|(_, it)| it.id));
+
+    // a zero direction is not a ray
+    assert!(t.raycast(origin, Point::new(0.0, 0.0), max_dist, radius).is_empty());
+
+    #[derive(Clone, Copy)]
+    struct I { id: u32, p: IPoint }
+    impl IPositioned for I { fn position(&self) -> IPoint { self.p } }
+    let ints: Vec<I> = (0..600u32).map(|i| I { id: i, p: IPoint::new(scatter(i, 5) as i32, scatter(i, 6) as i32) }).collect();
+    let it = IntegerTree::<I>::bulk_load(IRect::new(0, 0, 256, 256), 8, ints.clone());
+    let ihits = it.raycast(origin, dir, max_dist, radius);
+    let mut igot: Vec<u32> = ihits.iter().map(|(_, x)| x.id).collect();
+    let mut iwant: Vec<u32> = ints.iter()
+        .filter(|x| seg_dist2(Point::new(x.p.x as f64, x.p.y as f64), origin, end) <= radius * radius)
+        .map(|x| x.id).collect();
+    igot.sort_unstable(); iwant.sort_unstable();
+    assert_eq!(igot, iwant, "IntegerTree::raycast disagrees with brute force");
+    assert!(iwant.len() > 3, "the ray must hit several items ({})", iwant.len());
+    for w in ihits.windows(2) { assert!(w[0].0 <= w[1].0, "raycast returned out of order"); }
+}
