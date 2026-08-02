@@ -130,6 +130,61 @@ fn main() {
     println!("{:>26} {:>12.3} {:>16} {:>10.2}", "kept (update in place)", t_kept, v_kept, t_churn / t_kept);
     println!("{:>26} {:>12.3} {:>16} {:>10.2}", "rebuilt in Z-order (warm)", t_warm, v_warm, t_churn / t_warm);
 
+    // ------------------------------------------------------------------ the COLD probe
+    //
+    // Everything above measures 4 000 culls, five times over, on a grid nobody has touched
+    // since. That is a warm cache by construction — and it is NOT what a frame loop does. The
+    // 3D decision map runs **16 culls immediately after the maintain**, which is the first
+    // touch of whatever the maintain just moved through memory, and there the kept grid reads
+    // 1.09-1.17x faster than the rebuilt one however the arms are ordered.
+    //
+    // So: the same comparison again, cold. Per frame, move the points, maintain each grid the
+    // way it is meant to be maintained, then time a handful of culls on each. The arms
+    // alternate by frame parity so ordering cannot be the explanation this time either.
+    {
+        let mut kept2 = MortonGrid3::<P>::new(world, levels);
+        for (i, p) in pos.iter().enumerate() { kept2.insert(P { id: i as u32, p: *p }); }
+        let (mut t_kept_c, mut t_churn_c) = (0.0f64, 0.0f64);
+        let mut sink = 0usize;
+        const COLD_FRAMES: usize = 200;
+        const COLD_CULLS: usize = 16;
+        for f in 0..COLD_FRAMES {
+            for i in 0..N {
+                let old = pos[i];
+                let (vx, vy, vz) = vel[i];
+                let np = Point3::new((old.x + vx * dt).rem_euclid(W), (old.y + vy * dt).rem_euclid(W), (old.z + vz * dt).rem_euclid(W));
+                pos[i] = np;
+                let id = i as u32;
+                kept2.update(old, |c| c.id == id, |c| c.p = np);
+            }
+            let mut churn2 = MortonGrid3::<P>::new(world, levels);
+            for (i, p) in pos.iter().enumerate() { churn2.insert(P { id: i as u32, p: *p }); }
+
+            let qs: Vec<Sphere3> = (0..COLD_CULLS)
+                .map(|k| { let c = pos[(f * 131 + k * 7919) % N]; Sphere3::new(c.x, c.y, c.z, VISION) }).collect();
+            let kept_first = f % 2 == 0;
+            for pass in 0..2 {
+                let t = Instant::now();
+                if (pass == 0) == kept_first {
+                    for q in &qs { sink += kept2.cull(q).len(); }
+                    t_kept_c += t.elapsed().as_secs_f64() * 1e6 / COLD_CULLS as f64;
+                } else {
+                    for q in &qs { sink += churn2.cull(q).len(); }
+                    t_churn_c += t.elapsed().as_secs_f64() * 1e6 / COLD_CULLS as f64;
+                }
+            }
+        }
+        std::hint::black_box(sink);
+        let (ck, cc) = (t_kept_c / COLD_FRAMES as f64, t_churn_c / COLD_FRAMES as f64);
+        println!("\nCOLD probe — {COLD_CULLS} culls right after the maintain, {COLD_FRAMES} frames, arms alternating:");
+        println!("{:>26} {:>12}", "grid", "us/cull");
+        println!("{:>26} {:>12.3}", "rebuilt every frame", cc);
+        println!("{:>26} {:>12.3}   ({:.2}x)", "kept (update in place)", ck, cc / ck);
+        println!("#M cold.kept_us {ck:.3} us");
+        println!("#M cold.rebuilt_us {cc:.3} us");
+        println!("#M cold.rebuilt_over_kept {:.3} x", cc / ck);
+    }
+
     #[cfg(not(feature = "grid-stats"))]
     println!("\n(cells visited reads 0 — re-run with `--features grid-stats` for the counts.)");
     #[cfg(feature = "grid-stats")]

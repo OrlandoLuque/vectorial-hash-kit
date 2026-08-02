@@ -648,22 +648,24 @@ sequentially. **The bigger the population, the narrower the window in which keep
 2 000 points two thirds of them may move, at a million fewer than half. The ~70 % crossover
 quoted from `grid_keep_bench` is the small-N end of that curve, not a property of grids.
 
-One thing in those rows looked like a finding and was not. `morton-keep` appeared to **cull
-1.18× faster** than the rebuilt grid (1.526 against 1.797 µs) at identical world, identical
-`levels`, identical contents — the same ~15 % the adaptive index's grid had shown, so two
-sightings in unrelated settings. It does not survive a controlled comparison:
+One thing in those rows is **measured and unexplained**, and it is worth knowing which. The
+kept grid culls **1.09–1.17× faster** than the rebuilt one at identical world, identical
+`levels`, identical contents and identical probes. Six attempts to explain or reproduce it:
 
-- **Swapping the two arms' position in the frame** moved most of it. `morton`'s cull went
-  1.66 → 1.53 µs purely by being timed later, and the gap fell to 1.06×.
-- **`examples/kept_grid_query_edge`** takes the comparison out of the loop entirely: one grid
-  kept across 150 frames, one rebuilt every frame, one rebuilt in Z-order, all holding the same
-  points and answering the same 4 000 probes. **1.084 / 1.082 / 1.087 µs — 1.00×**, with
-  `grid-stats` reporting the identical **25 925 cells visited** for all three.
+| hypothesis | result |
+| --- | --- |
+| one grid traverses less | cell counts **identical** (25 925 both, `grid-stats`) |
+| position in the frame | swapping the arms moved 1.11× → 1.06×… |
+| …so rotate every arm's position each frame | ratio **unchanged** (1.09, 1.17) |
+| a warm microbenchmark hides it | `kept_grid_query_edge`, 4 000 culls ×5: **1.00×** |
+| a cold first-touch effect | same bench, 16 culls right after the maintain, 200 frames: **0.97×** |
+| the two grids hold different items | asserted equal every frame: **equal** |
 
-So the kept grid has no query advantage; the interleaved loop timed the two arms in different
-cache states. The lesson is in [`MEASURING.md`](MEASURING.md) § 8d, and it applies to this
-table: read the **cull** column here as ordering-sensitive, and do not credit a gap under ~10 %
-between two arms without pairing them outside the frame loop. The *maintain* column is far
+It does not reproduce outside this loop and it survives the fix for the one cause that looked
+likely. Treat the cull column here as **ordering-controlled but not fully understood**: the arms
+now rotate (each spends an equal share of the run in every position), the counts say nothing
+algorithmic is happening, and a gap of this size between two arms is not something to build an
+argument on. [`MEASURING.md`](MEASURING.md) § 8d has the full chase. The *maintain* column is far
 less exposed, each maintain being a large block of work that dominates whatever preceded it.
 
 The intuition — and the first draft of this section — was that the *persistent*

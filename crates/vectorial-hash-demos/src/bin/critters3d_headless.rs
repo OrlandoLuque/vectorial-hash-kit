@@ -231,57 +231,58 @@ fn measure(cfg: &Cfg) -> ([f64; 9], [f64; 9], bool) {
         for id in 0..cfg.pop { let p = pos[id]; proj.insert(P2 { id: id as u32, p: Point::new(p.x, p.y), z: p.z }); }
         if measuring { mt[3].push(us(t)); }
 
-        // --- cull (same sampled ids for all four), timed each ---
+        // --- cull (same sampled ids for every arm), timed each ---
+        //
+        // **The arms rotate.** Timing nine structures one after another inside a frame times
+        // them in nine different cache states, and the arm that runs last has had every other
+        // arm's working set moved through the cache first. That is not a small effect: it made
+        // the kept Morton grid look 1.18x faster than the rebuilt one at identical world,
+        // identical `levels` and identical contents, and swapping the two arms' position moved
+        // most of the gap (docs/MEASURING.md § 8d). Rotating the start index by the frame number
+        // gives every arm an equal share of every position, so the bias averages out instead of
+        // landing on whoever happens to be written last.
         let ids: Vec<usize> = (0..cfg.n_cull).map(|_| (rng.next() as usize) % cfg.pop).collect();
         let n = ids.len().max(1) as f64;
 
-        let t = Instant::now();
-        for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(tree.cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); }
-        if measuring { cl[0].push(us(t) / n); }
-
-        let t = Instant::now();
-        for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(tree_h.cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); }
-        if measuring { cl[4].push(us(t) / n); }
-
-        let t = Instant::now();
-        for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(octree.cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); }
-        if measuring { cl[1].push(us(t) / n); }
-
-        let t = Instant::now();
-        for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(morton.cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); }
-        if measuring { cl[2].push(us(t) / n); }
-
-        let t = Instant::now();
-        for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(linear.cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); }
-        if measuring { cl[5].push(us(t) / n); }
-
-        let t = Instant::now();
-        for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(kd.cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); }
-        if measuring { cl[6].push(us(t) / n); }
-
-        let t = Instant::now();
-        for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(morton_k.cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); }
-        if measuring { cl[7].push(us(t) / n); }
-
-        let t = Instant::now();
-        for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(linear_k.cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); }
-        if measuring { cl[8].push(us(t) / n); }
-
-        let t = Instant::now();
-        for &id in &ids {
-            let c = pos[id];
-            let cand = proj.cull(&Disc { cx: c.x, cy: c.y, r: cfg.vision });
-            let mut hits = 0usize;
-            for p2 in &cand {
-                let dz = p2.z - c.z;
-                if dz.abs() <= cfg.vision {
-                    let dx = p2.p.x - c.x; let dy = p2.p.y - c.y;
-                    if dx * dx + dy * dy + dz * dz <= cfg.vision * cfg.vision { hits += 1; }
-                }
+        for step in 0..9usize {
+            let k = (step + frame) % 9;
+            let t = Instant::now();
+            match k {
+                0 => for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(tree.cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); },
+                1 => for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(octree.cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); },
+                2 => for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(morton.cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); },
+                4 => for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(tree_h.cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); },
+                5 => for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(linear.cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); },
+                6 => for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(kd.cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); },
+                7 => for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(morton_k.cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); },
+                8 => for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(linear_k.cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); },
+                // the projection tree is the odd one: a disc cull, then an exact 3D narrowphase
+                // on the candidates, because a 2D index cannot answer a 3D question by itself.
+                _ => for &id in &ids {
+                    let c = pos[id];
+                    let cand = proj.cull(&Disc { cx: c.x, cy: c.y, r: cfg.vision });
+                    let mut hits = 0usize;
+                    for p2 in &cand {
+                        let dz = p2.z - c.z;
+                        if dz.abs() <= cfg.vision {
+                            let dx = p2.p.x - c.x; let dy = p2.p.y - c.y;
+                            if dx * dx + dy * dy + dz * dz <= cfg.vision * cfg.vision { hits += 1; }
+                        }
+                    }
+                    blackhole = blackhole.wrapping_add(hits);
+                },
             }
-            blackhole = blackhole.wrapping_add(hits);
+            if measuring { cl[k].push(us(t) / n); }
         }
-        if measuring { cl[3].push(us(t) / n); }
+
+        // A kept structure can lose an item and still answer plausibly on one sampled sphere,
+        // so check the POPULATIONS agree too — the single-sphere gate below cannot see a
+        // shortfall that happens to fall outside it, and a grid holding fewer points would cull
+        // faster for a reason that has nothing to do with keeping.
+        if measuring {
+            assert_eq!(morton_k.item_count(), morton.item_count(),
+                "kept grid holds {} items, rebuilt holds {}", morton_k.item_count(), morton.item_count());
+        }
 
         // Light agreement gate (untimed): all structures return the same id set
         // for the first sampled sphere — including the handle-maintained tree.

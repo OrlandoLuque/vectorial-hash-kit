@@ -175,32 +175,39 @@ part of the answer, and one run length is one point of a curve. (The same shape 
 measuring a grid at 100 % churn and concluding grids must rebuild — § "Grids rebuild, trees
 keep" in CHOOSING.md.)
 
-## 8d. In an interleaved loop, position in the frame is a confound
+## 8d. Four explanations, all refuted, and the number is still there
 
-A sweep that measures several structures inside one frame loop — maintain them all, then cull
-them all — is comparing arms that run at **different points in the same frame**, and therefore
-in different cache states. The arm timed last has had every other arm's working set evicted
-out from under it, or warmed into it, depending on what they touched.
+The 3D decision map reports the kept Morton grid culling **1.09–1.17× faster** than the rebuilt
+one at identical world, identical `levels`, identical contents and identical probes. A second,
+unrelated bench had shown the same ~15 %. Two sightings is usually where you start believing an
+effect. Here is what happened when it was chased instead.
 
-This is not hypothetical. The 3D decision map reported the kept Morton grid culling **1.18×
-faster** than the rebuilt one at identical world, identical `levels`, identical contents and
-identical probes, and the same ~15 % gap had shown up in a second, unrelated bench — two
-sightings, which is normally when you start believing an effect.
+| hypothesis | test | result |
+| --- | --- | --- |
+| one grid traverses less | `grid-stats` cell counts | **identical**, 25 925 both — nothing to explain |
+| position in the frame | swap the two arms | 1.11× → 1.06×, so: *probably it* |
+| position in the frame | **rotate every arm's position each frame** | ratio **unchanged** (1.09, 1.17) |
+| a warm microbenchmark hides it | isolated, 4 000 culls ×5 | **1.00×** |
+| it is a cold first-touch effect | isolated, 16 culls right after the maintain, arms alternating, 200 frames | **0.97×** |
+| the grids hold different items | assert equal populations every frame | **equal** — no shortfall |
 
-Two checks killed it:
+So the gap does not reproduce outside the interleaved loop, and inside it survives the fix for
+the one cause that looked likely. **It is recorded as unexplained.** Not "an artifact", which is
+what an earlier version of this section said — that claim rested entirely on the swap
+experiment, and the rotation shows the swap moved the number by less than the run-to-run spread.
+One A/B on a noisy metric is not evidence for a cause any more than it is for an effect.
 
-- **Swap the two arms' positions in the frame.** `morton`'s cull went 1.66 → 1.53 µs purely by
-  being measured later, and the gap fell from ~1.11× to 1.06×.
-- **Measure them in isolation** (`examples/kept_grid_query_edge`): same points, same levels,
-  same probes, one grid kept across 150 frames and one rebuilt every frame. Result **1.082 vs
-  1.084 µs — 1.00×**, with `grid-stats` reporting the identical **25 925 cells visited** for
-  both. No traversal difference existed to explain, and none of the timing difference survived.
+Three things to take from it:
 
-So: a difference under ~10 % between two arms of an interleaved sweep is not evidence. Reach
-for cell/point counts first (they are position-independent), and when the question is really
-about time, take the comparison **out** of the loop and pair it directly. The decision map's
-*maintain* column is far less exposed — each maintain is a large block of work that dominates
-whatever preceded it — but its cull column should be read as ordering-sensitive.
+- **Counts first.** The cell counts settled the algorithmic question in one reading and cost
+  nothing. Whatever this is, it is not traversal.
+- **A single swap is not a control.** Rotating all nine arms is, and it is now what
+  `critters3d_headless` does — each arm spends an equal share of the run in every position, so
+  ordering bias averages out instead of landing on whoever is written last. Keep it whether or
+  not it explains anything, because it removes a real confound cheaply.
+- **Say "unexplained" and leave the door open.** The temptation after refuting three hypotheses
+  is to declare the fourth. The honest state is a measured number with no mechanism, and the
+  reproductions that failed are more useful to the next person than a guess would be.
 
 ## 9. Publish from an idle machine
 
