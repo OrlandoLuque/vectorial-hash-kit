@@ -4,6 +4,42 @@ Future work queued for review. Nothing here is committed scope — prune,
 reprioritise, or drop freely. Items graduate into the per-crate roadmaps
 (e.g. `crates/vectorial-hash/README.md`) once picked up.
 
+## ★ 2026-08-02/03 — the audit night, then cooperative night 8
+
+**Landed.** Capability audit + matrix published in the README (`get_ref` on all five pointer
+trees, `bulk_load`/`compact`/`raycast` on QuadTree, `bulk_load`/`raycast` on IntegerTree,
+batch verbs across five, `occupancy`/`iter`/`iter_z_order` on the linear trees) · stealth kept
+its index instead of rebuilding it outside every timer (18–22× cheaper; charged for the rebuild
+the index never won at any size) · **warm-start migration** in both `AdaptiveIndex` twins, grids
+via `iter_z_order` and trees via the new `handles_dfs()` · `brute_max` resolved to 64 with
+`examples/brute_edge` · `calibrate` stopped bisecting a non-monotone predicate · the regression
+gate confirms over three passes before failing (13 of 14 alarms were transients) · both decision
+maps rotate their cull arms · **headless modes for all three wgpu demos**, wired into
+`bench-runner`.
+
+**Open, in priority order:**
+
+1. **#117 — re-baseline the gate, on an IDLE machine.** Blocked, and the block is real: the
+   attempt ran at 76 % CPU behind the user's own apps and two consecutive runs of the same
+   binary moved an untouched op from −2.8 % to +54 %. Also verify `cull_kdtree3_x64` (+75 %,
+   survived three passes, but read "ok" on an earlier run of the same commit — test the
+   hypothesis that adding `cull_many`/`knn_many` to that impl moved inlining).
+2. **#136 — the kept grid culls 1.09–1.17× faster in the decision map and nobody knows why.**
+   Six hypotheses refuted (identical cell counts, arm rotation, warm bench 1.00×, cold bench
+   0.97×, equal populations). Do not close it again without a mechanism.
+3. **#104 — a calibrate button in a demo.** The index already picks for itself in `fluid_wgpu`;
+   what is missing is running `Thresholds` calibration from inside a demo and keeping the result.
+4. **#98 — D\* Lite for moving goals** in the horde flow field, measured against the re-flood
+   (31 goals already costs about one single-goal rebuild, so the bar is high).
+5. **#83 / #95 — eyes-dependent**, unchanged: `building_tweak` per-model scale/orientation for
+   the Quaternius RTS buildings, and the mobile/touch UI on a real device.
+
+**Worth queueing, found tonight:** the *maintain* columns of both decision maps are still timed
+in a fixed order (only the culls rotate) — less exposed because each maintain is large, but the
+same confound; and `bulk_load_par` does not exist for QuadTree/IntegerTree, deliberately (their
+split is positional, so there is no `pick_split` to parallelise) — an argument, not a
+measurement, and someone should disagree with it on purpose one day.
+
 ## ★ 2026-07-29 (cooperative night 5) — the measurement night
 
 Nine commits on `main`, CI green. The thread was measurement rigour, and it paid in a way
