@@ -340,6 +340,21 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
     fn warm_order(&self) -> Vec<u32> {
         match &self.held {
             Held2::Grid(g) => g.iter_z_order().map(|t| t.slot).collect(),
+            // A tree can supply one too, now that it will hand back its handles in DFS order.
+            // Its `refs` table maps slot -> handle, which is the wrong way round, so invert it
+            // here: O(N) once per migration, and nothing at all in steady state. The
+            // alternative — storing the slot alongside every item, the way the grid backend has
+            // to — would cost 4 bytes per item on the query hot path forever, to save work that
+            // happens twice in a thousand frames.
+            Held2::Keep(t, refs) => {
+                let mut slot_of = vec![u32::MAX; refs.iter().map(|r| r.0).filter(|&h| h != u32::MAX).max().map_or(0, |m| m as usize + 1)];
+                for (slot, r) in refs.iter().enumerate() {
+                    if r.0 != u32::MAX && (r.0 as usize) < slot_of.len() { slot_of[r.0 as usize] = slot as u32; }
+                }
+                t.handles_dfs().iter()
+                    .filter_map(|h| slot_of.get(h.0 as usize).copied().filter(|&s| s != u32::MAX))
+                    .collect()
+            }
             _ => Vec::new(),
         }
     }

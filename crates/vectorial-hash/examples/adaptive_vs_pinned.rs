@@ -67,7 +67,11 @@ struct Frame {
     culls: usize,
 }
 
-fn script(n: usize, per_act: usize) -> Vec<Frame> {
+/// `cycles` repeats the churn/storm pair, which is the only way this bench can price a
+/// migration: at one pass there are two of them in a second and a half, far below what the
+/// run-to-run spread can resolve. Cycling drives the policy back and forth across
+/// `rebuild_query_ratio` so the migrations multiply while everything else stays identical.
+fn script(n: usize, per_act: usize, cycles: usize) -> Vec<Frame> {
     let mut f = Vec::new();
     // Act 1: small and quiet — below any sane brute_max, barely queried.
     for _ in 0..per_act {
@@ -78,9 +82,14 @@ fn script(n: usize, per_act: usize) -> Vec<Frame> {
         let want = 60 + (n - 60) * (i + 1) / per_act;
         f.push(Frame { act: 1, want, movers: want, culls: 8 });
     }
-    // Act 3: the query storm — one cull per item, far above rebuild_query_ratio.
+    // Act 3: the query storm — one cull per item, far above rebuild_query_ratio. Repeated with
+    // act 2 when `cycles > 1`, so the policy has to migrate each way every time.
     for _ in 0..per_act {
         f.push(Frame { act: 2, want: n, movers: n / 4, culls: n });
+    }
+    for _ in 1..cycles {
+        for _ in 0..per_act { f.push(Frame { act: 1, want: n, movers: n, culls: 8 }); }
+        for _ in 0..per_act { f.push(Frame { act: 2, want: n, movers: n / 4, culls: n }); }
     }
     // Act 4: frozen. Nothing moves; a build-once structure should take over.
     for _ in 0..per_act {
@@ -152,9 +161,10 @@ fn run(script: &[Frame], pin: Option<Backend>, warm_start: bool) -> ([f64; 4], V
 fn main() {
     let n: usize = std::env::var("AV_N").ok().and_then(|s| s.parse().ok()).unwrap_or(20_000);
     let per_act: usize = std::env::var("AV_FRAMES").ok().and_then(|s| s.parse().ok()).unwrap_or(60);
-    let s = script(n, per_act);
+    let cycles: usize = std::env::var("AV_CYCLES").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+    let s = script(n, per_act, cycles);
 
-    println!("adaptive vs pinned | peak {n} items | {per_act} frames per act, {} total", s.len());
+    println!("adaptive vs pinned | peak {n} items | {per_act} frames per act, {} total | {cycles} cycle(s)", s.len());
     println!("acts: 1 small+quiet · 2 growing+churning · 3 query storm (1 cull/item) · 4 frozen\n");
 
     // Adaptive first and last, so a warm-cache advantage cannot land entirely on it — the
@@ -218,9 +228,16 @@ fn main() {
     println!("  = {:+.2} ms per migration ({:.3}x on the total)",
         (cold_total - warm_total) / switches.max(1) as f64, cold_total / warm_total);
     println!("  {warm_starts_line}");
-    println!("  NOTE: {switches} migrations in a {warm_total:.0} ms run cannot move the total out of");
-    println!("  the noise — this run pairs them so the sign is at least honest. For the effect");
-    println!("  measured directly, see examples/migration_warm_start (1.07-1.81x on the build).");
+    // Why this figure is not worth reading, quantitatively rather than as a shrug.
+    let build_share = 100.0 * (switches as f64 * 7.0) / warm_total.max(1.0);
+    println!("  NOTE: the {switches} migrations are about {build_share:.1}% of this {warm_total:.0} ms run, and");
+    println!("  the warm start saves 7-45% OF THAT — so the effect on the total is well under 1%,");
+    println!("  against a run-to-run spread of tens of percent. Cycling the script 6x multiplied");
+    println!("  the migrations by six and the per-migration figure still read +13.8, +5.3 and -3.5");
+    println!("  ms on three consecutive runs. This bench cannot price the warm start and no amount");
+    println!("  of repetition inside it will change that; examples/migration_warm_start measures");
+    println!("  the build directly (1.07x grid, 1.42x k-d tree, 1.81x tree inserts). What this");
+    println!("  bench IS good for is the count above: whether the thing can fire at all.");
     println!("#M warm_start.per_migration_ms {:.3} ms", (cold_total - warm_total) / switches.max(1) as f64);
 
     println!("\nbackends the policy chose, in order: {seen:?}");
