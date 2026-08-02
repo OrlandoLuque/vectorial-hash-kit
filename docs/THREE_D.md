@@ -629,11 +629,23 @@ it — 7.98× at 10 % moving, 938× at 0.1 % (`examples/grid_keep_bench`), which
 horde's sleeping dead cost nothing to index. Call it unconditionally for every item every
 frame and you have bought a slower rebuild.
 
-One thing in those rows is *not* explained: `morton-keep` **culls 1.18× faster** than the
-rebuilt grid (1.526 against 1.797 µs) with an identical world and identical `levels`. That is
-the same unexplained query advantage as the adaptive index's grid (#136), reproducing in a
-completely independent setting — which upgrades it from a quirk of one bench to a real effect
-with no explanation yet.
+One thing in those rows looked like a finding and was not. `morton-keep` appeared to **cull
+1.18× faster** than the rebuilt grid (1.526 against 1.797 µs) at identical world, identical
+`levels`, identical contents — the same ~15 % the adaptive index's grid had shown, so two
+sightings in unrelated settings. It does not survive a controlled comparison:
+
+- **Swapping the two arms' position in the frame** moved most of it. `morton`'s cull went
+  1.66 → 1.53 µs purely by being timed later, and the gap fell to 1.06×.
+- **`examples/kept_grid_query_edge`** takes the comparison out of the loop entirely: one grid
+  kept across 150 frames, one rebuilt every frame, one rebuilt in Z-order, all holding the same
+  points and answering the same 4 000 probes. **1.084 / 1.082 / 1.087 µs — 1.00×**, with
+  `grid-stats` reporting the identical **25 925 cells visited** for all three.
+
+So the kept grid has no query advantage; the interleaved loop timed the two arms in different
+cache states. The lesson is in [`MEASURING.md`](MEASURING.md) § 8d, and it applies to this
+table: read the **cull** column here as ordering-sensitive, and do not credit a gap under ~10 %
+between two arms without pairing them outside the frame loop. The *maintain* column is far
+less exposed, each maintain being a large block of work that dominates whatever preceded it.
 
 The intuition — and the first draft of this section — was that the *persistent*
 structures must beat the *rebuilt* ones on build: an incremental `update` sounds

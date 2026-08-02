@@ -175,6 +175,33 @@ part of the answer, and one run length is one point of a curve. (The same shape 
 measuring a grid at 100 % churn and concluding grids must rebuild — § "Grids rebuild, trees
 keep" in CHOOSING.md.)
 
+## 8d. In an interleaved loop, position in the frame is a confound
+
+A sweep that measures several structures inside one frame loop — maintain them all, then cull
+them all — is comparing arms that run at **different points in the same frame**, and therefore
+in different cache states. The arm timed last has had every other arm's working set evicted
+out from under it, or warmed into it, depending on what they touched.
+
+This is not hypothetical. The 3D decision map reported the kept Morton grid culling **1.18×
+faster** than the rebuilt one at identical world, identical `levels`, identical contents and
+identical probes, and the same ~15 % gap had shown up in a second, unrelated bench — two
+sightings, which is normally when you start believing an effect.
+
+Two checks killed it:
+
+- **Swap the two arms' positions in the frame.** `morton`'s cull went 1.66 → 1.53 µs purely by
+  being measured later, and the gap fell from ~1.11× to 1.06×.
+- **Measure them in isolation** (`examples/kept_grid_query_edge`): same points, same levels,
+  same probes, one grid kept across 150 frames and one rebuilt every frame. Result **1.082 vs
+  1.084 µs — 1.00×**, with `grid-stats` reporting the identical **25 925 cells visited** for
+  both. No traversal difference existed to explain, and none of the timing difference survived.
+
+So: a difference under ~10 % between two arms of an interleaved sweep is not evidence. Reach
+for cell/point counts first (they are position-independent), and when the question is really
+about time, take the comparison **out** of the loop and pair it directly. The decision map's
+*maintain* column is far less exposed — each maintain is a large block of work that dominates
+whatever preceded it — but its cull column should be read as ordering-sensitive.
+
 ## 9. Publish from an idle machine
 
 None of the above removes contention: another process still evicts your cache lines and eats
