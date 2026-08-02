@@ -91,7 +91,7 @@ fn script(n: usize, per_act: usize) -> Vec<Frame> {
 
 /// Run the script once. `pin` forces a backend and disables migration by making every
 /// threshold unreachable; `None` lets the policy do its job.
-fn run(script: &[Frame], pin: Option<Backend>) -> ([f64; 4], Vec<Backend>, usize) {
+fn run(script: &[Frame], pin: Option<Backend>, warm_start: bool) -> ([f64; 4], Vec<Backend>, usize, u32) {
     let world = Aabb::new(0.0, 0.0, 0.0, W, W, W);
     // Pinning is done through the thresholds rather than by adding a "pinned" mode to the
     // index: the point is to compare against the index carrying ONE structure, with the same
@@ -104,7 +104,7 @@ fn run(script: &[Frame], pin: Option<Backend>) -> ([f64; 4], Vec<Backend>, usize
     // consult it.
     let alpha: f64 = std::env::var("AV_ALPHA").ok().and_then(|s| s.parse().ok()).unwrap_or(0.1);
     let th = match pin {
-        None => Thresholds { detector_alpha: alpha, ..Default::default() },
+        None => Thresholds { detector_alpha: alpha, warm_start, ..Default::default() },
         Some(Backend::Brute) => Thresholds { brute_max: usize::MAX, ..Default::default() },
         Some(Backend::KeepTree) => Thresholds { brute_max: 0, scan_budget: 0.0, rebuild_query_ratio: f64::MAX, static_ticks: u32::MAX, ..Default::default() },
         Some(Backend::Grid) => Thresholds { brute_max: 0, scan_budget: 0.0, rebuild_query_ratio: 0.0, static_ticks: u32::MAX, ..Default::default() },
@@ -146,7 +146,7 @@ fn run(script: &[Frame], pin: Option<Backend>) -> ([f64; 4], Vec<Backend>, usize
         }
     }
     std::hint::black_box(sink);
-    (acts, seen, ix.switch_count() as usize)
+    (acts, seen, ix.switch_count() as usize, ix.warm_starts())
 }
 
 fn main() {
@@ -159,16 +159,22 @@ fn main() {
 
     // Adaptive first and last, so a warm-cache advantage cannot land entirely on it — the
     // interleaving idea from docs/MEASURING.md, applied where compare2 does not fit.
-    let (warm, _, _) = run(&s, None);
+    let (warm, _, _, _) = run(&s, None, true);
     std::hint::black_box(warm);
 
     let mut rows: Vec<(String, [f64; 4], usize)> = Vec::new();
     for pin in [Some(Backend::Brute), Some(Backend::KeepTree), Some(Backend::Grid), Some(Backend::Static)] {
-        let (a, _, _) = run(&s, pin);
+        let (a, _, _, _) = run(&s, pin, true);
         rows.push((format!("pinned {:?}", pin.unwrap()), a, 0));
     }
-    let (a, seen, switches) = run(&s, None);
+    let (a, seen, switches, warmed) = run(&s, None, true);
     rows.push(("AdaptiveIndex".into(), a, switches));
+    // The same policy with warm-start migration OFF. Paired inside this process against the row
+    // above, because the run-to-run spread of the total (0.53-0.75x against the best pin) is far
+    // wider than anything a cheaper migration can contribute: an unpaired before/after here
+    // reports noise, in whichever direction it happens to fall.
+    let (a_cold, _, sw_cold, _) = run(&s, None, false);
+    rows.push(("AdaptiveIndex (cold)".into(), a_cold, sw_cold));
 
     let total = |a: &[f64; 4]| a.iter().sum::<f64>();
     let best_pinned = rows.iter().take(4).map(|r| total(&r.1)).fold(f64::MAX, f64::min);
@@ -192,6 +198,31 @@ fn main() {
         println!("  act {}: best fixed is {who} ({best:.1} ms) — adaptive spent {adaptive:.1} ms ({:.2}x)",
             act + 1, best / adaptive);
     }
+    // The warm-start question on its own terms. The total is the wrong denominator when only
+    // the migrations changed, so divide by them.
+    // How many of the migrations could ACTUALLY warm-start. Only a grid can hand over an
+    // order for free, so a script that never leaves a grid gets none — and then a zero result
+    // means "never ran", not "does not help".
+    let warm_starts_line = if warmed == 0 {
+        format!("0 of {switches} migrations could warm-start: none of them LEFT a grid, and only a
+  grid can hand over an order for free. The figure above is therefore two identical code paths
+  timed twice — noise, not a verdict. This bench cannot price the feature until a keep-tree can
+  also supply an order (see docs/BACKLOG.md).")
+    } else {
+        format!("{warmed} of {switches} migrations warm-started")
+    };
+    let warm_total = rows[rows.len() - 2].1.iter().sum::<f64>();
+    let cold_total = rows[rows.len() - 1].1.iter().sum::<f64>();
+    println!();
+    println!("warm-start migration: {warm_total:.1} ms warm vs {cold_total:.1} ms cold, over {switches} migrations");
+    println!("  = {:+.2} ms per migration ({:.3}x on the total)",
+        (cold_total - warm_total) / switches.max(1) as f64, cold_total / warm_total);
+    println!("  {warm_starts_line}");
+    println!("  NOTE: {switches} migrations in a {warm_total:.0} ms run cannot move the total out of");
+    println!("  the noise — this run pairs them so the sign is at least honest. For the effect");
+    println!("  measured directly, see examples/migration_warm_start (1.07-1.81x on the build).");
+    println!("#M warm_start.per_migration_ms {:.3} ms", (cold_total - warm_total) / switches.max(1) as f64);
+
     println!("\nbackends the policy chose, in order: {seen:?}");
     println!("(vs best pin > 1 means faster than the best fixed choice. The best pin is the one");
     println!("you would have had to know in advance — the adaptive index is worth its complexity");

@@ -43,6 +43,27 @@
 //! detector instant ([`Thresholds::detector_alpha`] = 1.0) recovers ~10 % of one act and loses
 //! it again on another.
 //!
+//! ## Migration, and why the bench cannot yet price the warm start
+//!
+//! Switching backend is a **migration**, and it rebuilds the successor from `items` in slot
+//! order — which is arrival order, spatially arbitrary. The backend being discarded is not
+//! arbitrary, though: it spent its life sorting exactly these points. Handing its order over
+//! is a *warm start*, worth **1.42× on a `KdTree3` build, 1.81× on `Tree3` inserts** measured
+//! directly (`examples/migration_warm_start`).
+//!
+//! In this index it is on by default ([`Thresholds::warm_start`]) — and on the bench it does
+//! **nothing at all**, for a reason worth stating plainly: only the grid can supply that order
+//! for free (it stores `Tagged { slot, .. }`), and `adaptive_vs_pinned`'s script migrates
+//! `Brute → KeepTree → Grid`. Neither of those *leaves* a grid, so
+//! [`AdaptiveIndex::warm_starts`] reports **0 of 2** and the two arms run identical code.
+//!
+//! That distinction is the point. A feature that cannot fire looks exactly like a feature that
+//! does not help, and the paired totals prove it: the same "per migration" figure read −14.5 ms
+//! on one run and +70.3 ms on the next. Both are noise. The bench reports the warm-start count
+//! next to the timing so nobody reads either number as a verdict, and the real blocker is that
+//! a keep-tree cannot supply an order — its items are bare `T` and the slot→handle table does
+//! not invert.
+//!
 //! **Hysteresis is the whole difficulty.** A naive "pick the best for the current numbers"
 //! flaps: at the boundary it rebuilds every frame and loses to *both* candidates. So a
 //! switch needs the new choice to hold for [`Thresholds::hold_ticks`] consecutive ticks,
@@ -176,6 +197,15 @@ pub struct Thresholds {
     /// is the frames spent on the previous backend before any detector could have decided, plus
     /// the migration's own rebuild.
     pub detector_alpha: f64,
+    /// Build a migrated-to backend from the order its predecessor already had (see
+    /// `AdaptiveIndex::warm_order`). On by default.
+    ///
+    /// The switch exists so the two can be raced **paired inside one process** rather than
+    /// compared across runs. `examples/adaptive_vs_pinned` spreads 0.53-0.75x against the best
+    /// pin from run to run, which is far wider than anything a cheaper migration contributes —
+    /// an unpaired before/after cannot see the effect at all, and would happily report noise
+    /// as either a win or a regression.
+    pub warm_start: bool,
     /// **How far past a boundary counts as decisive enough to skip the hysteresis.**
     ///
     /// `hold_ticks` and `cooldown` exist to stop the policy flapping at a boundary — and at a
@@ -210,6 +240,7 @@ impl Default for Thresholds {
             cooldown: 120,
             decisive_factor: 4.0,
             detector_alpha: 0.1,
+            warm_start: true,
         }
     }
 }
@@ -244,6 +275,7 @@ impl Thresholds {
                 "cooldown" => if let Ok(x) = v.parse() { t.cooldown = x },
                 "decisive_factor" => if let Ok(x) = v.parse() { t.decisive_factor = x },
                 "detector_alpha" => if let Ok(x) = v.parse() { t.detector_alpha = x },
+                "warm_start" => if let Ok(x) = v.parse() { t.warm_start = x },
                 _ => {}
             }
         }
@@ -262,10 +294,10 @@ impl Thresholds {
             "# vectorial-hash adaptive-index calibration\n\
              brute_max = {}\nhigh_churn = {}\nrebuild_query_ratio = {}\nscan_budget = {}\n\
              static_ticks = {}\nmargin = {}\nhold_ticks = {}\ncooldown = {}\n\
-             decisive_factor = {}\ndetector_alpha = {}\n",
+             decisive_factor = {}\ndetector_alpha = {}\nwarm_start = {}\n",
             self.brute_max, self.high_churn, self.rebuild_query_ratio, self.scan_budget,
             self.static_ticks, self.margin, self.hold_ticks, self.cooldown, self.decisive_factor,
-            self.detector_alpha)
+            self.detector_alpha, self.warm_start)
     }
 }
 
@@ -326,6 +358,8 @@ pub struct AdaptiveIndex<T: Positioned3 + Clone> {
     cooling: u32,
     dirty: bool,
     switches: u32,
+    /// Migrations that actually received a spatial order from the backend they replaced.
+    warm_starts: u32,
     /// Counts for the next `tick`, accumulated by the mutating calls.
     moves: u64,
     relocations: u64,
@@ -368,7 +402,7 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
 
     pub fn with_thresholds(world: Aabb, leaf: usize, th: Thresholds) -> Self {
         AdaptiveIndex {
-            items: Vec::new(), free: Vec::new(), live: 0, world, leaf: leaf.max(1), held: Held::Brute,
+            items: Vec::new(), free: Vec::new(), live: 0, world, leaf: leaf.max(1), held: Held::Brute, warm_starts: 0,
             profile: SpatialProfile::default(), th, pending: None, cooling: 0,
             dirty: false, switches: 0, moves: 0, relocations: 0, queries: 0, q_per_item: 0.0,
             m_per_item: 0.0, grid_for: 0, q_extent: 0.0,
@@ -601,6 +635,19 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
         Backend::KeepTree
     }
 
+    /// How many times the policy has changed backend. A migration is the one event a warm
+    /// start affects, so any claim about it divides by this rather than by frames.
+    pub fn migrations(&self) -> u32 { self.switches }
+
+    /// How many of those migrations actually got a warm start — i.e. how often the backend
+    /// being abandoned could hand over a spatial order.
+    ///
+    /// This is reported rather than assumed because the first paired measurement of the warm
+    /// start read **zero effect**, and the reason was not that it does not work: the script
+    /// migrated `Brute -> KeepTree -> Grid`, and neither of those *leaves* a grid, so the code
+    /// never ran. A feature that cannot fire looks exactly like a feature that does not help.
+    pub fn warm_starts(&self) -> u32 { self.warm_starts }
+
     fn migrate(&mut self, to: Backend) {
         self.switches += 1;
         let order = self.warm_order();
@@ -708,11 +755,14 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
     /// would work for any backend, but then the migration pays for the sort it is trying to
     /// avoid, so this deliberately returns nothing rather than guessing that the trade is
     /// positive. Empty means "no opinion, use arrival order".
-    fn warm_order(&self) -> Vec<u32> {
-        match &self.held {
+    fn warm_order(&mut self) -> Vec<u32> {
+        if !self.th.warm_start { return Vec::new(); }
+        let order: Vec<u32> = match &self.held {
             Held::Grid(g) => g.iter_z_order().map(|t| t.slot).collect(),
             _ => Vec::new(),
-        }
+        };
+        if !order.is_empty() { self.warm_starts += 1; }
+        order
     }
 }
 
@@ -975,6 +1025,7 @@ mod tests {
             brute_max: 777, high_churn: 0.42, rebuild_query_ratio: 0.37, scan_budget: 42.0,
             static_ticks: 13, margin: 0.11, hold_ticks: 9, cooldown: 5, decisive_factor: 9.0,
             detector_alpha: 0.33,
+            warm_start: true,
         };
         let parsed = Thresholds::parse(&(th.to_text() + "future_key = 12\n# a comment\n"));
         assert_eq!(parsed.brute_max, th.brute_max);
