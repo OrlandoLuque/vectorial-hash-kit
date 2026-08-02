@@ -57,6 +57,18 @@ pub struct Octree3<T: Positioned3> {
 }
 
 impl<T: Positioned3> Octree3<T> {
+    /// Read an item through its stable [`ItemRef`] — `None` if the handle has been retired by
+    /// `remove_ref`.
+    ///
+    /// The handle layer could **move** an item and could **delete** it, but not look at it, so
+    /// any caller wanting to read one had to keep a parallel copy or abuse `update_ref`'s
+    /// mutator to smuggle a value out. O(1), no descent and no scan: the handle *is* the dense
+    /// index into the location table.
+    pub fn get_ref(&self, r: ItemRef) -> Option<&T> {
+        let loc = self.live_loc(r)?;
+        self.get(loc.node).items.get(loc.slot as usize)
+    }
+
     pub fn new(bbox: Aabb, item_limit: usize) -> Self {
         assert!(item_limit >= 1, "item_limit must be >= 1");
         let min_cell = bbox.w.max(bbox.h).max(bbox.d) * 1e-12;
@@ -888,6 +900,23 @@ impl<T: Positioned3> Octree3<T> {
         }
         let free_handles: Vec<u32> = (0..max_h as u32).filter(|&h| !used[h as usize]).collect();
         Ok(Octree3 { nodes, free, locs, free_handles, item_limit, merge_limit, min_cell, root })
+    }
+}
+
+
+impl<T: Positioned3> Octree3<T> {
+    /// Batch k-NN — one result list per query point (`out[i]` for `queries[i]`). Serial; see
+    /// [`Self::knn_many_par`].
+    pub fn knn_many(&self, queries: &[Point3], k: usize) -> Vec<Vec<(f64, &T)>> {
+        queries.iter().map(|&q| self.knn(q, k)).collect()
+    }
+
+    /// Parallel batch k-NN (feature `parallel`) — the independent queries fan out over rayon.
+    #[cfg(feature = "parallel")]
+    pub fn knn_many_par(&self, queries: &[Point3], k: usize) -> Vec<Vec<(f64, &T)>>
+    where T: Sync {
+        use rayon::prelude::*;
+        queries.par_iter().map(|&q| self.knn(q, k)).collect()
     }
 }
 

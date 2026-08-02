@@ -55,6 +55,18 @@ pub struct QuadTree<T: Positioned> {
 }
 
 impl<T: Positioned> QuadTree<T> {
+    /// Read an item through its stable [`ItemRef`] — `None` if the handle has been retired by
+    /// `remove_ref`.
+    ///
+    /// The handle layer could **move** an item and could **delete** it, but not look at it, so
+    /// any caller wanting to read one had to keep a parallel copy or abuse `update_ref`'s
+    /// mutator to smuggle a value out. O(1), no descent and no scan: the handle *is* the dense
+    /// index into the location table.
+    pub fn get_ref(&self, r: ItemRef) -> Option<&T> {
+        let loc = self.live_loc(r)?;
+        self.get(loc.node).items.get(loc.slot as usize)
+    }
+
     pub fn new(bbox: Rect, item_limit: usize) -> Self {
         Self::with_limits(bbox, item_limit, item_limit)
     }
@@ -65,6 +77,86 @@ impl<T: Positioned> QuadTree<T> {
         let min_cell = bbox.width.max(bbox.height) * 1e-12;
         let root = QNode { bbox, parent: None, children: None, items: Vec::new(), hs: Vec::new() };
         Self { nodes: vec![root], free: Vec::new(), locs: Vec::new(), free_handles: Vec::new(), item_limit, merge_limit, min_cell, root: QNodeId(0) }
+    }
+
+    /// Rewrite the arena in depth-first order, dropping nodes orphaned by 4-way merge-ups.
+    ///
+    /// Churn leaves holes: `divide` allocates four children, a later merge-up frees them onto
+    /// `free`, and the arena keeps its high-water mark with live nodes scattered through it.
+    /// Compacting relays them so a descent walks forward through memory. The 2D binary tree has
+    /// had this since the arena landed; the quadtree simply never got it, which is why
+    /// `docs/THREE_D.md` could only report the binary-tree figure (~1.17x on cull) for a lever
+    /// that applies to any pointer tree.
+    ///
+    /// Handles stay valid: `locs` is remapped, and dead handles (freed, marked `DEAD_HANDLE`)
+    /// are skipped rather than remapped through a garbage index.
+    pub fn compact(&mut self) {
+        let mut old2new = vec![u32::MAX; self.nodes.len()];
+        let mut order: Vec<QNodeId> = Vec::new();
+        let mut stack = vec![self.root];
+        while let Some(id) = stack.pop() {
+            old2new[id.0 as usize] = order.len() as u32;
+            order.push(id);
+            // pushed in reverse so the pop order is quadrant 0..3, i.e. the descent's order
+            if let Some(kids) = self.get(id).children { for k in kids.iter().rev() { stack.push(*k); } }
+        }
+        let remap = |id: QNodeId| QNodeId(old2new[id.0 as usize]);
+        let mut new_nodes: Vec<QNode<T>> = Vec::with_capacity(order.len());
+        for &old in &order {
+            let bbox = self.nodes[old.0 as usize].bbox;
+            let mut node = std::mem::replace(&mut self.nodes[old.0 as usize],
+                QNode { bbox, parent: None, children: None, items: Vec::new(), hs: Vec::new() });
+            node.parent = node.parent.map(remap);
+            node.children = node.children.map(|k| [remap(k[0]), remap(k[1]), remap(k[2]), remap(k[3])]);
+            new_nodes.push(node);
+        }
+        for loc in self.locs.iter_mut() {
+            if loc.node.0 == DEAD_HANDLE { continue; } // freed handle: no live node to remap
+            let nn = old2new[loc.node.0 as usize];
+            if nn != u32::MAX { loc.node = QNodeId(nn); }
+        }
+        self.root = remap(self.root);
+        self.nodes = new_nodes;
+        self.free.clear();
+    }
+
+    /// Build a tree from all the items at once: drop them into the root, then split **once**,
+    /// instead of descending the tree N times.
+    ///
+    /// # It is not faster, and that is measured
+    ///
+    /// `examples/quadtree_bulk_load` against repeated `insert`: **0.83x** at 10 000 items,
+    /// 1.06x at 100 000, 0.92x at leaf 32, 1.18x at 500 000. A wash, tipping slightly its way
+    /// only when the tree gets deep. The reason is that `insert`'s descent was never the
+    /// expensive part — it is O(log n) with a tiny constant — while this path grows one `Vec`
+    /// to N and then re-partitions it down every level anyway.
+    ///
+    /// So this exists to complete the vocabulary, not to speed anything up: `Tree`, `Tree3` and
+    /// `Octree3` all take a `Vec` and this one made callers write the loop. If you want a
+    /// genuinely cheaper build for a quadtree-shaped problem, the honest answer is
+    /// [`crate::KdTree2`] or [`crate::MortonGrid`], both of which build faster than either path
+    /// here (see `docs/CHOOSING.md`).
+    ///
+    /// Items outside `bbox` are dropped, matching [`QuadTree::insert`]'s contract — an index
+    /// only holds what fits in its world, and a silent count mismatch against a linear scan is
+    /// exactly the bug `docs/STEALTH.md` records. The returned tree's handles are `ItemRef(i)`
+    /// for `items[i]` **among the accepted ones**, so a caller that may pass out-of-world points
+    /// should filter first if it wants to index by its own array.
+    ///
+    /// Unlike [`crate::Tree::bulk_load`] there is no `bulk_load_par` here: the 4-way split is
+    /// positional rather than chosen (no `pick_split` to parallelise over), so the recursion is
+    /// already the cheap part and the rayon machinery would buy little. Measured against
+    /// repeated `insert` in `examples/quadtree_bulk_load`.
+    pub fn bulk_load(bbox: Rect, item_limit: usize, items: Vec<T>) -> Self {
+        let mut t = Self::new(bbox, item_limit);
+        let root = t.root;
+        for item in items {
+            if !t.get(root).bbox.contains(item.position()) { continue; }
+            let h = t.alloc_handle();
+            t.push_h(root, item, h);
+        }
+        if t.get(root).items.len() > item_limit { t.divide(root); }
+        t
     }
 
     /// Empty the tree, retaining capacity — see [`crate::Tree3::clear`].
@@ -603,6 +695,23 @@ impl<T: Positioned> QuadTree<T> {
         }
         let free_handles: Vec<u32> = (0..max_h as u32).filter(|&h| !used[h as usize]).collect();
         Ok(QuadTree { nodes, free, locs, free_handles, item_limit, merge_limit, min_cell, root })
+    }
+}
+
+
+impl<T: Positioned> QuadTree<T> {
+    /// Batch k-NN — one result list per query point (`out[i]` for `queries[i]`). Serial; see
+    /// [`Self::knn_many_par`].
+    pub fn knn_many(&self, queries: &[Point], k: usize) -> Vec<Vec<(f64, &T)>> {
+        queries.iter().map(|&q| self.knn(q, k)).collect()
+    }
+
+    /// Parallel batch k-NN (feature `parallel`) — the independent queries fan out over rayon.
+    #[cfg(feature = "parallel")]
+    pub fn knn_many_par(&self, queries: &[Point], k: usize) -> Vec<Vec<(f64, &T)>>
+    where T: Sync {
+        use rayon::prelude::*;
+        queries.par_iter().map(|&q| self.knn(q, k)).collect()
     }
 }
 

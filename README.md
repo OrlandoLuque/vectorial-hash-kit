@@ -98,6 +98,41 @@ cargo run -p vectorial-hash-cli --features redis-store -- generate-redis \
 
 **Redis on this machine:** Redis 3.0.504 is installed at `C:\Program Files\Redis\` and runs as a Windows service. `redis-cli ping` should return `PONG`. No manual start needed.
 
+## Capability matrix
+
+Which verbs each structure answers to. A gap here is a real gap: three separate audits this week
+found capabilities missing not because they were impossible but because nobody had noticed the
+asymmetry, and each time a doc had quietly recorded the omission as a *property* of the
+structure. Publishing the grid makes the next one visible without a grep.
+
+| | Tree | QuadTree | IntegerTree | Tree3 | Octree3 | MortonGrid | MortonGrid3 | LinearQuadTree | LinearOctree3 | KdTree2 | KdTree3 |
+| --- |:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
+| `insert` | ● | ● | ● | ● | ● | ● | ● | ● | ● | – | – |
+| `bulk_load` / `from_items` | ● | ● | ● | ● | ● | – | – | ● | ● | ● | ● |
+| parallel build | ● | ○ | ○ | ● | ● | ● | ● | ○ | ○ | ● | ● |
+| `update` / `remove` | ● | ● | ● | ● | ● | ● | ● | ● | ● | ✗ | ✗ |
+| `insert_ref` / `update_ref` / `get_ref` | ● | ● | ● | ● | ● | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `cull` / `cull_many` / `cull_many_par` | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● |
+| `knn` / `knn_many` / `knn_many_par` | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● |
+| `raycast` | ● | ○ | ○ | ● | ● | ● | ● | ● | ● | ● | ● |
+| `compact` | ● | ● | ● | ● | ● | – | – | – | – | – | – |
+| `occupancy` | – | – | – | – | – | ● | ● | ● | ● | – | – |
+| `iter` / `iter_z_order` | – | – | – | – | – | ● | ● | ● | ● | – | – |
+| `serialize` / `deserialize` | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● |
+
+● present · ○ **missing, and could exist** · ✗ deliberately absent, with a reason · – not
+meaningful for this structure
+
+The two deliberate absences are the interesting ones:
+
+- **The grids and linear trees have no `ItemRef`.** Not an oversight: a handle would still have
+  to reach the bucket through the hash, and `examples/grid_update_cost` shows the hash *is* the
+  cost — the per-item update time is flat while cell occupancy changes 39×. A handle layer was
+  designed, measured against, and dropped.
+- **The k-d trees cannot `update`.** A median split is derived from the whole point set, so
+  moving a point in place leaves the tree silently unbalanced rather than merely slower. They
+  rebuild, and `docs/CHOOSING.md` is organised around exactly that question.
+
 ## Algorithm internals
 
 ### Runtime culling (`vectorial-hash`)

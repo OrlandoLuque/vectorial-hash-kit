@@ -280,6 +280,40 @@ fn rects_overlap(a: &Rect, b: &Rect) -> bool {
     a.x < b.x_max() && b.x < a.x_max() && a.y < b.y_max() && b.y < a.y_max()
 }
 
+
+impl<T: Positioned> KdTree2<T> {
+    /// Batch cull — one result list per shape (`out[i]` for `shapes[i]`). Serial; see
+    /// [`Self::cull_many_par`]. Identical to calling [`Self::cull`] in a loop, which is exactly
+    /// why it is worth having: it is the shape a parallel version can be swapped into.
+    pub fn cull_many<'a, S: Shape>(&'a self, shapes: &[S]) -> Vec<Vec<&'a T>> {
+        shapes.iter().map(|s| self.cull(s)).collect()
+    }
+
+    /// Parallel batch cull (feature `parallel`) — the independent queries fan out over rayon.
+    /// Reads only, so there is nothing to synchronise; the crossover is in `docs/PARALLEL.md`.
+    #[cfg(feature = "parallel")]
+    pub fn cull_many_par<'a, S: Shape + Sync>(&'a self, shapes: &[S]) -> Vec<Vec<&'a T>>
+    where T: Sync {
+        use rayon::prelude::*;
+        shapes.par_iter().map(|s| self.cull(s)).collect()
+    }
+
+    /// Batch k-NN — one result list per query point (`out[i]` for `queries[i]`). Serial; see
+    /// [`Self::knn_many_par`].
+    pub fn knn_many(&self, queries: &[Point], k: usize) -> Vec<Vec<(f64, &T)>> {
+        queries.iter().map(|&q| self.knn(q, k)).collect()
+    }
+
+    /// Parallel batch k-NN (feature `parallel`) — the independent queries fan out over rayon.
+    #[cfg(feature = "parallel")]
+    pub fn knn_many_par(&self, queries: &[Point], k: usize) -> Vec<Vec<(f64, &T)>>
+    where T: Sync {
+        use rayon::prelude::*;
+        queries.par_iter().map(|&q| self.knn(q, k)).collect()
+    }
+
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

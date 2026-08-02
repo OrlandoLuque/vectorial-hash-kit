@@ -194,6 +194,18 @@ pub enum Crossing2 {
 }
 
 impl<T: Positioned> Tree<T> {
+    /// Read an item through its stable [`ItemRef`] — `None` if the handle has been retired by
+    /// `remove_ref`.
+    ///
+    /// The handle layer could **move** an item and could **delete** it, but not look at it, so
+    /// any caller wanting to read one had to keep a parallel copy or abuse `update_ref`'s
+    /// mutator to smuggle a value out. O(1), no descent and no scan: the handle *is* the dense
+    /// index into the location table.
+    pub fn get_ref(&self, r: ItemRef) -> Option<&T> {
+        let loc = self.live_loc(r)?;
+        self.get(loc.node).items.get(loc.slot as usize)
+    }
+
     pub fn new(bbox: Rect, item_limit: usize) -> Self {
         Self::with_limits(bbox, item_limit, item_limit)
     }
@@ -1431,6 +1443,23 @@ mod tracked_tests {
         }
         assert!(jumped > refs.len() / 2, "teleporting reported only {jumped} relocations of {}", refs.len());
         assert_eq!(t.item_count(), refs.len(), "items lost while relocating");
+    }
+}
+
+
+impl<T: Positioned> Tree<T> {
+    /// Batch k-NN — one result list per query point (`out[i]` for `queries[i]`). Serial; see
+    /// [`Self::knn_many_par`].
+    pub fn knn_many(&self, queries: &[Point], k: usize) -> Vec<Vec<(f64, &T)>> {
+        queries.iter().map(|&q| self.knn(q, k)).collect()
+    }
+
+    /// Parallel batch k-NN (feature `parallel`) — the independent queries fan out over rayon.
+    #[cfg(feature = "parallel")]
+    pub fn knn_many_par(&self, queries: &[Point], k: usize) -> Vec<Vec<(f64, &T)>>
+    where T: Sync {
+        use rayon::prelude::*;
+        queries.par_iter().map(|&q| self.knn(q, k)).collect()
     }
 }
 

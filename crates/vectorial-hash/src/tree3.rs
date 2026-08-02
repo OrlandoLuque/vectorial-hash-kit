@@ -549,6 +549,18 @@ pub struct Tree3<T: Positioned3> {
 }
 
 impl<T: Positioned3> Tree3<T> {
+    /// Read an item through its stable [`ItemRef`] — `None` if the handle has been retired by
+    /// `remove_ref`.
+    ///
+    /// The handle layer could **move** an item and could **delete** it, but not look at it, so
+    /// any caller wanting to read one had to keep a parallel copy or abuse `update_ref`'s
+    /// mutator to smuggle a value out. O(1), no descent and no scan: the handle *is* the dense
+    /// index into the location table.
+    pub fn get_ref(&self, r: ItemRef) -> Option<&T> {
+        let loc = self.live_loc(r)?;
+        self.get(loc.node).items.get(loc.slot as usize)
+    }
+
     pub fn new(bbox: Aabb, item_limit: usize) -> Self {
         assert!(item_limit >= 1, "item_limit must be >= 1");
         let min_cell = bbox.w.max(bbox.h).max(bbox.d) * 1e-12;

@@ -605,6 +605,31 @@ impl<T: Positioned> MortonGrid<T> {
     }
 }
 
+
+impl<T: Positioned> MortonGrid<T> {
+
+    /// Batch k-NN — one result list per query point. Serial; see [`Self::knn_many_par`].
+    pub fn knn_many(&self, queries: &[Point], k: usize) -> Vec<Vec<(f64, &T)>> {
+        queries.iter().map(|&q| self.knn(q, k)).collect()
+    }
+
+    /// Parallel batch k-NN (feature `parallel`) — the independent queries fan out over rayon.
+    #[cfg(feature = "parallel")]
+    pub fn knn_many_par(&self, queries: &[Point], k: usize) -> Vec<Vec<(f64, &T)>>
+    where T: Sync {
+        use rayon::prelude::*;
+        queries.par_iter().map(|&q| self.knn(q, k)).collect()
+    }
+    /// Parallel batch cull (feature `parallel`) — the independent queries fan out over rayon.
+    /// The 3D twin has had this since the batch work landed; this one was simply missed.
+    #[cfg(feature = "parallel")]
+    pub fn cull_many_par<'a, S: Shape + Sync>(&'a self, shapes: &[S]) -> Vec<Vec<&'a T>>
+    where T: Sync {
+        use rayon::prelude::*;
+        shapes.par_iter().map(|s| self.cull(s)).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

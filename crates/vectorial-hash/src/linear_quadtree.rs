@@ -409,6 +409,50 @@ fn rect_of(world: Rect, key: u64) -> Rect {
     rc
 }
 
+
+impl<T: Positioned> LinearQuadTree<T> {
+}
+
+
+impl<T: Positioned> LinearQuadTree<T> {
+    /// Leaf occupancy — the same diagnostic the two Morton grids report, and needed here for
+    /// the same reason: a leaf-bucketed structure whose buckets you cannot inspect can be
+    /// badly shaped without anything saying so.
+    ///
+    /// `cells` counts **leaves** (an adaptive tree splits only where points cluster, so this is
+    /// not a function of `world` the way a grid's is). Read `mean` and `cells`; **`max / mean`
+    /// is not a skew signal** — it reads 1.0 for data collapsed into a single leaf, which is
+    /// the worst case, not the best.
+    pub fn occupancy(&self) -> crate::Occupancy {
+        let mut max = 0usize;
+        for b in self.leaves.values() { max = max.max(b.len()); }
+        let cells = self.leaves.len();
+        crate::Occupancy {
+            cells,
+            items: self.len,
+            mean: if cells == 0 { 0.0 } else { self.len as f64 / cells as f64 },
+            max,
+        }
+    }
+
+    /// Every item, in unspecified (hash) order. Without this the tree could be built and
+    /// queried but never *read*, which blocks handing its contents to another structure.
+    pub fn iter(&self) -> impl Iterator<Item = &T> { self.leaves.values().flat_map(|b| b.iter()) }
+
+    /// Every item, leaf by leaf in ascending **location code** — what a warm-start migration
+    /// hands the structure replacing this one (see [`crate::MortonGrid3::iter_z_order`]).
+    ///
+    /// The codes are self-describing (path *and* level in one `u64`), so this is not pure
+    /// Z-order across levels the way a flat grid's is: leaves at different depths interleave by
+    /// code rather than by position. It is deterministic and spatially coherent within a level,
+    /// which is what the ordering is for; it is not a claim about a global space-filling curve.
+    pub fn iter_z_order(&self) -> impl Iterator<Item = &T> {
+        let mut keys: Vec<u64> = self.leaves.keys().copied().collect();
+        keys.sort_unstable();
+        keys.into_iter().flat_map(move |k| self.leaves[&k].iter())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
