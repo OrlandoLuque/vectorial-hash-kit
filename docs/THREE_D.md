@@ -624,10 +624,29 @@ than its own predicate `update` has no grid equivalent for this reason, and that
 real rather than an omission.
 
 **The rule that follows: `update` saves the calls you do not make, not the calls you do.** Per
-call it is a wash against a rebuild (0.54–1.15×). It wins enormously when the caller can skip
+call it is a wash against a rebuild (0.54–1.38× across runs — the spread is the point: there is
+no per-call win to bank). It wins enormously when the caller can skip
 it — 7.98× at 10 % moving, 938× at 0.1 % (`examples/grid_keep_bench`), which is exactly why the
 horde's sleeping dead cost nothing to index. Call it unconditionally for every item every
 frame and you have bought a slower rebuild.
+
+#### How much may move — the threshold is not a constant, it shrinks with population
+
+For a caller that skips unmoved items, keeping costs `f × cross` per item and a rebuild costs
+`insert`, so they meet at **`f* = insert / cross`**. Cells sized for ~8 items at every N, so
+only the population varies:
+
+| N | 2 000 | 20 000 | 200 000 | 1 000 000 |
+| --- | ---: | ---: | ---: | ---: |
+| cross, ns/item | 98.4 | 108.8 | 138.9 | 252.5 |
+| insert, ns/item | 64.6 | 63.0 | 76.4 | 116.7 |
+| **break-even `f*`** | **0.66** | **0.58** | **0.55** | **0.46** |
+
+Crossing degrades 2.6× over that range against inserting's 1.8×: a cross does two hash
+operations on a table that is getting worse with size, while a rebuild fills a fresh one
+sequentially. **The bigger the population, the narrower the window in which keeping pays** — at
+2 000 points two thirds of them may move, at a million fewer than half. The ~70 % crossover
+quoted from `grid_keep_bench` is the small-N end of that curve, not a property of grids.
 
 One thing in those rows looked like a finding and was not. `morton-keep` appeared to **cull
 1.18× faster** than the rebuilt grid (1.526 against 1.797 µs) at identical world, identical

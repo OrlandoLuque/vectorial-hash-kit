@@ -336,12 +336,32 @@ impl<T: Positioned3> MortonGrid3<T> {
     /// still have to reach the bucket.
     ///
     /// The consequence is the rule worth remembering: **this method saves the calls you do not
-    /// make, not the calls you do.** Per item it is roughly a wash against a rebuild
-    /// (0.54–1.15×). It wins — hugely — when the caller can skip it for items that did not
-    /// move: 7.98× at 10 % moving and 938× at 0.1 % (`examples/grid_keep_bench`), which is why
-    /// the horde's sleeping dead cost nothing to index. On a workload where *everything* moves
-    /// every frame, `clear` + refill is the better call and the 3D decision map says so
+    /// make, not the calls you do.** Per item it is roughly a wash against a rebuild — the
+    /// ratio is noisy run to run (0.54–1.38× observed), which is itself the point: there is no
+    /// per-call win to bank on. It wins hugely when the caller can skip it for items that did
+    /// not move: 7.98× at 10 % moving and 938× at 0.1 % (`examples/grid_keep_bench`), which is
+    /// why the horde's sleeping dead cost nothing to index. On a workload where *everything*
+    /// moves every frame, `clear` + refill is the better call and the 3D decision map says so
     /// (`morton` 1 063 µs against `morton-keep` 1 566 µs).
+    ///
+    /// # How much may move before a rebuild wins — and why population matters
+    ///
+    /// For a caller that skips unmoved items, keeping costs `f × cross` per item against a
+    /// rebuild's `insert`, so they meet at **`f* = insert / cross`**: the fraction of the
+    /// population that may move before `clear` + refill is the better call. That fraction is
+    /// **not a constant — it shrinks as the population grows** (cells sized for ~8 items
+    /// throughout, so only N varies):
+    ///
+    /// | N | 2 000 | 20 000 | 200 000 | 1 000 000 |
+    /// | --- | ---: | ---: | ---: | ---: |
+    /// | cross, ns/item | 98.4 | 108.8 | 138.9 | 252.5 |
+    /// | insert, ns/item | 64.6 | 63.0 | 76.4 | 116.7 |
+    /// | **break-even `f*`** | **0.66** | **0.58** | **0.55** | **0.46** |
+    ///
+    /// Crossing degrades 2.6× across that range while inserting degrades 1.8×, because a cross
+    /// does two hash operations on a table that is getting worse with size while a rebuild
+    /// fills a fresh one sequentially. So the bigger the world, the *narrower* the window in
+    /// which keeping pays: at a million points, fewer than about half of them may move.
     pub fn update<P, M>(&mut self, old: Point3, predicate: P, mutate: M) -> Crossed
     where
         P: Fn(&T) -> bool,

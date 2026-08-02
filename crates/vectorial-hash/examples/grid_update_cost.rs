@@ -79,6 +79,56 @@ fn main() {
             levels, occ.cells, occ.mean, stay, cross, rebuild, stay / rebuild);
     }
 
+    // ---------------------------------------------------------------- population axis
+    //
+    // The table above holds N fixed. But the question a caller actually asks is "does this
+    // depend on how many things I have?", and it is not obvious a priori: a bigger hash table
+    // misses cache more, and `update` and `insert` need not degrade at the same rate. If they
+    // degrade together the rule is a constant; if they diverge it needs a population term.
+    //
+    // The break-even has a closed form once a caller SKIPS the items that did not move — the
+    // only regime where keeping is worth anything. Keeping then costs `f * cross` per item and
+    // rebuilding costs `insert`, so they meet at
+    //
+    //     f* = insert / cross
+    //
+    // the fraction of the population that may move before a rebuild becomes the better call.
+    // Cells are sized for ~8 items at every N, so occupancy is held constant and only N moves.
+    println!("\n\nDoes it depend on POPULATION? Cells sized for ~8 items each at every N,");
+    println!("so occupancy is held constant and only the population varies.\n");
+    println!("{:>10} {:>7} {:>10} {:>10} {:>11} {:>11} {:>14}",
+        "N", "levels", "mean/cell", "stay ns", "cross ns", "insert ns", "break-even f*");
+
+    for &n in &[2_000usize, 20_000, 200_000, 1_000_000] {
+        let mut rng = Rng(0x51EDu64 ^ n as u64);
+        let pos: Vec<Point3> = (0..n).map(|_| Point3::new(rng.f() * W, rng.f() * W, rng.f() * W)).collect();
+        let per_axis = (n as f64 / 8.0).cbrt().max(1.0);
+        let levels = (per_axis.log2().round().max(1.0) as u32).min(10);
+
+        let mut g = MortonGrid3::<P>::new(world, levels);
+        for (i, p) in pos.iter().enumerate() { g.insert(P { id: i as u32, p: *p }); }
+        let occ = g.occupancy();
+
+        let t = Instant::now();
+        for (i, &p) in pos.iter().enumerate() { let cid = i as u32; g.update(p, |c| c.id == cid, |c| c.p = p); }
+        let stay = t.elapsed().as_secs_f64() * 1e9 / n as f64;
+
+        let far: Vec<Point3> = pos.iter().map(|p| Point3::new((p.x + 137.0) % W, p.y, p.z)).collect();
+        let t = Instant::now();
+        for (i, &q) in far.iter().enumerate() { let cid = i as u32; g.update(pos[i], |c| c.id == cid, |c| c.p = q); }
+        let cross = t.elapsed().as_secs_f64() * 1e9 / n as f64;
+        for (i, &q) in pos.iter().enumerate() { let cid = i as u32; g.update(far[i], |c| c.id == cid, |c| c.p = q); }
+
+        let t = Instant::now();
+        let mut fresh = MortonGrid3::<P>::new(world, levels);
+        for (i, p) in pos.iter().enumerate() { fresh.insert(P { id: i as u32, p: *p }); }
+        let insert = t.elapsed().as_secs_f64() * 1e9 / n as f64;
+        assert_eq!(fresh.item_count(), n, "the rebuild must hold every point");
+
+        println!("{:>10} {:>7} {:>10.1} {:>10.1} {:>11.1} {:>11.1} {:>14.2}",
+            n, levels, occ.mean, stay, cross, insert, insert / cross);
+    }
+
     println!("\nRead the `stay` column against `mean/cell`. Measured answer: it is FLAT while");
     println!("occupancy changes 39x, and highest where cells hold one item each - so the");
     println!("predicate scan is not the cost, the hash lookup is. A handle layer would not");
