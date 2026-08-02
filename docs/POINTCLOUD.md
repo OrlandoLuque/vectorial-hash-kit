@@ -64,3 +64,27 @@ does not. Left as it was, deliberately, with the numbers recorded so it does not
 *outside* the box: `Octree3::bulk_load` panics with "octants tile the parent" and
 `MortonGrid3::insert` silently rejects it. The generator now clamps into the box — the
 smoke test prints the cloud's bounds precisely so that class of bug can't hide.
+
+## Running it without a screen
+
+`$CLOUD_HEADLESS=1` builds the cloud, builds each index and runs the k-NN pass with no window
+and no GPU. Both of this demo's headline numbers are a build time and a one-k-NN-per-point
+pass — neither needs a renderer, and requiring one meant the comparison could not be swept in
+CI or on a display-less machine.
+
+```bash
+CLOUD_HEADLESS=1 CLOUD_N=60000 cargo run -p vectorial-hash-demos --bin pointcloud_wgpu --release
+```
+
+60 000 points, k = 16:
+
+| structure | build ms | k-NN pass ms | µs/point |
+| --- | ---: | ---: | ---: |
+| KdTree3 (median) | 6.8 | **107.0** | 1.784 |
+| Octree3 (midpoint) | 13.3 | 134.6 | 2.243 |
+| MortonGrid3 (flat) | **4.8** | 146.6 | 2.444 |
+
+Same shape as the interactive run: the k-d tree wins the query, the grid wins the build. It
+also **asserts** that all three return identical k-NN distances rather than printing three
+timings side by side — a build-once structure that answers differently is not a faster option,
+it is a wrong one, and a headless run has no HUD for anyone to notice that on.

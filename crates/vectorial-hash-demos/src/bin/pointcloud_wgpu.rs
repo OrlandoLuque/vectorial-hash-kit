@@ -233,7 +233,54 @@ fn density_range(dens: &[f32]) -> (f32, f32) {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn main() { pollster::block_on(run()); }
+fn main() {
+    // `$CLOUD_HEADLESS=1` builds the cloud, builds the index and runs the k-NN pass with no
+    // window and no GPU. This demo's numbers are a build time and a one-k-NN-per-point pass —
+    // neither needs a renderer to exist, and requiring one meant the comparison could not be
+    // swept in CI or on a display-less machine.
+    if std::env::var("CLOUD_HEADLESS").ok().as_deref() == Some("1") {
+        headless();
+        return;
+    }
+    pollster::block_on(run());
+}
+
+/// Build + k-NN with no renderer, reporting what the HUD reports.
+#[cfg(not(target_arch = "wasm32"))]
+fn headless() {
+    let n = std::env::var("CLOUD_N").ok().and_then(|s| s.parse().ok()).unwrap_or(120_000usize).min(MAX_N);
+    let k = std::env::var("CLOUD_K").ok().and_then(|s| s.parse().ok()).unwrap_or(16usize);
+    let pts = scan_scene(n);
+    let mut dens: Vec<f32> = Vec::new();
+
+    println!("pointcloud headless | {n} points | k={k}\n");
+    println!("{:>10} {:>12} {:>12} {:>14}", "structure", "build ms", "knn ms", "us/point");
+    // Every structure answers the same question on the same cloud, so their k-NN distances must
+    // agree. A build-once structure that answers *differently* is not a faster option, it is a
+    // wrong one — and a headless run has no HUD for anyone to notice that on.
+    let mut reference: Option<Vec<f32>> = None;
+    for kind in [Structure::Kd, Structure::Oct, Structure::Mor] {
+        let (index, build_ms) = Index::build(kind, &pts);
+        let knn_ms = knn_pass(&index, &pts, k, &mut dens);
+        println!("{:>10} {:>12.1} {:>12.1} {:>14.3}", kind.label(), build_ms, knn_ms, knn_ms * 1000.0 / n as f32);
+        // A single token: `kind.label()` is prose ("KDTREE3 MEDIAN") and `#M` keys are parsed
+        // on whitespace, so using it here produced two fields where bench-runner expects one.
+        let tag = match kind { Structure::Kd => "kdtree3", Structure::Oct => "octree3", Structure::Mor => "morton3" };
+        println!("#M cloud_{tag}.build_ms {build_ms:.2} ms");
+        println!("#M cloud_{tag}.knn_ms {knn_ms:.2} ms");
+        match &reference {
+            None => reference = Some(dens.clone()),
+            Some(r) => {
+                let bad = r.iter().zip(&dens).filter(|(a, b)| (**a - **b).abs() > 1e-4 * a.abs().max(1.0)).count();
+                assert!(bad == 0, "{} k-NN distances differ from the first structure's — see docs/POINTCLOUD.md", bad);
+            }
+        }
+    }
+    println!("\nall three structures returned identical k-NN distances on {n} points");
+}
+
+#[cfg(target_arch = "wasm32")]
+fn headless() {}
 
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen::prelude::wasm_bindgen(start)]

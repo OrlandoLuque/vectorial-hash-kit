@@ -349,7 +349,56 @@ impl World {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn main() { pollster::block_on(run()); }
+fn main() {
+    // `$STEALTH_HEADLESS=<frames>` steps the world with no window and no GPU. `STEALTH_MAX_FRAMES`
+    // already ended a run after N frames, but it still opened a window and spun up an adapter, so
+    // the index-vs-scan crossover this demo exists to measure could not be swept on a machine
+    // without a display — which is every CI runner.
+    //
+    // `World::step` owns its index now (it used to be handed one built in the render loop), so
+    // there is nothing to reimplement here: the headless path calls exactly what the interactive
+    // path calls.
+    if let Some(frames) = std::env::var("STEALTH_HEADLESS").ok().and_then(|s| s.parse::<u32>().ok()) {
+        headless(frames);
+        return;
+    }
+    pollster::block_on(run());
+}
+
+/// Step the world `frames` times with no renderer and print the same means the smoke summary
+/// does, including the maintenance the index pays and the scan does not.
+#[cfg(not(target_arch = "wasm32"))]
+fn headless(frames: u32) {
+    let n_civs: usize = std::env::var("STEALTH_CIVS").ok().and_then(|s| s.parse().ok()).unwrap_or(CIVS);
+    let mut w = World::new(n_civs);
+    let mut lines = Vec::new();
+    for _ in 0..frames {
+        w.step(1.0 / 60.0, false, &mut lines);
+        lines.clear();
+    }
+    let n = w.acc_frames.max(1) as f64;
+    let (cone, brute, los, maint) = (w.acc_cone / n, w.acc_brute / n, w.acc_los / n, w.acc_maint / n);
+    let total = cone + maint;
+    println!("stealth headless | {} guards / {n_civs} crowd / {} crates | {} frames | means",
+        w.guards.len(), w.crates.len(), w.acc_frames);
+    println!("  index: maintain {maint:.1} us + cull {cone:.1} us = {total:.1} us   vs   scan {brute:.1} us   ({:.2}x)",
+        brute / total.max(1e-9));
+    println!("  exact LoS {los:.1} us | agree every frame: {}", w.bad_frames == 0);
+    let tag = n_civs;
+    println!("#M crowd{tag}.index_cull {cone:.2} us");
+    println!("#M crowd{tag}.index_maintain {maint:.2} us");
+    println!("#M crowd{tag}.index_total {total:.2} us");
+    println!("#M crowd{tag}.linear_scan {brute:.2} us");
+    println!("#M crowd{tag}.scan_over_total {:.3} x", brute / total.max(1e-9));
+    println!("#M crowd{tag}.exact_los {los:.2} us");
+    println!("#M crowd{tag}.agree {} bool", if w.bad_frames == 0 { 1 } else { 0 });
+    // An index and a scan that disagree are not two ways of answering the same question, so a
+    // headless run that is only ever read by a script must fail loudly rather than print a ratio.
+    assert!(w.bad_frames == 0, "index and scan disagreed on {} frames — see docs/STEALTH.md", w.bad_frames);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn headless(_frames: u32) {}
 
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen::prelude::wasm_bindgen(start)]

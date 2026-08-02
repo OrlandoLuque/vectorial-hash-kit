@@ -71,6 +71,29 @@ Charged for a keep, the crossover on honest total cost sits at **~1 100 agents**
 the cull-only ~1 000, because keeping costs so little. Maintenance is still 46 % of the index's
 total at 20 000 — visible, but no longer decisive.
 
+### Sweeping it without a screen
+
+`$STEALTH_HEADLESS=<frames>` steps the world with no window and no GPU. `STEALTH_MAX_FRAMES`
+already ended a run after N frames, but it still opened a window and created an adapter, so the
+crossover could not be swept on a machine without a display. 300 frames, means over the run:
+
+| crowd | index: maintain + cull = total | scan | scan ÷ total |
+| ---: | ---: | ---: | ---: |
+| 200 | 1.1 + 8.3 = 9.4 µs | 3.5 µs | 0.37× |
+| 1 000 | 7.0 + 34.8 = 41.8 µs | 26.9 µs | 0.64× |
+| 1 400 | 10.9 + 48.1 = 59.1 µs | 62.8 µs | **1.06×** |
+| 20 000 | 382.5 + 353.0 = 735.6 µs | 1 831.0 µs | 2.49× |
+
+**And the crossover moved: ~1 350 here against ~1 100 with the renderer running.** That is not
+an error in either — it is the finding. A linear scan is a tight contiguous loop and an index
+is pointer-chasing, so the scan gains more from an otherwise idle machine than the index does.
+The crossover is a property of the *whole frame*, not of the two algorithms alone, and a number
+measured with nothing else running will flatter the scan relative to what a real game sees.
+Quote the range, not a point.
+
+The headless path asserts index/scan agreement rather than printing a ratio beside a silent
+mismatch: a run only ever read by a script has nobody to notice the "AGREE NO" on a HUD.
+
 **The crossover is around a thousand agents.** Below it the tree is honestly slower: a
 `contains_point` against 6 planes is a handful of multiply-adds, and at 40 agents the
 traversal costs more than just looking at all of them. Above it the index pulls away and
