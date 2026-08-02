@@ -185,6 +185,63 @@ fn main() {
         println!("#M cold.rebuilt_over_kept {:.3} x", cc / ck);
     }
 
+    // ------------------------------------------------- the COLD probe, with company
+    //
+    // One hypothesis the six earlier ones did not cover. The decision map does not time these
+    // two grids alone: seven other structures are maintained and culled in the same frame, and
+    // their working sets pass through the cache in between. Rotating the arms equalises
+    // *position* but not that — every arm is still preceded by everyone else's traffic.
+    //
+    // An isolated bench has no company at all, which is exactly why it might be blind to this.
+    // So: the same cold probe, with a large scratch buffer walked between the maintain and the
+    // culls to stand in for the other arms. If the gap appears here it is an interaction with
+    // the rest of the frame rather than a property of either grid — and that would explain why
+    // every isolated reproduction so far has read 1.00x.
+    {
+        let mut kept3 = MortonGrid3::<P>::new(world, levels);
+        for (i, p) in pos.iter().enumerate() { kept3.insert(P { id: i as u32, p: *p }); }
+        let mut scratch: Vec<u64> = (0..2_000_000u64).collect();   // ~16 MB, past any L3 here
+        let (mut t_kept_c, mut t_churn_c) = (0.0f64, 0.0f64);
+        let mut sink = 0usize;
+        const CF: usize = 120;
+        const CC: usize = 16;
+        for f in 0..CF {
+            for i in 0..N {
+                let old = pos[i];
+                let (vx, vy, vz) = vel[i];
+                let np = Point3::new((old.x + vx * dt).rem_euclid(W), (old.y + vy * dt).rem_euclid(W), (old.z + vz * dt).rem_euclid(W));
+                pos[i] = np;
+                let id = i as u32;
+                kept3.update(old, |c| c.id == id, |c| c.p = np);
+            }
+            let mut churn3 = MortonGrid3::<P>::new(world, levels);
+            for (i, p) in pos.iter().enumerate() { churn3.insert(P { id: i as u32, p: *p }); }
+
+            let qs: Vec<Sphere3> = (0..CC).map(|k| { let c = pos[(f * 131 + k * 7919) % N]; Sphere3::new(c.x, c.y, c.z, VISION) }).collect();
+            let kept_first = f % 2 == 0;
+            for pass in 0..2 {
+                // the company: a stride walk that evicts, before EACH arm, symmetrically
+                for j in (0..scratch.len()).step_by(8) { scratch[j] = scratch[j].wrapping_add(1); }
+                sink += scratch[f % scratch.len()] as usize;
+                let t = Instant::now();
+                if (pass == 0) == kept_first {
+                    for q in &qs { sink += kept3.cull(q).len(); }
+                    t_kept_c += t.elapsed().as_secs_f64() * 1e6 / CC as f64;
+                } else {
+                    for q in &qs { sink += churn3.cull(q).len(); }
+                    t_churn_c += t.elapsed().as_secs_f64() * 1e6 / CC as f64;
+                }
+            }
+        }
+        std::hint::black_box(sink);
+        let (ck, cc) = (t_kept_c / CF as f64, t_churn_c / CF as f64);
+        println!("
+COLD probe WITH COMPANY — 16 MB walked before each arm, {CF} frames:");
+        println!("{:>26} {:>12.3}", "rebuilt every frame", cc);
+        println!("{:>26} {:>12.3}   ({:.2}x)", "kept (update in place)", ck, cc / ck);
+        println!("#M polluted.rebuilt_over_kept {:.3} x", cc / ck);
+    }
+
     #[cfg(not(feature = "grid-stats"))]
     println!("\n(cells visited reads 0 — re-run with `--features grid-stats` for the counts.)");
     #[cfg(feature = "grid-stats")]

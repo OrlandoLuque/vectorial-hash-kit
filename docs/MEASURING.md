@@ -191,6 +191,22 @@ effect. Here is what happened when it was chased instead.
 | it is a cold first-touch effect | isolated, 16 culls right after the maintain, arms alternating, 200 frames | **0.97×** |
 | the grids hold different items | assert equal populations every frame | **equal** — no shortfall |
 
+A seventh, tried later the same night, is the only one that has ever moved the number in the
+right direction — and it still does not explain it. The decision map does not time those two
+grids alone: seven other structures are maintained and culled in the same frame, and their
+working sets pass through the cache in between. Rotation equalises *position*, not company. So
+the isolated cold probe was run again with 16 MB of scratch walked before each arm:
+
+| | isolated, cold | with 16 MB of company |
+| --- | ---: | ---: |
+| rebuilt ÷ kept | 0.95–0.97× | **1.01×, 1.05×, 1.10×** (three runs) |
+
+The direction is right: company moves the ratio by about +0.09 in the kept grid's favour, which
+is consistent with stable bucket addresses surviving eviction better than freshly allocated ones.
+But the magnitude falls short of the map's 1.09–1.17×, and **the run-to-run spread is as large as
+the effect**. That is a lead, not a mechanism, and calling it the answer would be the third time
+in one day this was closed early.
+
 So the gap does not reproduce outside the interleaved loop, and inside it survives the fix for
 the one cause that looked likely. **It is recorded as unexplained.** Not "an artifact", which is
 what an earlier version of this section said — that claim rested entirely on the swap
