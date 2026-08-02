@@ -148,29 +148,29 @@ fn measure(cfg: &Cfg) -> ([f64; NAMES.len()], [f64; NAMES.len()], bool) {
         let kd = KdTree2::from_items(cfg.item_limit, (0..cfg.pop).map(|id| C2 { id: id as u32, p: pos[id] }).collect());
         if measuring { mt[3].push(us(t)); }
 
-        // cull: the same sampled disc centres for all three.
+        // cull: the same sampled disc centres for every arm.
+        //
+        // **The arms rotate**, for the reason documented in docs/MEASURING.md § 8d: timing five
+        // structures one after another inside a frame times them in five different cache states,
+        // and the one written last has had every other arm's working set moved through the cache
+        // first. Rotating the start index by the frame number gives each an equal share of every
+        // position. The 3D map does the same; keeping them consistent matters, because the two
+        // tables get read against each other.
         let ids: Vec<usize> = (0..cfg.n_cull).map(|_| (rng.next() as usize) % cfg.pop).collect();
         let n = ids.len().max(1) as f64;
 
-        let t = Instant::now();
-        for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(tree.cull(&Disc { cx: c.x, cy: c.y, r: cfg.vision }).len()); }
-        if measuring { cl[0].push(us(t) / n); }
-
-        let t = Instant::now();
-        for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(quad.cull(&Disc { cx: c.x, cy: c.y, r: cfg.vision }).len()); }
-        if measuring { cl[1].push(us(t) / n); }
-
-        let t = Instant::now();
-        for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(kd.cull(&Disc { cx: c.x, cy: c.y, r: cfg.vision }).len()); }
-        if measuring { cl[3].push(us(t) / n); }
-
-        let t = Instant::now();
-        for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(morton.cull(&Disc { cx: c.x, cy: c.y, r: cfg.vision }).len()); }
-        if measuring { cl[2].push(us(t) / n); }
-
-        let t = Instant::now();
-        for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(mkeep.cull(&Disc { cx: c.x, cy: c.y, r: cfg.vision }).len()); }
-        if measuring { cl[4].push(us(t) / n); }
+        for step in 0..5usize {
+            let k = (step + frame) % 5;
+            let t = Instant::now();
+            match k {
+                0 => for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(tree.cull(&Disc { cx: c.x, cy: c.y, r: cfg.vision }).len()); },
+                1 => for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(quad.cull(&Disc { cx: c.x, cy: c.y, r: cfg.vision }).len()); },
+                2 => for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(morton.cull(&Disc { cx: c.x, cy: c.y, r: cfg.vision }).len()); },
+                3 => for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(kd.cull(&Disc { cx: c.x, cy: c.y, r: cfg.vision }).len()); },
+                _ => for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(mkeep.cull(&Disc { cx: c.x, cy: c.y, r: cfg.vision }).len()); },
+            }
+            if measuring { cl[k].push(us(t) / n); }
+        }
 
         if measuring && !ids.is_empty() {
             let c = pos[ids[0]];
