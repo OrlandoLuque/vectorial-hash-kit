@@ -257,11 +257,50 @@ fn main() {
     }
 
     let pct = (threshold * 100.0) as i64;
+    // ---------------------------------------------------------------- confirm before failing
+    //
+    // A single timed pass on a shared desktop is a coin flip, and this gate proved it on itself:
+    // two consecutive runs of the SAME binary read `cull_tree3_x64` at -2.8% and then +54.0%, on
+    // an op nobody had touched, with the machine at 76% CPU behind a chat client and an editor.
+    // A gate that fails on one reading in those conditions is reporting the desktop rather than
+    // the commit — and a gate that cries wolf gets ignored, which is worse than not having one.
+    //
+    // So a suspected regression is re-measured. Each op's estimator is min-of-N already; extra
+    // passes simply widen N where it matters. A transient cannot be the minimum of every pass;
+    // a real regression is present in all of them.
     if !regressed.is_empty() {
-        println!("\nFAIL: {} op(s) regressed beyond +{pct}%:", regressed.len());
-        for (n, d) in &regressed { println!("  {n}: {:+.1}%", d * 100.0); }
+        const CONFIRM_PASSES: usize = 2;
+        println!("\n{} op(s) over threshold on the first pass — confirming with {CONFIRM_PASSES} more.", regressed.len());
+        println!("(a transient cannot be the minimum of every pass; a real regression is in all of them)");
+        let mut best: std::collections::HashMap<&str, f64> = results.iter().map(|(n, ns)| (*n, ns * scale)).collect();
+        for pass in 1..=CONFIRM_PASSES {
+            let c = calibrate();
+            let sc = base_calib / c;
+            for (name, ns) in measure() {
+                let v = ns * sc;
+                best.entry(name).and_modify(|b| if v < *b { *b = v }).or_insert(v);
+            }
+            println!("  pass {pass} done");
+        }
+        let before = regressed.len();
+        regressed.clear();
+        for (name, _) in &results {
+            if let (Some(&b), Some(&cur)) = (baseline.get(*name), best.get(*name)) {
+                let delta = (cur - b) / b;
+                if delta > threshold { regressed.push((*name, delta)); }
+            }
+        }
+        if regressed.is_empty() {
+            println!("  none survived — all {before} were transients. This machine is too noisy to");
+            println!("  gate on a single pass; treat one-off readings here as unmeasured.");
+            println!("\nPASS: no op regressed beyond +{pct}% (confirmed over {} passes).", CONFIRM_PASSES + 1);
+            if missing { println!("NOTE: new ops not yet in the baseline — re-run with --save on an IDLE machine."); }
+            return;
+        }
+        println!("\nFAIL: {} op(s) regressed beyond +{pct}% in EVERY pass:", regressed.len());
+        for (n, d) in &regressed { println!("  {n}: {:+.1}% (best of {} passes)", d * 100.0, CONFIRM_PASSES + 1); }
         std::process::exit(1);
     }
-    if missing { println!("\nNOTE: new ops not yet in the baseline — re-run with --save to record them."); }
+    if missing { println!("\nNOTE: new ops not yet in the baseline — re-run with --save on an IDLE machine."); }
     println!("\nPASS: no op regressed beyond +{pct}%.");
 }
