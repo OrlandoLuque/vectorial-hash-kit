@@ -130,8 +130,48 @@ pub enum Backend {
 /// different machine can and should re-measure them.
 #[derive(Copy, Clone, Debug)]
 pub struct Thresholds {
-    /// Below this many items, a linear scan wins. Measured crossover ~500-1000 for a
-    /// single AoI query; `advisor::BRUTE_FORCE_MAX` is the shared default.
+    /// **An unconditional floor**: at or below this many items the policy returns
+    /// [`Backend::Brute`] whatever else is true, before the load-aware rule
+    /// ([`Thresholds::scan_budget`]) is consulted at all.
+    ///
+    /// # 512 and 182 were both wrong, and so was the question
+    ///
+    /// This shipped at 512 (borrowed from `advisor::BRUTE_FORCE_MAX`) while `calibrate`
+    /// measured 182, and the disagreement stood for as long as both existed. It was never
+    /// resolvable as posed: "below how many items does a scan win?" has no single answer,
+    /// because a scan costs per **query** and an index costs per **move**.
+    /// `examples/brute_edge` sweeps both axes (500³ world, 300 frames, a quarter moving each
+    /// frame, every arm through this index with pinned thresholds so only the backend differs):
+    ///
+    /// | pop | q=1 | q=n/16 | q=n/4 | q=n |
+    /// | ---: | --- | --- | --- | --- |
+    /// | 64 | scan 1.96× | scan 1.41× | scan 1.10× | scan 1.06× |
+    /// | 128 | scan 2.07× | scan 1.12× | **keep 1.10×** | **grid 1.28×** |
+    /// | 182 | scan 2.47× | scan 1.08× | keep 1.08× | keep 1.25× |
+    /// | 512 | scan 3.80× | keep 1.45× | keep 1.80× | grid 1.97× |
+    /// | 2048 | **scan 7.00×** | keep 2.82× | grid 4.60× | grid 5.33× |
+    ///
+    /// Read along a row and the winner changes with load alone. So the two candidate numbers
+    /// were answers to different questions, and both were too high for *this* one: a floor that
+    /// fires before the load rule must be set by the case least favourable to a scan, because
+    /// that is where it overrides a correct choice. At the heaviest load an index first wins at
+    /// **128**, so the floor belongs below it — **64**, the largest population measured where a
+    /// scan wins at *every* load.
+    ///
+    /// `calibrate` agrees independently, once its own probe was fixed: its ladder reads scan up
+    /// to 182 and index from 256, against `brute_edge`'s 128 at the heaviest load (the two use
+    /// different query radii, so a bracket of 128-256 is the honest reading). Both put the
+    /// crossover far below the old 512.
+    ///
+    /// Lowering it is safe precisely because it is only a backstop: above it `scan_budget`
+    /// decides, and it can see the query load. The scan's real reach is enormous and load-shaped
+    /// — it still wins 7× at 2 048 items when nobody is querying — and capturing that is
+    /// `scan_budget`'s job, not this one's.
+    ///
+    /// Deliberately no longer tied to `advisor::BRUTE_FORCE_MAX`. That number answers "is an
+    /// index worth having at all?", which is a recommendation; this one answers "must I refuse
+    /// to index?", which is a veto. They are different questions and were only ever sharing a
+    /// constant by accident.
     pub brute_max: usize,
     /// Fraction of moves that cross a leaf. Kept because it describes the workload, but
     /// it is NOT what the policy switches on — see `rebuild_query_ratio`.
@@ -253,7 +293,7 @@ pub struct Thresholds {
 impl Default for Thresholds {
     fn default() -> Self {
         Thresholds {
-            brute_max: crate::advisor::BRUTE_FORCE_MAX,
+            brute_max: 64,
             high_churn: crate::advisor::HIGH_RELOCATION,
             // Re-measured with the three-arm calibration (2026-07-31): 0.205 on this
             // machine. Was 0.1, which switched to the grid roughly twice as early as the

@@ -57,21 +57,42 @@ fn cloud(n: usize, seed: u64) -> Vec<P> {
     (0..n).map(|i| P { id: i as u32, p: Point3::new(r.r(0.0, W), r.r(0.0, W), r.r(0.0, W)) }).collect()
 }
 
-/// Is an index worth it at this population? Compares one indexed cull against one scan,
-/// both min-of-N, INCLUDING neither build (the index is assumed already built — that is
-/// the regime the threshold is about).
+/// Is an index worth it at this population? — the probe behind `brute_max`.
+///
+/// **Rewritten 2026-08-03, because it was answering a different question than the threshold
+/// asks.** It used to time culls alone against a pre-built tree: no build, no maintenance, and
+/// 64 queries whatever the population. That is the regime most favourable to an index, and it
+/// is not what `brute_max` governs — that is an *unconditional floor*, consulted before the
+/// load-aware `scan_budget` rule, so it must be set by the case least favourable to a scan and
+/// it must charge the index for existing.
+///
+/// So a frame now looks like a frame: a quarter of the points move (the index pays `update_ref`,
+/// the scan pays nothing to maintain), then `n` culls run — the heaviest load in
+/// `examples/brute_edge`, which is where an index would otherwise have been chosen and this
+/// floor would have overridden it.
 fn index_beats_scan(n: usize, radius: f64) -> bool {
+    #![allow(clippy::needless_range_loop)]
     let items = cloud(n, 0xC0FFEE + n as u64);
-    let tree = Tree3::bulk_load(world(), 8, items.clone());
     let mut r = Lcg(7);
-    let qs: Vec<Point3> = (0..64).map(|_| Point3::new(r.r(0.0, W), r.r(0.0, W), r.r(0.0, W))).collect();
+    let qs: Vec<Point3> = (0..n.max(1)).map(|_| Point3::new(r.r(0.0, W), r.r(0.0, W), r.r(0.0, W))).collect();
+    let moves: Vec<Point3> = (0..n / 4).map(|_| Point3::new(r.r(0.0, W), r.r(0.0, W), r.r(0.0, W))).collect();
 
+    // Built ONCE, outside the timed region. A first draft built it inside, which quietly turned
+    // the probe into "rebuild the index every frame" — the harshest possible reading — and moved
+    // the answer from ~130 to ~940. The policy's index is *kept*, so the probe keeps it too.
+    let mut tree = Tree3::new(world(), 8);
+    let refs: Vec<_> = items.iter().map(|it| tree.insert_ref(*it).expect("inside the world")).collect();
     let indexed = common::measure(5, || {
+        for (i, np) in moves.iter().enumerate() { tree.update_ref(refs[i], |it| it.p = *np); }
         let mut acc = 0usize;
         for q in &qs { acc += tree.cull(&Sphere3::new(q.x, q.y, q.z, radius)).len(); }
         std::hint::black_box(acc);
     }).cycles;
     let scanned = common::measure(5, || {
+        // The scan's "maintain" is writing the new positions into its own array, which is what
+        // a caller would do anyway — it has no index to tell.
+        let mut items = items.clone();
+        for (i, np) in moves.iter().enumerate() { items[i].p = *np; }
         let mut acc = 0usize;
         for q in &qs {
             let (r2, qx, qy, qz) = (radius * radius, q.x, q.y, q.z);
@@ -167,16 +188,26 @@ fn main() {
     let t0 = Instant::now();
     println!("calibrating on this machine (keep it idle)…\n");
 
-    // --- brute_max: bisect on "does the index win yet?"
-    let (mut lo, mut hi) = (16usize, 8192usize);
+    // --- brute_max: a LADDER, not a bisection.
+    //
+    // This bisected until 2026-08-03, and a bisection assumes the predicate is monotone. Near
+    // the crossover it is not: the two costs are within noise of each other, so "does the index
+    // win?" flips at random and the search walks off. The trace it printed said so plainly and
+    // was read as a result for months — 527 scan, 975 index, 927 scan, 942 index, converging on
+    // whichever way the last coin landed.
+    //
+    // A ladder cannot do that. Every rung is measured, all of them are printed, and the answer
+    // is the largest population where the scan wins on EVERY rung up to it — so a single noisy
+    // flip costs one rung's worth of conservatism instead of an order of magnitude.
+    let ladder = [16usize, 32, 48, 64, 96, 128, 182, 256, 384, 512, 768, 1024, 2048];
     println!("  {:<10} {:>12}", "population", "winner");
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        let indexed_wins = index_beats_scan(mid, radius);
-        println!("  {:<10} {:>12}", mid, if indexed_wins { "index" } else { "scan" });
-        if indexed_wins { hi = mid; } else { lo = mid + 1; }
+    let mut brute_max = 1usize;
+    let mut still_scanning = true;
+    for &n in &ladder {
+        let indexed_wins = index_beats_scan(n, radius);
+        println!("  {:<10} {:>12}", n, if indexed_wins { "index" } else { "scan" });
+        if indexed_wins { still_scanning = false; } else if still_scanning { brute_max = n; }
     }
-    let brute_max = lo.saturating_sub(1).max(1);
 
     // --- high_churn: the fraction at which a rebuild starts beating the kept tree.
     // Swept against QUERIES PER FRAME as well, because that is what actually decides it:
@@ -248,7 +279,11 @@ fn main() {
     println!("wrote {out} — point VH_CALIBRATION at it and AdaptiveIndex::new picks it up.");
     let d = Thresholds::default();
     if brute_max.abs_diff(d.brute_max) * 100 / d.brute_max.max(1) > 25 {
-        println!("\nNOTE: brute_max is {brute_max} here vs the shipped default {} — a >25% difference,", d.brute_max);
-        println!("which is exactly the case this tool exists for. Ship the file with the build.");
+        println!("\nNOTE: this machine's scan/index crossover is {brute_max}; the shipped `brute_max`");
+        println!("default is {} and is deliberately LOWER, not wrong. That threshold is an", d.brute_max);
+        println!("unconditional floor, consulted before the load-aware `scan_budget` rule, so it sits");
+        println!("below the crossover on purpose: above it `scan_budget` decides and can see the");
+        println!("query load. Raising it to the crossover would force a scan onto workloads an index");
+        println!("wins. Ship the file if this machine's crossover is far from the shipped one.");
     }
 }
