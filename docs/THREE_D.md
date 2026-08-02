@@ -431,11 +431,14 @@ test). So: **grid for uniform-ish data with a known query scale (fastest, cheap
 build, trivial code); a tree when density varies or query sizes span a wide
 range (adaptive depth earns its keep).** A multi-level linear octree (codes at
 mixed depths) would recover the adaptivity, at the cost of the grid's
-simplicity — noted as a possible follow-up. `MortonGrid3` is build-and-cull
-only (no `update`); in the live `critters3d` demo it's selectable via the `M`
-toggle (`CRITTERS3D_STRUCTURE=morton`) and **rebuilt from scratch each frame**
-— which is fine precisely because its build is so cheap (the dynamic workload
-where the trees use `update`, the grid just re-buckets). `visit_cells` exposes
+simplicity — noted as a possible follow-up. ~~`MortonGrid3` is build-and-cull only (no `update`)~~ — **that stopped being true on
+2026-07-31** and the sentence is left visible because it is where the "grids always rebuild"
+belief came from: it described an API omission and got read as a property. The grid has
+`update`/`remove` now, and `examples/grid_update_cost` measures what they are worth — roughly a
+wash per call, a large win only when the caller can skip them for items that did not move (see
+"Why a rebuild wins at full churn" above). In the live `critters3d` demo the grid is selectable
+via the `M` toggle (`CRITTERS3D_STRUCTURE=morton`) and **rebuilt from scratch each frame**,
+which for that workload is still the right call: everything moves, every frame. `visit_cells` exposes
 the occupied cells for the `B` box overlay; `demorton3` decodes a code back to
 its `(x,y,z)` cell.
 

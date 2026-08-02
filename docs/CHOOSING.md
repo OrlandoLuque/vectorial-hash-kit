@@ -98,10 +98,24 @@ repeated passes** on an idle machine, via `cargo run -p bench-runner --release`:
 
 - **Start with `Tree` (2D) or `Tree3` (3D).** They adapt leaf size to local density and
   carry the full dynamic contract. Only move off the default for a concrete reason below.
-- **Check whether you need an index at all.** Below ~500–1000 items a contiguous scan
-  wins — no descent, no allocation, perfect cache behaviour. The kit says so out loud:
-  `advisor::BRUTE_FORCE_MAX`, the `formations` regiment level, and the stealth HUD all
-  report the scan winning at small N. Don't index 40 guards.
+- **Check whether you need an index at all — and note the answer is not a population.**
+  A scan costs per **query**; an index costs per **move**. Measured across both axes
+  (`examples/brute_edge`, 500³, a quarter moving each frame):
+
+  | population | 1 cull/frame | n/16 | n/4 | n culls/frame |
+  | ---: | --- | --- | --- | --- |
+  | 64 | scan 1.96× | scan 1.41× | scan 1.10× | scan 1.06× |
+  | 128 | scan 2.07× | scan 1.12× | **keep 1.10×** | **grid 1.28×** |
+  | 512 | scan 3.80× | keep 1.45× | keep 1.80× | grid 1.97× |
+  | 2 048 | **scan 7.00×** | keep 2.82× | grid 4.60× | grid 5.33× |
+
+  Read along a row: the winner changes with query load alone. A scan still wins **7× at 2 048
+  items** if you barely query, and loses at 128 if you query hard. The old "below ~500–1000 a
+  scan wins" was the middle of that table mistaken for its conclusion.
+  `AdaptiveIndex` splits the two questions accordingly: `brute_max` (64) is an unconditional
+  floor set from the case least favourable to a scan, and `scan_budget` handles the rest
+  because it can see the load. Don't index 40 guards; do index 2 000 if you ask them
+  something every frame.
 - **Relocating everything every frame?** Hold the `ItemRef` that `insert_ref` returns and
   call `update_ref` — it skips the predicate's leaf scan and is the single biggest
   **maintain** win (the decision map flipped on it). One extra field per entity.

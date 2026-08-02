@@ -43,6 +43,16 @@ pub enum StructureHint {
 /// in the `formations` regiment level) the crossover drops to the low hundreds.
 /// So: query-heavy → raise toward ~1000; build-heavy/query-light → lower. 512 is
 /// a middle default; tune per workload (the profiler's `query_per_move` helps).
+///
+/// **Note what "query-only, pre-built index" leaves out**, because the same flaw was found in
+/// `examples/calibrate` on 2026-08-03 and fixed there: charging the index nothing for existing
+/// is the reading most favourable to it. `examples/brute_edge` sweeps population *against query
+/// load* with maintenance included, and the winner changes along a row — a scan wins **7× at
+/// 2 048 items** at one cull per frame and loses at 128 when every item is queried. This
+/// constant is a recommendation ("is an index worth having?") and remains a middle default for
+/// that. It is deliberately **not** what [`crate::Thresholds::brute_max`] uses: that one is a
+/// veto ("must I refuse to index?"), fires before any load-aware rule, and is therefore set from
+/// the case least favourable to a scan — 64.
 pub const BRUTE_FORCE_MAX: usize = 512;
 
 /// Relocation rate above which the keep-index's per-move leaf-exit cost starts to
