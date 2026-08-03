@@ -32,6 +32,10 @@ pub mod formations_sim;
 /// this week — which way the slime faces, whether the wall meets the tower — has been blocked on
 /// a human watching a window.
 pub mod png;
+// Exactly where `wgpu` exists: it is a native-only dependency plus the optional `web-wgpu`
+// feature, so the lean macroquad wasm build (critters, critters3d — what CI builds) has no
+// `wgpu` at all. Gating this on `not(web-wgpu)` like `png` would be wrong in both directions.
+#[cfg(any(not(target_arch = "wasm32"), feature = "web-wgpu"))]
 /// Headless screenshots for the wgpu demos, built on [`png`] — the reusable half of what
 /// `horde_wgpu` grew first, so a visual question stops being a thing to queue for a human.
 pub mod shot;
