@@ -29,23 +29,32 @@
 //! cargo run -p vectorial-hash --example itree_bulk_load --release --features parallel
 //! ```
 mod common;
+#[cfg(feature = "parallel")]
 use common::abba;
+#[cfg(feature = "parallel")]
 use vectorial_hash::{IPoint, IPositioned, IRect, IntegerTree};
 
+#[cfg(feature = "parallel")]
 #[derive(Clone, Copy)]
 struct P { p: IPoint }
+#[cfg(feature = "parallel")]
 impl IPositioned for P { fn position(&self) -> IPoint { self.p } }
 
+#[cfg(feature = "parallel")]
 struct Rng(u64);
+#[cfg(feature = "parallel")]
 impl Rng {
     fn next(&mut self) -> u64 { self.0 ^= self.0 << 13; self.0 ^= self.0 >> 7; self.0 ^= self.0 << 17; self.0 }
     fn f(&mut self) -> f64 { (self.next() >> 11) as f64 / (1u64 << 53) as f64 }
 }
 
+#[cfg(feature = "parallel")]
 /// `IntegerTree` needs a power-of-two side (the half-boundary split is exact because of it).
 const W: i32 = 1024;
+#[cfg(feature = "parallel")]
 const ROUNDS: usize = 7;
 
+#[cfg(feature = "parallel")]
 fn uniform(n: usize, seed: u64) -> Vec<P> {
     let mut rng = Rng(0xBADC0DE ^ seed);
     (0..n).map(|_| P { p: IPoint::new((rng.f() * W as f64) as i32, (rng.f() * W as f64) as i32) }).collect()
@@ -53,6 +62,7 @@ fn uniform(n: usize, seed: u64) -> Vec<P> {
 
 /// Clustered: the case where a chosen split axis has something to choose. Uniform data makes
 /// every square node split the same way whatever the items do, so it hides half the work.
+#[cfg(feature = "parallel")]
 fn clustered(n: usize, seed: u64) -> Vec<P> {
     let mut rng = Rng(0xC0FFEE ^ seed);
     let centres: Vec<(f64, f64)> = (0..12).map(|_| (rng.f() * W as f64, rng.f() * W as f64)).collect();
@@ -68,10 +78,7 @@ fn clustered(n: usize, seed: u64) -> Vec<P> {
 
 fn main() {
     #[cfg(not(feature = "parallel"))]
-    {
-        println!("built without the `parallel` feature — re-run with --features parallel");
-        return;
-    }
+    println!("built without the `parallel` feature — re-run with --features parallel");
     #[cfg(feature = "parallel")]
     {
         let bbox = IRect::new(0, 0, W, W);
