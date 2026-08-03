@@ -159,6 +159,17 @@ fn measure(cfg: &Cfg) -> ([f64; 9], [f64; 9], bool) {
     for id in 0..cfg.pop { morton_k.insert(C3 { id: id as u32, p: pos[id] }); }
     let mut linear_k = LinearOctree3::<C3>::from_items(world, cfg.item_limit, 12, (0..cfg.pop).map(|id| C3 { id: id as u32, p: pos[id] }).collect());
 
+    // `$D3_ARMS=morton,morton-keep` measures only those arms — everything else is skipped in
+    // BOTH phases, so the other structures' working sets never pass through the cache.
+    //
+    // That is the decisive experiment for the open question in docs/MEASURING.md § 8d: the kept
+    // grid culls 1.09-1.17x faster than the rebuilt one here, six explanations are refuted, and
+    // the only surviving lead is that the gap comes from interacting with the rest of the frame.
+    // If it vanishes with just those two arms running, the lead is confirmed; if it survives,
+    // the lead dies too. **Run it on an idle machine** — this repo has spent a night learning
+    // that a busy desktop swings an untouched op by 57 points.
+    let arms_on = arms_on();
+
     let mut mt: [Series; 9] = std::array::from_fn(|_| Series::new());
     let mut cl: [Series; 9] = std::array::from_fn(|_| Series::new());
     let mut blackhole = 0usize;
@@ -180,56 +191,58 @@ fn measure(cfg: &Cfg) -> ([f64; 9], [f64; 9], bool) {
         let measuring = frame >= cfg.warmup;
 
         // --- maintain (persistent update vs full rebuild), timed each ---
-        // binary, predicate update (the O(item_limit) leaf scan):
-        let t = Instant::now();
-        for id in 0..cfg.pop { let cid = id as u32; tree.update(old_pos[id], |c| c.id == cid, |c| c.p = pos[id]); }
-        if measuring { mt[0].push(us(t)); }
+        //
+        // The arms rotate here too, for the reason in docs/MEASURING.md § 8d. The maintain
+        // column is far less exposed than the cull column — each maintain is a large block of
+        // work that dominates whatever ran before it — but "less exposed" is not "immune", and
+        // leaving one column controlled and the other not is a difference nobody would remember
+        // when reading the table a month later.
+        //
+        // The per-frame REBUILT structures have to be hoisted out of the rotation, because a
+        // `match` arm cannot introduce a binding the cull phase can see. `None` means the arm is
+        // switched off (see `D3_ARMS`), and its cull is skipped too, so these are never unwrapped
+        // empty.
+        let mut morton_o: Option<MortonGrid3<C3>> = None;
+        let mut linear_o: Option<LinearOctree3<C3>> = None;
+        let mut kd_o: Option<KdTree3<C3>> = None;
+        let mut proj_o: Option<Tree<P2>> = None;
 
-        // binary, stable-handle update (O(1), no scan) — timed right after the
-        // predicate one so both read `pos` under the same cache conditions:
-        let t = Instant::now();
-        for id in 0..cfg.pop { tree_h.update_ref(refs[id], |c| c.p = pos[id]); }
-        if measuring { mt[4].push(us(t)); }
-
-        let t = Instant::now();
-        for id in 0..cfg.pop { let cid = id as u32; octree.update(old_pos[id], |c| c.id == cid, |c| c.p = pos[id]); }
-        if measuring { mt[1].push(us(t)); }
-
-        let t = Instant::now();
-        let mut morton = MortonGrid3::<C3>::new(world, levels);
-        for id in 0..cfg.pop { morton.insert(C3 { id: id as u32, p: pos[id] }); }
-        if measuring { mt[2].push(us(t)); }
-
-        // the same grid, KEPT: told where the item was, it re-buckets only the ones that
-        // actually crossed a cell boundary. No handle layer — a grid has no `ItemRef` — so it
-        // pays a predicate scan of the one cell, which is what makes this a real contest
-        // rather than a foregone one.
-        let t = Instant::now();
-        for id in 0..cfg.pop { let cid = id as u32; morton_k.update(old_pos[id], |c| c.id == cid, |c| c.p = pos[id]); }
-        if measuring { mt[7].push(us(t)); }
-
-        // and the linear octree kept, which additionally has to merge leaves back up as the
-        // cloud thins — keeping an ADAPTIVE structure drifts its shape, keeping a flat one
-        // cannot.
-        let t = Instant::now();
-        for id in 0..cfg.pop { let cid = id as u32; linear_k.update(old_pos[id], |c| c.id == cid, |c| c.p = pos[id]); }
-        if measuring { mt[8].push(us(t)); }
-
-        // linear octree: adaptive, pointer-free, rebuilt each frame (its "maintain"
-        // is a full build, like morton/projection — no in-place handle path).
-        let t = Instant::now();
-        let linear = LinearOctree3::<C3>::from_items(world, cfg.item_limit, 12, (0..cfg.pop).map(|id| C3 { id: id as u32, p: pos[id] }).collect());
-        if measuring { mt[5].push(us(t)); }
-
-        // k-d tree: median split, also rebuilt each frame (static structure).
-        let t = Instant::now();
-        let kd = KdTree3::<C3>::from_items(cfg.item_limit, (0..cfg.pop).map(|id| C3 { id: id as u32, p: pos[id] }).collect());
-        if measuring { mt[6].push(us(t)); }
-
-        let t = Instant::now();
-        let mut proj = Tree::<P2>::new(rect, cfg.item_limit);
-        for id in 0..cfg.pop { let p = pos[id]; proj.insert(P2 { id: id as u32, p: Point::new(p.x, p.y), z: p.z }); }
-        if measuring { mt[3].push(us(t)); }
+        for step in 0..9usize {
+            let k = (step + frame) % 9;
+            if !arms_on[k] { continue; }
+            let t = Instant::now();
+            match k {
+                // binary, predicate update (the O(item_limit) leaf scan)
+                0 => for id in 0..cfg.pop { let cid = id as u32; tree.update(old_pos[id], |c| c.id == cid, |c| c.p = pos[id]); },
+                1 => for id in 0..cfg.pop { let cid = id as u32; octree.update(old_pos[id], |c| c.id == cid, |c| c.p = pos[id]); },
+                // binary, stable-handle update (O(1), no predicate scan) — the arm that flips
+                // the maintain winner; see THREE_D.md § "The fix: Stable ItemRef".
+                4 => for id in 0..cfg.pop { tree_h.update_ref(refs[id], |c| c.p = pos[id]); },
+                // the same grid, KEPT: told where the item was, it re-buckets only the ones that
+                // actually crossed a cell boundary. No handle layer — a grid has no `ItemRef` —
+                // so it pays a predicate scan of the one cell, which is what makes this a real
+                // contest rather than a foregone one.
+                7 => for id in 0..cfg.pop { let cid = id as u32; morton_k.update(old_pos[id], |c| c.id == cid, |c| c.p = pos[id]); },
+                // the linear octree kept, which additionally merges leaves back up as the cloud
+                // thins — keeping an ADAPTIVE structure drifts its shape, a flat one cannot.
+                8 => for id in 0..cfg.pop { let cid = id as u32; linear_k.update(old_pos[id], |c| c.id == cid, |c| c.p = pos[id]); },
+                2 => {
+                    let mut g = MortonGrid3::<C3>::new(world, levels);
+                    for id in 0..cfg.pop { g.insert(C3 { id: id as u32, p: pos[id] }); }
+                    morton_o = Some(g);
+                }
+                5 => linear_o = Some(LinearOctree3::<C3>::from_items(world, cfg.item_limit, 12,
+                        (0..cfg.pop).map(|id| C3 { id: id as u32, p: pos[id] }).collect())),
+                6 => kd_o = Some(KdTree3::<C3>::from_items(cfg.item_limit,
+                        (0..cfg.pop).map(|id| C3 { id: id as u32, p: pos[id] }).collect())),
+                _ => {
+                    let mut t2 = Tree::<P2>::new(rect, cfg.item_limit);
+                    for id in 0..cfg.pop { let p = pos[id]; t2.insert(P2 { id: id as u32, p: Point::new(p.x, p.y), z: p.z }); }
+                    proj_o = Some(t2);
+                }
+            }
+            if measuring { mt[k].push(us(t)); }
+        }
 
         // --- cull (same sampled ids for every arm), timed each ---
         //
@@ -246,21 +259,22 @@ fn measure(cfg: &Cfg) -> ([f64; 9], [f64; 9], bool) {
 
         for step in 0..9usize {
             let k = (step + frame) % 9;
+            if !arms_on[k] { continue; }
             let t = Instant::now();
             match k {
                 0 => for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(tree.cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); },
                 1 => for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(octree.cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); },
-                2 => for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(morton.cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); },
+                2 => for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(morton_o.as_ref().expect("arm on").cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); },
                 4 => for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(tree_h.cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); },
-                5 => for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(linear.cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); },
-                6 => for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(kd.cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); },
+                5 => for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(linear_o.as_ref().expect("arm on").cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); },
+                6 => for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(kd_o.as_ref().expect("arm on").cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); },
                 7 => for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(morton_k.cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); },
                 8 => for &id in &ids { let c = pos[id]; blackhole = blackhole.wrapping_add(linear_k.cull(&Sphere3::new(c.x, c.y, c.z, cfg.vision)).len()); },
                 // the projection tree is the odd one: a disc cull, then an exact 3D narrowphase
                 // on the candidates, because a 2D index cannot answer a 3D question by itself.
                 _ => for &id in &ids {
                     let c = pos[id];
-                    let cand = proj.cull(&Disc { cx: c.x, cy: c.y, r: cfg.vision });
+                    let cand = proj_o.as_ref().expect("arm on").cull(&Disc { cx: c.x, cy: c.y, r: cfg.vision });
                     let mut hits = 0usize;
                     for p2 in &cand {
                         let dz = p2.z - c.z;
@@ -277,34 +291,42 @@ fn measure(cfg: &Cfg) -> ([f64; 9], [f64; 9], bool) {
 
         // A kept structure can lose an item and still answer plausibly on one sampled sphere,
         // so check the POPULATIONS agree too — the single-sphere gate below cannot see a
-        // shortfall that happens to fall outside it, and a grid holding fewer points would cull
-        // faster for a reason that has nothing to do with keeping.
-        if measuring {
-            assert_eq!(morton_k.item_count(), morton.item_count(),
-                "kept grid holds {} items, rebuilt holds {}", morton_k.item_count(), morton.item_count());
+        // shortfall that falls outside it, and a grid holding fewer points would cull faster for
+        // a reason that has nothing to do with keeping.
+        if measuring && arms_on[2] && arms_on[7] {
+            let rebuilt = morton_o.as_ref().expect("arm on").item_count();
+            assert_eq!(morton_k.item_count(), rebuilt,
+                "kept grid holds {} items, rebuilt holds {rebuilt}", morton_k.item_count());
         }
 
-        // Light agreement gate (untimed): all structures return the same id set
-        // for the first sampled sphere — including the handle-maintained tree.
+        // Light agreement gate (untimed): every arm that RAN returns the same id set for the
+        // first sampled sphere. Only the arms that ran — a skipped structure is stale by
+        // construction, and asserting on it would turn `D3_ARMS` into a way to fail the gate
+        // rather than a way to isolate an arm.
+        //
+        // The kept pair matter most here: a rebuilt structure cannot drift, but one maintained
+        // in place for thousands of frames can lose an item and still answer plausibly.
         if measuring && !ids.is_empty() {
             let c = pos[ids[0]];
             let s = Sphere3::new(c.x, c.y, c.z, cfg.vision);
-            let mut a0: Vec<u32> = tree.cull(&s).iter().map(|x| x.id).collect();
-            let mut a1: Vec<u32> = octree.cull(&s).iter().map(|x| x.id).collect();
-            let mut a2: Vec<u32> = morton.cull(&s).iter().map(|x| x.id).collect();
-            let mut a3: Vec<u32> = proj.cull(&Disc { cx: c.x, cy: c.y, r: cfg.vision }).iter()
-                .filter(|p2| { let dz = p2.z - c.z; let dx = p2.p.x - c.x; let dy = p2.p.y - c.y; dx * dx + dy * dy + dz * dz <= cfg.vision * cfg.vision })
-                .map(|p2| p2.id).collect();
-            let mut a4: Vec<u32> = tree_h.cull(&s).iter().map(|x| x.id).collect();
-            let mut a5: Vec<u32> = linear.cull(&s).iter().map(|x| x.id).collect();
-            let mut a6: Vec<u32> = kd.cull(&s).iter().map(|x| x.id).collect();
-            // The kept pair matter MOST here: a rebuilt structure cannot drift, but one
-            // maintained in place for thousands of frames can lose an item and still answer
-            // plausibly. This is the gate that would catch it.
-            let mut a7: Vec<u32> = morton_k.cull(&s).iter().map(|x| x.id).collect();
-            let mut a8: Vec<u32> = linear_k.cull(&s).iter().map(|x| x.id).collect();
-            a0.sort_unstable(); a1.sort_unstable(); a2.sort_unstable(); a3.sort_unstable(); a4.sort_unstable(); a5.sort_unstable(); a6.sort_unstable(); a7.sort_unstable(); a8.sort_unstable();
-            if a1 != a0 || a2 != a0 || a3 != a0 || a4 != a0 || a5 != a0 || a6 != a0 || a7 != a0 || a8 != a0 { agree = false; }
+            let mut answers: Vec<(usize, Vec<u32>)> = Vec::new();
+            let mut take = |k: usize, mut v: Vec<u32>| { v.sort_unstable(); answers.push((k, v)); };
+            if arms_on[0] { take(0, tree.cull(&s).iter().map(|x| x.id).collect()); }
+            if arms_on[1] { take(1, octree.cull(&s).iter().map(|x| x.id).collect()); }
+            if arms_on[2] { take(2, morton_o.as_ref().expect("arm on").cull(&s).iter().map(|x| x.id).collect()); }
+            if arms_on[3] {
+                take(3, proj_o.as_ref().expect("arm on").cull(&Disc { cx: c.x, cy: c.y, r: cfg.vision }).iter()
+                    .filter(|p2| { let dz = p2.z - c.z; let dx = p2.p.x - c.x; let dy = p2.p.y - c.y; dx * dx + dy * dy + dz * dz <= cfg.vision * cfg.vision })
+                    .map(|p2| p2.id).collect());
+            }
+            if arms_on[4] { take(4, tree_h.cull(&s).iter().map(|x| x.id).collect()); }
+            if arms_on[5] { take(5, linear_o.as_ref().expect("arm on").cull(&s).iter().map(|x| x.id).collect()); }
+            if arms_on[6] { take(6, kd_o.as_ref().expect("arm on").cull(&s).iter().map(|x| x.id).collect()); }
+            if arms_on[7] { take(7, morton_k.cull(&s).iter().map(|x| x.id).collect()); }
+            if arms_on[8] { take(8, linear_k.cull(&s).iter().map(|x| x.id).collect()); }
+            if let Some((_, first)) = answers.first() {
+                if answers.iter().any(|(_, v)| v != first) { agree = false; }
+            }
         }
     }
     if blackhole == usize::MAX { println!("unreachable"); }
@@ -314,6 +336,38 @@ fn measure(cfg: &Cfg) -> ([f64; 9], [f64; 9], bool) {
 }
 
 /// (winner index, margin = 2nd-best / best) for a 4-vector to minimise.
+/// Which arms to run, from `$D3_ARMS`. Read by both the measurement and the report, so a
+/// skipped arm cannot appear in one and not the other.
+fn arms_on() -> [bool; 9] {
+    match std::env::var("D3_ARMS") {
+        Err(_) => [true; 9],
+        Ok(list) => {
+            let mut on = [false; 9];
+            for want in list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                match NAMES.iter().position(|n| *n == want) {
+                    Some(i) => on[i] = true,
+                    None => panic!("D3_ARMS: unknown arm {want:?}; known: {}", NAMES.join(", ")),
+                }
+            }
+            assert!(on.iter().any(|b| *b), "D3_ARMS selected no arms");
+            on
+        }
+    }
+}
+
+/// Fastest arm and its margin over the runner-up, **among the arms that ran**. A skipped arm
+/// reads 0.0, and 0.0 wins every comparison — reporting it would name a structure that was
+/// never measured as the winner, which is worse than reporting nothing.
+fn winner_of(v: &[f64], on: &[bool; 9]) -> Option<(usize, f64)> {
+    let mut order: Vec<usize> = (0..v.len()).filter(|&k| on[k]).collect();
+    if order.is_empty() { return None; }
+    order.sort_by(|&a, &b| v[a].partial_cmp(&v[b]).unwrap());
+    let w = order[0];
+    let margin = match order.get(1) { Some(&second) if v[w] > 0.0 => v[second] / v[w], _ => f64::NAN };
+    Some((w, margin))
+}
+
+#[allow(dead_code)]
 fn winner(v: &[f64]) -> (usize, f64) {
     let mut order: Vec<usize> = (0..v.len()).collect();
     order.sort_by(|&a, &b| v[a].partial_cmp(&v[b]).unwrap());
@@ -340,19 +394,33 @@ fn main() {
         cfg.world, cfg.pop, cfg.item_limit, cfg.vision, cfg.speed, cfg.n_cull, cfg.frames, cfg.warmup, cfg.seed);
     let (maintain, cull, agree) = measure(&cfg);
     println!("\n{:<12} {:>16} {:>14} {:>20}", "structure", "maintain us/frame", "cull us/cull", "per-frame total us");
+    let on = arms_on();
     for k in 0..9 {
+        // A skipped arm gets no row. Printing 0.0 invites exactly the misreading the filter
+        // exists to avoid: a structure that never ran, looking infinitely fast.
+        if !on[k] { continue; }
         let total = maintain[k] + cfg.n_cull as f64 * cull[k];
         println!("{:<14} {:>16.1} {:>14.3} {:>20.1}", NAMES[k], maintain[k], cull[k], total);
     }
+    if on.iter().any(|b| !b) {
+        println!("\n({} of 9 arms ran — $D3_ARMS. The rest were skipped in BOTH phases, so their",
+            on.iter().filter(|b| **b).count());
+        println!("working sets never passed through the cache. That is the point of the flag.)");
+    }
     let total: [f64; 9] = std::array::from_fn(|k| maintain[k] + cfg.n_cull as f64 * cull[k]);
-    let (wm, mm) = winner(&maintain);
-    let (wc, mc) = winner(&cull);
-    let (wt, mt) = winner(&total);
-    println!("\nwinner — maintain: {} ({:.2}× over 2nd) | cull: {} ({:.2}×) | total@{}culls: {} ({:.2}×)",
-        NAMES[wm], mm, NAMES[wc], mc, cfg.n_cull, NAMES[wt], mt);
-    // binary predicate vs handle, the Stable-ItemRef headline:
-    println!("maintain: binary(predicate) {:.1}us  ->  binary(ItemRef) {:.1}us  =  {:.2}× faster",
-        maintain[0], maintain[4], maintain[0] / maintain[4].max(1e-9));
+    let show = |label: String, v: &[f64]| match winner_of(v, &on) {
+        Some((w, m)) if m.is_finite() => format!("{label}: {} ({m:.2}x)", NAMES[w]),
+        Some((w, _)) => format!("{label}: {} (only arm)", NAMES[w]),
+        None => format!("{label}: -"),
+    };
+    println!("\nwinner — {} | {} | {}",
+        show("maintain".into(), &maintain), show("cull".into(), &cull),
+        show(format!("total@{}culls", cfg.n_cull), &total));
+    // binary predicate vs handle, the Stable-ItemRef headline — only if both arms ran.
+    if on[0] && on[4] {
+        println!("maintain: binary(predicate) {:.1}us  ->  binary(ItemRef) {:.1}us  =  {:.2}× faster",
+            maintain[0], maintain[4], maintain[0] / maintain[4].max(1e-9));
+    }
     println!("cull agreement: all structures {}", if agree { "EXACT (identical id sets)" } else { "DISAGREE <-- BUG" });
 }
 

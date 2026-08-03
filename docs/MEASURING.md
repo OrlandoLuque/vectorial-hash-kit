@@ -207,6 +207,21 @@ But the magnitude falls short of the map's 1.09–1.17×, and **the run-to-run s
 the effect**. That is a lead, not a mechanism, and calling it the answer would be the third time
 in one day this was closed early.
 
+**The decisive version of that test now exists**: `$D3_ARMS=morton,morton-keep` runs the decision
+map with only those two arms, skipping the other seven in *both* phases so their working sets
+never touch the cache. It is the real experiment rather than a scratch-buffer stand-in. Preliminary,
+on a machine that was **in use**, three runs each:
+
+| | run 1 | run 2 | run 3 |
+| --- | ---: | ---: | ---: |
+| two arms alone | 1.00× | 1.01× | **1.19×** |
+| all nine arms | 1.14× | 1.14× | 1.21× |
+
+Company is consistent (never below 1.14×) and isolation is usually ~1.00× — but that third
+isolated run is 1.19×, which is the whole effect with no company at all. So this supports company
+as a *contributor* and refutes it as the *explanation*, and neither conclusion is safe from a busy
+desktop. **Re-run it idle.** The flag is the tool; the answer is not in yet.
+
 So the gap does not reproduce outside the interleaved loop, and inside it survives the fix for
 the one cause that looked likely. **It is recorded as unexplained.** Not "an artifact", which is
 what an earlier version of this section said — that claim rested entirely on the swap
