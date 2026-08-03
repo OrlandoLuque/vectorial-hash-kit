@@ -119,34 +119,45 @@ fn measure(cfg: &Cfg) -> ([f64; NAMES.len()], [f64; NAMES.len()], bool) {
         }
         let measuring = frame >= cfg.warmup;
 
-        // maintain: binary (update_ref), quad (update_ref), morton (rebuild).
-        let t = Instant::now();
-        for id in 0..cfg.pop { tree.update_ref(tr[id], |c| c.p = pos[id]); }
-        if measuring { mt[0].push(us(t)); }
-
-        let t = Instant::now();
-        for id in 0..cfg.pop { quad.update_ref(qr[id], |c| c.p = pos[id]); }
-        if measuring { mt[1].push(us(t)); }
-
-        let t = Instant::now();
-        let mut morton = MortonGrid::<C2>::new(rect, levels);
-        for id in 0..cfg.pop { morton.insert(C2 { id: id as u32, p: pos[id] }); }
-        if measuring { mt[2].push(us(t)); }
-
-        // The same grid, kept instead of rebuilt. An item that has not left its cell costs
-        // nothing at all here; one that has costs a swap_remove and a push.
-        let t = Instant::now();
-        for id in 0..cfg.pop {
-            let idu = id as u32;
-            mkeep.update(prev[id], |c| c.id == idu, |c| c.p = pos[id]);
+        // maintain: binary (update_ref), quad (update_ref), morton (rebuild), kept grid,
+        // rebuilt k-d tree.
+        //
+        // **The arms rotate here too.** The maintain column is far less exposed than the cull
+        // column — each maintain is a large block of work that dominates whatever ran before it
+        // — but "less exposed" is not "immune", and leaving one column controlled and the other
+        // not is a distinction nobody would remember when reading the table later. The 3D map
+        // does the same; these two get read against each other.
+        //
+        // The two REBUILT structures are hoisted out of the rotation because a `match` arm
+        // cannot introduce a binding the cull phase can see.
+        let mut morton_o: Option<MortonGrid<C2>> = None;
+        let mut kd_o: Option<KdTree2<C2>> = None;
+        for step in 0..5usize {
+            let k = (step + frame) % 5;
+            let t = Instant::now();
+            match k {
+                0 => for id in 0..cfg.pop { tree.update_ref(tr[id], |c| c.p = pos[id]); },
+                1 => for id in 0..cfg.pop { quad.update_ref(qr[id], |c| c.p = pos[id]); },
+                2 => {
+                    let mut g = MortonGrid::<C2>::new(rect, levels);
+                    for id in 0..cfg.pop { g.insert(C2 { id: id as u32, p: pos[id] }); }
+                    morton_o = Some(g);
+                }
+                // The same grid, KEPT instead of rebuilt. An item that has not left its cell
+                // costs nothing here; one that has costs a swap_remove and a push.
+                4 => for id in 0..cfg.pop {
+                    let idu = id as u32;
+                    mkeep.update(prev[id], |c| c.id == idu, |c| c.p = pos[id]);
+                },
+                // KdTree2 has no maintain surface at all: it is build-once, so on moving data
+                // its "maintain" is a full rebuild — which is exactly what this row answers.
+                _ => kd_o = Some(KdTree2::from_items(cfg.item_limit,
+                        (0..cfg.pop).map(|id| C2 { id: id as u32, p: pos[id] }).collect())),
+            }
+            if measuring { mt[k].push(us(t)); }
         }
-        if measuring { mt[4].push(us(t)); }
-
-        // KdTree2 has no maintain surface at all: it is build-once, so on moving data its
-        // "maintain" is a full rebuild — which is exactly the question this row answers.
-        let t = Instant::now();
-        let kd = KdTree2::from_items(cfg.item_limit, (0..cfg.pop).map(|id| C2 { id: id as u32, p: pos[id] }).collect());
-        if measuring { mt[3].push(us(t)); }
+        let morton = morton_o.expect("morton arm always runs");
+        let kd = kd_o.expect("kd arm always runs");
 
         // cull: the same sampled disc centres for every arm.
         //
