@@ -31,7 +31,7 @@
       { label: 'Pause', code: 'KeyP', key: 'p', keyCode: 80, cycle: [{ name: 'running' }, { name: 'paused' }] },
       { label: 'Reset', code: 'KeyR', key: 'r', keyCode: 82 },
       { label: 'Gravity', code: 'KeyG', key: 'g', keyCode: 71, cycle: [{ name: 'down' }, { name: 'up' }] },
-      { group: 'step', label: 'Drops −', code: 'BracketLeft', key: '[', keyCode: 219, cost: 0.15 },
+      { slider: { steps: 29, start: 5, fmt: i => (200 + i*400) }, group: 'step', label: 'Drops −', code: 'BracketLeft', key: '[', keyCode: 219, cost: 0.15 },
       { group: 'step', label: 'Drops +', code: 'BracketRight', key: ']', keyCode: 221, cost: 0.85 },
     ];
     const msg = document.getElementById('msg');

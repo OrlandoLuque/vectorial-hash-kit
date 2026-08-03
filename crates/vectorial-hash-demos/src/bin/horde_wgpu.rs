@@ -1266,16 +1266,48 @@ impl State {
             acc / (2 * w + 1) as f32
         }).collect();
         let tower_at = |i: usize| self.sim.structures[i].kind == SKind::Tower;
-        let shadowed_by_tower = |i: usize| ring_n > 2 && i < ring_n
-            && self.sim.structures[i].kind == SKind::Wall
-            && (tower_at((i + 1) % ring_n) || tower_at((i + ring_n - 1) % ring_n));
+        // Where a wall meets a tower.
+        //
+        // This has now been wrong in both directions. The walls either side of a tower used to
+        // be SKIPPED entirely, leaving a whole empty 8-wu slot on each side — the tower is only
+        // ~5.4 wu wide, so it cannot fill one, and the rampart visibly broke at every tower.
+        // The fix before that overcorrected and jammed them together.
+        //
+        // The rule now is the user's, and it is stated in the tower's own footprint rather than
+        // in absolute world units, so it survives a change to either model's scale: measuring
+        // across the tower from 0 to 1, one wall starts at **1/4** and the other at **3/4**.
+        // Each adjacent wall therefore overlaps a quarter of the tower from its own side, and
+        // the rampart reads continuous through it.
+        const TOWER_ANCHOR: f32 = 0.25;      // where the wall meets, across the tower (0..1 from its edge)
+        const TOWER_ASPECT: f32 = 0.6;       // tall/narrow — width = scale * aspect
+        const WALL_CORE: f32 = 8.0;          // solid span of a wall piece (the model is ~2x this, half decorative)
+        let tower_w = building_tweak(SKind::Tower).0 * TOWER_ASPECT;
+        // distance from the tower's CENTRE to the adjacent wall's centre
+        let wall_anchor_d = tower_w * (0.5 - TOWER_ANCHOR) + WALL_CORE * 0.5;
+        // A wall next to a tower is drawn at that anchor instead of at its own slot; `side` is
+        // +1 when the tower sits behind it in ring order and -1 when it sits ahead.
+        let tower_side = |i: usize| -> Option<(usize, f32)> {
+            if ring_n <= 2 || i >= ring_n || self.sim.structures[i].kind != SKind::Wall { return None; }
+            let (next, prev) = ((i + 1) % ring_n, (i + ring_n - 1) % ring_n);
+            if tower_at(next) { Some((next, -1.0)) } else if tower_at(prev) { Some((prev, 1.0)) } else { None }
+        };
         for (bi, kind) in [SKind::Wall, SKind::Gate, SKind::Tower, SKind::House, SKind::Storehouse].into_iter().enumerate() {
             let start = building_inst.len() as u32;
             let (sc, yaw, yo) = building_tweak(kind);
             for (si, s) in self.sim.structures.iter().enumerate() {
                 if s.kind != kind { continue; }
-                if shadowed_by_tower(si) { continue; }
-                let (x, mut y, zz) = (s.p.x as f32, s.p.y as f32, s.p.z as f32);
+                let (mut x, mut y, mut zz) = (s.p.x as f32, s.p.y as f32, s.p.z as f32);
+                // Slide a tower-adjacent wall along the ring tangent to its anchor. The tangent
+                // is perpendicular to the radius, so this moves it around the ring rather than
+                // in or out of it — a wall nudged radially would leave the rampart's line.
+                if let Some((ti, side)) = tower_side(si) {
+                    let t = &self.sim.structures[ti];
+                    let (tx, tz) = (t.p.x as f32, t.p.z as f32);
+                    let ta = (tz - ccz).atan2(tx - ccx);
+                    let (tanx, tanz) = (-ta.sin(), ta.cos());
+                    x = tx + tanx * side * wall_anchor_d;
+                    zz = tz + tanz * side * wall_anchor_d;
+                }
                 if si < ring_n { y = ring_y[si]; } // levelled course (see ring_y)
                 let frac = (s.hp / s.kind.max_hp()).clamp(0.0, 1.0) as f32;
                 let ang = (zz - ccz).atan2(x - ccx);

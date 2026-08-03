@@ -43,8 +43,12 @@ export function setupMobileControls(cfg) {
     /* A - / + pair is one grid item, so the auto-fill grid can never put the minus at the end
        of a row and the plus at the start of the next — which it did, and which is unusable on
        a phone where you are alternating between them by feel. */
-    .mc-pair { grid-column: span 2; display: flex; gap: 9px; }
-    .mc-pair > .mc-btn { flex: 1 1 0; min-width: 0; }
+    .mc-pair { grid-column: span 2; display: flex; flex-direction: column; gap: 7px; }
+    .mc-pair-row { display: flex; gap: 9px; }
+    .mc-pair-row > .mc-btn { flex: 1 1 0; min-width: 0; }
+    .mc-slider { display: flex; align-items: center; gap: 8px; padding: 2px 4px 0; }
+    .mc-slider input { flex: 1 1 auto; min-width: 0; accent-color: #6ea8ff; height: 26px; }
+    .mc-slider .mc-val { color: #cfe0ff; font: 700 11px ui-monospace, monospace; min-width: 44px; text-align: right; }
     @keyframes mc-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
     #mc-title { grid-column: 1/-1; margin: 1px 3px 3px; color: #93a3c8; font: 700 11px system-ui, sans-serif;
       letter-spacing: 1.1px; text-transform: uppercase; }
@@ -97,8 +101,56 @@ export function setupMobileControls(cfg) {
   };
   const vibe = () => { try { navigator.vibrate && navigator.vibrate(8); } catch (e) {} };
 
-  // Consecutive entries sharing a `group` become one unbreakable pair.
+  // Consecutive entries sharing a `group` become one unbreakable pair, optionally with a
+  // slider above them.
+  //
+  // A slider here can only do what the rest of this overlay does: **press keys**. It has no way
+  // to set a value, and no way to read one — the demo owns the number and never tells the page.
+  // So a slider tracks its own position and sends the difference as that many presses, which is
+  // honest as long as two things hold:
+  //
+  //   1. the range is only a couple of dozen presses wide (the horde steps 4 000 at a time from
+  //      2k to 100k, so 25 — fine; the 2D critters step FIVE against a 40 000 cap, which would
+  //      be 8 000 events, so that one deliberately has no slider), and
+  //   2. **the presses are spaced by a frame.** The demos read input with edge detection once
+  //      per frame, so two keydowns inside one frame are seen as one press and the slider would
+  //      silently under-shoot. This is a correctness constraint, not politeness.
+  //
+  // If you also use the keyboard, the slider's idea of where it is will drift from the demo's.
+  // That is a real limitation of driving an app you cannot query, and the readout says "step"
+  // rather than pretending to know the population.
   const groups = new Map();
+
+  function buildSlider(g) {
+    const c = g.cfg;
+    const row = document.createElement('div'); row.className = 'mc-slider';
+    const inp = document.createElement('input');
+    inp.type = 'range'; inp.min = '0'; inp.max = String(c.steps); inp.step = '1';
+    inp.value = String(c.start != null ? c.start : 0);
+    const val = document.createElement('span'); val.className = 'mc-val';
+    const show = (i) => { val.textContent = c.fmt ? c.fmt(Number(i)) : `${i}/${c.steps}`; };
+    show(inp.value);
+    row.appendChild(inp); row.appendChild(val);
+    g.insertBefore(row, g.row);
+
+    // One press per animation frame. Anything faster is dropped by the demo's edge detection.
+    let at = Number(inp.value), queue = 0, pumping = false;
+    const pump = () => {
+      if (!queue) { pumping = false; return; }
+      const k = queue > 0 ? g.inc : g.dec;
+      queue += queue > 0 ? -1 : 1;
+      send('keydown', k); send('keyup', k);
+      requestAnimationFrame(pump);
+    };
+    inp.addEventListener('input', () => {
+      const want = Number(inp.value);
+      show(want);
+      queue += want - at; at = want;
+      if (!pumping) { pumping = true; requestAnimationFrame(pump); }
+    });
+    return true;
+  }
+
   for (const k of cfg.keys) {
     const b = document.createElement('button');
     b.className = 'mc-btn';
@@ -164,8 +216,15 @@ export function setupMobileControls(cfg) {
     b.addEventListener('mouseleave', release);
     if (k.group) {
       let g = groups.get(k.group);
-      if (!g) { g = document.createElement('div'); g.className = 'mc-pair'; groups.set(k.group, g); panel.appendChild(g); }
-      g.appendChild(b);
+      if (!g) {
+        g = document.createElement('div'); g.className = 'mc-pair';
+        g.row = document.createElement('div'); g.row.className = 'mc-pair-row';
+        groups.set(k.group, g); panel.appendChild(g);
+        g.appendChild(g.row);
+      }
+      g.row.appendChild(b);
+      if (k.slider) { g.dec = k; g.cfg = k.slider; } else if (g.cfg) { g.inc = k; }
+      if (g.dec && g.inc && !g.slid) { g.slid = buildSlider(g); }
     } else {
       panel.appendChild(b);
     }

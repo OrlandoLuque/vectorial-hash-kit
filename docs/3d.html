@@ -64,6 +64,9 @@
 <script>load("critters3d.wasm");</script>
 <script type="module">
   import { setupMobileControls } from './mobile-controls.js';
+  // No slider on this one, and that is not an oversight: its +/- SPAWN WHILE HELD (a rate,
+  // driven by dt), not a fixed step per press. A slider counts presses, so there is nothing
+  // here for it to count — hold-to-repeat on the buttons is already the right control.
   setupMobileControls({ title: 'Critters 3D', keys: [
     { label: 'Index', code: 'KeyM', key: 'm', keyCode: 77, cycle: [{ name: 'Tree3', cost: 0.45 }, { name: 'Octree3', cost: 0.5 }, { name: 'Morton', cost: 0.3 }, { name: 'Projection', cost: 0.35 }] },
     { label: 'Render', code: 'KeyG', key: 'g', keyCode: 71, cycle: [{ name: 'spheres', cost: 0.8 }, { name: 'billboards', cost: 0.5 }, { name: 'sq bill', cost: 0.35 }, { name: 'no render', cost: 0.1 }] },

@@ -78,7 +78,7 @@
   setupMobileControls({ title: 'Critters 2D', keys: [
     { label: 'Pause', code: 'Space', key: ' ', keyCode: 32, cycle: [{ name: 'running' }, { name: 'paused' }] },
     { label: 'Index', sub: 'mode', code: 'KeyM', key: 'm', keyCode: 77 },
-    { group: 'count', label: 'Critters −', sub: '5 each', code: 'Minus', key: '-', keyCode: 189, cost: 0.2 },
+    { slider: { steps: 110, start: 12 }, group: 'count', label: 'Critters −', sub: '5 each', code: 'Minus', key: '-', keyCode: 189, cost: 0.2 },
     { group: 'count', label: 'Critters +', sub: '5 each', code: 'Equal', key: '=', keyCode: 187, cost: 0.8 },
     { group: 'step', label: 'Slower', code: 'BracketLeft', key: '[', keyCode: 219 },
     { group: 'step', label: 'Faster', code: 'BracketRight', key: ']', keyCode: 221 },

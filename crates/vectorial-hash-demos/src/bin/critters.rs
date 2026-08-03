@@ -407,8 +407,12 @@ async fn main() {
                 }
             }
         }
+        // Step PROPORTIONALLY (5 minimum, ~4% of the current crowd). A flat five was 8 000
+        // presses to fill a 40 000 cap — unusable by hand and impossible to drive from a
+        // slider, which is what the mobile overlay needs (user 2026-08-03).
+        let pop_step = (sim.sims.item_count() / 25).clamp(5, 500);
         if is_key_pressed(KeyCode::Equal) && sim.sims.item_count() < MAX_CRITTERS {
-            for _ in 0..5 {
+            for _ in 0..pop_step {
                 let pos = sim.random_pos();
                 sim.spawn_at(brush, pos, false);
                 match brush {
@@ -420,7 +424,7 @@ async fn main() {
         }
         if is_key_pressed(KeyCode::Minus) {
             let mut all = sim.sims.snapshot();
-            for _ in 0..5 {
+            for _ in 0..pop_step {
                 if all.is_empty() {
                     break;
                 }

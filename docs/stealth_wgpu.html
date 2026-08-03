@@ -31,7 +31,7 @@
       { label: 'Left', code: 'KeyA', key: 'a', keyCode: 65 },
       { label: 'Right', code: 'KeyD', key: 'd', keyCode: 68 },
       { label: 'Sight lines', code: 'KeyL', key: 'l', keyCode: 76, cycle: [{ name: 'off' }, { name: 'on' }] },
-      { group: 'step', label: 'Crowd −', code: 'BracketLeft', key: '[', keyCode: 219, cost: 0.15 },
+      { slider: { steps: 12, start: 2, fmt: i => { const n = 10 * Math.pow(2, i); return n >= 1000 ? (n/1000) + 'k' : n; } }, group: 'step', label: 'Crowd −', code: 'BracketLeft', key: '[', keyCode: 219, cost: 0.15 },
       { group: 'step', label: 'Crowd +', code: 'BracketRight', key: ']', keyCode: 221, cost: 0.85 },
       { label: 'Pause', code: 'KeyP', key: 'p', keyCode: 80 },
       { label: 'Restart', code: 'KeyR', key: 'r', keyCode: 82 },

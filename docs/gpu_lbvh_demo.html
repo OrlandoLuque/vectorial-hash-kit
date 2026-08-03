@@ -28,7 +28,7 @@
       { label: 'CPU Tree', sub: 'backend', code: 'Digit1', key: '1', keyCode: 49, cost: 0.45 },
       { label: 'GPU brute', sub: 'backend', code: 'Digit2', key: '2', keyCode: 50, cost: 0.7 },
       { label: 'GPU LBVH', sub: 'backend', code: 'Digit3', key: '3', keyCode: 51, cost: 0.2 },
-      { group: 'step', label: 'Count −', code: 'BracketLeft', key: '[', keyCode: 219, cost: 0.15 },
+      { slider: { steps: 16, start: 2, fmt: i => (5 + i*24) + 'k' }, group: 'step', label: 'Count −', code: 'BracketLeft', key: '[', keyCode: 219, cost: 0.15 },
       { group: 'step', label: 'Count +', code: 'BracketRight', key: ']', keyCode: 221, cost: 0.85 },
     ];
     const msg = document.getElementById('msg');

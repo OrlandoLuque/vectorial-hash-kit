@@ -31,7 +31,7 @@
       { label: 'k', code: 'KeyK', key: 'k', keyCode: 75,
         cycle: [{ name: '16', cost: 0.4 }, { name: '32', cost: 0.8 }, { name: '8', cost: 0.2 }] },
       { label: 'Colour', code: 'KeyC', key: 'c', keyCode: 67, cycle: [{ name: 'density' }, { name: 'height' }] },
-      { group: 'step', label: 'Points −', code: 'BracketLeft', key: '[', keyCode: 219, cost: 0.15 },
+      { slider: { steps: 10, start: 2, fmt: i => (20 + i*38) + 'k' }, group: 'step', label: 'Points −', code: 'BracketLeft', key: '[', keyCode: 219, cost: 0.15 },
       { group: 'step', label: 'Points +', code: 'BracketRight', key: ']', keyCode: 221, cost: 0.85 },
     ];
     const msg = document.getElementById('msg');

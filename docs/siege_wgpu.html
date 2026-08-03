@@ -28,7 +28,7 @@
       { label: 'Collide', code: 'KeyC', key: 'c', keyCode: 67, cycle: [{ name: 'on', cost: 0.6 }, { name: 'off', cost: 0.2 }] },
       { label: 'Frustum', code: 'KeyK', key: 'k', keyCode: 75, start: 1, cycle: [{ name: 'off', cost: 0.7 }, { name: 'on', cost: 0.25 }] },
       { label: 'Free-fly', code: 'KeyF', key: 'f', keyCode: 70, cycle: [{ name: 'orbit' }, { name: 'free' }] },
-      { group: 'step', label: 'Pop −', code: 'BracketLeft', key: '[', keyCode: 219, cost: 0.15 },
+      { slider: { steps: 99, start: 5, fmt: i => (20 + i*100) }, group: 'step', label: 'Pop −', code: 'BracketLeft', key: '[', keyCode: 219, cost: 0.15 },
       { group: 'step', label: 'Pop +', code: 'BracketRight', key: ']', keyCode: 221, cost: 0.85 },
     ];
     const msg = document.getElementById('msg');
