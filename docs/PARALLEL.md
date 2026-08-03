@@ -286,15 +286,25 @@ an id shift — so the parallel build produces a **node-for-node identical** tre
 what the test asserts (same node count, same leaf boxes and ranges, same depth, same cull
 and k-NN answers) rather than merely an equivalent one.
 
-200 000 points, 16 threads, min-of-5 inside the bench, **median of 3 passes** of it:
+200 000 points, 16 threads, min-of-5 inside the bench, **median of 3 passes** of it
+(`examples/kdtree3_bench`, `examples/linear_quadtree_bench`):
 
 | build | serial | parallel | speed-up |
 | --- | ---: | ---: | ---: |
-| `KdTree3` uniform | 20.13 ms | **6.03 ms** | **≈3.4×** |
-| `KdTree3` clustered | 20.57 ms | **6.02 ms** | **≈3.3×** |
-| `Tree3::bulk_load` uniform | 40.49 ms | 25.77 ms | 1.56× |
-| `Tree3::bulk_load` clustered | 55.86 ms | 29.98 ms | 1.86× |
-| `KdTree2` (2D, clustered) | 7.96 ms | **2.85 ms** | **2.79×** |
+| `KdTree3` uniform | 20.29 ms | **6.32 ms** | **≈3.1×** |
+| `KdTree3` clustered | 20.48 ms | **6.44 ms** | **≈3.5×** |
+| `Tree3::bulk_load` uniform | 57.41 ms | 31.94 ms | **2.01×** |
+| `Tree3::bulk_load` clustered | 77.22 ms | 38.80 ms | **2.17×** |
+| `KdTree2` (2D, clustered) | 8.38 ms | **3.01 ms** | **2.78×** |
+
+**Re-measured 2026-08-04, and the midpoint rows moved.** The earlier table had `Tree3` at 1.56×
+and 1.86×; both benches were timing `build(items.clone())`, i.e. charging every arm for a fresh
+allocation, memcpy and free of the input. That is not the neutral constant it looks like
+(MEASURING.md § 8g — the same mistake reported an `IntegerTree` speed-up of 2.65× as 0.85×), and
+the size of the distortion scales with how *cheap* the measured work is. So it barely touched the
+k-d rows, whose median selection dominates its own clone, and it was hiding a fifth of `Tree3`'s
+fan-out. The qualitative conclusion below survives — the median split still parallelises better —
+but the gap is ~1.6×, not the ~2.2× the old numbers implied.
 
 **The median split parallelises better than the midpoint split, and it's not an accident.**
 `rayon::join` is only as fast as its slower half, so a fan-out is worth what its *load

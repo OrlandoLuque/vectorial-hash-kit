@@ -162,10 +162,13 @@ struct World {
     seen_now: usize,
     // per-frame query costs (µs)
     cone_us: f32, los_us: f32, brute_us: f32, maint_us: f32,
+    /// Of `maint_us`, how much was the input COPY the rebuild path needs and the keep path does
+    /// not. Charging it silently to rebuild would flatter keeping; see `docs/MEASURING.md` § 8g.
+    maint_copy_us: f32,
     agree: bool, mismatch: (usize, usize), bad_frames: u32,
     // Running sums, because a single frame's reading is not a measurement: if the last
     // frame happens not to step, "the number" is 0. (It did, once, in a batch run.)
-    acc_cone: f64, acc_brute: f64, acc_los: f64, acc_seen: f64, acc_maint: f64, acc_frames: u32,
+    acc_cone: f64, acc_brute: f64, acc_los: f64, acc_seen: f64, acc_maint: f64, acc_copy: f64, acc_frames: u32,
 }
 
 impl World {
@@ -199,8 +202,8 @@ impl World {
         let refs = all.iter().map(|a| agents.insert_ref(*a).expect("agent starts inside the world box")).collect();
         World { crates, occ, occ_r, guards, civs, agents, refs, all,
             rebuild: std::env::var("STEALTH_REBUILD").ok().as_deref() == Some("1"),
-            player, goal: Vec3::new(WORLD - 60.0, 7.0, WORLD - 60.0), caught: 0.0, escaped: false, seen_now: 0, cone_us: 0.0, los_us: 0.0, brute_us: 0.0, maint_us: 0.0, agree: true, mismatch: (0, 0), bad_frames: 0,
-            acc_cone: 0.0, acc_brute: 0.0, acc_los: 0.0, acc_seen: 0.0, acc_maint: 0.0, acc_frames: 0 }
+            player, goal: Vec3::new(WORLD - 60.0, 7.0, WORLD - 60.0), caught: 0.0, escaped: false, seen_now: 0, cone_us: 0.0, los_us: 0.0, brute_us: 0.0, maint_us: 0.0, maint_copy_us: 0.0, agree: true, mismatch: (0, 0), bad_frames: 0,
+            acc_cone: 0.0, acc_brute: 0.0, acc_los: 0.0, acc_seen: 0.0, acc_maint: 0.0, acc_copy: 0.0, acc_frames: 0 }
     }
 
     /// The guard's view cone as a frustum: a near quad just in front of the eye and a
@@ -283,8 +286,17 @@ impl World {
         self.all[0].p = Point3::new(self.player.x as f64, self.player.y as f64, self.player.z as f64);
         for (i, (p, _)) in self.civs.iter().enumerate() { self.all[1 + i].p = Point3::new(p.x as f64, p.y as f64, p.z as f64); }
         if self.rebuild {
-            self.agents = Tree3::bulk_load(agents_world(), 8, self.all.clone());
+            // `bulk_load` takes ownership, so a rebuild needs an owned copy of the agent array
+            // that the keep path never makes. Timed separately rather than folded in: it is a
+            // real cost of THIS demo's layout, but it is not a cost of rebuilding in general
+            // (a design that stored agents only in the tree would not pay it), so the reader
+            // gets to see both figures instead of one that quietly favours keeping.
+            let t_c = Instant::now();
+            let copy = self.all.clone();
+            self.maint_copy_us = (Instant::now() - t_c).as_secs_f32() * 1e6;
+            self.agents = Tree3::bulk_load(agents_world(), 8, copy);
         } else {
+            self.maint_copy_us = 0.0;
             for i in 0..self.all.len() {
                 let p = self.all[i].p;
                 self.agents.update_ref(self.refs[i], |a| a.p = p);
@@ -338,6 +350,7 @@ impl World {
         self.acc_brute += self.brute_us as f64;
         self.acc_los += self.los_us as f64;
         self.acc_maint += self.maint_us as f64;
+        self.acc_copy += self.maint_copy_us as f64;
         self.acc_seen += self.seen_now as f64;
         self.acc_frames += 1;
 
@@ -378,11 +391,16 @@ fn headless(frames: u32) {
     }
     let n = w.acc_frames.max(1) as f64;
     let (cone, brute, los, maint) = (w.acc_cone / n, w.acc_brute / n, w.acc_los / n, w.acc_maint / n);
+    let copy = w.acc_copy / n;
     let total = cone + maint;
     println!("stealth headless | {} guards / {n_civs} crowd / {} crates | {} frames | means",
         w.guards.len(), w.crates.len(), w.acc_frames);
     println!("  index: maintain {maint:.1} us + cull {cone:.1} us = {total:.1} us   vs   scan {brute:.1} us   ({:.2}x)",
         brute / total.max(1e-9));
+    if copy > 0.0 {
+        println!("  of that maintain, {copy:.1} us ({:.0}%) is the owned COPY `bulk_load` needs and", 100.0 * copy / maint.max(1e-9));
+        println!("  the keep path never makes -- quoted separately so the comparison is not flattered.");
+    }
     println!("  exact LoS {los:.1} us | agree every frame: {}", w.bad_frames == 0);
     let tag = n_civs;
     println!("#M crowd{tag}.index_cull {cone:.2} us");

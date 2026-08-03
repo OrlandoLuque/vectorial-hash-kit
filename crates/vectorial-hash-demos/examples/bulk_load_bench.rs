@@ -78,29 +78,45 @@ fn main() {
     println!("clash snapshot: {} live units\n", items.len());
     println!("{:>26} | {:>10} {:>9} {:>8}", "strategy", "us/rebuild", "Mitems/s", "vs insert");
 
-    // Baseline: clear() + insert per unit (what both binaries do today).
+    // Every arm is timed per-rep with its INPUT PREPARED OUTSIDE THE CLOCK, and reported as the
+    // minimum over reps.
+    //
+    // The previous version wrapped the whole rep loop in one timer and wrote `bulk_load(world,
+    // item_limit, items.clone())` inside it. Two things were wrong with that. The clone was
+    // charged to the two bulk arms and NOT to the `clear + insert` baseline, which iterates
+    // `&items` — so the headline "vs insert" column was biased against the thing being proposed.
+    // And a clone inside the clock is not the harmless constant it appears to be: on
+    // `IntegerTree` the same mistake reported a 2.65x parallel win as 0.85x, i.e. inverted it.
+    // See `docs/MEASURING.md` § 8g. The old footnote argued the clone away on the grounds that
+    // the demo builds its snapshot Vec fresh each frame anyway — true of the demo, and no
+    // defence at all of a bench whose arms did not all pay it.
+    //
+    // Minimum rather than mean, for the reason § 8e gives: this machine's noise is episodic, so
+    // the mean of a run that caught one interruption is not a measurement of the code.
+    let mut best = |mut f: Box<dyn FnMut(Vec<IUnit>)>| -> f64 {
+        let mut b = f64::INFINITY;
+        f(items.clone());                       // warm: first touch, and rayon's lazy pool
+        for _ in 0..reps {
+            let input = items.clone();          // outside the clock
+            let t = Instant::now();
+            f(input);
+            b = b.min(t.elapsed().as_secs_f64());
+        }
+        b
+    };
+
     let mut idx = Tree3::<IUnit>::new(world, item_limit);
-    let t = Instant::now();
-    for _ in 0..reps { idx.clear(); for it in &items { idx.insert(*it); } }
-    let base = t.elapsed().as_secs_f64() / reps as f64;
+    let base = best(Box::new(move |v| { idx.clear(); for it in &v { idx.insert(*it); } std::hint::black_box(&idx); }));
     let report = |name: &str, per: f64| println!("{:>26} | {:>10.1} {:>9.1} {:>7.2}x", name, per * 1e6, items.len() as f64 / per / 1e6, base / per);
     report("clear + insert (current)", base);
 
-    // Serial bulk_load.
-    let t = Instant::now();
-    for _ in 0..reps { std::hint::black_box(Tree3::<IUnit>::bulk_load(world, item_limit, items.clone())); }
-    let ser = t.elapsed().as_secs_f64() / reps as f64;
+    let ser = best(Box::new(|v| { std::hint::black_box(Tree3::<IUnit>::bulk_load(world, item_limit, v)); }));
     report("bulk_load (serial)", ser);
 
-    // Parallel bulk_load at each thread count.
     for threads in [2usize, 4, 8, max].into_iter().collect::<std::collections::BTreeSet<_>>() {
         if threads > max { continue; }
         let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
-        let t = Instant::now();
-        pool.install(|| { for _ in 0..reps { std::hint::black_box(Tree3::<IUnit>::bulk_load_par(world, item_limit, items.clone())); } });
-        let par = t.elapsed().as_secs_f64() / reps as f64;
+        let par = best(Box::new(move |v| { pool.install(|| { std::hint::black_box(Tree3::<IUnit>::bulk_load_par(world, item_limit, v)); }); }));
         report(&format!("bulk_load_par ({} thr)", threads), par);
     }
-    // Note: bulk_load takes an owned Vec (a clone here); in the demo the snapshot
-    // Vec is built fresh each frame anyway, so it's a move, not an extra copy.
 }

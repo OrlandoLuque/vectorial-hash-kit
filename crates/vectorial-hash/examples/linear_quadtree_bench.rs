@@ -49,12 +49,20 @@ fn main() {
 
     println!("LinearQuadTree bench — {n} points ({:.0}% clustered), {nq} queries, cull r={radius}\n", 200.0 / 3.0);
 
-    let t_build_lin = best(5, || { let _ = LinearQuadTree::from_items(world, 32, 18, items.clone()); });
-    let t_build_qt = best(5, || { let mut q = QuadTree::new(world, 32); for it in &items { q.insert(*it); } });
-    let t_build_mor = best(5, || { let mut g = MortonGrid::new(world, 6); for it in &items { g.insert(*it); } });
-    let t_build_kd = best(5, || { let _ = KdTree2::from_items(32, items.clone()); });
+    // Every arm gets its input prepared OUTSIDE the clock, whether or not it consumes it.
+    //
+    // This used to clone inside the timer for the two `from_items` arms and not for the two
+    // insert arms, which charged the build-once structures for an allocation their rivals never
+    // paid — on the one table that concludes the k-d tree has the fastest 2D build. (It still
+    // does, so the conclusion was safe; the margin was not.) A clone inside the clock is also
+    // not the neutral constant it looks like: see `docs/MEASURING.md` § 8g, where the same
+    // mistake reported a 2.65x speed-up as 0.85x.
+    let t_build_lin = common::wall_ms_consuming(5, &items, |v| { let _ = LinearQuadTree::from_items(world, 32, 18, v); });
+    let t_build_qt = common::wall_ms_consuming(5, &items, |v| { let mut q = QuadTree::new(world, 32); for it in &v { q.insert(*it); } std::hint::black_box(&q); });
+    let t_build_mor = common::wall_ms_consuming(5, &items, |v| { let mut g = MortonGrid::new(world, 6); for it in &v { g.insert(*it); } std::hint::black_box(&g); });
+    let t_build_kd = common::wall_ms_consuming(5, &items, |v| { let _ = KdTree2::from_items(32, v); });
     #[cfg(feature = "parallel")]
-    let t_build_kd_par = best(5, || { let _ = KdTree2::from_items_par(32, items.clone()); });
+    let t_build_kd_par = common::wall_ms_consuming(5, &items, |v| { let _ = KdTree2::from_items_par(32, v); });
 
     let lin = LinearQuadTree::from_items(world, 32, 18, items.clone());
     let mut qt = QuadTree::new(world, 32);

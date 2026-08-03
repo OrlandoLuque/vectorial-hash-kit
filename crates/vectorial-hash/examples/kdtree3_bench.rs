@@ -35,13 +35,13 @@ fn run(name: &str, items: &[P], queries: &[Point3], radius: f64) {
     let v: Vec<P> = items.to_vec();
     let t_b_kd = best(5, || { let _ = KdTree3::from_items(16, v.clone()); });
     #[cfg(feature = "parallel")]
-    let t_b_kd_wall = best_wall(5, || { let _ = KdTree3::from_items(16, v.clone()); });
+    let t_b_kd_wall = common::wall_ms_consuming(5, &v, |x| { let _ = KdTree3::from_items(16, x); });
     #[cfg(feature = "parallel")]
-    let t_b_bin_wall = best_wall(5, || { let _ = Tree3::bulk_load(world, 16, v.clone()); });
+    let t_b_bin_wall = common::wall_ms_consuming(5, &v, |x| { let _ = Tree3::bulk_load(world, 16, x); });
     #[cfg(feature = "parallel")]
-    let t_b_kd_par = best_wall(5, || { let _ = KdTree3::from_items_par(16, v.clone()); });
+    let t_b_kd_par = common::wall_ms_consuming(5, &v, |x| { let _ = KdTree3::from_items_par(16, x); });
     #[cfg(feature = "parallel")]
-    let t_b_bin_par = best_wall(5, || { let _ = Tree3::bulk_load_par(world, 16, v.clone()); });
+    let t_b_bin_par = common::wall_ms_consuming(5, &v, |x| { let _ = Tree3::bulk_load_par(world, 16, x); });
     let t_b_bin = best(5, || { let _ = Tree3::bulk_load(world, 16, v.clone()); });
     let t_b_oct = best(5, || { let _ = Octree3::bulk_load(world, 16, v.clone()); });
     let t_b_lin = best(5, || { let _ = LinearOctree3::from_items(world, 16, 18, v.clone()); });

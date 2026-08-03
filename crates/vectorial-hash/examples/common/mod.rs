@@ -279,3 +279,24 @@ pub fn abba<T: Clone, A: FnMut(Vec<T>), B: FnMut(Vec<T>)>(rounds: usize, items: 
     }
     (abest, bbest, abest / bbest)
 }
+
+/// Wall-clock minimum over `runs`, for an operation that **consumes** its input.
+///
+/// The single-arm companion to [`abba`]. Same reason it exists: `wall_ms(5, || build(v.clone()))`
+/// puts the clone inside the clock, which is not a neutral constant — see `docs/MEASURING.md`
+/// § 8g, where that mistake reported a 2.65x parallel speed-up as 0.85x.
+///
+/// Wall rather than CPU time because parallel builds are the point: a process-CPU clock sums
+/// every worker thread, so a perfectly-scaling fan-out would show as no improvement at all.
+/// Returns milliseconds.
+pub fn wall_ms_consuming<T: Clone, F: FnMut(Vec<T>)>(runs: usize, items: &[T], mut f: F) -> f64 {
+    f(items.to_vec());                       // warm: first touch, and rayon's lazy pool
+    let mut best = f64::INFINITY;
+    for _ in 0..runs.max(1) {
+        let input = items.to_vec();          // outside the clock
+        let t = std::time::Instant::now();
+        f(input);
+        best = best.min(t.elapsed().as_secs_f64() * 1e3);
+    }
+    best
+}
