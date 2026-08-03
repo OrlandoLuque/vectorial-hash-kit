@@ -651,25 +651,32 @@ sequentially. **The bigger the population, the narrower the window in which keep
 2 000 points two thirds of them may move, at a million fewer than half. The ~70 % crossover
 quoted from `grid_keep_bench` is the small-N end of that curve, not a property of grids.
 
-One thing in those rows is **measured and unexplained**, and it is worth knowing which. The
-kept grid culls **1.09–1.17× faster** than the rebuilt one at identical world, identical
-`levels`, identical contents and identical probes. Six attempts to explain or reproduce it:
+One thing in those rows is **measured, reproducible, and not a property of either structure** —
+worth knowing precisely because it looks like one. The kept grid culls 1.09–1.17× faster than the
+rebuilt one here at identical world, identical `levels`, identical contents and identical probes.
+Traversal counts are byte-identical (`grid-stats`), so nothing algorithmic is happening; and
+sweeping population shows the advantage moving around:
 
-| hypothesis | result |
-| --- | --- |
-| one grid traverses less | cell counts **identical** (25 925 both, `grid-stats`) |
-| position in the frame | swapping the arms moved 1.11× → 1.06×… |
-| …so rotate every arm's position each frame | ratio **unchanged** (1.09, 1.17) |
-| a warm microbenchmark hides it | `kept_grid_query_edge`, 4 000 culls ×5: **1.00×** |
-| a cold first-touch effect | same bench, 16 culls right after the maintain, 200 frames: **0.97×** |
-| the two grids hold different items | asserted equal every frame: **equal** |
+| population | only these two arms running | all nine arms running |
+| ---: | --- | --- |
+| 5 000 | ≈1.00× | ≈1.00× |
+| 20 000 | ≈1.00× | **≈1.17×** |
+| 50 000 | **≈1.19×** | ≈1.03× |
 
-It does not reproduce outside this loop and it survives the fix for the one cause that looked
-likely. Treat the cull column here as **ordering-controlled but not fully understood**: the arms
-now rotate (each spends an equal share of the run in every position), the counts say nothing
-algorithmic is happening, and a gap of this size between two arms is not something to build an
-argument on. [`MEASURING.md`](MEASURING.md) § 8d has the full chase. The *maintain* column is far
-less exposed, each maintain being a large block of work that dominates whatever preceded it.
+(six A/B/B/A-paired readings per cell, no overlap within a population — `$D3_ARMS=morton,
+morton-keep` runs the map with only those arms, skipped in both phases)
+
+At 20 000 the advantage needs the other arms sharing the cache; at 50 000 it needs them *gone*.
+An effect that inverts its precondition with population is a footprint coincidence, not a
+difference between keeping and rebuilding. **So do not quote the cull ratio between these two
+rows.** The column that separates them reliably, at every population, is *maintain* — where the
+difference is algorithmic.
+
+The arms rotate (each spends an equal share of the run in every position) and the two grids'
+populations are asserted equal every measured frame. [`MEASURING.md`](MEASURING.md) § 8d has the
+full chase, including the four wrong explanations it took to get here. The *maintain* column is
+far less exposed to all of this, each maintain being a large block of work that dominates whatever
+preceded it.
 
 The intuition — and the first draft of this section — was that the *persistent*
 structures must beat the *rebuilt* ones on build: an incremental `update` sounds

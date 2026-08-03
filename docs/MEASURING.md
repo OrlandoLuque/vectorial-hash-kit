@@ -175,70 +175,72 @@ part of the answer, and one run length is one point of a curve. (The same shape 
 measuring a grid at 100 % churn and concluding grids must rebuild — § "Grids rebuild, trees
 keep" in CHOOSING.md.)
 
-## 8d. Four explanations, all refuted, and the number is still there
+## 8d. A ratio that is not a property — the anatomy of four wrong answers
 
-The 3D decision map reports the kept Morton grid culling **1.09–1.17× faster** than the rebuilt
-one at identical world, identical `levels`, identical contents and identical probes. A second,
-unrelated bench had shown the same ~15 %. Two sightings is usually where you start believing an
-effect. Here is what happened when it was chased instead.
+The 3D decision map reported a kept Morton grid culling **1.09–1.17× faster** than a rebuilt one
+holding the same points at identical world, identical `levels` and identical probes. It took four
+wrong explanations to find out what that number is, and the sequence is more useful than the
+answer.
+
+**What it is not.** Six hypotheses, each refuted:
 
 | hypothesis | test | result |
 | --- | --- | --- |
-| one grid traverses less | `grid-stats` cell counts | **identical**, 25 925 both — nothing to explain |
+| one grid traverses less | `grid-stats` cell counts | **identical** — nothing algorithmic |
 | position in the frame | swap the two arms | 1.11× → 1.06×, so: *probably it* |
-| position in the frame | **rotate every arm's position each frame** | ratio **unchanged** (1.09, 1.17) |
-| a warm microbenchmark hides it | isolated, 4 000 culls ×5 | **1.00×** |
-| it is a cold first-touch effect | isolated, 16 culls right after the maintain, arms alternating, 200 frames | **0.97×** |
-| the grids hold different items | assert equal populations every frame | **equal** — no shortfall |
+| position in the frame | **rotate all nine arms every frame** | ratio **unchanged** |
+| a warm bench hides it | isolated, 4 000 culls ×5 | **1.00×** |
+| a cold first-touch effect | isolated, 16 culls after the maintain | **0.97×** |
+| the grids hold different items | assert equal populations per frame | **equal** |
 
-A seventh, tried later the same night, is the only one that has ever moved the number in the
-right direction — and it still does not explain it. The decision map does not time those two
-grids alone: seven other structures are maintained and culled in the same frame, and their
-working sets pass through the cache in between. Rotation equalises *position*, not company. So
-the isolated cold probe was run again with 16 MB of scratch walked before each arm:
+**The seventh looked decisive and was not.** The only surviving idea was that the gap comes from
+sharing the frame with seven other structures, whose working sets pass through the cache between
+arms — something rotation equalises the *position* of but not the *presence* of. `$D3_ARMS`
+runs the map with only chosen arms, skipped in both phases. Eight A/B/B/A-paired readings gave
+**zero overlap**: alone 0.99–1.07, with company 1.15–1.22. Every reading separated cleanly.
 
-| | isolated, cold | with 16 MB of company |
-| --- | ---: | ---: |
-| rebuilt ÷ kept | 0.95–0.97× | **1.01×, 1.05×, 1.10×** (three runs) |
+Then one parameter was swept, and it fell apart. Six paired readings per population
+(rebuilt ÷ kept — above 1.0 means the kept grid is faster):
 
-The direction is right: company moves the ratio by about +0.09 in the kept grid's favour, which
-is consistent with stable bucket addresses surviving eviction better than freshly allocated ones.
-But the magnitude falls short of the map's 1.09–1.17×, and **the run-to-run spread is as large as
-the effect**. That is a lead, not a mechanism, and calling it the answer would be the third time
-in one day this was closed early.
+| population | two arms alone | all nine arms |
+| ---: | --- | --- |
+| 5 000 | 0.978–1.021 (**≈1.00**) | 0.960–1.028 (**≈1.00**) |
+| 20 000 | 0.976–1.008 (**≈1.00**) | 1.127–1.202 (**≈1.17**) |
+| 50 000 | **1.147–1.218 (≈1.19)** | 0.993–1.077 (**≈1.03**) |
 
-**The decisive version of that test now exists**: `$D3_ARMS=morton,morton-keep` runs the decision
-map with only those two arms, skipping the other seven in *both* phases so their working sets
-never touch the cache. It is the real experiment rather than a scratch-buffer stand-in. Preliminary,
-on a machine that was **in use**, three runs each:
+At 50 000 the advantage appears *without* company — the opposite of the mechanism the 20 000 rows
+had just "proved". The distributions do not overlap within any population, so none of this is
+noise; the effect is real, reproducible, and **conditional on the configuration in a way no single
+mechanism tested predicts**.
 
-| | run 1 | run 2 | run 3 |
-| --- | ---: | ---: | ---: |
-| two arms alone | 1.00× | 1.01× | **1.19×** |
-| all nine arms | 1.14× | 1.14× | 1.21× |
+### What can be said, and what should be quoted
 
-Company is consistent (never below 1.14×) and isolation is usually ~1.00× — but that third
-isolated run is 1.19×, which is the whole effect with no company at all. So this supports company
-as a *contributor* and refutes it as the *explanation*, and neither conclusion is safe from a busy
-desktop. **Re-run it idle.** The flag is the tool; the answer is not in yet.
+The kept grid is never *slower*; it is equal or up to ~1.2× faster, and *when* that happens
+depends on population and on what else shares the cache. Since the traversal counts are identical,
+this lives entirely in the memory system — a footprint coincidence, not a difference between
+keeping and rebuilding.
 
-So the gap does not reproduce outside the interleaved loop, and inside it survives the fix for
-the one cause that looked likely. **It is recorded as unexplained.** Not "an artifact", which is
-what an earlier version of this section said — that claim rested entirely on the swap
-experiment, and the rotation shows the swap moved the number by less than the run-to-run spread.
-One A/B on a noisy metric is not evidence for a cause any more than it is for an effect.
+So: **do not quote the cull ratio between these two.** It is a property of the measurement
+configuration, not of the strategies. The column that distinguishes them reliably is *maintain*,
+where the difference is algorithmic and shows up at every population.
 
-Three things to take from it:
+The microarchitectural cause — which cache level, which footprint crosses which boundary — is not
+pinned down, and pinning it would need counters this kit does not have. That is a smaller gap than
+it looks: the practical question ("is one of these a faster structure to query?") is answered, and
+the answer is no.
 
-- **Counts first.** The cell counts settled the algorithmic question in one reading and cost
-  nothing. Whatever this is, it is not traversal.
-- **A single swap is not a control.** Rotating all nine arms is, and it is now what
-  `critters3d_headless` does — each arm spends an equal share of the run in every position, so
-  ordering bias averages out instead of landing on whoever is written last. Keep it whether or
-  not it explains anything, because it removes a real confound cheaply.
-- **Say "unexplained" and leave the door open.** The temptation after refuting three hypotheses
-  is to declare the fourth. The honest state is a measured number with no mechanism, and the
-  reproductions that failed are more useful to the next person than a guess would be.
+### The four lessons, which are the real output
+
+1. **One A/B on a noisy metric is not evidence for a cause any more than for an effect.** The swap
+   experiment moved the number by less than the run-to-run spread and was believed for a day.
+2. **Zero overlap across paired readings is not proof of a mechanism** — only that the two
+   conditions differ *at that configuration*. It is exactly as convincing at a point where the
+   conclusion happens to be wrong.
+3. **Sweep one parameter before believing any of it.** A single parameter change refuted a result
+   that eight clean paired readings had just established.
+4. **Controls are cheap and beliefs are expensive.** Rotating arms, asserting equal populations,
+   counting traversals and `$D3_ARMS` each cost under an hour; the four wrong explanations cost
+   two days between them.
 
 ## 9. Publish from an idle machine
 
