@@ -477,6 +477,13 @@ struct BillboardInst { pos: [f32; 3], size: f32, heading: f32, phase: f32, mode:
 // ============================================================ renderer
 
 struct State {
+    /// `$HORDE_SHOT=path.png` — render one frame OFFSCREEN and write it, then exit.
+    ///
+    /// Every geometry question this week (which way does the slime face, does the wall meet the
+    /// tower, is the keep the right size) has been answered by a human looking at a window. This
+    /// lets the run answer them itself. `$HORDE_SHOT_AFTER` is how many frames to simulate first,
+    /// because frame zero is a lattice no battle ever looks like.
+    shot: Option<(String, u32)>,
     surface: Option<wgpu::Surface<'static>>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -851,7 +858,13 @@ impl State {
         #[cfg(not(target_arch = "wasm32"))]
         let pool = rayon::ThreadPoolBuilder::new().num_threads(max_threads).build().unwrap();
 
+        fn envf(k: &str, d: f32) -> f32 { std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d) }
+        let shot = std::env::var("HORDE_SHOT").ok().map(|p| {
+            let after = std::env::var("HORDE_SHOT_AFTER").ok().and_then(|s| s.parse().ok()).unwrap_or(120u32);
+            (p, after)
+        });
         let mut st = State {
+            shot,
             surface, device, queue, config,
             skin_pipeline, models, inst_buf,
             box_model, box_inst_buf, building_models, building_inst_buf, tree_inst_buf, tree_n: 0, castle_model, cannon_model, cannon_inst_buf,
@@ -873,7 +886,9 @@ impl State {
             sim, seed, pop,
             dpr,
             paused: false, frustum_cull: true, lod: std::env::var("HORDE_NOLOD").is_err(), fps: 0.0, last: Instant::now(),
-            yaw: 0.9, pitch: 0.7, dist: 820.0, dragging: false, last_mouse: (0.0, 0.0),
+            // A headless shot has nobody to drag the camera, so the orbit is settable.
+            yaw: envf("HORDE_CAM_YAW", 0.9), pitch: envf("HORDE_CAM_PITCH", 0.7),
+            dist: envf("HORDE_CAM_DIST", 820.0), dragging: false, last_mouse: (0.0, 0.0),
             free_cam: false, cam_pos: glam::Vec3::ZERO, mv: [false; 6],
             skin_instances: Vec::with_capacity(64 * 1024),
         };
@@ -1492,8 +1507,30 @@ impl State {
         let ui_n = ui.len() as u32;
 
         // ---- render
-        let frame = match &self.surface { Some(s) => match s.get_current_texture() { Ok(f) => f, Err(_) => return }, None => return };
-        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        //
+        // A pending screenshot renders into an offscreen COPY_SRC texture instead of the
+        // swapchain, so it works with or without a window and never depends on a surface
+        // format that happens to allow copies.
+        let shooting = matches!(&self.shot, Some((_, 0)));
+        if let Some((_, left)) = &mut self.shot { if *left > 0 { *left -= 1; } }
+        let shot_tex = shooting.then(|| self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shot"),
+            size: wgpu::Extent3d { width: self.config.width, height: self.config.height, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: self.config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        }));
+        let frame = match (&shot_tex, &self.surface) {
+            (Some(_), _) => None,
+            (None, Some(s)) => match s.get_current_texture() { Ok(f) => Some(f), Err(_) => return },
+            (None, None) => return,
+        };
+        let view = match (&shot_tex, &frame) {
+            (Some(t), _) => t.create_view(&wgpu::TextureViewDescriptor::default()),
+            (None, Some(f)) => f.texture.create_view(&wgpu::TextureViewDescriptor::default()),
+            _ => return,
+        };
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1609,8 +1646,64 @@ impl State {
                 pass.draw(0..ui_n, 0..1);
             }
         }
+        // A screenshot copies the offscreen colour target into a mapped buffer. `copy_texture_
+        // to_buffer` requires rows padded to 256 bytes, which is the single most common way this
+        // comes out sheared — so the padded stride is computed, and unpadded again on the way
+        // into the encoder.
+        // Native only: the PNG writer is not in the web build, and a browser has no file to
+        // write to. `HORDE_SHOT` is never set there anyway (`env::var` always fails on wasm), so
+        // this is dead code on the web rather than a second behaviour to keep in step.
+        #[cfg(not(feature = "web-wgpu"))]
+        if let (Some(tex), Some((path, _))) = (&shot_tex, self.shot.clone()) {
+            let (w, h) = (self.config.width, self.config.height);
+            let unpadded = w * 4;
+            let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+            let padded = unpadded.div_ceil(align) * align;
+            let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("shot-readback"), size: (padded * h) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false,
+            });
+            enc.copy_texture_to_buffer(
+                wgpu::ImageCopyTexture { texture: tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::ImageCopyBuffer { buffer: &buf, layout: wgpu::ImageDataLayout {
+                    offset: 0, bytes_per_row: Some(padded), rows_per_image: Some(h) } },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 });
+            self.queue.submit(Some(enc.finish()));
+
+            let slice = buf.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+            self.device.poll(wgpu::Maintain::Wait);
+            match rx.recv() {
+                Ok(Ok(())) => {
+                    let data = slice.get_mapped_range();
+                    let mut rgba = Vec::with_capacity((unpadded * h) as usize);
+                    let bgra = matches!(self.config.format,
+                        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb);
+                    for y in 0..h as usize {
+                        let row = &data[y * padded as usize..y * padded as usize + unpadded as usize];
+                        for px in row.chunks_exact(4) {
+                            // The swapchain is usually BGRA on Windows; PNG is RGBA. Getting this
+                            // backwards produces a picture that looks right until you notice the
+                            // sky is orange.
+                            if bgra { rgba.extend_from_slice(&[px[2], px[1], px[0], 255]); }
+                            else { rgba.extend_from_slice(&[px[0], px[1], px[2], 255]); }
+                        }
+                    }
+                    drop(data);
+                    buf.unmap();
+                    match std::fs::write(&path, vectorial_hash_demos::png::encode_rgba(w, h, &rgba)) {
+                        Ok(()) => println!("shot -> {path} ({w}x{h})"),
+                        Err(e) => eprintln!("shot: cannot write {path}: {e}"),
+                    }
+                }
+                other => eprintln!("shot: readback failed ({other:?})"),
+            }
+            std::process::exit(0);
+        }
+
         self.queue.submit(Some(enc.finish()));
-        frame.present();
+        if let Some(f) = frame { f.present(); }
     }
 }
 

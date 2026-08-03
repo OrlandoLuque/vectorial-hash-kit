@@ -28,4 +28,8 @@ pub mod horde_sim;
 /// automatic army battle; wgpu renderer) — see `docs/FORMATIONS_DESIGN.md`.
 pub mod formations_sim;
 #[cfg(not(feature = "web-wgpu"))]
+/// A dependency-free PNG writer, so a headless run can look at itself. Every geometry question
+/// this week — which way the slime faces, whether the wall meets the tower — has been blocked on
+/// a human watching a window.
+pub mod png;
 pub mod time;

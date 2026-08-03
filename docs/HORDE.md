@@ -338,6 +338,30 @@ reached — which is why it now kills 25 units outright partway through.
 The keep/rebuild crossover for a grid sits near **70 % of the population moving per frame**
 (`examples/grid_keep_bench`); the horde is nowhere near it, with almost everything asleep.
 
+## Looking at it without eyes (`$HORDE_SHOT`)
+
+The renderer can take its own screenshot, so a question like *"does the wall actually meet the
+tower?"* stops being a thing to queue for the next time a human is at the machine.
+
+```bash
+HORDE_SHOT=out.png HORDE_SHOT_AFTER=90 horde_wgpu          # sim 90 frames, then shoot and exit
+HORDE_CAM_YAW=0.0 HORDE_CAM_PITCH=1.40 HORDE_CAM_DIST=150  # frame it — nobody is dragging
+```
+
+The shot frame renders into an offscreen `COPY_SRC` texture rather than the swapchain, so it
+does not depend on the surface format allowing copies, and works the same whether or not the
+window is visible. Readback goes through a buffer whose rows are padded to
+`COPY_BYTES_PER_ROW_ALIGNMENT` — skip that and the image shears — and BGRA is swizzled to RGBA
+on the way out, because the Windows swapchain is BGRA and PNG is not; skip *that* and you get a
+believable frame with an orange sky. The encoder (`src/png.rs`) writes uncompressed stored
+deflate blocks, so a 1600x1000 frame is about 6 MB and the whole thing stays readable.
+
+Its first use answered a question that had been marked "needs the user's eyes": a top-down shot
+showed the wall ring closed, the towers at the corners and mid-spans, the walls attaching
+off-centre exactly as the 1/4 / 3/4 anchor specifies, and the two western gaps being the gates.
+What still needs a human is `building_tweak`'s per-model scale, which is taste rather than
+correctness — and that is the useful split.
+
 ## Still queued
 
 The Quaternius Ultimate Fantasy RTS wall/tower models to replace the

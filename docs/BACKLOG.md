@@ -37,11 +37,34 @@ answers.
 5. **#141 — IntegerTree's parallel build**, for API symmetry only; expect the same modest figure
    QuadTree got.
 
-**A capability worth having, queued rather than built:** a headless `--shot` that renders one
-frame to a PNG. Every geometry question this week (slime facing, wall/tower gap, building scale)
-has been blocked on someone looking at a screen. The impostor atlas already proves the offscreen
-render path works in this codebase; what is missing is a COPY_SRC target, a padded readback and
-a PNG writer. It would let the next session verify its own geometry instead of queueing it.
+**★ BUILT the same night: the headless screenshot.** Every geometry question this week (slime
+facing, wall/tower gap, building scale) was blocked on someone looking at a screen, so the
+queue entry above became `$HORDE_SHOT`:
+
+```bash
+HORDE_SHOT=out.png HORDE_SHOT_AFTER=90   HORDE_CAM_DIST=150 HORDE_CAM_PITCH=1.40 HORDE_CAM_YAW=0.0 horde_wgpu
+```
+
+Simulate N frames, render frame N into an offscreen `COPY_SRC` texture instead of the swapchain,
+copy to a 256-byte-row-aligned buffer, unpad, and write a PNG. The camera orbit is settable
+because a headless run has nobody to drag it. `crates/vectorial-hash-demos/src/png.rs` is a
+sixty-line encoder with **no compression** — stored deflate blocks, so a 1600×1000 frame is
+~6 MB. That is the right trade for something a developer looks at once: the whole encoder stays
+auditable instead of shipping a Huffman coder nobody reads, and it adds no dependency to a crate
+that already carries wgpu and winit into a size-sensitive wasm build. Native only (`#[cfg(not(
+feature = "web-wgpu"))]`); the web build never sees it.
+
+**Two traps it was written around**, both of which produce a picture that looks *almost* right:
+`copy_texture_to_buffer` demands rows padded to `COPY_BYTES_PER_ROW_ALIGNMENT`, so an unpadded
+read shears the image; and the Windows swapchain is BGRA while PNG is RGBA, so skipping the
+swizzle gives a plausible frame with an orange sky.
+
+**What it immediately answered.** The 1/4–3/4 wall anchor had been committed *unverified* and
+queued for the user's eyes. A top-down shot shows the ring is closed, towers sit at the corners
+and mid-spans, the walls attach off-centre exactly as specified, and the two western gaps are
+the gates — so the anchor is right and only `building_tweak`'s per-model *scale* still needs a
+human. That is the point of the capability: it does not replace the user's taste, it stops
+correctness questions from queueing behind it.
 
 ## ★ 2026-08-02/03 — the audit night, then cooperative night 8
 
