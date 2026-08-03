@@ -91,8 +91,8 @@ per-frame single frustum cull would only be slowed down by threads.
 
 ## Thread-count scaling (measured)
 
-The same bench also sweeps the **pool size** 1..=16 at a fixed workload
-(`pop=20000`), so the diminishing returns are visible. `vs 1` is speedup over a
+The same bench (`critters3d_headless --features parallel -- --parallel`) also sweeps the **pool
+size** 1..=16 at a fixed workload (`pop=20000`), so the diminishing returns are visible. `vs 1` is speedup over a
 single thread (ideal = N); `eff` is that ÷ N (parallel efficiency). The pool's
 worker threads are built **once** and reused every rep — only the *work* is
 forked/joined each call — so this is steady-state per-frame cost, not thread

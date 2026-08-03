@@ -96,5 +96,11 @@ jobs:
         continue-on-error: true
         run: bash scripts/check-web-fresh.sh --list
 
+      # This one CAN gate: it reads only file contents, so a fresh clone gives the same answer
+      # as a working copy. A broken link or a measurement nobody can reproduce is a defect in
+      # the repository, not a property of the machine it was checked on.
+      - name: docs are reproducible (links, anchors, named sources)
+        run: bash scripts/check-docs-numbers.sh
+
       - name: build web demos (wasm32)
         run: cargo build --target wasm32-unknown-unknown -p vectorial-hash-demos --bin critters --bin critters3d --release

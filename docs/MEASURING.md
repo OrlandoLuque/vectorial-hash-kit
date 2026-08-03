@@ -270,6 +270,47 @@ Two things do work, and both are this file's own estimator applied where it was 
 The corollary for anything you intend to publish: **a number measured once is unmeasured**, and
 "the machine looked quiet" is not a method.
 
+## 8f. A number nobody can re-run is not a measurement, it is a memory
+
+On 2026-07-29 a headline figure went stale without anyone touching the sentence that stated it.
+THREE_D.md and the README said `LinearOctree3`'s clustered k-NN was ~5x `MortonGrid3`'s. That was
+true when written; then the grid gained per-axis shell expansion (§ 8b's sibling finding) and got
+3.6x faster on exactly that workload, leaving the published claim wrong by a factor of three.
+Nothing broke. No test failed. The prose simply went on describing a world that had moved.
+
+The general shape: **a comparative number has two operands, and it can be invalidated by a change
+to the one it does not name.** No amount of care about the structure you are documenting protects
+you, because the edit that falsifies the sentence happens somewhere else entirely.
+
+There is no cheap gate for "is this number still true" — re-running every bench takes minutes, and
+§ 8e says this machine's noise is episodic, so a gate that fails on a re-measurement would fail on
+weather. What *is* cheap is enforcing the precondition:
+
+```bash
+scripts/check-docs-numbers.sh      # in CI, gating
+```
+
+It checks that every command a doc tells you to run exists, that every link and `#anchor`
+resolves, and that **every section quoting a measurement names something you can actually run** —
+where "something you can run" is decided against the real set of examples, bins and benches, not
+against a phrasing convention. Sections inherit a source from their ancestors, because a `###`
+table under a `##` heading that names the command is properly sourced.
+
+Two design notes worth keeping:
+
+- **The first version was wrong in the direction that destroys a check's credibility.** It
+  demanded a literal `cargo run` invocation and flagged a dozen sections that named
+  their source perfectly well as `` `critters3d_headless --parallel` `` or as a path to the file.
+  The docs were right and the check was wrong. A checker that cries wolf gets switched off, so
+  the bar is not "did the author phrase it my way" but "can a reader find the thing".
+- **Dated log entries are exempt** (BACKLOG.md, CLAUDE.md). "115 lib tests green" under a
+  2026-07-24 heading is a record of that day, and rewriting history to match the present is how a
+  log stops being evidence.
+
+And it was verified by breaking it: strip a source, break a link, break an anchor — all three
+flag, and all three clear on restore. A green check that has never been shown to go red is not a
+check.
+
 ## 9. Publish from an idle machine — necessary, not sufficient
 
 None of the above removes contention: another process still evicts your cache lines and eats

@@ -574,7 +574,7 @@ autonomously verifiable. User picked **"Todo (A–E)"** + the headline below.
      active): 15 Hz 5.41 ms (185 fps) → **7.5 Hz (`8`, new default) 4.44 ms
      (225 fps, +22 %)** → 4 Hz 4.09 ms (244 fps, +32 %). Chose 8 — banks most of
      the win with coherent steering; 8→15 buys only +8 % for coarser paths.
-     Table in [HORDE.md](HORDE.md#decision-buckets).
+     Table in [HORDE.md](HORDE.md#decision-buckets-measured-horde_decide_n).
   2. Impostor **elevation-band blending** — only if the band switch is visible
      when flying the camera up/down (user to confirm).
   3. **Scenario presets** (mountain pass / river crossing / forest paths) —
