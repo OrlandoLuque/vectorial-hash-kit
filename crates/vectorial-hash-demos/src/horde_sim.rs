@@ -360,6 +360,15 @@ pub struct FlowField {
 fn is_goal(k: SKind) -> bool { matches!(k, SKind::House | SKind::Storehouse | SKind::CommandCenter) }
 
 impl FlowField {
+    /// Force a rebuild on the next step, throttle and all.
+    ///
+    /// Setting `dirty` alone is not enough: the field is also rate-limited by `rebuild_t`, so a
+    /// caller that flips `dirty` and steps gets the OLD field back. That cost an experiment its
+    /// result — `examples/flow_repair_budget` moved a goal 20 cells and measured 0.0 % of the
+    /// field changing, which reads like a spectacular case for incremental repair and is in fact
+    /// a field that never recomputed.
+    pub fn force_rebuild(&mut self) { self.dirty = true; self.rebuild_t = 0.0; }
+
     fn new(n: usize) -> FlowField {
         FlowField { n, cell: WORLD / n as f64, dir: vec![(0.0, 0.0); n * n], integ: vec![u32::MAX; n * n], dirty: true, rebuild_t: 0.0, multi: false }
     }
