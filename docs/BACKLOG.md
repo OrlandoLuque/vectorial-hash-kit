@@ -4,6 +4,45 @@ Future work queued for review. Nothing here is committed scope — prune,
 reprioritise, or drop freely. Items graduate into the per-crate roadmaps
 (e.g. `crates/vectorial-hash/README.md`) once picked up.
 
+## ★ 2026-08-03/04 — the day with the user, then cooperative night 9
+
+**Landed.** Slime turned π (both axes swapped is a rotation, not a mirror) · mobile ± pairs made
+unbreakable + minus-first + hold-to-repeat · sliders on nine of ten demo pages, each built from
+its demo's real step rule · 2D critters step proportionally (was 5 against a 40 000 cap) · walls
+anchored at 1/4 and 3/4 of the tower's footprint · **the web staleness check**, which found
+seven of ten demos serving old code on its first run · `build-wgpu-web.sh` covers all seven wgpu
+demos instead of only siege · `QuadTree::bulk_load_par` · `decision2d` rotates its maintain arms.
+
+**Two arguments of mine were refuted within a day of writing them**, which is the entry worth
+reading. "A quadtree's positional split makes its recursion cheap, so rayon would buy little" —
+the recursion is 92–97 % of the build. Then "so the ceiling is 7–11×" — the real figure is
+1.2–1.9×, because a *share-of-time bound says where the time is, not whether it can be spread*.
+Both corrections are in `examples/quadtree_bulk_load`, which now carries three tables and three
+answers.
+
+**Open, in priority order:**
+
+1. **#83 / the new wall anchor — needs eyes.** `building_tweak`'s six (scale, yaw, y) triples are
+   still a first-pass guess, and the 1/4–3/4 wall anchor landed tonight **unverified visually**.
+   One sentence per piece from the user converts to numbers in minutes.
+2. **#98 — D\* Lite is the user's call**, measured: 3.1 % of the field changes per goal step,
+   ceiling ~32×, realistic prize ~1 ms of a 25 ms frame, and only in the moving-goal mode that is
+   not currently used. Real opportunity, modest payoff, ~600 lines and a second pathfinder.
+3. **#142 — audit the docs' quoted numbers** the way the site was audited for staleness. The
+   staleness check's value was looking *systematically* rather than at the cases someone
+   remembered; the docs quote dozens of measured figures and several have already been found
+   stale or wrong this week.
+4. **#95 — the touch UI on a device.** The synthetic-key path is confirmed working; what is left
+   is whether the in-canvas sliders (siege, horde) can be dragged with a thumb, and DPR.
+5. **#141 — IntegerTree's parallel build**, for API symmetry only; expect the same modest figure
+   QuadTree got.
+
+**A capability worth having, queued rather than built:** a headless `--shot` that renders one
+frame to a PNG. Every geometry question this week (slime facing, wall/tower gap, building scale)
+has been blocked on someone looking at a screen. The impostor atlas already proves the offscreen
+render path works in this codebase; what is missing is a COPY_SRC target, a padded readback and
+a PNG writer. It would let the next session verify its own geometry instead of queueing it.
+
 ## ★ 2026-08-02/03 — the audit night, then cooperative night 8
 
 **Landed.** Capability audit + matrix published in the README (`get_ref` on all five pointer
