@@ -478,12 +478,9 @@ struct BillboardInst { pos: [f32; 3], size: f32, heading: f32, phase: f32, mode:
 
 struct State {
     /// `$HORDE_SHOT=path.png` — render one frame OFFSCREEN and write it, then exit.
-    ///
-    /// Every geometry question this week (which way does the slime face, does the wall meet the
-    /// tower, is the keep the right size) has been answered by a human looking at a window. This
-    /// lets the run answer them itself. `$HORDE_SHOT_AFTER` is how many frames to simulate first,
-    /// because frame zero is a lattice no battle ever looks like.
-    shot: Option<(String, u32)>,
+    /// `$HORDE_SHOT_AFTER` is how many frames to simulate first (a shot of frame 0 is a picture
+    /// of the initial conditions, not the sim). See `vectorial_hash_demos::shot`.
+    shot: Option<vectorial_hash_demos::shot::Shot>,
     surface: Option<wgpu::Surface<'static>>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -859,10 +856,7 @@ impl State {
         let pool = rayon::ThreadPoolBuilder::new().num_threads(max_threads).build().unwrap();
 
         fn envf(k: &str, d: f32) -> f32 { std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d) }
-        let shot = std::env::var("HORDE_SHOT").ok().map(|p| {
-            let after = std::env::var("HORDE_SHOT_AFTER").ok().and_then(|s| s.parse().ok()).unwrap_or(120u32);
-            (p, after)
-        });
+        let shot = vectorial_hash_demos::shot::Shot::from_env("HORDE");
         let mut st = State {
             shot,
             surface, device, queue, config,
@@ -1508,34 +1502,16 @@ impl State {
 
         // ---- render
         //
-        // A pending screenshot renders into an offscreen COPY_SRC texture instead of the
-        // swapchain, so it works with or without a window and never depends on a surface
-        // format that happens to allow copies.
-        let shooting = matches!(&self.shot, Some((_, 0)));
-        if let Some((_, left)) = &mut self.shot { if *left > 0 { *left -= 1; } }
-        let shot_tex = shooting.then(|| self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("shot"),
-            size: wgpu::Extent3d { width: self.config.width, height: self.config.height, depth_or_array_layers: 1 },
-            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
-            format: self.config.format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        }));
-        let frame = match (&shot_tex, &self.surface) {
-            (Some(_), _) => None,
-            (None, Some(s)) => match s.get_current_texture() { Ok(f) => Some(f), Err(_) => return },
-            (None, None) => return,
-        };
-        let view = match (&shot_tex, &frame) {
-            (Some(t), _) => t.create_view(&wgpu::TextureViewDescriptor::default()),
-            (None, Some(f)) => f.texture.create_view(&wgpu::TextureViewDescriptor::default()),
-            _ => return,
-        };
+        // The screenshot machinery lives in `vectorial_hash_demos::shot` so the other wgpu
+        // demos can adopt it in three lines instead of re-deriving the row padding and the
+        // BGRA swizzle, both of which fail by producing a picture that looks almost right.
+        let target = vectorial_hash_demos::shot::Target::begin(&self.device, &self.config, self.surface.as_ref(), &mut self.shot);
+        let view = match target.view() { Some(v) => v, None => return };
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(if self.night { wgpu::Color { r: 0.030, g: 0.040, b: 0.085, a: 1.0 } } else { wgpu::Color { r: 0.42, g: 0.50, b: 0.62, a: 1.0 } }), store: wgpu::StoreOp::Store } })],
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(if self.night { wgpu::Color { r: 0.030, g: 0.040, b: 0.085, a: 1.0 } } else { wgpu::Color { r: 0.42, g: 0.50, b: 0.62, a: 1.0 } }), store: wgpu::StoreOp::Store } })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &self.depth, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }),
                 timestamp_writes: None, occlusion_query_set: None,
             });
@@ -1650,60 +1626,7 @@ impl State {
         // to_buffer` requires rows padded to 256 bytes, which is the single most common way this
         // comes out sheared — so the padded stride is computed, and unpadded again on the way
         // into the encoder.
-        // Native only: the PNG writer is not in the web build, and a browser has no file to
-        // write to. `HORDE_SHOT` is never set there anyway (`env::var` always fails on wasm), so
-        // this is dead code on the web rather than a second behaviour to keep in step.
-        #[cfg(not(feature = "web-wgpu"))]
-        if let (Some(tex), Some((path, _))) = (&shot_tex, self.shot.clone()) {
-            let (w, h) = (self.config.width, self.config.height);
-            let unpadded = w * 4;
-            let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-            let padded = unpadded.div_ceil(align) * align;
-            let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("shot-readback"), size: (padded * h) as u64,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false,
-            });
-            enc.copy_texture_to_buffer(
-                wgpu::ImageCopyTexture { texture: tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                wgpu::ImageCopyBuffer { buffer: &buf, layout: wgpu::ImageDataLayout {
-                    offset: 0, bytes_per_row: Some(padded), rows_per_image: Some(h) } },
-                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 });
-            self.queue.submit(Some(enc.finish()));
-
-            let slice = buf.slice(..);
-            let (tx, rx) = std::sync::mpsc::channel();
-            slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-            self.device.poll(wgpu::Maintain::Wait);
-            match rx.recv() {
-                Ok(Ok(())) => {
-                    let data = slice.get_mapped_range();
-                    let mut rgba = Vec::with_capacity((unpadded * h) as usize);
-                    let bgra = matches!(self.config.format,
-                        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb);
-                    for y in 0..h as usize {
-                        let row = &data[y * padded as usize..y * padded as usize + unpadded as usize];
-                        for px in row.chunks_exact(4) {
-                            // The swapchain is usually BGRA on Windows; PNG is RGBA. Getting this
-                            // backwards produces a picture that looks right until you notice the
-                            // sky is orange.
-                            if bgra { rgba.extend_from_slice(&[px[2], px[1], px[0], 255]); }
-                            else { rgba.extend_from_slice(&[px[0], px[1], px[2], 255]); }
-                        }
-                    }
-                    drop(data);
-                    buf.unmap();
-                    match std::fs::write(&path, vectorial_hash_demos::png::encode_rgba(w, h, &rgba)) {
-                        Ok(()) => println!("shot -> {path} ({w}x{h})"),
-                        Err(e) => eprintln!("shot: cannot write {path}: {e}"),
-                    }
-                }
-                other => eprintln!("shot: readback failed ({other:?})"),
-            }
-            std::process::exit(0);
-        }
-
-        self.queue.submit(Some(enc.finish()));
-        if let Some(f) = frame { f.present(); }
+        target.finish(&self.device, &self.queue, enc);
     }
 }
 

@@ -356,6 +356,17 @@ on the way out, because the Windows swapchain is BGRA and PNG is not; skip *that
 believable frame with an orange sky. The encoder (`src/png.rs`) writes uncompressed stored
 deflate blocks, so a 1600x1000 frame is about 6 MB and the whole thing stays readable.
 
+The machinery lives in `vectorial_hash_demos::shot`, not in this binary, so the other seven wgpu
+demos can adopt it in three lines (`Shot::from_env("SIEGE")`, `Target::begin`, `target.finish`)
+rather than each re-deriving the row padding and the BGRA swizzle. `siege_wgpu` and
+`formations_wgpu` are the next candidates — both already have their own offscreen path for a
+headless bench, so wiring them is a merge rather than an addition.
+
+**A screenshot is not a golden-image test here.** Two runs of the same binary with the same seed
+and the same frame count produce different bytes: the animation phase is driven by wall clock and
+the HUD prints an FPS. So it verifies by being *looked at*, not by being hashed — which was worth
+finding out before writing a comparison that would have failed on its first green run.
+
 Its first use answered a question that had been marked "needs the user's eyes": a top-down shot
 showed the wall ring closed, the towers at the corners and mid-spans, the walls attaching
 off-centre exactly as the 1/4 / 3/4 anchor specifies, and the two western gaps being the gates.

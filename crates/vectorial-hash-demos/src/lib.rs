@@ -32,4 +32,7 @@ pub mod formations_sim;
 /// this week — which way the slime faces, whether the wall meets the tower — has been blocked on
 /// a human watching a window.
 pub mod png;
+/// Headless screenshots for the wgpu demos, built on [`png`] — the reusable half of what
+/// `horde_wgpu` grew first, so a visual question stops being a thing to queue for a human.
+pub mod shot;
 pub mod time;
