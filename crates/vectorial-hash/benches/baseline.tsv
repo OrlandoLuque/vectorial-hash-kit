@@ -1,24 +1,33 @@
-# vectorial-hash regression baseline — op<TAB>nanoseconds (min-of-N).
-# _calib is a fixed CPU loop; the gate compares op/_calib ratios to cancel clock scaling. Regenerate with --save on a quiet machine.
-_calib	5284700
-build_tree3	4597300
-build_octree3	3563400
-build_morton3	1168600
-build_kdtree3	1966200
-build_linear_octree3	1548500
-cull_tree3_x64	77100
-cull_octree3_x64	68800
-cull_morton3_x64	38600
-cull_kdtree3_x64	50900
-cull_linear_octree3_x64	106300
-knn_tree3_k16_x256	530000
-knn_kdtree3_k16_x256	448400
-knn_linear_octree3_k16_x256	656000
-update_predicate_frame	3064500
-update_ref_frame	489200
-build_tree2	4053400
-build_quadtree2	3097400
-build_linear_quadtree	1462600
-cull_tree2_x64	49800
-cull_quadtree2_x64	46900
-cull_linear_quadtree_x64	72700
+# vectorial-hash regression baseline — op<TAB>nanoseconds (min over passes, each itself min-of-N).
+# _calib is a fixed CPU loop; the gate compares op/_calib ratios to cancel clock scaling.
+# Regenerate with `--save [--passes N]`. More passes is strictly better: each one can only
+# lower a number toward the machine's uncontended floor, never raise it.
+_calib	5513100
+build_tree3	4909900
+build_octree3	3702300
+build_morton3	894300
+build_kdtree3	2015300
+build_linear_octree3	1044500
+cull_tree3_x64	78400
+cull_octree3_x64	69100
+cull_morton3_x64	41500
+cull_kdtree3_x64	51700
+cull_linear_octree3_x64	107800
+knn_tree3_k16_x256	558400
+knn_kdtree3_k16_x256	458500
+knn_linear_octree3_k16_x256	678800
+knn_morton3_k16_x256	572600
+knn_octree3_k16_x256	468100
+update_predicate_frame	3112500
+update_ref_frame	503800
+build_tree2	4392300
+build_quadtree2	3265500
+build_linear_quadtree	1476100
+cull_tree2_x64	49700
+cull_quadtree2_x64	46200
+cull_linear_quadtree_x64	66100
+knn_tree2_k16_x256	246200
+knn_quadtree2_k16_x256	202600
+knn_kdtree2_k16_x256	190300
+knn_linear_quadtree_k16_x256	310800
+knn_morton2_k16_x256	634400

@@ -213,14 +213,42 @@ fn main() {
     let results = measure();
 
     if save {
-        let mut s = String::from("# vectorial-hash regression baseline — op<TAB>nanoseconds (min-of-N).\n");
-        s.push_str("# _calib is a fixed CPU loop; the gate compares op/_calib ratios to cancel clock scaling. Regenerate with --save on a quiet machine.\n");
-        s.push_str(&format!("_calib\t{calib:.0}\n"));
-        for (name, ns) in &results { s.push_str(&format!("{name}\t{ns:.0}\n")); }
+        // **Save takes the minimum over several passes**, the same estimator the check uses when
+        // confirming a suspected regression. It used to measure once, which is the one place a
+        // single reading does the most damage: a baseline is not a datum, it is the reference
+        // every future run is judged against, so a bad sample is wrong forever rather than for
+        // one run.
+        //
+        // And a single reading here is a lottery. Ten identical runs of one op on this machine,
+        // at 18-32 % background load, spanned **851–1 192 µs — a 1.40× spread**, and two
+        // consecutive gate runs read an untouched op at ±3 % and then +74 %. The noise is not
+        // proportional to average load; it is episodic, so "wait until the CPU looks free" does
+        // not catch it either. A minimum converges on the machine's uncontended floor, which is
+        // the quantity that is actually stable, and more passes only sharpen it.
+        let passes: usize = argv.iter().position(|a| a == "--passes")
+            .and_then(|i| argv.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(5);
+        println!("\nbaselining over {passes} passes, keeping the minimum per op");
+        let mut best: std::collections::HashMap<&str, f64> = results.iter().copied().collect();
+        let mut best_calib = calib;
+        for pass in 2..=passes {
+            best_calib = best_calib.min(calibrate());
+            for (name, ns) in measure() { best.entry(name).and_modify(|b| if ns < *b { *b = ns }).or_insert(ns); }
+            println!("  pass {pass}/{passes} done");
+        }
+        let mut s = String::from("# vectorial-hash regression baseline — op<TAB>nanoseconds (min over passes, each itself min-of-N).\n");
+        s.push_str("# _calib is a fixed CPU loop; the gate compares op/_calib ratios to cancel clock scaling.\n");
+        s.push_str("# Regenerate with `--save [--passes N]`. More passes is strictly better: each one can only\n");
+        s.push_str("# lower a number toward the machine's uncontended floor, never raise it.\n");
+        s.push_str(&format!("_calib\t{best_calib:.0}\n"));
+        for (name, _) in &results { s.push_str(&format!("{name}\t{:.0}\n", best[name])); }
         std::fs::write(BASELINE, &s).unwrap_or_else(|e| panic!("cannot write {BASELINE}: {e}"));
         println!("\nsaved baseline -> {BASELINE}");
-        println!("  {:<24} {:>12.0} ns (calibration yardstick)", "_calib", calib);
-        for (name, ns) in &results { println!("  {name:<24} {:>12.0} ns", ns); }
+        println!("  {:<24} {:>12.0} ns (calibration yardstick)", "_calib", best_calib);
+        for (name, first) in &results {
+            let b = best[name];
+            let gain = if b > 0.0 { first / b } else { 1.0 };
+            println!("  {name:<24} {b:>12.0} ns  (pass 1 read {first:.0}, {gain:.2}× higher)");
+        }
         return;
     }
 
