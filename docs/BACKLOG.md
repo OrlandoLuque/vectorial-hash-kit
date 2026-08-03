@@ -34,8 +34,28 @@ answers.
    stale or wrong this week.
 4. **#95 — the touch UI on a device.** The synthetic-key path is confirmed working; what is left
    is whether the in-canvas sliders (siege, horde) can be dragged with a thumb, and DPR.
-5. **#141 — IntegerTree's parallel build**, for API symmetry only; expect the same modest figure
-   QuadTree got.
+5. ~~**#141 — IntegerTree's parallel build**~~ **DONE, and it was not the modest figure expected.**
+   `IntegerTree::bulk_load_par` measures **1.8–2.9×** on 16 threads (`examples/itree_bulk_load`),
+   best on clustered data. Same partition as the serial build (identical node and leaf counts,
+   every item in the same leaf box) but not the same arena order — `divide` allocates both
+   children before recursing, this flattens depth-first — so the test asserts the property a
+   caller can observe rather than a byte comparison.
+
+   **★ The result arrived inverted, and the harness was the culprit.** The first version reported
+   **0.67–0.89×, parallel SLOWER**, because `bulk_load` consumes its input so the natural closure
+   is `|| build(items.clone())` — putting a 500k allocation, memcpy and free inside the clock.
+   That looks like a constant added to both arms, and the arithmetic appears to prove it can only
+   drag a ratio toward 1.0, never across it. It carried it across. Cloning outside the clock turns
+   0.85× into 2.65×.
+
+   It was caught by a control the bench did not need: the float `Tree` twin read 0.68× too, while
+   `Tree3`'s own bench had the same algorithm winning 2.17× over serial. **Two of the kit's own
+   benches disagreeing about one algorithm is what moved suspicion from the code to the harness.**
+   The distortion scales with how *cheap* the real work is, so it flipped both binary trees and
+   barely touched `QuadTree::bulk_load_par` (1.44–1.75× either way) — a harness of that shape lies
+   most about the code that is fastest. Now `common::abba`, MEASURING.md § 8g, and the QuadTree
+   bench re-measured through it. The README capability matrix was also stale: it still showed
+   QuadTree's parallel build as missing a night after it landed.
 
 **★ BUILT the same night: the headless screenshot.** Every geometry question this week (slime
 facing, wall/tower gap, building scale) was blocked on someone looking at a screen, so the

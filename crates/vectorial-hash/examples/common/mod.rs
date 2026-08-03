@@ -243,3 +243,39 @@ pub fn wall_ms<F: FnMut()>(runs: usize, mut f: F) -> f64 {
 
 /// Warm CPU milliseconds, for benches that just want the one number.
 pub fn cpu_ms<F: FnMut()>(samples: usize, f: F) -> f64 { measure(samples, f).ms }
+
+/// A B B A for operations that **consume** their input — bulk builds, mainly.
+///
+/// [`compare2`] takes closures of no arguments, so the natural way to bench a build that eats a
+/// `Vec` is `|| build(items.clone())`. That puts a large allocation, a memcpy and a free inside
+/// the clock, and it is not the harmless constant it looks like. Measured on
+/// `IntegerTree::bulk_load_par` at 500k items: clone-inside reported **0.85x** (parallel slower),
+/// clone-outside reports **2.65x** (parallel much faster) — the same code, the same machine, the
+/// same round structure, opposite conclusions. See `docs/MEASURING.md` § 8g.
+///
+/// So: inputs are cloned UP FRONT, outside the clock, and each timed call consumes one. Arms are
+/// interleaved `A B B A` per round so first-order drift cancels within the round, and each arm is
+/// reported as its minimum, which is the estimator § 8e argues for on an episodically noisy box.
+///
+/// Returns `(a_us, b_us, speedup_a_over_b)`.
+pub fn abba<T: Clone, A: FnMut(Vec<T>), B: FnMut(Vec<T>)>(rounds: usize, items: &[T], mut a: A, mut b: B) -> (f64, f64, f64) {
+    fn one<T>(f: &mut dyn FnMut(Vec<T>), input: Vec<T>) -> f64 {
+        let t = std::time::Instant::now();
+        f(input);
+        t.elapsed().as_secs_f64() * 1e6
+    }
+    // Warm both: the first touch of either path is a different measurement, and rayon builds its
+    // worker pool lazily on the first `join` — charging that to round one would flatter serial.
+    one(&mut a, items.to_vec());
+    one(&mut b, items.to_vec());
+    let (mut abest, mut bbest) = (f64::INFINITY, f64::INFINITY);
+    for _ in 0..rounds.max(1) {
+        let a1 = one(&mut a, items.to_vec());
+        let b1 = one(&mut b, items.to_vec());
+        let b2 = one(&mut b, items.to_vec());
+        let a2 = one(&mut a, items.to_vec());
+        abest = abest.min(a1.min(a2));
+        bbest = bbest.min(b1.min(b2));
+    }
+    (abest, bbest, abest / bbest)
+}

@@ -109,7 +109,7 @@ structure. Publishing the grid makes the next one visible without a grep.
 | --- |:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
 | `insert` | ● | ● | ● | ● | ● | ● | ● | ● | ● | – | – |
 | `bulk_load` / `from_items` | ● | ● | ● | ● | ● | – | – | ● | ● | ● | ● |
-| parallel build | ● | ○ | ○ | ● | ● | ● | ● | ○ | ○ | ● | ● |
+| parallel build | ● | ● | ● | ● | ● | ● | ● | ○ | ○ | ● | ● |
 | `update` / `remove` | ● | ● | ● | ● | ● | ● | ● | ● | ● | ✗ | ✗ |
 | `insert_ref` / `update_ref` / `get_ref` | ● | ● | ● | ● | ● | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `cull` / `cull_many` / `cull_many_par` | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● |

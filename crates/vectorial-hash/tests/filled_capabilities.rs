@@ -290,3 +290,58 @@ fn quadtree_bulk_load_par_matches_the_serial_build() {
     let piled = QuadTree::<P>::bulk_load_par(rect(), 8, same.clone());
     assert_eq!(piled.item_count(), 200, "200 identical points must all survive the parallel build");
 }
+
+/// `IntegerTree::bulk_load_par` — the same partition as the serial build, and the same answers.
+///
+/// What "the same" means here needed measuring rather than asserting. The split rule is a pure
+/// function of a node's own items, so both builds produce the SAME PARTITION: identical node and
+/// leaf counts, and every item in the same leaf box. They do not produce the same arena ORDER —
+/// `divide` allocates both children before recursing (level order), while the parallel path
+/// flattens depth-first — so node ids differ and a byte-level comparison would fail for a reason
+/// that means nothing to a caller. This asserts the property that is real.
+#[cfg(feature = "parallel")]
+#[test]
+fn itree_bulk_load_par_matches_the_serial_partition_and_brute_force() {
+    use vectorial_hash::{IPoint, IPositioned, IRect, IntegerTree, Circle, Point, Shape};
+    #[derive(Clone, Copy, PartialEq)]
+    struct I { id: u32, p: IPoint }
+    impl IPositioned for I { fn position(&self) -> IPoint { self.p } }
+
+    let bbox = IRect::new(0, 0, 512, 512);
+    let items: Vec<I> = (0..4000u32)
+        .map(|i| I { id: i, p: IPoint::new(scatter(i, 11) as i32, scatter(i, 12) as i32) })
+        .collect();
+
+    let ser = IntegerTree::<I>::bulk_load(bbox, 8, items.clone());
+    let par = IntegerTree::<I>::bulk_load_par(bbox, 8, items.clone());
+
+    assert_eq!(par.item_count(), ser.item_count(), "the parallel build kept a different number of items");
+    assert_eq!(par.live_node_count(), ser.live_node_count(), "different partition (node count)");
+    assert_eq!(par.leaf_count(), ser.leaf_count(), "different partition (leaf count)");
+
+    // Same item -> same leaf box. Ids alone would not catch a partition that is the right SHAPE
+    // but assigns items to the wrong side of a boundary.
+    let mut sleaf: Vec<(u32, IRect)> = Vec::new();
+    ser.visit_leaves(|_, n| for it in &n.items { sleaf.push((it.id, n.bbox)); });
+    let mut pleaf: Vec<(u32, IRect)> = Vec::new();
+    par.visit_leaves(|_, n| for it in &n.items { pleaf.push((it.id, n.bbox)); });
+    sleaf.sort_unstable_by_key(|e| e.0);
+    pleaf.sort_unstable_by_key(|e| e.0);
+    assert_eq!(sleaf.len(), pleaf.len());
+    for (a, b) in sleaf.iter().zip(pleaf.iter()) {
+        assert_eq!(a.0, b.0, "different items");
+        assert_eq!((a.1.x, a.1.y, a.1.w, a.1.h), (b.1.x, b.1.y, b.1.w, b.1.h),
+                   "item {} landed in a different leaf box", a.0);
+    }
+
+    // And the referee: brute force, on a probe that must actually hit something.
+    // `scatter` lands in 5..195, so the probe has to sit in there or the guard below fires —
+    // which is exactly how the first version of this test failed, before it was believed.
+    let probe = Circle::new(Point::new(100.0, 120.0), 45.0);
+    let mut want: Vec<u32> = items.iter()
+        .filter(|x| probe.contains_point(Point::new(x.p.x as f64, x.p.y as f64))).map(|x| x.id).collect();
+    let mut got: Vec<u32> = par.cull(&probe).iter().map(|x| x.id).collect();
+    want.sort_unstable(); got.sort_unstable();
+    assert!(!want.is_empty(), "the probe must hit something or this proves nothing");
+    assert_eq!(got, want, "the parallel-built tree disagrees with brute force");
+}

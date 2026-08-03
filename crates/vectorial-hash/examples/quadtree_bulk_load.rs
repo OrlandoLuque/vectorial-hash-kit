@@ -30,6 +30,8 @@
 //! cargo run -p vectorial-hash --example quadtree_bulk_load --release
 //! ```
 use std::time::Instant;
+mod common;
+use common::abba;
 use vectorial_hash::{Circle, Point, Positioned, QuadTree, Rect, Shape};
 
 #[derive(Clone, Copy)]
@@ -56,20 +58,12 @@ fn main() {
         let mut rng = Rng(0xBADC0DE ^ n as u64);
         let items: Vec<P> = (0..n).map(|i| P { id: i as u32, p: Point::new(rng.f() * W, rng.f() * W) }).collect();
 
-        let a = med((0..REPS).map(|_| {
-            let t = Instant::now();
-            let mut q = QuadTree::<P>::new(world, leaf);
-            for it in &items { q.insert(*it); }
-            let us = t.elapsed().as_secs_f64() * 1e6;
-            std::hint::black_box(&q); us
-        }).collect());
-
-        let b = med((0..REPS).map(|_| {
-            let t = Instant::now();
-            let q = QuadTree::<P>::bulk_load(world, leaf, items.clone());
-            let us = t.elapsed().as_secs_f64() * 1e6;
-            std::hint::black_box(&q); us
-        }).collect());
+        // Both arms take an owned Vec so neither is charged for the other's setup: the insert
+        // arm ignores it and inserts from the loop, the bulk arm consumes it. Cloning inside the
+        // clock is what made this bench wrong for a week (see the note under the third table).
+        let (a, b, _) = abba(REPS, &items,
+            |v| { let mut q = QuadTree::<P>::new(world, leaf); for it in &v { q.insert(*it); } std::hint::black_box(&q); },
+            |v| { let q = QuadTree::<P>::bulk_load(world, leaf, v); std::hint::black_box(&q); });
 
         // Faster is worthless if it is also different. Brute force is the referee.
         let mut q = QuadTree::<P>::new(world, leaf);
@@ -128,17 +122,9 @@ fn main() {
         for &(n, ceiling) in &[(10_000usize, 10.79f64), (100_000, 8.27), (500_000, 7.13)] {
             let mut rng = Rng(0xBADC0DE ^ n as u64);
             let items: Vec<P> = (0..n).map(|i| P { id: i as u32, p: Point::new(rng.f() * W, rng.f() * W) }).collect();
-            let ser = med((0..REPS).map(|_| {
-                let t = Instant::now();
-                let q = QuadTree::<P>::bulk_load(world, 8, items.clone());
-                let us = t.elapsed().as_secs_f64() * 1e6; std::hint::black_box(&q); us
-            }).collect());
-            let par = med((0..REPS).map(|_| {
-                let t = Instant::now();
-                let q = QuadTree::<P>::bulk_load_par(world, 8, items.clone());
-                let us = t.elapsed().as_secs_f64() * 1e6; std::hint::black_box(&q); us
-            }).collect());
-            let sp = ser / par;
+            let (ser, par, sp) = abba(REPS, &items,
+                |v| { let q = QuadTree::<P>::bulk_load(world, 8, v); std::hint::black_box(&q); },
+                |v| { let q = QuadTree::<P>::bulk_load_par(world, 8, v); std::hint::black_box(&q); });
             println!("{:>10} {:>14.0} {:>16.0} {:>11.2}x {:>15.0}%", n, ser, par, sp, 100.0 * sp / ceiling);
         }
     }

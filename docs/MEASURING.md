@@ -270,6 +270,51 @@ Two things do work, and both are this file's own estimator applied where it was 
 The corollary for anything you intend to publish: **a number measured once is unmeasured**, and
 "the machine looked quiet" is not a method.
 
+## 8g. Setup inside the clock does not cancel — it inverted a result
+
+`bulk_load` consumes its input, so the natural way to bench it is:
+
+```rust
+compare2(rounds, || build(items.clone()), || build_par(items.clone()))
+```
+
+Both arms clone. The clone is the same size, the same type, on the same thread. It reads like a
+constant added to both sides, and the arithmetic seems to settle it: if the measured ratio is
+`(C + t_par) / (C + t_ser)`, then a larger `C` drags the ratio toward 1.0 and can never carry it
+across 1.0. A real speed-up still reads as a speed-up. It just reads smaller.
+
+That argument is wrong, and the evidence is not subtle. `IntegerTree::bulk_load_par`, 500k items,
+16 threads:
+
+| harness | 10k | 100k | 500k |
+| --- | ---: | ---: | ---: |
+| clone **inside** the clock | 0.67× | 0.68× | 0.89× |
+| clone **outside** (`common::abba`) | 1.97× | 2.01× | 2.33× |
+
+Same code, same machine, same A B B A round structure, opposite conclusions — one says ship it,
+the other says the parallel build is a pessimisation. The flaw in the arithmetic is the premise
+that `C` is the same in both arms. It is not: the parallel arm frees the input from a different
+allocator state than the serial one, and its 16 workers are contending for memory bandwidth with
+whatever the clone left in flight. The setup and the work are not independent, so they do not
+subtract.
+
+**The distortion scales with how cheap the real work is**, which is the part worth carrying
+forward. It flipped both binary trees and barely touched `QuadTree::bulk_load_par` (1.44–1.75×
+measured either way), because a 4-way build is expensive enough to dominate its own clone. So a
+harness of this shape lies *most* about the code that is *fastest* — precisely the code you are
+most likely to be trying to prove is fast.
+
+**How it was caught, which is the transferable part.** Not by inspection. The bench measured a
+control it did not need: the float `Tree` twin, same binary split, same off-arena parallel path.
+It read 0.68× as well — and `Tree3`'s own long-standing bench had that same algorithm winning
+2.17× over serial. Two of the kit's own benches disagreeing about one algorithm is what moved
+suspicion from the code to the harness. § 8d's lesson was that one A/B on a noisy metric is not
+evidence of a cause; this is its companion: **when two of your own measurements disagree, the
+harness is a suspect, not just the machine.**
+
+The fix is `common::abba`: clone every input up front, outside the clock, and have each timed call
+consume one. Use it for anything that takes ownership of its input.
+
 ## 8f. A number nobody can re-run is not a measurement, it is a memory
 
 On 2026-07-29 a headline figure went stale without anyone touching the sentence that stated it.
