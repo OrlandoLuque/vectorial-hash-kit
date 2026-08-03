@@ -433,7 +433,11 @@ fn unit_box() -> vectorial_hash_demos::model::SkinnedModel {
 /// capture time, applied live on the skinned path.
 fn ztweak(c: ZClass) -> (f32, f32) {
     // Chubby (slime) faced 90° off — turned another 90° left (user 2026-07-23): −π/2 → 0.
-    match c { ZClass::Chubby => (0.0, 0.80), _ => (0.0, 1.0) }
+    // Then reported (2026-08-03) as having front↔back AND left↔right swapped. Both axes at
+    // once is a **rotation of π**, not a mirror: a mirror inverts one axis, which would flip
+    // the model's handedness and show as inside-out shading rather than as a facing error.
+    // So it is one number, and 0.0 was a half-turn short.
+    match c { ZClass::Chubby => (std::f32::consts::PI, 0.80), _ => (0.0, 1.0) }
 }
 
 /// LOD switch distance (camera→unit, wu): only units the camera is REALLY

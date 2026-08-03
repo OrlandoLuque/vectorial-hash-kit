@@ -40,6 +40,11 @@ export function setupMobileControls(cfg) {
       -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
       -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
     #mc-panel.open { display: grid; animation: mc-in .16s ease; }
+    /* A - / + pair is one grid item, so the auto-fill grid can never put the minus at the end
+       of a row and the plus at the start of the next — which it did, and which is unusable on
+       a phone where you are alternating between them by feel. */
+    .mc-pair { grid-column: span 2; display: flex; gap: 9px; }
+    .mc-pair > .mc-btn { flex: 1 1 0; min-width: 0; }
     @keyframes mc-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
     #mc-title { grid-column: 1/-1; margin: 1px 3px 3px; color: #93a3c8; font: 700 11px system-ui, sans-serif;
       letter-spacing: 1.1px; text-transform: uppercase; }
@@ -92,6 +97,8 @@ export function setupMobileControls(cfg) {
   };
   const vibe = () => { try { navigator.vibrate && navigator.vibrate(8); } catch (e) {} };
 
+  // Consecutive entries sharing a `group` become one unbreakable pair.
+  const groups = new Map();
   for (const k of cfg.keys) {
     const b = document.createElement('button');
     b.className = 'mc-btn';
@@ -115,16 +122,38 @@ export function setupMobileControls(cfg) {
     };
     paint();
 
-    let held = false;
+    let held = false, timer = null;
+    // Hold to repeat. A step button sends ONE event per tap, which is fine when the step is a
+    // quarter of the range and useless when it is not: the 2D critters add five at a time out
+    // of a 40 000 cap, i.e. 8 000 taps to fill the world. Repeating on hold turns that into a
+    // few seconds of thumb without touching the simulation's step size, and it costs nothing on
+    // the buttons where one press is the point.
+    //
+    // Cycle buttons (pause, index, brush) never repeat: they advance a state, and repeating one
+    // just spins through the states under your finger.
+    const repeats = !(k.cycle && k.cycle.length) && k.repeat !== false;
+    const fire = () => { send('keydown', k); send('keyup', k); };
+    const startRepeat = () => {
+      if (!repeats) return;
+      let gap = 260;                                   // a beat, so a deliberate single tap stays single
+      const tick = () => {
+        fire();
+        gap = Math.max(45, gap * 0.82);                // accelerate: coarse at first, fast once you commit
+        timer = setTimeout(tick, gap);
+      };
+      timer = setTimeout(tick, 420);
+    };
     const press = (e) => {
       if (e) e.preventDefault();
       if (held) return; held = true;
       b.classList.add('pressed'); send('keydown', k); vibe();
       if (k.cycle && k.cycle.length) { idx = (idx + 1) % k.cycle.length; paint(); } // reflect the new state now
+      startRepeat();
     };
     const release = (e) => {
       if (e) e.preventDefault();
       if (!held) return; held = false;
+      if (timer) { clearTimeout(timer); timer = null; }
       b.classList.remove('pressed'); send('keyup', k);
     };
     b.addEventListener('touchstart', press, { passive: false });
@@ -133,7 +162,13 @@ export function setupMobileControls(cfg) {
     b.addEventListener('mousedown', press);
     b.addEventListener('mouseup', release);
     b.addEventListener('mouseleave', release);
-    panel.appendChild(b);
+    if (k.group) {
+      let g = groups.get(k.group);
+      if (!g) { g = document.createElement('div'); g.className = 'mc-pair'; groups.set(k.group, g); panel.appendChild(g); }
+      g.appendChild(b);
+    } else {
+      panel.appendChild(b);
+    }
   }
   document.body.appendChild(burger);
   document.body.appendChild(panel);

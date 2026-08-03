@@ -74,10 +74,10 @@
     { label: 'Cull', code: 'KeyC', key: 'c', keyCode: 67, cycle: [{ name: '×1', cost: 0.15 }, { name: '×50', cost: 0.4 }, { name: '×200', cost: 0.65 }, { name: '×1000', cost: 0.95 }] },
     { label: 'FPS cap', code: 'KeyV', key: 'v', keyCode: 86, cycle: [{ name: 'uncapped', cost: 0.8 }, { name: 'capped', cost: 0.3 }] },
     { label: 'Hide UI', code: 'KeyU', key: 'u', keyCode: 85, cycle: [{ name: 'shown' }, { name: 'hidden' }] },
-    { label: 'Pop +', code: 'Equal', key: '=', keyCode: 187, cost: 0.85 },
-    { label: 'Pop −', code: 'Minus', key: '-', keyCode: 189, cost: 0.15 },
-    { label: 'Threads −', code: 'BracketLeft', key: '[', keyCode: 219, cost: 0.6 },
-    { label: 'Threads +', code: 'BracketRight', key: ']', keyCode: 221, cost: 0.2 },
+    { group: 'count', label: 'Pop −', code: 'Minus', key: '-', keyCode: 189, cost: 0.15 },
+    { group: 'count', label: 'Pop +', code: 'Equal', key: '=', keyCode: 187, cost: 0.85 },
+    { group: 'step', label: 'Threads −', code: 'BracketLeft', key: '[', keyCode: 219, cost: 0.6 },
+    { group: 'step', label: 'Threads +', code: 'BracketRight', key: ']', keyCode: 221, cost: 0.2 },
   ]});
 </script>
 </body>

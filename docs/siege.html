@@ -54,8 +54,8 @@
     { label: 'Pause', code: 'KeyP', key: 'p', keyCode: 80, cycle: [{ name: 'running' }, { name: 'paused' }] },
     { label: 'Collide', code: 'KeyC', key: 'c', keyCode: 67, cycle: [{ name: 'on', cost: 0.6 }, { name: 'off', cost: 0.2 }] },
     { label: 'Terrain', code: 'KeyV', key: 'v', keyCode: 86, cycle: [{ name: 'voxel', cost: 0.7 }, { name: 'smooth', cost: 0.3 }] },
-    { label: 'Pop −', code: 'BracketLeft', key: '[', keyCode: 219, cost: 0.15 },
-    { label: 'Pop +', code: 'BracketRight', key: ']', keyCode: 221, cost: 0.85 },
+    { group: 'step', label: 'Pop −', code: 'BracketLeft', key: '[', keyCode: 219, cost: 0.15 },
+    { group: 'step', label: 'Pop +', code: 'BracketRight', key: ']', keyCode: 221, cost: 0.85 },
   ]});
 </script>
 </body>

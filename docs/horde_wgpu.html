@@ -36,8 +36,8 @@
       { label: 'Frustum', code: 'KeyK', key: 'k', keyCode: 75, start: 1, cycle: [{ name: 'off', cost: 0.7 }, { name: 'on', cost: 0.25 }] },
       { label: 'Goals', code: 'KeyO', key: 'o', keyCode: 79, cycle: [{ name: 'CC', cost: 0.3 }, { name: 'all', cost: 0.55 }] },
       { label: 'Free-fly', code: 'KeyF', key: 'f', keyCode: 70, cycle: [{ name: 'orbit' }, { name: 'free' }] },
-      { label: 'Pop −', code: 'BracketLeft', key: '[', keyCode: 219, cost: 0.15 },
-      { label: 'Pop +', code: 'BracketRight', key: ']', keyCode: 221, cost: 0.85 },
+      { group: 'step', label: 'Pop −', code: 'BracketLeft', key: '[', keyCode: 219, cost: 0.15 },
+      { group: 'step', label: 'Pop +', code: 'BracketRight', key: ']', keyCode: 221, cost: 0.85 },
     ];
     const msg = document.getElementById('msg');
     if (!navigator.gpu) {
