@@ -107,6 +107,32 @@ impl<T: Positioned> QuadTree<T> {
         Self { nodes: vec![root], free: Vec::new(), locs: Vec::new(), free_handles: Vec::new(), item_limit, merge_limit, min_cell, root: QNodeId(0) }
     }
 
+    /// Parallel [`QuadTree::bulk_load`] (feature `parallel`): the recursive subdivision — the
+    /// part that is **92–97 % of the build** — fans out over rayon, and flattening the result
+    /// into the arena is a cheap serial tail. The 4-way sibling of [`crate::Tree::bulk_load_par`].
+    ///
+    /// This exists because the argument for *not* having it was measured and refuted. The claim
+    /// was that a positional 4-way split makes the recursion cheap; `examples/quadtree_bulk_load`
+    /// showed it is nearly all of the cost, with an Amdahl ceiling of 7–11× on 16 threads. A
+    /// positional split is cheap per node — there are simply a great many nodes.
+    ///
+    /// Items outside `bbox` are dropped, exactly as [`QuadTree::insert`] drops them.
+    #[cfg(feature = "parallel")]
+    pub fn bulk_load_par(bbox: Rect, item_limit: usize, items: Vec<T>) -> Self
+    where T: Send {
+        assert!(item_limit >= 1, "item_limit must be >= 1");
+        let min_cell = bbox.width.max(bbox.height) * 1e-12;
+        let inside: Vec<(u32, T)> = items.into_iter().filter(|it| bbox.contains(it.position()))
+            .enumerate().map(|(i, it)| (i as u32, it)).collect();
+        let n = inside.len();
+        let build = build_quad_par(item_limit, min_cell, bbox, inside);
+        let mut nodes: Vec<QNode<T>> = Vec::new();
+        let mut locs = vec![QItemLoc { node: QNodeId(0), slot: 0 }; n];
+        flatten_quad(&mut nodes, &mut locs, bbox, None, build);
+        QuadTree { nodes, free: Vec::new(), locs, free_handles: Vec::new(),
+            item_limit, merge_limit: item_limit, min_cell, root: QNodeId(0) }
+    }
+
     /// Rewrite the arena in depth-first order, dropping nodes orphaned by 4-way merge-ups.
     ///
     /// Churn leaves holes: `divide` allocates four children, a later merge-up frees them onto
@@ -171,12 +197,12 @@ impl<T: Positioned> QuadTree<T> {
     /// for `items[i]` **among the accepted ones**, so a caller that may pass out-of-world points
     /// should filter first if it wants to index by its own array.
     ///
-    /// There is no `bulk_load_par` here **yet**, and the reason once given for that was wrong.
-    /// The claim was that a 4-way positional split makes the recursion cheap, so rayon would
-    /// buy little. `examples/quadtree_bulk_load` measures it: the recursion is **92–97 % of the
-    /// build**, giving a parallel version a ceiling of **7–11×** on 16 threads. A positional
-    /// split is cheap per node; there are simply a great many nodes. Writing it is queued
-    /// rather than done, but it is now queued on a number.
+    /// See [`QuadTree::bulk_load_par`] — and note that BOTH of the things said about it before
+    /// it existed were wrong, in opposite directions. First: "a positional 4-way split makes the
+    /// recursion cheap, so rayon would buy little" — the recursion is **92–97 % of the build**.
+    /// Then: "so the ceiling is 7–11× on 16 threads" — the real figure is **1.2–1.9×**, 11–23 %
+    /// of that bound. Where the time is and whether that time can be spread are different
+    /// questions; see `examples/quadtree_bulk_load` for both tables.
     pub fn bulk_load(bbox: Rect, item_limit: usize, items: Vec<T>) -> Self {
         let mut t = Self::new(bbox, item_limit);
         let root = t.root;
@@ -743,6 +769,71 @@ impl<T: Positioned> QuadTree<T> {
         use rayon::prelude::*;
         queries.par_iter().map(|&q| self.knn(q, k)).collect()
     }
+}
+
+/// The shape a parallel build produces before it touches the arena. The child rects ride along
+/// because `flatten_quad` must not recompute them: a quadrant is derived from its parent's box,
+/// and recomputing on flatten would drift from what the partition actually used.
+#[cfg(feature = "parallel")]
+enum BuildQ<T> { Leaf(Vec<(u32, T)>), Split([Rect; 4], [Box<BuildQ<T>>; 4]) }
+
+/// Partition into the four quadrants, recursing on each in parallel.
+#[cfg(feature = "parallel")]
+fn build_quad_par<T: Positioned + Send>(item_limit: usize, min_cell: f64, bbox: Rect, items: Vec<(u32, T)>) -> BuildQ<T> {
+    // Same three stopping conditions as `divide`, and they matter: without the "all points
+    // identical" one, a pile of coincident points recurses until the cell underflows.
+    let inseparable = items.first().map(|f| { let p = f.1.position(); items.iter().all(|it| it.1.position() == p) }).unwrap_or(true);
+    if items.len() <= item_limit || inseparable || bbox.width.max(bbox.height) <= min_cell {
+        return BuildQ::Leaf(items);
+    }
+    let (hw, hh) = (bbox.width / 2.0, bbox.height / 2.0);
+    let quads = [
+        Rect::new(bbox.x, bbox.y, hw, hh),
+        Rect::new(bbox.x + hw, bbox.y, hw, hh),
+        Rect::new(bbox.x, bbox.y + hh, hw, hh),
+        Rect::new(bbox.x + hw, bbox.y + hh, hw, hh),
+    ];
+    let mut buckets: [Vec<(u32, T)>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    for (h, it) in items {
+        let p = it.position();
+        let k = quads.iter().position(|q| q.contains(p)).expect("quadrants tile the parent");
+        buckets[k].push((h, it));
+    }
+    let [b0, b1, b2, b3] = buckets;
+    // join twice rather than a 4-way spawn: two nested joins give rayon the same work-stealing
+    // shape with no extra scope, and the tree is deep enough that the split pays immediately.
+    let ((c0, c1), (c2, c3)) = rayon::join(
+        || rayon::join(|| build_quad_par(item_limit, min_cell, quads[0], b0),
+                       || build_quad_par(item_limit, min_cell, quads[1], b1)),
+        || rayon::join(|| build_quad_par(item_limit, min_cell, quads[2], b2),
+                       || build_quad_par(item_limit, min_cell, quads[3], b3)),
+    );
+    BuildQ::Split(quads, [Box::new(c0), Box::new(c1), Box::new(c2), Box::new(c3)])
+}
+
+/// Serial flatten into the arena — the cheap tail after the parallel partition.
+#[cfg(feature = "parallel")]
+fn flatten_quad<T: Positioned>(nodes: &mut Vec<QNode<T>>, locs: &mut [QItemLoc], bbox: Rect, parent: Option<QNodeId>, build: BuildQ<T>) -> QNodeId {
+    let id = QNodeId(nodes.len() as u32);
+    nodes.push(QNode { bbox, parent, children: None, items: Vec::new(), hs: Vec::new() });
+    match build {
+        BuildQ::Leaf(items) => {
+            let node = &mut nodes[id.0 as usize];
+            for (h, it) in items {
+                let slot = node.items.len() as u32;
+                locs[h as usize] = QItemLoc { node: id, slot };
+                node.items.push(it); node.hs.push(h);
+            }
+        }
+        BuildQ::Split(rects, kids) => {
+            let mut ids = [QNodeId(0); 4];
+            for (k, child) in kids.into_iter().enumerate() {
+                ids[k] = flatten_quad(nodes, locs, rects[k], Some(id), *child);
+            }
+            nodes[id.0 as usize].children = Some(ids);
+        }
+    }
+    id
 }
 
 #[cfg(test)]

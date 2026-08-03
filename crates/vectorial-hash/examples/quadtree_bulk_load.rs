@@ -5,7 +5,8 @@
 //! descends the tree N times and splits as it goes — so it should win, and by more as the tree
 //! gets deeper. This checks that, and checks the two trees answer the same.
 //!
-//! Note what is NOT here: a `bulk_load_par` — and **the reason given for that was wrong**.
+//! It also carries the story of `bulk_load_par`, in which **two successive claims were both
+//! wrong, in opposite directions** — which is why both tables below exist.
 //!
 //! The argument was that `Tree`'s parallel bulk load exists because its split axis is *chosen*
 //! (`pick_split`), whereas a quadtree's is positional, so its recursion is already cheap and
@@ -15,9 +16,15 @@
 //! ceiling of **7–11×**. Positional splits are cheap PER NODE; there are simply an enormous
 //! number of nodes.
 //!
-//! The second table below is that measurement, and it needs no parallel implementation to
-//! make: the recursion is the only part that could fan out, so isolating its share bounds the
-//! win — and an `item_limit` of n makes the root never split, which measures the fill alone.
+//! The second table is that measurement, and it needed no parallel implementation to make: the
+//! recursion is the only part that could fan out, so isolating its share bounds the win — an
+//! `item_limit` of n makes the root never split, which measures the fill alone.
+//!
+//! **Then the ceiling turned out to be misleading too.** The parallel version now exists, and it
+//! delivers **1.2–1.9×** — 11–23 % of the 7–11× bound. A share-of-time bound says where the time
+//! IS; it says nothing about whether that time can be *spread*. This recursion allocates
+//! thousands of small `Vec`s, so it is memory- and allocator-bound rather than compute-bound, and
+//! most of the theoretical headroom is not headroom at all. Third table, third answer.
 //!
 //! ```bash
 //! cargo run -p vectorial-hash --example quadtree_bulk_load --release
@@ -112,6 +119,32 @@ fn main() {
         let ceiling = 1.0 / ((1.0 - share) + share / 16.0);
         println!("{:>10} {:>14.0} {:>16.0} {:>13.0}% {:>17.2}x", n, fill, full, share * 100.0, ceiling);
     }
+    // And the real thing, now that it exists. The ceiling above is what perfect scaling would
+    // buy; this is what rayon actually delivers, and the gap between them is the honest cost of
+    // synchronisation, allocator contention and the serial flatten.
+    #[cfg(feature = "parallel")]
+    {
+        println!("\n{:>10} {:>14} {:>16} {:>12} {:>16}", "N", "serial us", "parallel us", "speedup", "of the ceiling");
+        for &(n, ceiling) in &[(10_000usize, 10.79f64), (100_000, 8.27), (500_000, 7.13)] {
+            let mut rng = Rng(0xBADC0DE ^ n as u64);
+            let items: Vec<P> = (0..n).map(|i| P { id: i as u32, p: Point::new(rng.f() * W, rng.f() * W) }).collect();
+            let ser = med((0..REPS).map(|_| {
+                let t = Instant::now();
+                let q = QuadTree::<P>::bulk_load(world, 8, items.clone());
+                let us = t.elapsed().as_secs_f64() * 1e6; std::hint::black_box(&q); us
+            }).collect());
+            let par = med((0..REPS).map(|_| {
+                let t = Instant::now();
+                let q = QuadTree::<P>::bulk_load_par(world, 8, items.clone());
+                let us = t.elapsed().as_secs_f64() * 1e6; std::hint::black_box(&q); us
+            }).collect());
+            let sp = ser / par;
+            println!("{:>10} {:>14.0} {:>16.0} {:>11.2}x {:>15.0}%", n, ser, par, sp, 100.0 * sp / ceiling);
+        }
+    }
+    #[cfg(not(feature = "parallel"))]
+    println!("\n(re-run with `--features parallel` for the measured speed-up next to the ceiling)");
+
     println!("\nThe last column is an upper bound and a generous one: it assumes the recursion");
     println!("parallelises perfectly across 16 threads with no synchronisation, no allocator");
     println!("contention and no cost to merge the arenas. Whatever it reads, the real figure is");

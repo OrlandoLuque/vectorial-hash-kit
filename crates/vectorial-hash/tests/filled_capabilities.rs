@@ -250,3 +250,43 @@ fn quadtree_and_integertree_raycast_agree_with_brute_force() {
     assert!(iwant.len() > 3, "the ray must hit several items ({})", iwant.len());
     for w in ihits.windows(2) { assert!(w[0].0 <= w[1].0, "raycast returned out of order"); }
 }
+
+/// The parallel quadtree build must answer exactly like the serial one, and its handles must
+/// address the same items. Node ORDER is free to differ; answers and handles are not.
+///
+/// Refereed by brute force as well as by the serial build — two builds agreeing only proves
+/// they share an idea, and the shared idea here is a partition that could be wrong in both.
+#[test]
+#[cfg(feature = "parallel")]
+fn quadtree_bulk_load_par_matches_the_serial_build() {
+    let items = pts(4000);
+    let serial = QuadTree::<P>::bulk_load(rect(), 8, items.clone());
+    let par = QuadTree::<P>::bulk_load_par(rect(), 8, items.clone());
+    assert_eq!(par.item_count(), serial.item_count());
+
+    let mut probed = 0;
+    for (cx, cy) in [(30.0, 30.0), (100.0, 100.0), (170.0, 60.0), (55.0, 140.0), (12.0, 190.0)] {
+        let s = Circle::new(Point::new(cx, cy), 35.0);
+        let mut want: Vec<u32> = items.iter().filter(|x| s.contains_point(x.p)).map(|x| x.id).collect();
+        let mut a: Vec<u32> = serial.cull(&s).iter().map(|x| x.id).collect();
+        let mut b: Vec<u32> = par.cull(&s).iter().map(|x| x.id).collect();
+        want.sort_unstable(); a.sort_unstable(); b.sort_unstable();
+        assert_eq!(a, want, "the serial build disagrees with brute force");
+        assert_eq!(b, want, "the PARALLEL build disagrees with brute force");
+        probed += want.len();
+    }
+    assert!(probed > 40, "the probes must actually hit things ({probed})");
+
+    // Handles: `bulk_load_par` promises ItemRef(i) is items[i] among the ACCEPTED items, same
+    // as the serial one. A partition that lost track of an index would still cull correctly.
+    for (i, want) in items.iter().enumerate() {
+        let r = ItemRef(i as u32);
+        assert_eq!(par.get_ref(r).map(|it| it.id), Some(want.id), "parallel handle {i} is wrong");
+        assert_eq!(serial.get_ref(r).map(|it| it.id), Some(want.id), "serial handle {i} is wrong");
+    }
+
+    // Coincident points are the case that makes a naive recursion never terminate.
+    let same = vec![P { id: 0, p: Point::new(50.0, 50.0) }; 200];
+    let piled = QuadTree::<P>::bulk_load_par(rect(), 8, same.clone());
+    assert_eq!(piled.item_count(), 200, "200 identical points must all survive the parallel build");
+}
