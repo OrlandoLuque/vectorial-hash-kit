@@ -242,13 +242,47 @@ the answer is no.
    counting traversals and `$D3_ARMS` each cost under an hour; the four wrong explanations cost
    two days between them.
 
-## 9. Publish from an idle machine
+## 8e. Noise is episodic, so "wait for an idle machine" is not the control you think
+
+The obvious defence against a noisy machine is to wait for it to go quiet, and both the gate and
+`bench-runner` said exactly that in their own output. Measured on this desktop at 18–32 %
+background load:
+
+- **Ten identical runs of one op: 851–1 192 µs, a 1.40× spread.** Not two clusters — values
+  spread through the whole range.
+- **Two consecutive gate runs on an untouched op: ±3 %, then +74 %** — and the +74 % run had
+  *lower* reported CPU load than the ±3 % ones.
+
+So load percentage does not predict it. Whatever the source (turbo residency, a background task
+bursting, thermals), it arrives in episodes an idle-*looking* machine does not rule out, and
+`bench-runner`'s idle gate waits up to 300 s per bench for a threshold it cannot see through.
+
+Two things do work, and both are this file's own estimator applied where it was missing:
+
+1. **Minimum over repeats.** A minimum converges on the uncontended floor, which is the stable
+   quantity; a mean or a single reading chases the episode. It is why the gate confirms a
+   suspected regression over further passes — and now why `--save` does the same, a baseline
+   being the thing every future run is judged against. Saving one pass would have recorded an op
+   at **1.76× its floor**, and then never flagged a 70 % regression in it.
+2. **Pairing inside one process.** The `$D3_ARMS` comparison in § 8d ran A/B/B/A and separated
+   cleanly at 18–46 % load, because an episode that hits one arm hits its partner too.
+
+The corollary for anything you intend to publish: **a number measured once is unmeasured**, and
+"the machine looked quiet" is not a method.
+
+## 9. Publish from an idle machine — necessary, not sufficient
 
 None of the above removes contention: another process still evicts your cache lines and eats
 memory bandwidth, so under load the same work genuinely costs more cycles (measured: ~1.7×
 under 3× oversubscription, for *both* clocks). `bench-runner` waits for the machine to be
 free before every pass — using a calibration loop rather than OS performance counters, so it
 needs no platform API and no localised counter names.
+
+Read that together with § 8e, though: waiting for an idle machine lowers the *rate* of bad
+episodes, it does not eliminate them, and the wait is charged per bench (up to 300 s each, which
+on a loaded desktop is an hour before anything is measured). Prefer a design that survives an
+episode — minimum over repeats, pairs inside one process — and treat idleness as the thing that
+makes those cheaper rather than the thing that makes them unnecessary.
 
 ---
 
