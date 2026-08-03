@@ -304,6 +304,7 @@ impl Rng {
     fn range(&mut self, a: f32, b: f32) -> f32 { a + (b - a) * self.f() }
 }
 
+#[derive(Clone)]
 struct Fluid {
     px: Vec<f32>, py: Vec<f32>,       // positions
     qx: Vec<f32>, qy: Vec<f32>,       // predicted positions (the PBF working set)
@@ -528,6 +529,60 @@ fn main() {
     pollster::block_on(run());
 }
 
+/// Race every index choice on the CURRENT state and report which one the policy has to beat.
+///
+/// This is the honest version of "is the adaptive index picking right?". The policy's own HUD
+/// says what it chose; it cannot say whether that was correct, because it never runs the
+/// alternatives. This does, on a **clone** of the fluid, so the visible simulation is untouched
+/// and every arm sees the same starting state.
+///
+/// Order matters and is not incidental: the arms run **forward, then in reverse**, and each keeps
+/// its minimum. That gives every arm the same mean position in the sequence, so a machine that
+/// drifts during the bake-off (turbo decaying, a background task waking) cannot favour whoever
+/// happened to go first — the ABBA counterbalancing in docs/MEASURING.md § 8e, applied to five
+/// arms instead of two. A minimum rather than a mean because the noise here is episodic: it can
+/// only ever add time, so the smallest reading is the closest to the truth.
+fn bakeoff(fluid: &Fluid, frames: usize) -> Vec<(Idx, f32)> {
+    const KINDS: [Idx; 5] = [Idx::Morton, Idx::MortonKeep, Idx::TreeKeep, Idx::Linear, Idx::Adaptive];
+    let mut best = [f32::MAX; 5];
+    for pass in 0..2 {
+        let order: Vec<usize> = if pass == 0 { (0..5).collect() } else { (0..5).rev().collect() };
+        for i in order {
+            let mut f = fluid.clone();
+            let mut ix = Index::build(KINDS[i], &f.px, &f.py);
+            // warm-up: the first frames pay for buckets nobody has allocated yet, which is a
+            // build cost wearing a maintain cost's clothes.
+            for _ in 0..8 { f.step(&mut ix, KINDS[i]); }
+            let mut acc = 0.0f32;
+            for _ in 0..frames { let (m, q, p) = f.step(&mut ix, KINDS[i]); acc += m + q + p; }
+            best[i] = best[i].min(acc / frames.max(1) as f32);
+        }
+    }
+    KINDS.iter().copied().zip(best).collect()
+}
+
+/// Print a bake-off and say whether the policy's choice was the right one.
+fn report_bakeoff(fluid: &Fluid, frames: usize, picked: Option<&str>) -> String {
+    let rows = bakeoff(fluid, frames);
+    let fixed_best = rows.iter().filter(|(k, _)| !matches!(k, Idx::Adaptive))
+        .min_by(|a, b| a.1.total_cmp(&b.1)).expect("four fixed arms");
+    let adaptive = rows.iter().find(|(k, _)| matches!(k, Idx::Adaptive)).expect("adaptive arm");
+    println!("
+bake-off on the live state | {} particles | {frames} frames per arm, min of 2 passes", fluid.n());
+    for (k, us) in &rows {
+        println!("  {:<32} {us:>9.1} us/frame", k.label());
+    }
+    let ratio = fixed_best.1 / adaptive.1.max(1e-9);
+    let verdict = format!("adaptive {:.2}x the best fixed ({})", ratio, fixed_best.0.label());
+    println!("  -> best fixed: {} at {:.1} us | adaptive: {:.1} us{}",
+        fixed_best.0.label(), fixed_best.1, adaptive.1,
+        picked.map(|p| format!(" (it is holding: {p})")).unwrap_or_default());
+    println!("  -> {verdict}");
+    println!("  (>1.00x means the policy beat every fixed choice; ~1.00x means it found the best");
+    println!("   one by itself, which is the honest goal — see AdaptiveIndex's module docs.)");
+    verdict
+}
+
 /// Run `frames` simulation steps with no renderer and report the per-phase means.
 ///
 /// Reports **means over the run, not the last frame** — the stealth demo learned that the hard
@@ -550,6 +605,14 @@ fn headless(frames: usize) {
     // allocated, which is a build cost wearing a maintain cost's clothes.
     let warmup = (frames / 10).clamp(1, 60);
     for _ in 0..warmup { fluid.step(&mut index, kind); }
+
+    if std::env::var("FLUID_BAKEOFF").ok().as_deref() == Some("1") {
+        // Settle the fluid first: a bake-off on frame zero races five indexes on a lattice that
+        // no fluid ever looks like again.
+        for _ in 0..200 { fluid.step(&mut index, kind); }
+        report_bakeoff(&fluid, frames.min(120).max(20), index.chosen());
+        return;
+    }
 
     let (mut acc_m, mut acc_q, mut acc_p) = (0.0f64, 0.0f64, 0.0f64);
     for _ in 0..frames {
@@ -650,6 +713,9 @@ async fn run() {
     let smoke: Option<u64> = std::env::var("FLUID_MAX_FRAMES").ok().and_then(|s| s.parse().ok());
     let (mut maint_us, mut query_us, mut phys_us) = (0.0f32, 0.0f32, 0.0f32);
     let (mut paused, mut frame, mut fps) = (false, 0u64, 0.0f32);
+    // The last `C` bake-off verdict, kept so the answer stays on screen rather than scrolling
+    // past in a console the player may not be looking at.
+    let mut bake: Option<String> = None;
     let mut last = Instant::now();
     let (mut stirring, mut cursor, mut prev_cursor) = (false, (0.0f32, 0.0f32), (0.0f32, 0.0f32));
     let mut inst: Vec<Inst> = Vec::with_capacity(MAX_N);
@@ -684,6 +750,12 @@ async fn run() {
                 }
                 WindowEvent::KeyboardInput { event: KeyEvent { physical_key: PhysicalKey::Code(c), state: ElementState::Pressed, .. }, .. } => match c {
                     KeyCode::KeyM => { kind = kind.next(); index = Index::build(kind, &fluid.px, &fluid.py); }
+                    // Race every fixed choice against whatever the policy is holding, on the
+                    // state currently on screen. The HUD can say what the index CHOSE; only this
+                    // can say whether that was right, and it costs a visible stutter to answer.
+                    KeyCode::KeyC => {
+                        bake = Some(report_bakeoff(&fluid, 45, index.chosen()));
+                    }
                     KeyCode::KeyP => paused = !paused,
                     KeyCode::KeyR => { fluid = Fluid::new(n); index = Index::build(kind, &fluid.px, &fluid.py); }
                     KeyCode::KeyG => fluid.grav = -fluid.grav,
@@ -747,6 +819,16 @@ async fn run() {
                         let by = ty + 5.0 * tp;
                         push_quad(&mut ui, pad + 3.0 * tp, by, bar_w, bar_h, [0.13, 0.15, 0.22, 0.85], cw, ch);
                         push_quad(&mut ui, pad + 3.0 * tp, by, bar_w * (us / total), bar_h, *col, cw, ch);
+                    }
+                    // The bake-off verdict, if `C` has ever been pressed. It stays until the
+                    // next one: the whole point is a claim you can check, and a claim that
+                    // scrolls out of a console nobody is watching is not one.
+                    if let Some(v) = &bake {
+                        push_text(&mut ui, pad + 3.0 * tp, y0 + 3.0 * row, tp * 0.8,
+                            [1.0, 0.95, 0.55, 0.95], &v.to_uppercase(), cw, ch);
+                    } else {
+                        push_text(&mut ui, pad + 3.0 * tp, y0 + 3.0 * row, tp * 0.8,
+                            [0.55, 0.60, 0.72, 0.85], "C - RACE EVERY INDEX ON THIS STATE", cw, ch);
                     }
                     queue.write_buffer(&ui_buf, 0, bytemuck::cast_slice(&ui));
                     let ui_count = ui.len() as u32;

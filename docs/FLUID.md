@@ -63,6 +63,33 @@ So the churn rule would have got the repo's only genuine counterexample backward
 query-intensity rule gets it right. That is why `adaptive::Thresholds` switches on
 `rebuild_query_ratio` and keeps `high_churn` only as a description of the workload.
 
+## `C` — race every index on the state you are looking at
+
+The HUD can tell you what the adaptive index *chose*. It cannot tell you whether that was right,
+because it never runs the alternatives. `C` does: it clones the fluid, races all five choices from
+the current state, and prints a verdict that stays on the HUD.
+
+```
+bake-off on the live state | 2200 particles | 120 frames per arm, min of 2 passes
+  MORTONGRID REBUILD                  2865.4 us/frame
+  MORTONGRID KEEP                     2878.0 us/frame
+  TREE KEEP-INDEX                     3342.8 us/frame
+  LINEARQUADTREE REBUILD              2987.6 us/frame
+  ADAPTIVEINDEX2 (picks its own)      2712.1 us/frame
+  -> best fixed: MORTONGRID REBUILD at 2865.4 us | adaptive: 2712.1 us (it is holding: grid)
+  -> adaptive 1.06x the best fixed
+```
+
+`$FLUID_BAKEOFF=1` runs the same thing headless (after settling the fluid for 200 frames — racing
+five indexes on frame zero measures a lattice no fluid ever looks like again).
+
+Two details that are not decoration. The arms run **forward and then in reverse**, each keeping
+its minimum: that gives every arm the same mean position in the sequence, so a machine that
+drifts mid-bake-off cannot favour whoever went first — the counterbalancing argument in
+[`MEASURING.md`](MEASURING.md) § 8e, applied to five arms instead of two. And it is a *minimum*
+rather than a mean because this machine's noise is episodic and can only ever add time, so the
+smallest reading is the closest to the truth.
+
 ## Running it without a screen
 
 `$FLUID_HEADLESS=<frames>` runs the simulation with no window, no GPU and no wgpu adapter, then
