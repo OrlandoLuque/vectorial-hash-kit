@@ -89,5 +89,12 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+      # Advisory only: mtimes mean nothing in a fresh clone (every file gets the checkout
+      # time), so this cannot FAIL here — it exists so the log shows the table, and so the
+      # script itself keeps working. The check that matters is run locally before publishing.
+      - name: web publish freshness (advisory)
+        continue-on-error: true
+        run: bash scripts/check-web-fresh.sh --list
+
       - name: build web demos (wasm32)
         run: cargo build --target wasm32-unknown-unknown -p vectorial-hash-demos --bin critters --bin critters3d --release
