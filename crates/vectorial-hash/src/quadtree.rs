@@ -171,10 +171,12 @@ impl<T: Positioned> QuadTree<T> {
     /// for `items[i]` **among the accepted ones**, so a caller that may pass out-of-world points
     /// should filter first if it wants to index by its own array.
     ///
-    /// Unlike [`crate::Tree::bulk_load`] there is no `bulk_load_par` here: the 4-way split is
-    /// positional rather than chosen (no `pick_split` to parallelise over), so the recursion is
-    /// already the cheap part and the rayon machinery would buy little. Measured against
-    /// repeated `insert` in `examples/quadtree_bulk_load`.
+    /// There is no `bulk_load_par` here **yet**, and the reason once given for that was wrong.
+    /// The claim was that a 4-way positional split makes the recursion cheap, so rayon would
+    /// buy little. `examples/quadtree_bulk_load` measures it: the recursion is **92–97 % of the
+    /// build**, giving a parallel version a ceiling of **7–11×** on 16 threads. A positional
+    /// split is cheap per node; there are simply a great many nodes. Writing it is queued
+    /// rather than done, but it is now queued on a number.
     pub fn bulk_load(bbox: Rect, item_limit: usize, items: Vec<T>) -> Self {
         let mut t = Self::new(bbox, item_limit);
         let root = t.root;

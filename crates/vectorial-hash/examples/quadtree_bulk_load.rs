@@ -5,11 +5,19 @@
 //! descends the tree N times and splits as it goes — so it should win, and by more as the tree
 //! gets deeper. This checks that, and checks the two trees answer the same.
 //!
-//! Note what is NOT here: a `bulk_load_par`. `Tree`'s parallel bulk load exists because its
-//! split axis is *chosen* (`pick_split`), so the partition is the expensive part and worth
-//! fanning out. A quadtree's split is positional — four fixed quadrants — so the recursion is
-//! already cheap and rayon would mostly buy overhead. That is an argument, not a measurement,
-//! and it is written down here so the next person can disagree with it on purpose.
+//! Note what is NOT here: a `bulk_load_par` — and **the reason given for that was wrong**.
+//!
+//! The argument was that `Tree`'s parallel bulk load exists because its split axis is *chosen*
+//! (`pick_split`), whereas a quadtree's is positional, so its recursion is already cheap and
+//! rayon would only buy overhead. Written down as "an argument, not a measurement, so the next
+//! person can disagree with it on purpose" — which is what happened, on the next day, by
+//! measuring it. The recursion is **92–97 % of the build**, so a parallel version has a
+//! ceiling of **7–11×**. Positional splits are cheap PER NODE; there are simply an enormous
+//! number of nodes.
+//!
+//! The second table below is that measurement, and it needs no parallel implementation to
+//! make: the recursion is the only part that could fan out, so isolating its share bounds the
+//! win — and an `item_limit` of n makes the root never split, which measures the fill alone.
 //!
 //! ```bash
 //! cargo run -p vectorial-hash --example quadtree_bulk_load --release
@@ -72,6 +80,44 @@ fn main() {
         println!("{:>10} {:>6} {:>14.0} {:>14.0} {:>10.2}", n, leaf, a, b, a / b);
     }
     println!("\n(both trees checked against brute force at every row before timing)");
+    // ---------------------------------------------------------- would a parallel build pay?
+    //
+    // `Tree` has a `bulk_load_par` and this does not, on the argument that a quadtree's split
+    // is POSITIONAL (four fixed quadrants) rather than chosen, so the partition is not the
+    // expensive part and rayon would buy overhead. That was an argument, not a measurement —
+    // and the table below refutes it: the recursion is 92-97% of the build.
+    //
+    // Measuring it does not require writing the parallel version. The recursion is the only
+    // part that could be fanned out, so what bounds the win is its SHARE of the build — and
+    // that can be isolated with the public API alone: an `item_limit` of n means the root never
+    // splits, so the same call measures the fill by itself.
+    println!("\n\nWhat could a parallel build even save? (the recursion's share of bulk_load)\n");
+    println!("{:>10} {:>14} {:>16} {:>14} {:>18}", "N", "fill only us", "fill+divide us", "divide share", "ceiling @16 thr");
+    for &n in &[10_000usize, 100_000, 500_000] {
+        let mut rng = Rng(0xBADC0DE ^ n as u64);
+        let items: Vec<P> = (0..n).map(|i| P { id: i as u32, p: Point::new(rng.f() * W, rng.f() * W) }).collect();
+        // item_limit = n: every point lands in the root and `divide` never runs.
+        let fill = med((0..REPS).map(|_| {
+            let t = Instant::now();
+            let q = QuadTree::<P>::bulk_load(world, n.max(1), items.clone());
+            let us = t.elapsed().as_secs_f64() * 1e6; std::hint::black_box(&q); us
+        }).collect());
+        let full = med((0..REPS).map(|_| {
+            let t = Instant::now();
+            let q = QuadTree::<P>::bulk_load(world, 8, items.clone());
+            let us = t.elapsed().as_secs_f64() * 1e6; std::hint::black_box(&q); us
+        }).collect());
+        let share = ((full - fill) / full).max(0.0);
+        // Amdahl on the recursion alone, with the fill left serial.
+        let ceiling = 1.0 / ((1.0 - share) + share / 16.0);
+        println!("{:>10} {:>14.0} {:>16.0} {:>13.0}% {:>17.2}x", n, fill, full, share * 100.0, ceiling);
+    }
+    println!("\nThe last column is an upper bound and a generous one: it assumes the recursion");
+    println!("parallelises perfectly across 16 threads with no synchronisation, no allocator");
+    println!("contention and no cost to merge the arenas. Whatever it reads, the real figure is");
+    println!("below it — so if the ceiling is small, the argument for not writing the parallel");
+    println!("version has become a measurement.");
+
     println!();
     println!("Measured answer: it does NOT reliably win - 0.83x at 10k, 1.06x at 100k, 1.18x at");
     println!("500k. `insert`'s descent was never the expensive part (O(log n), tiny constant),");
