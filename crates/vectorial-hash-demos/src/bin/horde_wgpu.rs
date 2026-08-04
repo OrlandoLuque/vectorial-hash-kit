@@ -437,7 +437,7 @@ const ZNAMES: [&str; 5] = ["walker", "runner", "chubby/slime", "venom", "harpy"]
 /// Bumped by hand on every build handed to the user. Three rounds of "it looks the same" against
 /// binaries verified to differ meant the first thing to rule out was whether we were even looking
 /// at the same process — and a title you can read beats any amount of reasoning about it.
-const BUILD_TAG: &str = "R4-footprints";
+const BUILD_TAG: &str = "R5-flush-joints";
 
 fn ztweak(c: ZClass) -> (f32, f32) {
     // Chubby (slime) faced 90° off — turned another 90° left (user 2026-07-23): −π/2 → 0.

@@ -795,11 +795,30 @@ fn build_base(rng: &mut Rng, seed: f64, sc: Scenario) -> Vec<Structure> {
     let (wall_w, gate_w, tower_w) = (ring_footprint(SKind::Wall), ring_footprint(SKind::Gate), ring_footprint(SKind::Tower));
     let x_off = tower_w * TOWER_WALL_X;
     let gap_arc = std::f64::consts::TAU * BASE_R / RING_TOWERS as f64;
+    // Fill `run` with walls, BOTH ENDS FLUSH.
+    //
+    // The first version used the step straight from the user's sketch,
+    // `step = wall_w - (I*wall_w - run) / I`, which is `run / I`. That spreads the rounding
+    // evenly between the walls but leaves the last one sticking out past the end by
+    // `wall_w - step`: the near end lands exactly on the boundary and the far end overhangs.
+    // On the ring that overhang is always on the same side, so every gate got invaded by the
+    // wall to one side of it and every tower by the wall to one side of it -- "a la sección con
+    // puerta se le solapa el muro de su derecha... de la torre, también" (user 2026-08-04).
+    //
+    // Pinning both ends instead: first centre at `start + w/2`, last at `start + run - w/2`,
+    // and `I - 1` equal steps between them. Same intent -- the rounding is absorbed by letting
+    // the walls overlap each other -- but the run now ends where it is supposed to.
     let fill = |out: &mut Vec<(f64, SKind)>, start: f64, run: f64| {
         if run <= 0.0 { return; }
-        let i_n = (run / wall_w).ceil().max(1.0);
-        let step = wall_w - (i_n * wall_w - run) / i_n;
-        for i in 0..i_n as usize { out.push((start + i as f64 * step + wall_w * 0.5, SKind::Wall)); }
+        let i_n = (run / wall_w).ceil().max(1.0) as usize;
+        if i_n == 1 {
+            // One wall wider than its run: centre it so it laps equally at both ends rather
+            // than sitting flush at one and hanging off the other.
+            out.push((start + run * 0.5, SKind::Wall));
+            return;
+        }
+        let step = (run - wall_w) / (i_n - 1) as f64;
+        for i in 0..i_n { out.push((start + wall_w * 0.5 + i as f64 * step, SKind::Wall)); }
     };
     let mut ring: Vec<(f64, SKind)> = Vec::new();
     for k in 0..RING_TOWERS {
@@ -2186,6 +2205,25 @@ mod tests {
         }
         // A hole is the failure that reads as "the rampart breaks at every tower".
         assert!(worst_gap <= 1e-6, "the ring has a {worst_gap:.2} wu hole in it");
+
+        // Sharper: each KIND of junction has an intended lap, and the bug this test missed the
+        // first time was an overhang at one end of every run only. A wall meeting a gate should
+        // be flush; a wall meeting a tower should lap exactly TOWER_WALL_X of the tower.
+        let tower_lap = ring_footprint(SKind::Tower) * TOWER_WALL_X;
+        for i in 0..ring.len() {
+            let (a, ha, ka) = ring[i];
+            let (b, hb, kb) = ring[(i + 1) % ring.len()];
+            let d = if i + 1 == ring.len() { b + circ - a } else { b - a };
+            let ov = ha + hb - d;
+            let want = match (ka, kb) {
+                (SKind::Wall, SKind::Wall) => continue,          // free to overlap: that is the rounding
+                (SKind::Gate, _) | (_, SKind::Gate) => 0.0,
+                (SKind::Tower, _) | (_, SKind::Tower) => tower_lap,
+                _ => continue,
+            };
+            assert!((ov - want).abs() < 0.05,
+                "{ka:?}|{kb:?} junction laps {ov:.2} wu, should be {want:.2} — the run is not                  flush at that end");
+        }
         // A pile-up is the opposite failure. The intended maxima are the rounding sliver
         // absorbed between walls (< one wall) and a wall lapping TOWER_WALL_X into a tower.
         assert!(worst_overlap < wall_w, "pieces overlap by {worst_overlap:.2} wu (>= one wall {wall_w:.2}) — they are stacking, not tiling");
