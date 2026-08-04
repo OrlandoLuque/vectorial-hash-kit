@@ -431,6 +431,14 @@ fn unit_box() -> vectorial_hash_demos::model::SkinnedModel {
 /// Per-model orientation/size corrections (the slime faces +X — same tweak as
 /// siege's `model_tweak`, and it reads big). Baked into the impostor photos at
 /// capture time, applied live on the skinned path.
+/// The five zombie classes in model order — the impostor atlas's layer order too.
+const ZCLASSES: [ZClass; 5] = [ZClass::Walker, ZClass::Runner, ZClass::Chubby, ZClass::Venom, ZClass::Harpy];
+const ZNAMES: [&str; 5] = ["walker", "runner", "chubby/slime", "venom", "harpy"];
+/// Bumped by hand on every build handed to the user. Three rounds of "it looks the same" against
+/// binaries verified to differ meant the first thing to rule out was whether we were even looking
+/// at the same process — and a title you can read beats any amount of reasoning about it.
+const BUILD_TAG: &str = "R4-footprints";
+
 fn ztweak(c: ZClass) -> (f32, f32) {
     // Chubby (slime) faced 90° off — turned another 90° left (user 2026-07-23): −π/2 → 0.
     // Then reported (2026-08-03) as having front↔back AND left↔right swapped. Both axes at
@@ -551,6 +559,19 @@ struct State {
     frustum_cull: bool,
     /// HORDE_NOLOD=1 → everything fully skinned (the pre-LOD path, for A/B).
     lod: bool,
+    /// Per-class model yaw, live-tunable with `Y` (pick class) and `U` (+90 deg).
+    ///
+    /// `ztweak`'s yaw has now been guessed three times from a verbal report (-PI/2, then 0, then
+    /// PI) and has been wrong each time, because the person who can SEE the screen and the one
+    /// who can EDIT the constant are different, and a rebuild sits between them. So the constant
+    /// became a knob: turn it until it looks right, read the number off the title bar, and that
+    /// number is the answer instead of the next guess.
+    zyaw: [f32; 5],
+    /// What the impostor atlas was BAKED with. Photos are captured once at startup with the
+    /// yaw applied, so a runtime change must be sent to the billboard as a DELTA against this
+    /// or the far units would stop agreeing with the near ones.
+    zyaw0: [f32; 5],
+    zyaw_sel: usize,
     fps: f32,
     last: Instant,
     yaw: f32,
@@ -880,6 +901,7 @@ impl State {
             sim, seed, pop,
             dpr,
             paused: false, frustum_cull: true, lod: std::env::var("HORDE_NOLOD").is_err(), fps: 0.0, last: Instant::now(),
+            zyaw: ZCLASSES.map(|c| ztweak(c).0), zyaw0: ZCLASSES.map(|c| ztweak(c).0), zyaw_sel: 2,
             // A headless shot has nobody to drag the camera, so the orbit is settable.
             yaw: envf("HORDE_CAM_YAW", 0.9), pitch: envf("HORDE_CAM_PITCH", 0.7),
             dist: envf("HORDE_CAM_DIST", 820.0), dragging: false, last_mouse: (0.0, 0.0),
@@ -1168,13 +1190,19 @@ impl State {
                     // turn the moment it crossed LOD_DIST. Read as "some slimes walk
                     // sideways, some backwards" (user 2026-08-04), because the atlas
                     // quantises to 8 views so the error lands on different cells per unit.
-                    pos: [x, y + cy, zz], size, heading: -yaw + std::f32::consts::FRAC_PI_2,
+                    // The +90 deg the skinned path applies, plus any live yaw change as a delta
+                    // against what the atlas was baked with (the per-class yaw itself is already
+                    // in the photos, so only the CHANGE belongs here).
+                    pos: [x, y + cy, zz], size,
+                    heading: -yaw + std::f32::consts::FRAC_PI_2
+                             + (self.zyaw[z.class.index()] - self.zyaw0[z.class.index()]),
                     phase: (i % 89) as f32 * 0.0112,
                     mode: 0, layer: zmodel(z.class) as u32, tint: [0.0, 0.0, 0.0, 0.0],
                 });
                 continue;
             }
-            let (tw_yaw, tw_scale) = ztweak(z.class);
+            let (_, tw_scale) = ztweak(z.class);
+            let tw_yaw = self.zyaw[z.class.index()];
             let mi = zmodel(z.class);
             // Stationary (attacking/standing) or dormant → play the IDLE clip, not a
             // walk-on-the-spot (user 2026-07-23). Idle uses a varied id-based facing.
@@ -1225,7 +1253,8 @@ impl State {
                 let nf = m.n_frames.max(1);
                 let phase = (it.id % 8) as f32 / 8.0;
                 let frame = (((now as f32 * 0.7 + phase) * nf as f32) as u32) % nf;
-                let (tw_yaw, tw_scale) = ztweak(it.class);
+                let (_, tw_scale) = ztweak(it.class);
+                let tw_yaw = self.zyaw[it.class.index()];
                 let model = Mat4::from_translation(Vec3::new(x, y, zz)) * Mat4::from_rotation_y(it.id as f32 * 2.399963 + tw_yaw) * Mat4::from_scale(Vec3::splat(zscale(it.class) * tw_scale));
                 idle_buckets[mi].push(SkinInstance { model: model.to_cols_array_2d(), color: ztint(it.class, true), frame_base: frame * m.num_joints, _pad: [0; 3] });
             }
@@ -1919,6 +1948,12 @@ async fn run() {
                         KeyCode::KeyP => st.paused = !st.paused,
                         KeyCode::KeyN => st.sim.trigger_wave(), // bring the next wave
                         KeyCode::KeyK => st.frustum_cull = !st.frustum_cull,
+                        KeyCode::KeyY => { st.zyaw_sel = (st.zyaw_sel + 1) % 5; println!("yaw target: {}", ZNAMES[st.zyaw_sel]); }
+                        KeyCode::KeyU => {
+                            let i = st.zyaw_sel;
+                            st.zyaw[i] = (st.zyaw[i] + std::f32::consts::FRAC_PI_2) % std::f32::consts::TAU;
+                            println!("yaw[{}] = {:.0} deg", ZNAMES[i], st.zyaw[i].to_degrees());
+                        }
                         KeyCode::KeyT => st.sim.tower_threat_mode = !st.sim.tower_threat_mode,
                         KeyCode::KeyG => { let sc = st.sim.scenario.next(); st.set_scenario(sc); } // cycle the map preset
                         KeyCode::KeyM => { let zm = st.sim.zmode.next(); st.sim.set_zmode(zm); }   // Tree3 ↔ Morton, live
@@ -1982,7 +2017,7 @@ async fn run() {
                         if std::env::var_os("SHOT").is_some() { window.set_title("vhshot"); }
                         else {
                         let (d, a) = st.sim.counts();
-                        window.set_title(&format!("vectorial-hash — horde (wgpu) · map {} [G] · index {} [M] · goal {} [O]{} · sleep {d} | awake {a} | kills {} · run {} · {:.0} fps{}", st.sim.scenario.label(), st.sim.zmode.label(), if st.sim.flow_multi() { "BUILDINGS" } else { "CC" }, if st.night { " · NIGHT [L]" } else { "" }, st.sim.kills, st.sim.run, st.fps, if st.paused { " · PAUSED" } else { "" }));
+                        window.set_title(&format!("vectorial-hash — horde (wgpu) · map {} [G] · index {} [M] · goal {} [O]{} · sleep {d} | awake {a} | kills {} · run {} · {:.0} fps{} · yaw[{}]={:.0}° [Y/U] · build {}", st.sim.scenario.label(), st.sim.zmode.label(), if st.sim.flow_multi() { "BUILDINGS" } else { "CC" }, if st.night { " · NIGHT [L]" } else { "" }, st.sim.kills, st.sim.run, st.fps, if st.paused { " · PAUSED" } else { "" }, ZNAMES[st.zyaw_sel], st.zyaw[st.zyaw_sel].to_degrees(), BUILD_TAG));
                         }
                     }
                     #[cfg(not(target_arch = "wasm32"))]

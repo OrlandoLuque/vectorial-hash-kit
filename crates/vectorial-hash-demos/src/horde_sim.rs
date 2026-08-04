@@ -41,14 +41,24 @@ pub const RING_TOWERS: usize = 8;
 /// user's 1/4 · 3/4 rule, now expressed once instead of nudged in the renderer.
 pub const TOWER_WALL_X: f64 = 0.25;
 
-/// The SOLID arc a ring piece occupies, in world units.
+/// The arc a ring piece occupies, in world units — **the width its model is actually drawn at**.
 ///
-/// These are the layout's numbers and the renderer's model scales are chosen to match them
-/// (`horde_wgpu::building_tweak`): wall and gate models carry ~half their bounding box as
-/// decorative overhang, so the solid core is about half the model's width. Changing one side
-/// without the other is what put walls through towers.
+/// MEASURED, not asserted: `examples/model_footprints` loads each glb, reads its XZ bounding
+/// box, and multiplies by the world height `horde_wgpu::building_tweak` gives it. The values
+/// below are that output, and `ring_models_match_the_layout_footprints` fails if the two ever
+/// drift apart again.
+///
+/// They had drifted badly. The previous values described a "solid core, about half the model,
+/// the rest decorative overhang" — a claim in a comment that nothing computed and that named a
+/// `model_dims` function which does not exist. Measured, the wall model is **16.10 wu wide and
+/// was being placed every 8.00**, so every wall buried half of each neighbour: the rampart the
+/// user reported as "murallas solapadas" (2026-08-04). The tower, at 1.03x its slot, was the
+/// only piece that looked right — which is exactly why the towers were never the complaint.
+///
+/// The lesson is the one this project keeps relearning: a number that bridges two subsystems
+/// has to be derived from one of them, or it becomes folklore.
 pub fn ring_footprint(k: SKind) -> f64 {
-    match k { SKind::Tower => 5.4, SKind::Gate => 8.75, _ => 8.0 }
+    match k { SKind::Tower => 5.56, SKind::Gate => 13.40, _ => 16.10 }
 }
 const MARGIN: f64 = 2.0;
 
@@ -2115,6 +2125,27 @@ impl Horde {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ring_footprint` must equal the width the model is really drawn at.
+    ///
+    /// This is the check that was missing when the wall was placed every 8 wu while being drawn
+    /// 16.10 wide. It loads the actual glb, so it cannot be satisfied by a comment.
+    #[test]
+    fn ring_models_match_the_layout_footprints() {
+        // `building_tweak`'s scale column: the model's world HEIGHT (the loader normalises
+        // every glb to unit height).
+        let cases = [(SKind::Wall, "wall.glb", 4.6f64), (SKind::Gate, "gate.glb", 5.0), (SKind::Tower, "tower.glb", 9.0)];
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/siege/models");
+        for (kind, file, height) in cases {
+            let bytes = std::fs::read(dir.join(file)).expect("the models are committed assets");
+            let m = crate::model::load_glb(&bytes);
+            let drawn = 2.0 * m.footprint as f64 * height;   // footprint is a HALF-extent
+            let layout = ring_footprint(kind);
+            assert!((drawn / layout - 1.0).abs() < 0.05,
+                "{kind:?}: drawn {drawn:.2} wu but the layout reserves {layout:.2} wu ({:.2}x).                  Pieces this far apart either overlap or leave holes; run                  `cargo run -p vectorial-hash-demos --example model_footprints --release`.",
+                drawn / layout);
+        }
+    }
 
     /// The ring has no GAPS and no pile-ups — the property the arc-fitting layout exists for.
     ///
