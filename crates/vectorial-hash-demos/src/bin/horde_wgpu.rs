@@ -73,7 +73,11 @@ fn building_tweak(k: SKind) -> (f32, f32, f32) {
     //   tower aspect 0.6 → tall/narrow; cannon sits on top (see the render loop)
     let ccw = std::f32::consts::FRAC_PI_2;
     match k {
-        SKind::Wall => (4.6, ccw, 0.0),
+        // Matched to the gate's CURTAIN — the plain rampart between its two built-in towers,
+        // measured at 0.607 of the gate model's height, so 5.47 wu once the gate stands at 9.0.
+        // At 4.6 the common wall read 16% lower than the wall inside the gate section and the
+        // rampart stepped down at every gate (user 2026-08-04).
+        SKind::Wall => (5.47, ccw, 0.0),
         // The gate model is a gatehouse: it has a tower built into each side, so those towers
         // should stand as tall as a standalone Tower rather than two-thirds of it (user
         // 2026-08-04). Raising the height widens it too — the layout follows via
@@ -441,15 +445,27 @@ const ZNAMES: [&str; 5] = ["walker", "runner", "chubby/slime", "venom", "harpy"]
 /// Bumped by hand on every build handed to the user. Three rounds of "it looks the same" against
 /// binaries verified to differ meant the first thing to rule out was whether we were even looking
 /// at the same process — and a title you can read beats any amount of reasoning about it.
-const BUILD_TAG: &str = "R6-gate-height";
+const BUILD_TAG: &str = "R10-slime-left90";
 
 fn ztweak(c: ZClass) -> (f32, f32) {
-    // Chubby (slime) faced 90° off — turned another 90° left (user 2026-07-23): −π/2 → 0.
-    // Then reported (2026-08-03) as having front↔back AND left↔right swapped. Both axes at
-    // once is a **rotation of π**, not a mirror: a mirror inverts one axis, which would flip
-    // the model's handedness and show as inside-out shading rather than as a facing error.
-    // So it is one number, and 0.0 was a half-turn short.
-    match c { ZClass::Chubby => (std::f32::consts::PI, 0.80), _ => (0.0, 1.0) }
+    // The slime's yaw went −π/2 → 0 → π, each step guessed from a verbal report, and each one
+    // reported wrong. `examples/model_facing` finally asked the asset instead: it reads the
+    // baked walk cycle and finds the axis the vertices swing along, and **every unit model,
+    // slime included, walks along Z** (slime 0.35, the others 0.11–0.56, the never-complained-
+    // about Ranger 0.37). The slime is not rotated a quarter turn in the asset; its geometry is
+    // oriented exactly like the classes that use 0.
+    //
+    // That ruled out a quarter turn in the ASSET, and it was right to: the remaining error was
+    // the impostor path disagreeing with the skinned one, which is why turning this constant
+    // fixed one row of slimes and broke another (a global rotation moves near and far together
+    // and never closes the gap BETWEEN them). Toggling billboards off with `J` made every group
+    // agree, which is what finally separated the two problems.
+    //
+    // With that settled the model still needed a quarter turn, and the user read the direction
+    // off the screen: **90° to the left**. Left is counterclockwise is **+π/2** here — the same
+    // convention `building_tweak`'s `ccw` uses, and the same one that made the earlier
+    // −π/2 → 0 step "another 90° left". The scale stays at 0.80.
+    match c { ZClass::Chubby => (std::f32::consts::FRAC_PI_2, 0.80), _ => (0.0, 1.0) }
 }
 
 /// LOD switch distance (camera→unit, wu): only units the camera is REALLY
@@ -576,6 +592,13 @@ struct State {
     /// or the far units would stop agreeing with the near ones.
     zyaw0: [f32; 5],
     zyaw_sel: usize,
+    /// Extra yaw applied to the IMPOSTOR billboards only, live-tunable with `I`.
+    ///
+    /// Toggling impostors off with `J` made every group of slimes agree, so the residual error
+    /// is between the two draw paths and not in any per-class constant — which is also why
+    /// turning `U` fixed one row and broke another: a global rotation moves near and far
+    /// together and never closes the gap between them. This knob moves only the far one.
+    imp_yaw: f32,
     fps: f32,
     last: Instant,
     yaw: f32,
@@ -905,7 +928,7 @@ impl State {
             sim, seed, pop,
             dpr,
             paused: false, frustum_cull: true, lod: std::env::var("HORDE_NOLOD").is_err(), fps: 0.0, last: Instant::now(),
-            zyaw: ZCLASSES.map(|c| ztweak(c).0), zyaw0: ZCLASSES.map(|c| ztweak(c).0), zyaw_sel: 2,
+            zyaw: ZCLASSES.map(|c| ztweak(c).0), zyaw0: ZCLASSES.map(|c| ztweak(c).0), zyaw_sel: 2, imp_yaw: 0.0,
             // A headless shot has nobody to drag the camera, so the orbit is settable.
             yaw: envf("HORDE_CAM_YAW", 0.9), pitch: envf("HORDE_CAM_PITCH", 0.7),
             dist: envf("HORDE_CAM_DIST", 820.0), dragging: false, last_mouse: (0.0, 0.0),
@@ -1199,7 +1222,8 @@ impl State {
                     // in the photos, so only the CHANGE belongs here).
                     pos: [x, y + cy, zz], size,
                     heading: -yaw + std::f32::consts::FRAC_PI_2
-                             + (self.zyaw[z.class.index()] - self.zyaw0[z.class.index()]),
+                             + (self.zyaw[z.class.index()] - self.zyaw0[z.class.index()])
+                             + self.imp_yaw,
                     phase: (i % 89) as f32 * 0.0112,
                     mode: 0, layer: zmodel(z.class) as u32, tint: [0.0, 0.0, 0.0, 0.0],
                 });
@@ -1952,6 +1976,15 @@ async fn run() {
                         KeyCode::KeyP => st.paused = !st.paused,
                         KeyCode::KeyN => st.sim.trigger_wave(), // bring the next wave
                         KeyCode::KeyK => st.frustum_cull = !st.frustum_cull,
+                        // The decisive slime experiment, live. If facings become consistent
+                        // across every group with impostors OFF, the billboard is the culprit;
+                        // if the groups still disagree, it is not, and a constant yaw was never
+                        // going to fix it. (Was $HORDE_NOLOD, i.e. restart-per-guess.)
+                        KeyCode::KeyI => {
+                            st.imp_yaw = (st.imp_yaw + std::f32::consts::FRAC_PI_2) % std::f32::consts::TAU;
+                            println!("impostor yaw = {:.0} deg", st.imp_yaw.to_degrees());
+                        }
+                        KeyCode::KeyJ => { st.lod = !st.lod; println!("impostors {}", if st.lod { "ON" } else { "OFF (all 3D)" }); }
                         KeyCode::KeyY => { st.zyaw_sel = (st.zyaw_sel + 1) % 5; println!("yaw target: {}", ZNAMES[st.zyaw_sel]); }
                         KeyCode::KeyU => {
                             let i = st.zyaw_sel;
@@ -2021,7 +2054,7 @@ async fn run() {
                         if std::env::var_os("SHOT").is_some() { window.set_title("vhshot"); }
                         else {
                         let (d, a) = st.sim.counts();
-                        window.set_title(&format!("vectorial-hash — horde (wgpu) · map {} [G] · index {} [M] · goal {} [O]{} · sleep {d} | awake {a} | kills {} · run {} · {:.0} fps{} · yaw[{}]={:.0}° [Y/U] · build {}", st.sim.scenario.label(), st.sim.zmode.label(), if st.sim.flow_multi() { "BUILDINGS" } else { "CC" }, if st.night { " · NIGHT [L]" } else { "" }, st.sim.kills, st.sim.run, st.fps, if st.paused { " · PAUSED" } else { "" }, ZNAMES[st.zyaw_sel], st.zyaw[st.zyaw_sel].to_degrees(), BUILD_TAG));
+                        window.set_title(&format!("vectorial-hash — horde (wgpu) · map {} [G] · index {} [M] · goal {} [O]{} · sleep {d} | awake {a} | kills {} · run {} · {:.0} fps{} · yaw[{}]={:.0}° [Y/U] · imp {} [J] impyaw {:.0}° [I] · build {}", st.sim.scenario.label(), st.sim.zmode.label(), if st.sim.flow_multi() { "BUILDINGS" } else { "CC" }, if st.night { " · NIGHT [L]" } else { "" }, st.sim.kills, st.sim.run, st.fps, if st.paused { " · PAUSED" } else { "" }, ZNAMES[st.zyaw_sel], st.zyaw[st.zyaw_sel].to_degrees(), if st.lod { "ON" } else { "OFF" }, st.imp_yaw.to_degrees(), BUILD_TAG));
                         }
                     }
                     #[cfg(not(target_arch = "wasm32"))]

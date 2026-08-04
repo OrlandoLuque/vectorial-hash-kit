@@ -18,7 +18,7 @@ use vectorial_hash_demos::horde_sim::{ring_footprint, SKind};
 /// Mirrors `horde_wgpu::building_tweak`'s scale column (the model's world height).
 fn world_height(k: SKind) -> f32 {
     match k {
-        SKind::Wall => 4.6, SKind::Gate => 9.0, SKind::Tower => 9.0,
+        SKind::Wall => 5.47, SKind::Gate => 9.0, SKind::Tower => 9.0,
         SKind::House => 6.5, SKind::Storehouse => 7.5, SKind::CommandCenter => 40.0,
     }
 }
@@ -47,6 +47,29 @@ fn main() {
         let layout = ring_footprint(kind) as f32;
         println!("{:>12} {:>10.2} {:>12.3} {:>12.2} {:>12.2} {:>9.2}x",
                  format!("{kind:?}"), h, m.footprint, world_w, layout, world_w / layout);
+    }
+
+    // How tall is the CURTAIN part of the gate model — the plain rampart between its two
+    // built-in towers? That is what a standalone Wall has to match, and after raising the gate
+    // to 9.0 the user reports the common wall now reads LOWER than the gate's own wall.
+    {
+        let bytes = std::fs::read(dir.join("gate.glb")).expect("committed asset");
+        let m = vectorial_hash_demos::model::load_glb(&bytes);
+        // Long axis = along the ring. Sample the middle fifth, away from the end towers.
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for v in &m.vertices { for k in 0..3 { lo[k] = lo[k].min(v.pos[k]); hi[k] = hi[k].max(v.pos[k]); } }
+        let long = if hi[0] - lo[0] >= hi[2] - lo[2] { 0 } else { 2 };
+        let (c, half) = ((lo[long] + hi[long]) * 0.5, (hi[long] - lo[long]) * 0.5);
+        let mut curtain = 0.0f32;
+        for v in &m.vertices {
+            if (v.pos[long] - c).abs() < half * 0.20 { curtain = curtain.max(v.pos[1]); }
+        }
+        let gate_h = world_height(SKind::Gate);
+        println!("
+gate curtain: {:.3} of the model's height → {:.2} wu at gate height {:.1}",
+                 curtain, curtain * gate_h, gate_h);
+        println!("a standalone Wall is drawn {:.2} wu tall — {:.2}x the gate's curtain",
+                 world_height(SKind::Wall), world_height(SKind::Wall) / (curtain * gate_h));
     }
 
     // And what the layout does with those widths, on the real base.

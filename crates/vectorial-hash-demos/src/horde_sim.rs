@@ -68,7 +68,7 @@ pub const GATE_WALL_X: f64 = 0.10;
 /// The lesson is the one this project keeps relearning: a number that bridges two subsystems
 /// has to be derived from one of them, or it becomes folklore.
 pub fn ring_footprint(k: SKind) -> f64 {
-    match k { SKind::Tower => 5.56, SKind::Gate => 24.12, _ => 16.10 }
+    match k { SKind::Tower => 5.56, SKind::Gate => 24.12, _ => 19.15 }
 }
 const MARGIN: f64 = 2.0;
 
@@ -2165,7 +2165,7 @@ mod tests {
     fn ring_models_match_the_layout_footprints() {
         // `building_tweak`'s scale column: the model's world HEIGHT (the loader normalises
         // every glb to unit height).
-        let cases = [(SKind::Wall, "wall.glb", 4.6f64), (SKind::Gate, "gate.glb", 9.0), (SKind::Tower, "tower.glb", 9.0)];
+        let cases = [(SKind::Wall, "wall.glb", 5.47f64), (SKind::Gate, "gate.glb", 9.0), (SKind::Tower, "tower.glb", 9.0)];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/siege/models");
         for (kind, file, height) in cases {
             let bytes = std::fs::read(dir.join(file)).expect("the models are committed assets");
