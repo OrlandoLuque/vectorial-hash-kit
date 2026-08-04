@@ -445,7 +445,7 @@ const ZNAMES: [&str; 5] = ["walker", "runner", "chubby/slime", "venom", "harpy"]
 /// Bumped by hand on every build handed to the user. Three rounds of "it looks the same" against
 /// binaries verified to differ meant the first thing to rule out was whether we were even looking
 /// at the same process — and a title you can read beats any amount of reasoning about it.
-const BUILD_TAG: &str = "R10-slime-left90";
+const BUILD_TAG: &str = "R11-atlas-unrotated";
 
 fn ztweak(c: ZClass) -> (f32, f32) {
     // The slime's yaw went −π/2 → 0 → π, each step guessed from a verbal report, and each one
@@ -461,11 +461,12 @@ fn ztweak(c: ZClass) -> (f32, f32) {
     // and never closes the gap BETWEEN them). Toggling billboards off with `J` made every group
     // agree, which is what finally separated the two problems.
     //
-    // With that settled the model still needed a quarter turn, and the user read the direction
-    // off the screen: **90° to the left**. Left is counterclockwise is **+π/2** here — the same
-    // convention `building_tweak`'s `ccw` uses, and the same one that made the earlier
-    // −π/2 → 0 step "another 90° left". The scale stays at 0.80.
-    match c { ZClass::Chubby => (std::f32::consts::FRAC_PI_2, 0.80), _ => (0.0, 1.0) }
+    // Settled by eye, in two steps: 90° left, then another 180°. That lands on **−π/2**, which
+    // is the value this constant had before any of this started. The skinned path was right all
+    // along; every intermediate "correction" was me chasing the impostor mismatch with the one
+    // knob that could not fix it, because a global rotation moves near and far together. The
+    // scale stays at 0.80.
+    match c { ZClass::Chubby => (-std::f32::consts::FRAC_PI_2, 0.80), _ => (0.0, 1.0) }
 }
 
 /// LOD switch distance (camera→unit, wu): only units the camera is REALLY
@@ -587,10 +588,6 @@ struct State {
     /// became a knob: turn it until it looks right, read the number off the title bar, and that
     /// number is the answer instead of the next guess.
     zyaw: [f32; 5],
-    /// What the impostor atlas was BAKED with. Photos are captured once at startup with the
-    /// yaw applied, so a runtime change must be sent to the billboard as a DELTA against this
-    /// or the far units would stop agreeing with the near ones.
-    zyaw0: [f32; 5],
     zyaw_sel: usize,
     /// Extra yaw applied to the IMPOSTOR billboards only, live-tunable with `I`.
     ///
@@ -743,7 +740,7 @@ impl State {
         let mut bb_geom = [(0.0f32, 0.0f32); 5];
         for (ci, walk) in models[..5].iter().enumerate() {
             let class = [ZClass::Walker, ZClass::Runner, ZClass::Chubby, ZClass::Venom, ZClass::Harpy][ci];
-            let (tw_yaw, tw_scale) = ztweak(class);
+            let (_, tw_scale) = ztweak(class);
             let world_scale = zscale(class) * tw_scale;
             bb_geom[ci] = (IMP_HALF * 2.0 * world_scale, IMP_CY * world_scale);
             let layer_view = atlas.create_view(&wgpu::TextureViewDescriptor { base_array_layer: ci as u32, array_layer_count: Some(1), dimension: Some(wgpu::TextureViewDimension::D2), ..Default::default() });
@@ -768,7 +765,12 @@ impl State {
                         let proj = Mat4::orthographic_rh(-h, h, -h, h, 0.1, h * 14.0);
                         let cam = CameraUniform { vp: (proj * view).to_cols_array_2d(), light: [-0.45, 0.84, -0.30, 0.0], eye_time: [0.0; 4], night_torch: [0.0; 4], torches: NO_TORCHES };
                         queue.write_buffer(&cam_buf, 0, bytemuck::cast_slice(&[cam]));
-                        let inst = SkinInstance { model: Mat4::from_rotation_y(tw_yaw).to_cols_array_2d(), color: [0.0, 0.0, 0.0, 0.0], frame_base: frame * m.num_joints, _pad: [0; 3] };
+                        // Photograph the model UNROTATED. Baking the per-class yaw in here and
+                        // subtracting it again at runtime split ONE rotation across two places,
+                        // which is where a sign can hide — and did. The billboard now carries
+                        // the whole rotation, in the same expression the skinned path uses, so
+                        // the two cannot disagree about a constant.
+                        let inst = SkinInstance { model: Mat4::IDENTITY.to_cols_array_2d(), color: [0.0, 0.0, 0.0, 0.0], frame_base: frame * m.num_joints, _pad: [0; 3] };
                         queue.write_buffer(&inst_buf, 0, bytemuck::cast_slice(&[inst]));
                         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
                         {
@@ -928,7 +930,7 @@ impl State {
             sim, seed, pop,
             dpr,
             paused: false, frustum_cull: true, lod: std::env::var("HORDE_NOLOD").is_err(), fps: 0.0, last: Instant::now(),
-            zyaw: ZCLASSES.map(|c| ztweak(c).0), zyaw0: ZCLASSES.map(|c| ztweak(c).0), zyaw_sel: 2, imp_yaw: 0.0,
+            zyaw: ZCLASSES.map(|c| ztweak(c).0), zyaw_sel: 2, imp_yaw: 0.0,
             // A headless shot has nobody to drag the camera, so the orbit is settable.
             yaw: envf("HORDE_CAM_YAW", 0.9), pitch: envf("HORDE_CAM_PITCH", 0.7),
             dist: envf("HORDE_CAM_DIST", 820.0), dragging: false, last_mouse: (0.0, 0.0),
@@ -1211,18 +1213,11 @@ impl State {
                 // Far: a walking impostor (photo billboard, animated in-shader).
                 let (size, cy) = self.bb_geom[zmodel(z.class)];
                 proxies.push(BillboardInst {
-                    // Same quarter-turn the skinned path applies below. The atlas photos
-                    // already BAKE `ztweak`'s per-class yaw, so that one must not be added
-                    // here — but the +90° must, and its absence turned every unit a quarter
-                    // turn the moment it crossed LOD_DIST. Read as "some slimes walk
-                    // sideways, some backwards" (user 2026-08-04), because the atlas
-                    // quantises to 8 views so the error lands on different cells per unit.
-                    // The +90 deg the skinned path applies, plus any live yaw change as a delta
-                    // against what the atlas was baked with (the per-class yaw itself is already
-                    // in the photos, so only the CHANGE belongs here).
+                    // Literally the skinned path's `rot` below, plus the live tuning offset.
+                    // The atlas is baked unrotated now, so the whole rotation belongs here and
+                    // there is no bake-time half of it to keep in step.
                     pos: [x, y + cy, zz], size,
-                    heading: -yaw + std::f32::consts::FRAC_PI_2
-                             + (self.zyaw[z.class.index()] - self.zyaw0[z.class.index()])
+                    heading: -yaw + std::f32::consts::FRAC_PI_2 + self.zyaw[z.class.index()]
                              + self.imp_yaw,
                     phase: (i % 89) as f32 * 0.0112,
                     mode: 0, layer: zmodel(z.class) as u32, tint: [0.0, 0.0, 0.0, 0.0],
