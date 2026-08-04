@@ -18,7 +18,7 @@ use vectorial_hash_demos::horde_sim::{ring_footprint, SKind};
 /// Mirrors `horde_wgpu::building_tweak`'s scale column (the model's world height).
 fn world_height(k: SKind) -> f32 {
     match k {
-        SKind::Wall => 4.6, SKind::Gate => 5.0, SKind::Tower => 9.0,
+        SKind::Wall => 4.6, SKind::Gate => 9.0, SKind::Tower => 9.0,
         SKind::House => 6.5, SKind::Storehouse => 7.5, SKind::CommandCenter => 40.0,
     }
 }

@@ -36,10 +36,20 @@ pub const BASE_R: f64 = 150.0; // wall ring radius around the map centre
 /// of an arc (see `build_base`).
 pub const RING_TOWERS: usize = 8;
 /// Arc distance from a tower's CENTRE to the near edge of the first wall beside it, as a
-/// fraction of the tower's own width. A quarter means each neighbouring wall overlaps a
-/// quarter of the tower from its own side, so the rampart reads continuous through it — the
-/// user's 1/4 · 3/4 rule, now expressed once instead of nudged in the renderer.
-pub const TOWER_WALL_X: f64 = 0.25;
+/// fraction of the tower's own width. The user's 1/4 · 3/4 rule, expressed once instead of
+/// nudged in the renderer.
+///
+/// **Smaller means MORE overlap**, which is the opposite of what the name suggests: the wall
+/// laps `width × (0.5 − TOWER_WALL_X)` of the tower. At exactly 0.25 those two expressions
+/// coincide, which hid the difference until the junction test was asked for a different value
+/// and immediately said so.
+pub const TOWER_WALL_X: f64 = 0.15;
+/// The same idea at a gate, as a fraction of the GATE's width: the adjacent wall run starts
+/// slightly inside the gate rather than exactly at its edge. Bounding boxes that merely touch
+/// still show daylight, because the box includes the model's widest point and the stonework
+/// beside it is narrower — the user could see the seam at both sides of every gate and at one
+/// side of every tower (2026-08-04). A small lap is what closes it.
+pub const GATE_WALL_X: f64 = 0.10;
 
 /// The arc a ring piece occupies, in world units — **the width its model is actually drawn at**.
 ///
@@ -58,7 +68,7 @@ pub const TOWER_WALL_X: f64 = 0.25;
 /// The lesson is the one this project keeps relearning: a number that bridges two subsystems
 /// has to be derived from one of them, or it becomes folklore.
 pub fn ring_footprint(k: SKind) -> f64 {
-    match k { SKind::Tower => 5.56, SKind::Gate => 13.40, _ => 16.10 }
+    match k { SKind::Tower => 5.56, SKind::Gate => 24.12, _ => 16.10 }
 }
 const MARGIN: f64 = 2.0;
 
@@ -830,9 +840,11 @@ fn build_base(rng: &mut Rng, seed: f64, sc: Scenario) -> Vec<Structure> {
         let span = gap_arc - 2.0 * x_off;
         if RING_TOWERS % 4 == 0 && (k + 1) % (RING_TOWERS / 4) == 0 {
             ring.push((centre, SKind::Gate));
-            let run = (span - gate_w) * 0.5;
-            fill(&mut ring, tower_arc + x_off, run);          // tower → gate
-            fill(&mut ring, centre + gate_w * 0.5, run);      // gate → next tower
+            // Each run laps `gate_lap` into the gate so the joint reads solid.
+            let gate_lap = gate_w * GATE_WALL_X;
+            let run = (span - gate_w) * 0.5 + gate_lap;
+            fill(&mut ring, tower_arc + x_off, run);                      // tower → gate
+            fill(&mut ring, centre + gate_w * 0.5 - gate_lap, run);       // gate → next tower
         } else {
             fill(&mut ring, tower_arc + x_off, span);
         }
@@ -2153,7 +2165,7 @@ mod tests {
     fn ring_models_match_the_layout_footprints() {
         // `building_tweak`'s scale column: the model's world HEIGHT (the loader normalises
         // every glb to unit height).
-        let cases = [(SKind::Wall, "wall.glb", 4.6f64), (SKind::Gate, "gate.glb", 5.0), (SKind::Tower, "tower.glb", 9.0)];
+        let cases = [(SKind::Wall, "wall.glb", 4.6f64), (SKind::Gate, "gate.glb", 9.0), (SKind::Tower, "tower.glb", 9.0)];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/siege/models");
         for (kind, file, height) in cases {
             let bytes = std::fs::read(dir.join(file)).expect("the models are committed assets");
@@ -2209,7 +2221,7 @@ mod tests {
         // Sharper: each KIND of junction has an intended lap, and the bug this test missed the
         // first time was an overhang at one end of every run only. A wall meeting a gate should
         // be flush; a wall meeting a tower should lap exactly TOWER_WALL_X of the tower.
-        let tower_lap = ring_footprint(SKind::Tower) * TOWER_WALL_X;
+        let tower_lap = ring_footprint(SKind::Tower) * (0.5 - TOWER_WALL_X);
         for i in 0..ring.len() {
             let (a, ha, ka) = ring[i];
             let (b, hb, kb) = ring[(i + 1) % ring.len()];
@@ -2217,7 +2229,7 @@ mod tests {
             let ov = ha + hb - d;
             let want = match (ka, kb) {
                 (SKind::Wall, SKind::Wall) => continue,          // free to overlap: that is the rounding
-                (SKind::Gate, _) | (_, SKind::Gate) => 0.0,
+                (SKind::Gate, _) | (_, SKind::Gate) => ring_footprint(SKind::Gate) * GATE_WALL_X,
                 (SKind::Tower, _) | (_, SKind::Tower) => tower_lap,
                 _ => continue,
             };

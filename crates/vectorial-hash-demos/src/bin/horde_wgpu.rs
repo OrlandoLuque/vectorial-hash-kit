@@ -74,7 +74,11 @@ fn building_tweak(k: SKind) -> (f32, f32, f32) {
     let ccw = std::f32::consts::FRAC_PI_2;
     match k {
         SKind::Wall => (4.6, ccw, 0.0),
-        SKind::Gate => (5.0, ccw, 0.0),
+        // The gate model is a gatehouse: it has a tower built into each side, so those towers
+        // should stand as tall as a standalone Tower rather than two-thirds of it (user
+        // 2026-08-04). Raising the height widens it too — the layout follows via
+        // `ring_footprint`, and `ring_models_match_the_layout_footprints` fails if it does not.
+        SKind::Gate => (9.0, ccw, 0.0),
         SKind::Tower => (9.0, ccw, 0.0),
         SKind::House => (6.5, ccw, 0.0),
         SKind::Storehouse => (7.5, ccw, 0.0),
@@ -437,7 +441,7 @@ const ZNAMES: [&str; 5] = ["walker", "runner", "chubby/slime", "venom", "harpy"]
 /// Bumped by hand on every build handed to the user. Three rounds of "it looks the same" against
 /// binaries verified to differ meant the first thing to rule out was whether we were even looking
 /// at the same process — and a title you can read beats any amount of reasoning about it.
-const BUILD_TAG: &str = "R5-flush-joints";
+const BUILD_TAG: &str = "R6-gate-height";
 
 fn ztweak(c: ZClass) -> (f32, f32) {
     // Chubby (slime) faced 90° off — turned another 90° left (user 2026-07-23): −π/2 → 0.
