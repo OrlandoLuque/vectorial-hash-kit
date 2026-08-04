@@ -1162,7 +1162,13 @@ impl State {
                 // Far: a walking impostor (photo billboard, animated in-shader).
                 let (size, cy) = self.bb_geom[zmodel(z.class)];
                 proxies.push(BillboardInst {
-                    pos: [x, y + cy, zz], size, heading: -yaw,
+                    // Same quarter-turn the skinned path applies below. The atlas photos
+                    // already BAKE `ztweak`'s per-class yaw, so that one must not be added
+                    // here — but the +90° must, and its absence turned every unit a quarter
+                    // turn the moment it crossed LOD_DIST. Read as "some slimes walk
+                    // sideways, some backwards" (user 2026-08-04), because the atlas
+                    // quantises to 8 views so the error lands on different cells per unit.
+                    pos: [x, y + cy, zz], size, heading: -yaw + std::f32::consts::FRAC_PI_2,
                     phase: (i % 89) as f32 * 0.0112,
                     mode: 0, layer: zmodel(z.class) as u32, tint: [0.0, 0.0, 0.0, 0.0],
                 });
@@ -1274,49 +1280,18 @@ impl State {
             }).sum();
             acc / (2 * w + 1) as f32
         }).collect();
-        let tower_at = |i: usize| self.sim.structures[i].kind == SKind::Tower;
-        // Where a wall meets a tower.
-        //
-        // This has now been wrong in both directions. The walls either side of a tower used to
-        // be SKIPPED entirely, leaving a whole empty 8-wu slot on each side — the tower is only
-        // ~5.4 wu wide, so it cannot fill one, and the rampart visibly broke at every tower.
-        // The fix before that overcorrected and jammed them together.
-        //
-        // The rule now is the user's, and it is stated in the tower's own footprint rather than
-        // in absolute world units, so it survives a change to either model's scale: measuring
-        // across the tower from 0 to 1, one wall starts at **1/4** and the other at **3/4**.
-        // Each adjacent wall therefore overlaps a quarter of the tower from its own side, and
-        // the rampart reads continuous through it.
-        const TOWER_ANCHOR: f32 = 0.25;      // where the wall meets, across the tower (0..1 from its edge)
-        const TOWER_ASPECT: f32 = 0.6;       // tall/narrow — width = scale * aspect
-        const WALL_CORE: f32 = 8.0;          // solid span of a wall piece (the model is ~2x this, half decorative)
-        let tower_w = building_tweak(SKind::Tower).0 * TOWER_ASPECT;
-        // distance from the tower's CENTRE to the adjacent wall's centre
-        let wall_anchor_d = tower_w * (0.5 - TOWER_ANCHOR) + WALL_CORE * 0.5;
-        // A wall next to a tower is drawn at that anchor instead of at its own slot; `side` is
-        // +1 when the tower sits behind it in ring order and -1 when it sits ahead.
-        let tower_side = |i: usize| -> Option<(usize, f32)> {
-            if ring_n <= 2 || i >= ring_n || self.sim.structures[i].kind != SKind::Wall { return None; }
-            let (next, prev) = ((i + 1) % ring_n, (i + ring_n - 1) % ring_n);
-            if tower_at(next) { Some((next, -1.0)) } else if tower_at(prev) { Some((prev, 1.0)) } else { None }
-        };
+        // Where a wall meets a tower is decided by the SIM now (`horde_sim::build_base`): the
+        // towers are placed first and the walls are fitted into the arc between them, with the
+        // rounding absorbed by overlapping them slightly. This used to be a renderer-side nudge
+        // that slid tower-adjacent walls to an anchor, which was a patch over a layout that cut
+        // the ring into equal slots regardless of what stood in them — and it had been wrong in
+        // both directions (walls skipped entirely, then jammed together).
         for (bi, kind) in [SKind::Wall, SKind::Gate, SKind::Tower, SKind::House, SKind::Storehouse].into_iter().enumerate() {
             let start = building_inst.len() as u32;
             let (sc, yaw, yo) = building_tweak(kind);
             for (si, s) in self.sim.structures.iter().enumerate() {
                 if s.kind != kind { continue; }
-                let (mut x, mut y, mut zz) = (s.p.x as f32, s.p.y as f32, s.p.z as f32);
-                // Slide a tower-adjacent wall along the ring tangent to its anchor. The tangent
-                // is perpendicular to the radius, so this moves it around the ring rather than
-                // in or out of it — a wall nudged radially would leave the rampart's line.
-                if let Some((ti, side)) = tower_side(si) {
-                    let t = &self.sim.structures[ti];
-                    let (tx, tz) = (t.p.x as f32, t.p.z as f32);
-                    let ta = (tz - ccz).atan2(tx - ccx);
-                    let (tanx, tanz) = (-ta.sin(), ta.cos());
-                    x = tx + tanx * side * wall_anchor_d;
-                    zz = tz + tanz * side * wall_anchor_d;
-                }
+                let (x, mut y, zz) = (s.p.x as f32, s.p.y as f32, s.p.z as f32);
                 if si < ring_n { y = ring_y[si]; } // levelled course (see ring_y)
                 let frac = (s.hp / s.kind.max_hp()).clamp(0.0, 1.0) as f32;
                 let ang = (zz - ccz).atan2(x - ccx);

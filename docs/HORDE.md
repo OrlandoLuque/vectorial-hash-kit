@@ -338,6 +338,35 @@ reached — which is why it now kills 25 units outright partway through.
 The keep/rebuild crossover for a grid sits near **70 % of the population moving per frame**
 (`examples/grid_keep_bench`); the horde is nowhere near it, with almost everything asleep.
 
+## The wall ring: towers first, then fit the walls to the arc
+
+The ring used to be cut into equal 8-wu slots, every sixth one made a tower, and the *renderer*
+slid tower-adjacent walls sideways to hide the resulting seam. That is a patch over a wrong
+layout — a tower's slot had nothing to do with a tower's footprint (it is ~5.4 wu, not 8), so
+pieces overlapped each other and the towers. The layout is now the user's method, and it lives
+in `horde_sim::build_base` because positions drive the flow field, breaches and collision, not
+just the picture:
+
+```
+D    = arc between tower centres       X    = tower centre → first wall's near edge
+span = D - 2X                          run  = (span - gate_w) / 2      (a gated arc has two)
+I    = ceil(run / wall_w)              step = wall_w - (I·wall_w - run) / I
+```
+
+`RING_TOWERS` towers are placed first; each gets its arc, and the walls are *fitted* into what
+is left, with the rounding absorbed by overlapping them all by the same sliver rather than
+leaving a gap at one end. With `RING_TOWERS` a multiple of 4 the four gates land exactly on the
+cardinals, because a gate sits at the centre of an arc. `TOWER_WALL_X = 0.25` reproduces the
+1/4 · 3/4 rule symmetrically: each neighbouring wall laps a quarter of the tower from its own
+side. Solid widths live in `ring_footprint()` next to the radius, so they cannot drift from the
+model scales in `horde_wgpu::building_tweak`.
+
+**Checked as an inequality, not by eye.** `the_wall_ring_closes_with_no_gaps_and_no_pile_ups`
+converts every piece to an arc position and half-width and asserts no hole, an overlap that
+exists but is smaller than one wall, and the expected tower and gate counts. Both failure modes
+have shipped before (walls skipped entirely; then jammed together), and neither was caught
+reliably by looking at a screenshot. Verified to fail when the fit's `ceil` becomes `floor`.
+
 ## Looking at it without eyes (`$HORDE_SHOT`)
 
 The renderer can take its own screenshot, so a question like *"does the wall actually meet the
@@ -367,9 +396,14 @@ and the same frame count produce different bytes: the animation phase is driven 
 the HUD prints an FPS. So it verifies by being *looked at*, not by being hashed — which was worth
 finding out before writing a comparison that would have failed on its first green run.
 
-Its first use answered a question that had been marked "needs the user's eyes": a top-down shot
-showed the wall ring closed, the towers at the corners and mid-spans, the walls attaching
-off-centre exactly as the 1/4 / 3/4 anchor specifies, and the two western gaps being the gates.
+**Its first use also shows the limit of the tool, and it is worth writing down.** A top-down
+shot was read as confirming the wall ring's geometry — closed, towers at the corners and
+mid-spans, walls attaching off-centre. It was not the ring. At that camera distance the frame
+was filled by the Command Center's castle model (scale 40) and the ring, radius 150, was off
+frame entirely; the "corners and mid-spans" were the castle's own towers. Framing a shot is
+part of the measurement, and a picture of the wrong thing is as confident-looking as a picture
+of the right one. The ring's geometry is now checked by the test above instead.
+
 What still needs a human is `building_tweak`'s per-model scale, which is taste rather than
 correctness — and that is the useful split.
 

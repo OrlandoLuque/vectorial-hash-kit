@@ -32,6 +32,24 @@ use rayon::prelude::*;
 pub const WORLD: f64 = 1800.0; // map side, world units — roomy: the horde needs somewhere to sleep
 pub const SKY: f64 = 64.0; // index height (terrain amp ~6 + flyer altitude)
 pub const BASE_R: f64 = 150.0; // wall ring radius around the map centre
+/// Towers on the ring. A multiple of 4 so the four cardinal gates land square in the middle
+/// of an arc (see `build_base`).
+pub const RING_TOWERS: usize = 8;
+/// Arc distance from a tower's CENTRE to the near edge of the first wall beside it, as a
+/// fraction of the tower's own width. A quarter means each neighbouring wall overlaps a
+/// quarter of the tower from its own side, so the rampart reads continuous through it — the
+/// user's 1/4 · 3/4 rule, now expressed once instead of nudged in the renderer.
+pub const TOWER_WALL_X: f64 = 0.25;
+
+/// The SOLID arc a ring piece occupies, in world units.
+///
+/// These are the layout's numbers and the renderer's model scales are chosen to match them
+/// (`horde_wgpu::building_tweak`): wall and gate models carry ~half their bounding box as
+/// decorative overhang, so the solid core is about half the model's width. Changing one side
+/// without the other is what put walls through towers.
+pub fn ring_footprint(k: SKind) -> f64 {
+    match k { SKind::Tower => 5.4, SKind::Gate => 8.75, _ => 8.0 }
+}
 const MARGIN: f64 = 2.0;
 
 /// Gentle 2-octave value-noise heightfield — flatter than siege's (no volcano,
@@ -750,14 +768,52 @@ fn build_base(rng: &mut Rng, seed: f64, sc: Scenario) -> Vec<Structure> {
     let (cx, cz) = (WORLD / 2.0, WORLD / 2.0);
     let at = |x: f64, z: f64| Point3::new(x, terrain_h(x, z, seed, sc), z);
     let mut s = Vec::new();
-    let segs = (std::f64::consts::TAU * BASE_R / 8.0) as usize; // one wall piece ≈ every 8 wu
-    let step = std::f64::consts::TAU / segs as f64;
-    // Exactly one gate per cardinal: the single closest segment to each.
-    let gates: Vec<usize> = (0..4).map(|q| ((q as f64 * std::f64::consts::FRAC_PI_2) / step).round() as usize % segs).collect();
-    for i in 0..segs {
-        let a = i as f64 * step;
+    // ---- the ring: place the TOWERS first, then fit walls into the arc left between them.
+    //
+    // The old layout cut the circle into equal 8-wu slots and made every sixth one a tower,
+    // after which the renderer nudged tower-adjacent walls sideways to hide the seam. That was
+    // a patch on a wrong layout — a tower's slot had nothing to do with a tower's footprint,
+    // so pieces overlapped each other and the towers (user 2026-08-04). Their method instead:
+    //
+    //   D    = arc between tower centres      X    = tower centre → first wall's near edge
+    //   span = D - 2X                         run  = (span - gate_w) / 2   (gated arcs)
+    //   I    = ceil(run / wall_w)             walls needed to cover that run
+    //   step = wall_w - (I·wall_w - run) / I  the rounding, absorbed by overlapping them
+    //
+    // so I walls each overlap their neighbour by the same sliver and the run is covered
+    // exactly, instead of leaving a gap at one end or piling up at the other.
+    let (wall_w, gate_w, tower_w) = (ring_footprint(SKind::Wall), ring_footprint(SKind::Gate), ring_footprint(SKind::Tower));
+    let x_off = tower_w * TOWER_WALL_X;
+    let gap_arc = std::f64::consts::TAU * BASE_R / RING_TOWERS as f64;
+    let fill = |out: &mut Vec<(f64, SKind)>, start: f64, run: f64| {
+        if run <= 0.0 { return; }
+        let i_n = (run / wall_w).ceil().max(1.0);
+        let step = wall_w - (i_n * wall_w - run) / i_n;
+        for i in 0..i_n as usize { out.push((start + i as f64 * step + wall_w * 0.5, SKind::Wall)); }
+    };
+    let mut ring: Vec<(f64, SKind)> = Vec::new();
+    for k in 0..RING_TOWERS {
+        let tower_arc = (k as f64 + 0.5) * gap_arc;
+        ring.push((tower_arc, SKind::Tower));
+        // The arc AFTER this tower; its centre is (k+1)·gap_arc, which is a cardinal exactly
+        // when RING_TOWERS is a multiple of 4 — that is how the four gates land square.
+        let centre = (k as f64 + 1.0) * gap_arc;
+        let span = gap_arc - 2.0 * x_off;
+        if RING_TOWERS % 4 == 0 && (k + 1) % (RING_TOWERS / 4) == 0 {
+            ring.push((centre, SKind::Gate));
+            let run = (span - gate_w) * 0.5;
+            fill(&mut ring, tower_arc + x_off, run);          // tower → gate
+            fill(&mut ring, centre + gate_w * 0.5, run);      // gate → next tower
+        } else {
+            fill(&mut ring, tower_arc + x_off, span);
+        }
+    }
+    // Emit in ring order: the renderer levels each piece's height against its index
+    // neighbours, so a piece out of arc order would be levelled against the wrong course.
+    ring.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    for (arc, kind) in ring {
+        let a = arc / BASE_R;
         let (x, z) = (cx + a.cos() * BASE_R, cz + a.sin() * BASE_R);
-        let kind = if gates.contains(&i) { SKind::Gate } else if i % 6 == 3 { SKind::Tower } else { SKind::Wall };
         s.push(Structure { kind, p: at(x, z), hp: kind.max_hp(), pop: 0 });
     }
     // Houses: rejection-sampled so no two buildings interpenetrate (≥16 wu between
@@ -2059,6 +2115,51 @@ impl Horde {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ring has no GAPS and no pile-ups — the property the arc-fitting layout exists for.
+    ///
+    /// Both failures have shipped. First the walls either side of a tower were skipped, leaving
+    /// an empty slot the ~5.4-wu tower could not fill; then they were jammed together; then the
+    /// renderer nudged them sideways to hide it, over a layout that still cut the circle into
+    /// equal slots regardless of what stood in them (user: "un montón de murallas solapadas
+    /// entre ellas y con las torres", 2026-08-04). Eyeballing a screenshot found none of that
+    /// reliably, so it is checked in arc space where it is a plain inequality.
+    #[test]
+    fn the_wall_ring_closes_with_no_gaps_and_no_pile_ups() {
+        let h = Horde::new(7, 2000);
+        let (cx, cz) = (WORLD / 2.0, WORLD / 2.0);
+        let is_ring = |k: SKind| matches!(k, SKind::Wall | SKind::Gate | SKind::Tower);
+
+        // (arc position around the ring, solid half-width) for every ring piece, in order.
+        let mut ring: Vec<(f64, f64, SKind)> = h.structures.iter().filter(|s| is_ring(s.kind))
+            .map(|s| {
+                let a = (s.p.z - cz).atan2(s.p.x - cx).rem_euclid(std::f64::consts::TAU);
+                (a * BASE_R, ring_footprint(s.kind) * 0.5, s.kind)
+            }).collect();
+        ring.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        assert!(ring.len() > 20, "a ring of {} pieces is not a ring", ring.len());
+        assert_eq!(ring.iter().filter(|r| r.2 == SKind::Tower).count(), RING_TOWERS);
+        assert_eq!(ring.iter().filter(|r| r.2 == SKind::Gate).count(), 4);
+
+        let circ = std::f64::consts::TAU * BASE_R;
+        let wall_w = ring_footprint(SKind::Wall);
+        let (mut worst_gap, mut worst_overlap) = (f64::MIN, f64::MIN);
+        for i in 0..ring.len() {
+            let (a, ha, _) = ring[i];
+            let (b, hb, _) = ring[(i + 1) % ring.len()];
+            // wrap the last→first step across 0
+            let d = if i + 1 == ring.len() { b + circ - a } else { b - a };
+            let overlap = ha + hb - d;            // >0 they overlap, <0 there is a hole
+            worst_gap = worst_gap.max(-overlap);
+            worst_overlap = worst_overlap.max(overlap);
+        }
+        // A hole is the failure that reads as "the rampart breaks at every tower".
+        assert!(worst_gap <= 1e-6, "the ring has a {worst_gap:.2} wu hole in it");
+        // A pile-up is the opposite failure. The intended maxima are the rounding sliver
+        // absorbed between walls (< one wall) and a wall lapping TOWER_WALL_X into a tower.
+        assert!(worst_overlap < wall_w, "pieces overlap by {worst_overlap:.2} wu (>= one wall {wall_w:.2}) — they are stacking, not tiling");
+        assert!(worst_overlap > 0.0, "nothing overlaps at all — the rounding is landing somewhere else");
+    }
 
     #[test]
     fn base_layout_is_sane_and_static_index_matches_brute() {
