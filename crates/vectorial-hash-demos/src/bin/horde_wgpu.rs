@@ -445,7 +445,7 @@ const ZNAMES: [&str; 5] = ["walker", "runner", "chubby/slime", "venom", "harpy"]
 /// Bumped by hand on every build handed to the user. Three rounds of "it looks the same" against
 /// binaries verified to differ meant the first thing to rule out was whether we were even looking
 /// at the same process — and a title you can read beats any amount of reasoning about it.
-const BUILD_TAG: &str = "R11-atlas-unrotated";
+const BUILD_TAG: &str = "R12-heading-sign";
 
 fn ztweak(c: ZClass) -> (f32, f32) {
     // The slime's yaw went −π/2 → 0 → π, each step guessed from a verbal report, and each one
@@ -473,7 +473,10 @@ fn ztweak(c: ZClass) -> (f32, f32) {
 /// close to get the full GPU-skinned model — everything else is an impostor
 /// billboard (a photo). Dormant sleepers inside this bubble also upgrade to
 /// the skinned model playing its real Idle clip.
-const LOD_DIST: f32 = 170.0;
+const LOD_DIST_DEFAULT: f32 = 170.0;
+/// `$HORDE_LOD_DIST` — drop it to make big, CLOSE units render as impostors, which is the only
+/// way to compare the two draw paths at a size where a facing error is worth more than a pixel.
+fn lod_dist() -> f32 { std::env::var("HORDE_LOD_DIST").ok().and_then(|v| v.parse().ok()).unwrap_or(LOD_DIST_DEFAULT) }
 
 // Impostor atlas: per class (texture-array layer), 8 yaw views × 16 rows of
 // 64 px cells — rows 0..8 = walk cycle, 8..12 = idle sway (the dormant carpet
@@ -729,7 +732,10 @@ impl State {
             label: Some("impostor-atlas"),
             size: wgpu::Extent3d { width: atlas_w, height: IMP_ROWS * IMP_CELL, depth_or_array_layers: 5 },
             mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
-            format, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
+            // COPY_SRC so `$HORDE_ATLAS` can dump it. When near and far disagree the question
+            // is whether the 24 cells hold what the shader assumes they hold, and that is a
+            // question about a picture, not about arithmetic.
+            format, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
         });
         let atlas_depth = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("impostor-depth"),
@@ -794,6 +800,69 @@ impl State {
                 }
             }
         }
+        // `$HORDE_ATLAS=out.png` — write the atlas's first row (all 24 cells: 8 yaws x 3
+        // elevation bands, walk frame 0) for the class in `$HORDE_ATLAS_LAYER` and exit. The
+        // cells should read as one turntable per band: the same model seen from 0, 45, 90 ...
+        // degrees, in order.
+        if let Ok(path) = std::env::var("HORDE_ATLAS") {
+            let layer: u32 = std::env::var("HORDE_ATLAS_LAYER").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+            let (w, h) = (atlas_w, IMP_CELL);
+            let unpadded = w * 4;
+            let padded = unpadded.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+            let buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("atlas-dump"), size: (padded * h) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            enc.copy_texture_to_buffer(
+                wgpu::ImageCopyTexture { texture: &atlas, mip_level: 0, origin: wgpu::Origin3d { x: 0, y: 0, z: layer }, aspect: wgpu::TextureAspect::All },
+                wgpu::ImageCopyBuffer { buffer: &buf, layout: wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(padded), rows_per_image: Some(h) } },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 });
+            queue.submit(Some(enc.finish()));
+            let slice = buf.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+            device.poll(wgpu::Maintain::Wait);
+            if let Ok(Ok(())) = rx.recv() {
+                let data = slice.get_mapped_range();
+                let bgra = matches!(format, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb);
+                let mut rgba = Vec::with_capacity((unpadded * h) as usize);
+                for y in 0..h as usize {
+                    let row = &data[y * padded as usize..y * padded as usize + unpadded as usize];
+                    // Alpha-cutout art on transparent black reads as nothing in a viewer, so
+                    // composite it over grey to make the silhouettes legible.
+                    for px in row.chunks_exact(4) {
+                        let (r, g, b) = if bgra { (px[2], px[1], px[0]) } else { (px[0], px[1], px[2]) };
+                        let a = px[3] as u32;
+                        let mix = |c: u8| ((c as u32 * a + 110 * (255 - a)) / 255) as u8;
+                        rgba.extend_from_slice(&[mix(r), mix(g), mix(b), 255]);
+                    }
+                }
+                drop(data);
+                // Reading an angle off a 128px thumbnail is guesswork, so measure it: the eyes
+                // are the darkest thing on the model, so the cell with the MOST dark pixels is
+                // the one whose camera sees the face. With the model baked unrotated and its
+                // forward along +Z (see `examples/model_facing`), a correct atlas puts that at
+                // the cell whose azimuth is +90°, i.e. v = 2.
+                println!("
+  cell   az    eye px   centroid    (band 0 = lowest elevation)");
+                for v in 0..IMP_VIEWS as usize {
+                    let (mut dark, mut sx) = (0u32, 0i64);
+                    for y in 0..h as usize {
+                        for x in 0..IMP_CELL as usize {
+                            let i = (y * w as usize + v * IMP_CELL as usize + x) * 4;
+                            let (r, g, b) = (rgba[i] as u32, rgba[i + 1] as u32, rgba[i + 2] as u32);
+                            if r + g + b < 120 { dark += 1; sx += x as i64 - (IMP_CELL as i64 / 2); }
+                        }
+                    }
+                    let c = if dark > 0 { sx as f64 / dark as f64 } else { 0.0 };
+                    println!("  {v:>4} {:>4.0}° {dark:>9} {c:>10.1}", v as f32 / IMP_VIEWS as f32 * 360.0);
+                }
+                let _ = std::fs::write(&path, vectorial_hash_demos::png::encode_rgba(w, h, &rgba));
+                println!("
+atlas layer {layer} -> {path} ({w}x{h}, 24 cells of {IMP_CELL})");
+            }
+            std::process::exit(0);
+        }
+
         // Billboard pipeline: camera + the atlas array + a sampler; the quad is
         // generated from the vertex index (no vertex buffer), faced in-shader.
         let atlas_view = atlas.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
@@ -930,7 +999,12 @@ impl State {
             sim, seed, pop,
             dpr,
             paused: false, frustum_cull: true, lod: std::env::var("HORDE_NOLOD").is_err(), fps: 0.0, last: Instant::now(),
-            zyaw: ZCLASSES.map(|c| ztweak(c).0), zyaw_sel: 2, imp_yaw: 0.0,
+            zyaw: ZCLASSES.map(|c| ztweak(c).0), zyaw_sel: 2,
+            // `$HORDE_IMPYAW=<deg>` so the offset can be swept headlessly: shoot the same scene
+            // with impostors on at each candidate and with them off as the reference, and the
+            // one that matches the reference best is the right one. Beats asking a human to
+            // judge four screenshots.
+            imp_yaw: std::env::var("HORDE_IMPYAW").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0).to_radians(),
             // A headless shot has nobody to drag the camera, so the orbit is settable.
             yaw: envf("HORDE_CAM_YAW", 0.9), pitch: envf("HORDE_CAM_PITCH", 0.7),
             dist: envf("HORDE_CAM_DIST", 820.0), dragging: false, last_mouse: (0.0, 0.0),
@@ -1109,7 +1183,7 @@ impl State {
             for (i, z) in self.sim.units.iter().enumerate() {
                 if !z.alive() || !z.dormant() { continue; }
                 let (x, y, zz) = (z.p.x as f32, z.p.y as f32, z.p.z as f32);
-                if (Vec3::new(x, y, zz) - eye).length_squared() < LOD_DIST * LOD_DIST { continue; } // skinned below
+                if (Vec3::new(x, y, zz) - eye).length_squared() < lod_dist() * lod_dist() { continue; } // skinned below
                 let (size, cy) = self.bb_geom[zmodel(z.class)];
                 di.push(BillboardInst {
                     pos: [x, y + cy, zz],
@@ -1189,7 +1263,7 @@ impl State {
             di.len() as u32
         };
 
-        // ACTIVE zombies: full skinned model when near (LOD_DIST), the standing
+        // ACTIVE zombies: full skinned model when near (lod_dist()), the standing
         // proxy when far; defenders always skinned (there are ~50 of them).
         let mut buckets: Vec<Vec<SkinInstance>> = (0..self.models.len()).map(|_| Vec::new()).collect();
         // Idle-clip buckets, one per unit model (zombies + defenders): any stationary
@@ -1209,15 +1283,23 @@ impl State {
             // 2026-07-26). Only never-woken sleepers get the varied id-based pose.
             let yaw = z.face;
             let d2 = (Vec3::new(x, y, zz) - eye).length_squared();
-            if self.lod && d2 > LOD_DIST * LOD_DIST {
+            if self.lod && d2 > lod_dist() * lod_dist() {
                 // Far: a walking impostor (photo billboard, animated in-shader).
                 let (size, cy) = self.bb_geom[zmodel(z.class)];
                 proxies.push(BillboardInst {
-                    // Literally the skinned path's `rot` below, plus the live tuning offset.
-                    // The atlas is baked unrotated now, so the whole rotation belongs here and
-                    // there is no bake-time half of it to keep in step.
+                    // **Minus** the skinned path's `rot`, and the sign is the whole bug.
+                    //
+                    // Rotating the model by θ sends a local direction at azimuth α to world
+                    // azimuth α − θ, so a camera at world azimuth A sits at LOCAL azimuth
+                    // A + θ. The atlas cell wanted is therefore `a_cam + rot`, while the
+                    // shader selects with `a_cam − heading`: heading = −rot.
+                    //
+                    // With +rot the selected cell was off by 2·rot, which depends on each
+                    // unit's own heading — so groups marching different ways were wrong by
+                    // different amounts, and no global constant could fix them together. That
+                    // is exactly what the user saw and what `U` could never repair.
                     pos: [x, y + cy, zz], size,
-                    heading: -yaw + std::f32::consts::FRAC_PI_2 + self.zyaw[z.class.index()]
+                    heading: yaw - std::f32::consts::FRAC_PI_2 - self.zyaw[z.class.index()]
                              + self.imp_yaw,
                     phase: (i % 89) as f32 * 0.0112,
                     mode: 0, layer: zmodel(z.class) as u32, tint: [0.0, 0.0, 0.0, 0.0],
@@ -1265,11 +1347,11 @@ impl State {
         // shared idle_buckets declared above.
         if self.lod {
             use vectorial_hash::Sphere3;
-            let near = Sphere3::new(eye.x as f64, eye.y as f64, eye.z as f64, LOD_DIST as f64 + 8.0);
+            let near = Sphere3::new(eye.x as f64, eye.y as f64, eye.z as f64, lod_dist() as f64 + 8.0);
             for it in self.sim.zq().cull(&near) {
                 if !it.dormant { continue; }
                 let (x, y, zz) = (it.p.x as f32, it.p.y as f32, it.p.z as f32);
-                if (Vec3::new(x, y, zz) - eye).length_squared() >= LOD_DIST * LOD_DIST { continue; }
+                if (Vec3::new(x, y, zz) - eye).length_squared() >= lod_dist() * lod_dist() { continue; }
                 if do_cull && !sphere_in_frustum(&planes, Vec3::new(x, y, zz), 12.0) { continue; }
                 let mi = zmodel(it.class);
                 let m = &self.idle_models[mi];
