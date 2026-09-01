@@ -104,3 +104,11 @@ jobs:
 
       - name: build web demos (wasm32)
         run: cargo build --target wasm32-unknown-unknown -p vectorial-hash-demos --bin critters --bin critters3d --release
+
+      # The wgpu demos are a SECOND wasm build: they need `--features web-wgpu`, and that
+      # feature switches off `png` (and with it the screenshot and atlas-dump paths). Building
+      # only the macroquad pair above left that half unchecked, and a native-only call slipped
+      # into `horde_wgpu` and sat there until a republish tripped over it two weeks later.
+      # One representative binary is enough to keep the feature combination honest.
+      - name: build a wgpu demo for the web (wasm32 + web-wgpu)
+        run: cargo build --target wasm32-unknown-unknown -p vectorial-hash-demos --bin horde_wgpu --features web-wgpu --release

@@ -804,6 +804,10 @@ impl State {
         // elevation bands, walk frame 0) for the class in `$HORDE_ATLAS_LAYER` and exit. The
         // cells should read as one turntable per band: the same model seen from 0, 45, 90 ...
         // degrees, in order.
+        // Native only: it writes a PNG, and `png` is not in the web build. (This is how it
+        // escaped — the wasm job in CI builds the macroquad demos, not the wgpu ones, so
+        // nothing checked this path until a republish tried it two weeks later.)
+        #[cfg(not(feature = "web-wgpu"))]
         if let Ok(path) = std::env::var("HORDE_ATLAS") {
             let layer: u32 = std::env::var("HORDE_ATLAS_LAYER").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
             let (w, h) = (atlas_w, IMP_CELL);
