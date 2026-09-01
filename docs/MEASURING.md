@@ -465,3 +465,39 @@ per cone on average (max 66) before being trusted.
 7. Idle machine for anything you publish (`bench-runner` gates on it).
 8. Can it be counted instead of timed? Then count it.
 9. Quote ratios, not absolutes, unless the environment is pinned in the same table.
+
+## 8i. A sweep is a slice, and the axis you held fixed is the one that decides
+
+`grid_tree_frontier` sweeps the (churn × query-load) plane, 42 cells, five repetitions each,
+both arms kept and neither rebuilt. At every one of those 42 cells the kept `MortonGrid3` beat
+the keep-`Tree3`, by 1.5–2.2×. It is a careful table and its conclusion — *the grid wins here* —
+is wrong in a way no amount of care inside the plane could have caught.
+
+The `radius` was a `const`, 36, chosen because it is the cell size. Re-run at `radius=8`:
+
+| | radius 8 | radius 36 |
+| --- | --- | --- |
+| grid wins | 8 of 42 cells | **42 of 42** |
+| typical ratio | 0.36–1.5, no structure | 1.5–2.2 grid |
+
+Same populations, same churn rows, same query-load columns, opposite answer. And at the horde's
+own coordinates (`churn=0.056 queries=0.06`) `pick_a_structure` names **three** different winners
+along that axis alone: the tree at radius 1–4, the grid from 12 to 90, a **brute scan** at 170.
+
+The failure is not that a third axis existed — there is always a third axis. It is that the value
+we froze it at was **derived from the structure under test**: radius = one cell width is the
+extent a grid is built to serve in one lookup, so the sweep was conducted at the grid's best
+point and reported as a property of the plane. A held-fixed parameter chosen *from* one arm is a
+thumb on the scale, and it does not show up as noise, a wide spread, or an unstable ratio — every
+cell was reproducible to a few percent.
+
+**Two questions to ask of any sweep, including your own:**
+1. What did I hold fixed, and would a reader guess that it was an axis?
+2. Was that value derived from one of the arms? If so, sweep it too, or state the conclusion as
+   *"at radius 36"* — which is a real result and a much smaller one.
+
+This resolved a 7× disagreement between two of our own measurements (`docs/HORDE.md`), and it
+demotes `Thresholds::rebuild_query_ratio` from "a threshold fitted at maximum churn" to "a
+threshold fitted at maximum churn **and one query extent**" — the policy reads two axes of a
+three-axis surface. See § 8d for the other shape of this mistake: there, a ratio that *did* move
+turned out to depend on something not in the model either.

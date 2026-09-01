@@ -4,6 +4,45 @@ Future work queued for review. Nothing here is committed scope — prune,
 reprioritise, or drop freely. Items graduate into the per-crate roadmaps
 (e.g. `crates/vectorial-hash/README.md`) once picked up.
 
+## ★ 2026-09-01/02 — cooperative night 10: the adaptive layer, and two of my own numbers
+
+**Landed.** R1 canonical ordering by `Slot` (default) with `cull_unordered`/`knn_unordered` as the
+visible opt-out · `prepare(Hints)` + `freeze`/`thaw` · `migrate_to`/`recommended`/`observed` so a
+third party can drive the switch themselves · `SwitchStats` (per-pair, time-in-structure,
+near-misses), shared by both twins · `examples/pick_a_structure` (a measured recommendation on the
+caller's own machine) · `examples/grid_tree_frontier` · shipped `calibrations/` + a calibration for
+this i7 laptop · the horde's `M` key gained an ADAPTIVE third mode.
+
+**Two published numbers of mine were wrong, in two different ways.**
+
+1. **1.03× was one lucky draw.** `horde_index_modes` ran each 900-frame arm once, in a fixed order;
+   five runs gave 1.03, 1.36, 1.47, 1.67, 1.63 and I quoted the best. The example now rotates the
+   arm order, forms the ratio *within* a round, and reports the median with its range: **1.38×
+   (1.34–1.61)**. This is `MEASURING.md` § 7 committed by the person who wrote § 7.
+2. **★ The frontier's conclusion was a property of a `const`.** `grid_tree_frontier` reported the
+   kept grid ahead in **all 42** cells of the (churn × query-load) plane. Its `RADIUS` was 36 —
+   *one grid cell wide*, i.e. a value derived from one of the arms under test. At `radius=8` the
+   table flips to the tree in 34 of 42. `radius` is an axis now, and `MEASURING.md` § 8i asks the
+   two questions this should have been caught by. It also **resolved a 7× disagreement** between
+   two of our own measurements: the horde's commonest cull has radius **3**, which is tree
+   territory, and its one grid must serve radii 3 to 300 with a single cell size. Clustering was
+   checked and is not the cause.
+
+**Open, in priority order:**
+
+1. **#153 (new) — the policy observes two axes of a three-axis surface.** `Hints::query_extent`
+   exists; `observed()` does not report extent and `rebuild_query_ratio` cannot express it. The
+   fix is to record the mean cull extent in `note_cull` (the shapes already pass through it) and
+   make the grid rule read extent relative to cell size. Do NOT retune the scalar first — a better
+   value for a rule that is missing an axis is still missing an axis.
+2. **#149 — close the 0.70×**: detector lag plus the migration's own rebuild (shadow-build and
+   atomic swap, which is R2's §2.4 pattern in miniature).
+3. **#152 — `rebuild_query_ratio` is a vertical line through a diagonal frontier.** Measured and
+   left unchanged deliberately; now superseded in scope by #153.
+4. **Re-measure on the main machine when it returns.** Everything above was measured on the i7
+   laptop with the main disk attached externally; `calibrations/` exists so the two can be
+   compared rather than argued about.
+
 ## ★ 2026-08-03/04 — the day with the user, then cooperative night 9
 
 **Landed.** Slime turned π (both axes swapped is a rotation, not a mirror) · mobile ± pairs made

@@ -12,7 +12,16 @@
 //!
 //! ```bash
 //! cargo run -p vectorial-hash --example grid_tree_frontier --release
+//! cargo run -p vectorial-hash --example grid_tree_frontier --release -- radius=8
 //! ```
+//!
+//! **The plane is a SLICE, and `radius=` is the axis it slices along.** Held at one query extent
+//! this table looks like the whole answer, and it is not: at a fixed (churn, query load) the
+//! winner moves with extent alone. At `churn=0.056 queries=0.06` (the horde's own numbers)
+//! `pick_a_structure` reads the keep-tree ahead at radius 1-4, the grid ahead from 12 to 90, and
+//! a **brute scan** ahead at 170 — three different answers at one point of this plane. So a
+//! conclusion drawn here is a conclusion *at this radius*, and the default 36 is one cell wide by
+//! construction, which is the extent most flattering to a grid.
 //!
 //! Both arms are *kept*, never rebuilt: `Tree3` through `update_ref`, `MortonGrid3` through
 //! `update`. Each cell reports the total per-frame cost of maintain + query for both, so the
@@ -32,19 +41,25 @@ impl Rng {
 
 const W: f64 = 512.0;
 const N: usize = 20_000;
-const RADIUS: f64 = 36.0;
 const REPS: usize = 5;
+
+/// The query extent, in world units. Not a constant: see the module docs — it is an axis, and
+/// leaving it fixed at one cell width is what made this table look like the whole answer.
+fn radius() -> f64 {
+    std::env::args().find_map(|a| a.strip_prefix("radius=")?.parse().ok()).unwrap_or(36.0)
+}
 
 fn world() -> Aabb { Aabb::new(0.0, 0.0, 0.0, W, W, W) }
 
 fn main() {
+    let radius = radius();
     let churns = [0.0, 0.001, 0.01, 0.05, 0.2, 0.5, 1.0];
     let qpis = [0.01, 0.05, 0.2, 0.5, 1.0, 2.0];
 
     let mut rng = Rng(0xF00D);
     let items: Vec<P> = (0..N).map(|_| P { p: Point3::new(rng.f() * W, rng.f() * W, rng.f() * W) }).collect();
 
-    println!("kept grid vs keep-tree — total ms/frame, {N} items, radius {RADIUS}, min of {REPS}\n");
+    println!("kept grid vs keep-tree — total ms/frame, {N} items, radius {radius}, min of {REPS}\n");
     println!("the policy's current rule: take the grid when queries/item > {:.3}\n", Thresholds::default().rebuild_query_ratio);
     print!("{:>8} |", "churn\\q");
     for q in qpis { print!("{q:>10}"); }
@@ -63,7 +78,7 @@ fn main() {
             let queries = ((N as f64 * qpi) as usize).clamp(1, 4096);
             let probes: Vec<Sphere3> = (0..queries).map(|i| {
                 let it = items[i * N / queries];
-                Sphere3::new(it.p.x, it.p.y, it.p.z, RADIUS)
+                Sphere3::new(it.p.x, it.p.y, it.p.z, radius)
             }).collect();
 
             let tree_ms = {
@@ -76,7 +91,7 @@ fn main() {
                 })
             };
             let grid_ms = {
-                let levels = MortonGrid3::<P>::levels_for_cell_size(world(), RADIUS);
+                let levels = MortonGrid3::<P>::levels_for_cell_size(world(), radius);
                 let mut g = MortonGrid3::new(world(), levels);
                 for it in &items { g.insert(*it); }
                 let mut pos = items.clone();
@@ -117,6 +132,10 @@ fn main() {
         println!("The boundary does NOT move with churn across this range: one scalar is enough after");
         println!("all, and `rebuild_query_ratio` should simply be set to the column above.");
     }
+    println!();
+    println!("This is ONE SLICE, at radius {radius}. Re-run with `-- radius=8` or `-- radius=120`:");
+    println!("at a FIXED (churn, query load) the winner still moves with extent alone, so any");
+    println!("threshold fitted to this table is a threshold for this radius.");
     println!();
     println!("Both arms KEEP (update_ref / update); neither is rebuilt. That is the comparison the");
     println!("policy makes, and it only became the right one when the grid learned to keep in place.");

@@ -412,14 +412,25 @@ worth having when you cannot know which of those two you would have picked.
 that version gave 1.03–1.67; the published figure was the best draw. It now rotates the arm order
 per round and quotes the median with its range.)*
 
-**An open contradiction, recorded rather than smoothed over.** `grid_tree_frontier` maps the
-(churn × query-load) plane on uniform data and says the grid should win *by 1.9×* at this very
-point — the horde reports `0.0599 q/item, 0.0564 mv/item`, which lands squarely in that cell. The
-horde measures the opposite, by 3.8×. Two of our own measurements disagree by a factor of ~7 at
-the same coordinates, so at least one instrument is wrong about something: the likely suspects
-are the horde's grid being sized by a fixed `ZGRID_LEVELS` rather than to its query mix (whose
-radii range from ~3 to 288), and clustered versus uniform data. Until that is settled, the
-frontier's conclusion must NOT be used to retune `rebuild_query_ratio`.
+**A contradiction, and its resolution: the missing axis was QUERY EXTENT.** `grid_tree_frontier`
+maps the (churn × query-load) plane and said the grid should win *by 1.9×* at this very point —
+the horde reports `0.0599 q/item, 0.0564 mv/item`, landing squarely in that cell — while the horde
+measures the grid **3.8× worse**. Two of our own measurements disagreeing by ~7× at the same
+coordinates meant one of them was answering a different question.
+
+Both were right about their own slice. That plane was measured at **one radius, 36**, which is one
+grid cell wide by construction — the extent most flattering to a grid. Re-running it at
+`radius=8` flips almost the whole table to the tree; `pick_a_structure` at the horde's exact
+`churn=0.056 queries=0.06` reads the **keep-tree** ahead at radius 1–4, the **grid** ahead from 12
+to 90, and a **brute scan** ahead at 170. Three different winners at one point of the plane.
+
+That is the horde: its highest-frequency cull is the radius-**3** separation query, which is the
+regime where the tree wins, and its grid must serve radii from 3 to 300 with a single cell size
+while every arm above was re-sized to its own radius. Clustering was checked and is *not* the
+cause — the grid still beats the tree on clustered data at radius 36 and 90.
+
+Re-run either side: `--example grid_tree_frontier -- radius=8`, or
+`--example pick_a_structure -- n=30000 churn=0.056 queries=0.06 radius=3`.
 
 **Tested, and not only for equivalence.** `adaptive_mode_matches_the_others_and_actually_switches`
 checks the answers against the tree AND against brute force after a real battle — but it also

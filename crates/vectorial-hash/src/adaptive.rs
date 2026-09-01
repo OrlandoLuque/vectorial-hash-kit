@@ -83,6 +83,16 @@
 //! layer, stated fairly: it did not beat the best fixed choice, it cost ~38 % more than one —
 //! and it cost 2.7x *less* than the fixed choice a reasonable person might have made instead.
 //!
+//! **`rebuild_query_ratio` is fitted at one query extent, and that is its real limitation.** The
+//! table it comes from was swept at radius 36 — one grid cell wide, the extent most flattering to
+//! a grid — where the grid wins every cell. At radius 8 the same table flips to the tree almost
+//! everywhere. So the threshold is not merely "a vertical line through a diagonal frontier"
+//! (#152); the frontier it cuts is a **surface in three axes** (churn x query load x query
+//! extent) and the policy observes only two of them. [`Hints::query_extent`] exists and
+//! [`AdaptiveIndex::observed`] does not report it. That is the honest next move, and it is why
+//! the horde -- whose commonest cull has radius 3 -- is right to prefer the tree while the plane
+//! says grid.
+//!
 //! **That row first read 1.03x, and the correction is the more useful part.** The example ran
 //! each arm once, to completion, in a fixed order; five runs of it gave 1.03, 1.36, 1.47, 1.67,
 //! 1.63, and 1.03 is simply the luckiest draw. A 900-frame battle is long enough for the machine
