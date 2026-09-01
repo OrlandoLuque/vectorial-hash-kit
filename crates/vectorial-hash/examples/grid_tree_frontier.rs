@@ -81,10 +81,10 @@ fn main() {
                 for it in &items { g.insert(*it); }
                 let mut pos = items.clone();
                 best(|| {
-                    for i in 0..moves {
-                        let was = pos[i].p;
-                        pos[i].p.x = (pos[i].p.x + 1.0) % W;
-                        let p = pos[i];
+                    for it in pos.iter_mut().take(moves) {
+                        let was = it.p;
+                        it.p.x = (it.p.x + 1.0) % W;
+                        let p = *it;
                         #[allow(clippy::float_cmp)]
                         g.update(was, |c| c.p.x == was.x && c.p.y == was.y && c.p.z == was.z, |c| *c = p);
                     }
