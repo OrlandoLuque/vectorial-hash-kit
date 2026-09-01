@@ -141,6 +141,15 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
         }
     }
 
+    /// Switch backend now, whatever the policy thinks — see
+    /// [`crate::AdaptiveIndex::migrate_to`]. Slots keep addressing the same items.
+    pub fn migrate_to(&mut self, to: Backend) { if to != self.backend() { self.migrate(to); } }
+    /// What the built-in policy would choose right now, without acting on it.
+    pub fn recommended(&self) -> Backend { self.desired() }
+    /// `(items, queries per item, moves per item)` — the whole input to
+    /// [`recommended`](Self::recommended), so an external policy need not re-measure it.
+    pub fn observed(&self) -> (usize, f64, f64) { (self.live, self.q_per_item, self.m_per_item) }
+
     /// Pin the current backend until [`thaw`](Self::thaw). The detector keeps observing.
     pub fn freeze(&mut self) { self.frozen = true; }
     /// Release [`freeze`](Self::freeze); the next tick may migrate immediately.

@@ -645,6 +645,43 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
         }
     }
 
+    /// Switch backend **now**, whatever the policy thinks.
+    ///
+    /// The items come across; every [`Slot`] still addresses the same item afterwards, which is
+    /// the property the slot table exists for. Warm-started where the outgoing backend can
+    /// supply a spatial order.
+    ///
+    /// This is here because the built-in policy is a *default*, not a requirement. A caller who
+    /// already knows their workload — a level loader, a phase change the program can see coming,
+    /// or a cost model of their own with better inputs than this one has — should be able to say
+    /// so directly instead of arranging for the detector to guess it. Pair it with
+    /// [`freeze`](Self::freeze) if the choice should stick:
+    ///
+    /// ```ignore
+    /// ix.migrate_to(Backend::Grid);   // I know: this phase is query-heavy
+    /// ix.freeze();                    // and I do not want to be second-guessed
+    /// ```
+    ///
+    /// Counted in [`stats`](Self::stats) like any other switch — a manual migration is still
+    /// work, and a program doing it every frame should be able to see that it is.
+    pub fn migrate_to(&mut self, to: Backend) {
+        if to != self.backend() { self.migrate(to); }
+    }
+
+    /// What the built-in policy would choose right now, without acting on it.
+    ///
+    /// The other half of [`migrate_to`](Self::migrate_to): a caller running their own decision
+    /// can still ask this one for a second opinion, or blend it, or log the disagreement. It
+    /// reads only the smoothed counters, so it is cheap and side-effect free.
+    pub fn recommended(&self) -> Backend { self.desired() }
+
+    /// The observed rates the policy decides from: `(items, queries per item, moves per item)`,
+    /// both smoothed by [`Thresholds::detector_alpha`].
+    ///
+    /// Exposed so an external policy does not have to duplicate the measurement to disagree
+    /// with the conclusion. This is the whole input to [`recommended`](Self::recommended).
+    pub fn observed(&self) -> (usize, f64, f64) { (self.live, self.q_per_item, self.m_per_item) }
+
     /// Pin the current backend: no migration until [`thaw`](Self::thaw).
     ///
     /// For windows where a switch would be wrong even if the policy is right — a bulk load
@@ -1416,6 +1453,43 @@ mod tests {
                 assert_eq!(got, want, "{backend:?} answered differently with the {name} order hint");
             }
         }
+    }
+
+    /// A caller driving the switch by hand must get the same guarantees the policy does: the
+    /// items survive, the slots still address them, and the answers do not change.
+    #[test]
+    fn a_hand_driven_migration_keeps_every_slot_and_every_answer() {
+        let mut ix: AdaptiveIndex<P> = AdaptiveIndex::new(world(), 8);
+        let slots: Vec<Slot> = (0..500).map(|i| ix.insert(P { p: pt(i) })).collect();
+        let probe = Sphere3::new(120.0, 120.0, 120.0, 70.0);
+
+        let want: Vec<(u64, u64, u64)> = ix.cull(&probe).iter().map(|p| p.p.to_bits3()).collect();
+        assert!(want.len() > 20, "the probe must hit plenty or this proves nothing");
+        let by_slot: Vec<(u64, u64, u64)> = slots.iter().map(|s| ix.get(*s).unwrap().p.to_bits3()).collect();
+
+        // Round trip every backend, by hand, in an order the policy would never choose.
+        for to in [Backend::Static, Backend::Brute, Backend::Grid, Backend::KeepTree, Backend::Grid] {
+            ix.migrate_to(to);
+            assert_eq!(ix.backend(), to, "migrate_to must actually arrive");
+            assert_eq!(ix.len(), 500, "no item may be lost in transit");
+            let got: Vec<(u64, u64, u64)> = ix.cull(&probe).iter().map(|p| p.p.to_bits3()).collect();
+            assert_eq!(got, want, "{to:?}: a hand-driven switch changed the answer");
+            let now: Vec<(u64, u64, u64)> = slots.iter().map(|s| ix.get(*s).unwrap().p.to_bits3()).collect();
+            assert_eq!(now, by_slot, "{to:?}: a slot stopped pointing at its item");
+        }
+        // Migrating to where we already are is not work, and must not be counted as a switch.
+        let before = ix.switch_count();
+        ix.migrate_to(ix.backend());
+        assert_eq!(ix.switch_count(), before, "a switch to the current backend is not a switch");
+        assert_eq!(ix.stats().switches(), before);
+
+        // `recommended` reports without acting, and `observed` is its whole input.
+        let held = ix.backend();
+        let _ = ix.recommended();
+        assert_eq!(ix.backend(), held, "recommended() must not migrate");
+        let (n, q, m) = ix.observed();
+        assert_eq!(n, 500);
+        assert!(q.is_finite() && m.is_finite());
     }
 
     /// `prepare` must save the walk up through the backends, and `freeze` must actually stop a
