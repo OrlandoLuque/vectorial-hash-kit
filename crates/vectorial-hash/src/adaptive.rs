@@ -69,6 +69,20 @@
 //! other two. Its maintenance drops to 0.00 ms because it picks the grid and *keeps* it where
 //! the fixed option refills it.
 //!
+//! **`horde_wgpu`'s `M` mode**, the third and the most favourable — and the one whose workload
+//! the layer was actually designed for. One seeded battle, 30 000 zombies, 900 frames, three
+//! indexes (`vectorial-hash-demos/examples/horde_index_modes`):
+//!
+//! | index | ms/step | |
+//! | --- | ---: | --- |
+//! | `Tree3` pinned | 2.064 | the best fixed choice |
+//! | `MortonGrid3` pinned | 8.007 | the *wrong* fixed choice, 3.9x worse |
+//! | adaptive | 2.119 | **1.03x the best**, found without being told |
+//!
+//! Three switches and 29 near-misses over the battle. That is the shape of the case for the
+//! layer, stated fairly: it did not beat the best fixed choice, it cost 3 % more than one — and
+//! it cost 3.8x *less* than the fixed choice a reasonable person might have made instead.
+//!
 //! So: on a workload that does not change, the policy costs nothing and picks correctly. On one
 //! that changes, migrating and noticing are both real costs and it currently loses to the best
 //! fixed choice. The honest pitch is **insurance, not optimisation** — it is worth having when

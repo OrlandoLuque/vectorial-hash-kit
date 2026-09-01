@@ -395,6 +395,19 @@ Two things it needed from the library, both of which were missing and are genera
 from zero makes the policy migrate away from the destination and back, which is measurably worse
 than not hinting at all.
 
+**Measured** (`examples/horde_index_modes`, one seeded battle, 30 000 zombies, 900 frames — read
+the ranking, the absolute milliseconds are whatever machine ran it):
+
+| index | ms/step | |
+| --- | ---: | --- |
+| `Tree3` pinned | 2.064 | the best fixed choice here |
+| `MortonGrid3` pinned | 8.007 | the wrong fixed choice, **3.9x worse** |
+| adaptive | 2.119 | **1.03x the best**, found without being told |
+
+Three switches, 29 near-misses. It did not beat the best fixed choice — it cost 3 % more than
+one, and 3.8x *less* than the other one. That is the argument for the layer stated fairly: it is
+worth having when you cannot know which of those two you would have picked.
+
 **Tested, and not only for equivalence.** `adaptive_mode_matches_the_others_and_actually_switches`
 checks the answers against the tree AND against brute force after a real battle — but it also
 asserts the policy moved or at least wanted to. A demo where the switcher silently sat on one
