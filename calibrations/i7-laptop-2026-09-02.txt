@@ -1,0 +1,12 @@
+# vectorial-hash adaptive-index calibration
+brute_max = 182
+high_churn = 0
+rebuild_query_ratio = 0.2048
+scan_budget = 60
+static_ticks = 30
+margin = 0.25
+hold_ticks = 30
+cooldown = 120
+decisive_factor = 4
+detector_alpha = 0.1
+warm_start = true

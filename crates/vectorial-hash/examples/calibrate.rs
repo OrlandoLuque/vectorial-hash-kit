@@ -188,25 +188,39 @@ fn main() {
     let t0 = Instant::now();
     println!("calibrating on this machine (keep it idle)…\n");
 
-    // --- brute_max: a LADDER, not a bisection.
+    // --- brute_max: a ladder, and every rung VOTED.
     //
     // This bisected until 2026-08-03, and a bisection assumes the predicate is monotone. Near
     // the crossover it is not: the two costs are within noise of each other, so "does the index
-    // win?" flips at random and the search walks off. The trace it printed said so plainly and
-    // was read as a result for months — 527 scan, 975 index, 927 scan, 942 index, converging on
-    // whichever way the last coin landed.
+    // win?" flips at random and the search walks off. A ladder was supposed to bound that, and
+    // the comment here used to claim a single noisy flip cost "one rung's worth of
+    // conservatism". It does not, and five runs on one machine proved it:
     //
-    // A ladder cannot do that. Every rung is measured, all of them are printed, and the answer
-    // is the largest population where the scan wins on EVERY rung up to it — so a single noisy
-    // flip costs one rung's worth of conservatism instead of an order of magnitude.
+    //     brute_max = 182, 182, 1, 256, 256
+    //
+    // Because the rungs are read in order and the first `index` reading closes the search for
+    // good, a flip on the FIRST rung collapses the answer to 1 — an order of magnitude, from
+    // one coin toss. The ladder never protected against the case that mattered.
+    //
+    // So each rung is decided by a majority of three probes. That does not make the underlying
+    // comparison less noisy; it makes a single unlucky read unable to end the search. The vote
+    // is printed per rung, because a rung that splits 2-1 is telling you the crossover is
+    // *there*, and that is worth more than the number this writes out.
     let ladder = [16usize, 32, 48, 64, 96, 128, 182, 256, 384, 512, 768, 1024, 2048];
-    println!("  {:<10} {:>12}", "population", "winner");
+    println!("  {:<10} {:>12} {:>8}", "population", "winner", "votes");
     let mut brute_max = 1usize;
     let mut still_scanning = true;
+    let mut split_rungs = 0;
     for &n in &ladder {
-        let indexed_wins = index_beats_scan(n, radius);
-        println!("  {:<10} {:>12}", n, if indexed_wins { "index" } else { "scan" });
+        let votes = (0..3).filter(|_| index_beats_scan(n, radius)).count();
+        let indexed_wins = votes >= 2;
+        if votes == 1 || votes == 2 { split_rungs += 1; }
+        println!("  {:<10} {:>12} {:>8}", n, if indexed_wins { "index" } else { "scan" }, format!("{votes}/3"));
         if indexed_wins { still_scanning = false; } else if still_scanning { brute_max = n; }
+    }
+    if split_rungs > 0 {
+        println!("  ({split_rungs} rung(s) did not agree with themselves — the crossover is in there,");
+        println!("   and any single number this writes for it is a summary, not a measurement)");
     }
 
     // --- high_churn: the fraction at which a rebuild starts beating the kept tree.
@@ -278,12 +292,24 @@ fn main() {
     println!("#M calibrate.rebuild_query_ratio {rebuild_query_ratio:.4} q_per_item");
     println!("wrote {out} — point VH_CALIBRATION at it and AdaptiveIndex::new picks it up.");
     let d = Thresholds::default();
+    // The note has to branch on WHICH SIDE the crossover fell, because the two cases mean
+    // opposite things — and the first version only wrote the one the author's machine happened
+    // to produce. On a box whose crossover came out BELOW the default it confidently explained
+    // that "the default is deliberately lower" about a default that was higher.
     if brute_max.abs_diff(d.brute_max) * 100 / d.brute_max.max(1) > 25 {
-        println!("\nNOTE: this machine's scan/index crossover is {brute_max}; the shipped `brute_max`");
-        println!("default is {} and is deliberately LOWER, not wrong. That threshold is an", d.brute_max);
-        println!("unconditional floor, consulted before the load-aware `scan_budget` rule, so it sits");
-        println!("below the crossover on purpose: above it `scan_budget` decides and can see the");
-        println!("query load. Raising it to the crossover would force a scan onto workloads an index");
-        println!("wins. Ship the file if this machine's crossover is far from the shipped one.");
+        println!();
+        println!("NOTE: this machine's scan/index crossover measures {brute_max}; the shipped");
+        println!("`brute_max` default is {}.", d.brute_max);
+        if brute_max > d.brute_max {
+            println!("The default sitting BELOW the crossover is deliberate, not wrong. It is an");
+            println!("unconditional floor consulted before the load-aware `scan_budget` rule, so");
+            println!("above it `scan_budget` decides and can see the query load. Raising it to");
+            println!("the crossover would force a scan onto workloads an index wins.");
+        } else {
+            println!("Here the default is ABOVE the crossover, which is the case that costs you:");
+            println!("between {brute_max} and {} items this machine is forced onto a scan the", d.brute_max);
+            println!("floor insists on, while an index already wins. Ship this file via");
+            println!("VH_CALIBRATION rather than inheriting the repo's box.");
+        }
     }
 }

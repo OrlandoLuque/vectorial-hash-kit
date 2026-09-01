@@ -356,6 +356,49 @@ And it was verified by breaking it: strip a source, break a link, break an ancho
 flag, and all three clear on restore. A green check that has never been shown to go red is not a
 check.
 
+## 8h. A search whose first step is noisy does not fail gracefully
+
+`calibrate` finds `brute_max` — the population where an index stops losing to a linear scan — by
+walking a ladder of populations and taking the largest one where the scan still wins. It used to
+bisect; § 8's cousin, [#131], replaced that because a bisection assumes a monotone predicate and
+near the crossover this one is a coin toss. The ladder came with a comment claiming that a single
+noisy flip now cost "one rung's worth of conservatism".
+
+It did not. Five runs on one idle machine:
+
+```
+brute_max = 182, 182, 1, 256, 256
+```
+
+The `1` is the whole lesson. The rungs are read in ascending order and the first `index` reading
+ends the search for good, so a flip on the *first* rung — the smallest, cheapest, noisiest
+comparison — collapses the answer by two orders of magnitude. **The bound the ladder was chosen
+for applies to every rung except the one that can do the damage.**
+
+Deciding each rung by a majority of three probes bounds it for real:
+
+```
+brute_max = 96, 256, 182, 256, 182      (median 182)
+```
+
+That is not a more precise measurement — the underlying comparison is exactly as noisy — it just
+stops one unlucky read from being decisive. The per-rung vote is printed now, because a rung that
+splits 2–1 is more informative than the number the run writes out: it says the crossover is
+*there*, and that no single number describes it.
+
+**The transferable part.** When a search's early steps are cheap and its late steps are expensive,
+the cheap ones are the noisy ones, and a search that terminates on the first positive is a search
+that terminates on noise. Either repeat the early steps, or arrange for termination to need
+agreement.
+
+Two things this run also settled, which is why it is worth writing down rather than just fixing:
+
+- `rebuild_query_ratio` read **0.2048 on all five runs**, against 0.2 shipped from a very
+  different machine. Some thresholds genuinely travel.
+- `brute_max` does not travel *and does not even reproduce locally*. The rule of thumb this
+  suggests — a ratio between two structures travels, an absolute population does not — is
+  recorded in `calibrations/README.md` as a hypothesis, not a finding.
+
 ## 9. Publish from an idle machine — necessary, not sufficient
 
 None of the above removes contention: another process still evicts your cache lines and eats
