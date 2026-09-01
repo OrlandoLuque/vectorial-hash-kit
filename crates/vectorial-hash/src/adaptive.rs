@@ -645,6 +645,56 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
         }
     }
 
+    /// Bring the index up to date and make it safe to query behind a shared reference.
+    ///
+    /// [`cull`](Self::cull) takes `&mut self` because it does two things: it answers, and it
+    /// *observes* — counting the query and feeding the grid's cell-size estimate. That is fine
+    /// for one caller in a loop and impossible for several, or for a parallel fan-out, or for a
+    /// program that hands `&index` to a dozen systems in one frame.
+    ///
+    /// So the two halves separate: `settle` once per frame where you have `&mut`, then
+    /// [`cull_ref`](Self::cull_ref) as many times as you like behind `&`, then
+    /// [`note_queries`](Self::note_queries) to give the policy back what it would have counted.
+    ///
+    /// ```ignore
+    /// ix.settle();                                   // &mut, once
+    /// let hits: Vec<_> = systems.par_iter().map(|s| ix.cull_ref(&s.volume)).collect();
+    /// ix.note_queries(systems.len() as u32, radius); // &mut, once
+    /// ix.tick();
+    /// ```
+    pub fn settle(&mut self) { self.refresh(); }
+
+    /// Everything inside `shape`, canonically ordered, from a settled index.
+    ///
+    /// The read-only half of [`cull`](Self::cull). It cannot rebuild a stale backend, so it is
+    /// the caller's job to have called [`settle`](Self::settle) after the last mutation — and in
+    /// debug builds it says so rather than quietly answering from a stale structure, which is
+    /// the failure that would otherwise show up as an item that moved three frames ago.
+    pub fn cull_ref<S: Shape3>(&self, shape: &S) -> Vec<&T> {
+        debug_assert!(!self.dirty, "cull_ref on a stale index — call settle() after mutating");
+        let mut v = self.cull_tagged(shape);
+        v.sort_unstable_by_key(|e| e.0);
+        v.into_iter().map(|e| e.1).collect()
+    }
+
+    /// Backend order, from a settled index — see [`cull_unordered`](Self::cull_unordered) for
+    /// when that is safe.
+    pub fn cull_ref_unordered<S: Shape3>(&self, shape: &S) -> Vec<&T> {
+        debug_assert!(!self.dirty, "cull_ref on a stale index — call settle() after mutating");
+        self.cull_tagged(shape).into_iter().map(|e| e.1).collect()
+    }
+
+    /// Tell the policy about queries made through [`cull_ref`](Self::cull_ref), which could not
+    /// count themselves. `extent` is the typical query size in world units — the grid sizes its
+    /// cells to it. Without this the index looks unqueried and will happily migrate to a
+    /// structure chosen for a workload that is not happening.
+    pub fn note_queries(&mut self, n: u32, extent: f64) {
+        self.queries += n as u64;
+        if extent > 0.0 {
+            self.q_extent = if self.q_extent == 0.0 { extent } else { self.q_extent + 0.1 * (extent - self.q_extent) };
+        }
+    }
+
     /// Switch backend **now**, whatever the policy thinks.
     ///
     /// The items come across; every [`Slot`] still addresses the same item afterwards, which is
@@ -1453,6 +1503,59 @@ mod tests {
                 assert_eq!(got, want, "{backend:?} answered differently with the {name} order hint");
             }
         }
+    }
+
+    /// The `&`-only read path must answer exactly what the `&mut` one does, and the policy must
+    /// still learn about queries it could not count itself.
+    #[test]
+    fn settle_then_read_behind_a_shared_reference() {
+        let mut ix: AdaptiveIndex<P> = AdaptiveIndex::new(world(), 8);
+        for i in 0..600 { ix.insert(P { p: pt(i) }); }
+        let probe = Sphere3::new(120.0, 120.0, 120.0, 70.0);
+
+        ix.settle();
+        // Several readers at once — the thing `cull(&mut self)` makes impossible.
+        let a = ix.cull_ref(&probe);
+        let b = ix.cull_ref(&probe);
+        assert_eq!(a.len(), b.len());
+        assert!(a.len() > 20, "the probe must hit plenty or this proves nothing");
+        let shared: Vec<(u64, u64, u64)> = a.iter().map(|p| p.p.to_bits3()).collect();
+        let by_ref_b: Vec<(u64, u64, u64)> = b.iter().map(|p| p.p.to_bits3()).collect();
+        assert_eq!(shared, by_ref_b, "two shared reads must agree");
+        drop((a, b));
+        let owned: Vec<(u64, u64, u64)> = ix.cull(&probe).iter().map(|p| p.p.to_bits3()).collect();
+        assert_eq!(shared, owned, "the &-path must answer exactly what the &mut path does");
+
+        // A mutation makes it stale, and settle is what clears that. (The debug_assert in
+        // cull_ref is the loud version of this; here we just check the flag is honest.)
+        ix.update(Slot(0), |p| p.p.x = (p.p.x + 40.0) % 250.0);
+        ix.settle();
+        assert_eq!(ix.cull_ref(&probe).len(), ix.cull(&probe).len());
+
+        // And the policy must SEE queries it did not count: without note_queries an index
+        // queried only through cull_ref looks idle, and migrates for a workload that is not
+        // happening.
+        let mut quiet: AdaptiveIndex<P> = AdaptiveIndex::new(world(), 8);
+        let mut loud: AdaptiveIndex<P> = AdaptiveIndex::new(world(), 8);
+        for i in 0..200 { quiet.insert(P { p: pt(i) }); loud.insert(P { p: pt(i) }); }
+        // Query load well over `rebuild_query_ratio`, and keep everything moving so the
+        // build-once arm is not the answer: this is the workload the grid exists for, and the
+        // only difference between the two indexes is whether anyone told them it is happening.
+        for t in 0..80 {
+            for i in 0..200u32 {
+                let d = ((t + i) % 7) as f64;
+                quiet.update(Slot(i), |p| p.p.x = (p.p.x + d) % 250.0);
+                loud.update(Slot(i), |p| p.p.x = (p.p.x + d) % 250.0);
+            }
+            quiet.settle(); loud.settle();
+            for _ in 0..120 { let _ = quiet.cull_ref(&probe); let _ = loud.cull_ref(&probe); }
+            loud.note_queries(120, 140.0);
+            quiet.tick(); loud.tick();
+        }
+        assert_eq!(quiet.observed().1, 0.0, "an unreported reader leaves the policy blind");
+        assert!(loud.observed().1 > 0.0, "note_queries must reach the detector");
+        assert_ne!(quiet.backend(), loud.backend(),
+            "and being blind must actually change the decision, or this reports nothing");
     }
 
     /// A caller driving the switch by hand must get the same guarantees the policy does: the

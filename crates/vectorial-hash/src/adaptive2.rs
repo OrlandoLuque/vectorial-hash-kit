@@ -141,6 +141,29 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
         }
     }
 
+    /// Bring the index up to date so it can be queried behind `&` — see
+    /// [`crate::AdaptiveIndex::settle`] for why the observing and the answering split.
+    pub fn settle(&mut self) { self.refresh(); }
+    /// Canonically ordered read from a settled index.
+    pub fn cull_ref<S: Shape>(&self, shape: &S) -> Vec<&T> {
+        debug_assert!(!self.dirty, "cull_ref on a stale index — call settle() after mutating");
+        let mut v = self.cull_tagged(shape);
+        v.sort_unstable_by_key(|e| e.0);
+        v.into_iter().map(|e| e.1).collect()
+    }
+    /// Backend order, from a settled index.
+    pub fn cull_ref_unordered<S: Shape>(&self, shape: &S) -> Vec<&T> {
+        debug_assert!(!self.dirty, "cull_ref on a stale index — call settle() after mutating");
+        self.cull_tagged(shape).into_iter().map(|e| e.1).collect()
+    }
+    /// Report queries made through [`cull_ref`](Self::cull_ref), which cannot count themselves.
+    pub fn note_queries(&mut self, n: u32, extent: f64) {
+        self.queries += n as u64;
+        if extent > 0.0 {
+            self.q_extent = if self.q_extent == 0.0 { extent } else { self.q_extent + 0.1 * (extent - self.q_extent) };
+        }
+    }
+
     /// Switch backend now, whatever the policy thinks — see
     /// [`crate::AdaptiveIndex::migrate_to`]. Slots keep addressing the same items.
     pub fn migrate_to(&mut self, to: Backend) { if to != self.backend() { self.migrate(to); } }
