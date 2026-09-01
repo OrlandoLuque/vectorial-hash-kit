@@ -86,6 +86,30 @@ the gates — so the anchor is right and only `building_tweak`'s per-model *scal
 human. That is the point of the capability: it does not replace the user's taste, it stops
 correctness questions from queueing behind it.
 
+## Horde — parked 2026-09-01, resume when the main machine is back
+
+The wall/ring geometry is finished and gated by tests. What is left needs the user's screen and
+their own hardware:
+
+1. **Confirm the impostor heading by eye.** `heading = -rot` is *derived* (rotating the model by
+   θ sends a local azimuth α to world α − θ, so the atlas cell wanted is `a_cam + rot` while the
+   shader selects with `a_cam − heading`). The atlas itself was dumped and measured correct —
+   `$HORDE_ATLAS` writes it and prints per-cell eye-pixel counts; the slime's turntable reads
+   face at ~0°, back at ~200°, monotone. **Not verified visually.** The automated check failed
+   and is recorded as insufficient rather than as agreement: rendering the four candidate
+   offsets against an all-3D reference and diffing over unit pixels gave 20.04 / 19.97 / 20.01 /
+   20.21 — a spread of 0.23, noise. A ten-pixel unit turned covers nearly the same pixels.
+   In the demo, `I` rotates only the billboards and prints the value.
+2. **Remove the tuning knobs** once the geometry is signed off: `Y`/`U` (per-class yaw), `I`
+   (impostor-only yaw), `J` (impostors on/off), `$HORDE_LOD_DIST`, `$HORDE_IMPYAW`, and the
+   `BUILD_TAG` in the window title. They exist because the person who can see the screen and the
+   one who can edit the constant are different, with a rebuild in between; each turned a
+   round-trip into a keypress. `$HORDE_ATLAS` and `$HORDE_SHOT` are worth keeping — they are
+   diagnostics, not scaffolding.
+3. **Re-measure on the main machine.** Nothing was benchmarked on 2026-09-01: that session ran
+   on a laptop with the main machine's disk attached externally, and MEASURING.md § 8e is
+   explicit that timings here would not be comparable to the committed baselines.
+
 ## ★ 2026-08-02/03 — the audit night, then cooperative night 8
 
 **Landed.** Capability audit + matrix published in the README (`get_ref` on all five pointer
