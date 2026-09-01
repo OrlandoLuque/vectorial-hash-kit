@@ -36,9 +36,9 @@ impl<T: Positioned> Positioned for Tagged<T> {
 
 enum Held2<T: Positioned> {
     Brute,
-    Keep(Box<Tree<T>>, Vec<ItemRef>),
+    Keep(Box<Tree<Tagged<T>>>, Vec<ItemRef>),
     Grid(Box<MortonGrid<Tagged<T>>>),
-    Static(Box<KdTree2<T>>),
+    Static(Box<KdTree2<Tagged<T>>>),
 }
 
 /// An index that picks its own structure. See the module docs.
@@ -137,7 +137,7 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
         let mut stale = false;
         match &mut self.held {
             Held2::Keep(t, refs) => {
-                let r = match t.insert_ref(item.clone()) { Some(r) => r, None => { stale = true; ItemRef(u32::MAX) } };
+                let r = match t.insert_ref(Tagged { slot, item: item.clone() }) { Some(r) => r, None => { stale = true; ItemRef(u32::MAX) } };
                 // `refs` is indexed BY SLOT, holes included, so a recycled slot writes in
                 // place rather than pushing and shifting everyone after it.
                 if refs.len() <= slot as usize { refs.resize(slot as usize + 1, ItemRef(u32::MAX)); }
@@ -190,7 +190,7 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
                     // `_tracked` so the policy learns the REAL relocation rate: how often a
                     // move actually crosses a leaf, which is the number that decides
                     // whether keeping the index still beats rebuilding it.
-                    match t.update_ref_tracked(r, |c| *c = item) {
+                    match t.update_ref_tracked(r, |c| c.item = item) {
                         Crossing2::Stayed(_) => {}
                         Crossing2::Moved { .. } => self.relocations += 1,
                         _ => self.dirty = true,
@@ -214,22 +214,59 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
     /// Everything inside `shape`. Rebuilds a stale backend first, so a caller never sees
     /// a partially-updated index.
     pub fn cull<S: Shape>(&mut self, shape: &S) -> Vec<&T> {
+        self.note_cull(shape);
+        let mut v = self.cull_tagged(shape);
+        v.sort_unstable_by_key(|e| e.0);
+        v.into_iter().map(|e| e.1).collect()
+    }
+
+    /// Backend order, explicitly opted into. See [`crate::AdaptiveIndex::cull_unordered`] for
+    /// the full argument — short version: only for consumers PROVEN order-insensitive, because
+    /// truncation, early exit with a side effect and float accumulation all are not.
+    pub fn cull_unordered<S: Shape>(&mut self, shape: &S) -> Vec<&T> {
+        self.note_cull(shape);
+        self.cull_tagged(shape).into_iter().map(|e| e.1).collect()
+    }
+
+    fn note_cull<S: Shape>(&mut self, shape: &S) {
         self.queries += 1;
         // What is this caller actually asking for? The grid's cells want to be about this big.
         let b = shape.bounding_box();
         let e = b.width.max(b.height);
         self.q_extent = if self.q_extent == 0.0 { e } else { self.q_extent + 0.1 * (e - self.q_extent) };
         self.refresh();
+    }
+
+    fn cull_tagged<S: Shape>(&self, shape: &S) -> Vec<(u32, &T)> {
         match &self.held {
-            Held2::Brute => self.items.iter().flatten().filter(|it| shape.contains_point(it.position())).collect(),
-            Held2::Keep(t, _) => t.cull(shape),
-            Held2::Grid(g) => g.cull(shape).into_iter().map(|t| &t.item).collect(),
-            Held2::Static(k) => k.cull(shape),
+            Held2::Brute => self.items.iter().enumerate()
+                .filter_map(|(i, o)| o.as_ref().map(|it| (i as u32, it)))
+                .filter(|(_, it)| shape.contains_point(it.position())).collect(),
+            Held2::Keep(t, _) => t.cull(shape).into_iter().map(|g| (g.slot, &g.item)).collect(),
+            Held2::Grid(g) => g.cull(shape).into_iter().map(|g| (g.slot, &g.item)).collect(),
+            Held2::Static(k) => k.cull(shape).into_iter().map(|g| (g.slot, &g.item)).collect(),
         }
     }
 
-    /// k nearest to `q`, as `(distance, &item)` sorted by distance.
+    /// The k nearest, canonically — the SET does not depend on the live backend. See
+    /// [`crate::AdaptiveIndex::knn`] for why sorting the backend's answer is not enough.
     pub fn knn(&mut self, q: Point, k: usize) -> Vec<(f64, &T)> {
+        if k == 0 { return Vec::new(); }
+        let probe = self.knn_unordered(q, k);
+        let Some(&(far, _)) = probe.last() else { return Vec::new() };
+        let r = far * (1.0 + 1e-12) + f64::EPSILON;
+        let mut v: Vec<(f64, u32, &T)> = self.cull_tagged(&crate::Circle::new(q, r)).into_iter()
+            .map(|(slot, it)| { let p = it.position();
+                let (dx, dy) = (p.x - q.x, p.y - q.y);
+                ((dx * dx + dy * dy).sqrt(), slot, it) })
+            .collect();
+        v.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        v.truncate(k);
+        v.into_iter().map(|(d, _, it)| (d, it)).collect()
+    }
+
+    /// k nearest straight from the live backend: ties broken however it broke them.
+    pub fn knn_unordered(&mut self, q: Point, k: usize) -> Vec<(f64, &T)> {
         self.queries += 1;
         self.refresh();
         match &self.held {
@@ -243,9 +280,9 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
                 v.truncate(k);
                 v
             }
-            Held2::Keep(t, _) => t.knn(q, k),
-            Held2::Grid(g) => g.knn(q, k).into_iter().map(|(d, t)| (d, &t.item)).collect(),
-            Held2::Static(kd) => kd.knn(q, k),
+            Held2::Keep(t, _) => t.knn(q, k).into_iter().map(|(d, g)| (d, &g.item)).collect(),
+            Held2::Grid(g) => g.knn(q, k).into_iter().map(|(d, g)| (d, &g.item)).collect(),
+            Held2::Static(kd) => kd.knn(q, k).into_iter().map(|(d, g)| (d, &g.item)).collect(),
         }
     }
 
@@ -340,21 +377,10 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
     fn warm_order(&self) -> Vec<u32> {
         match &self.held {
             Held2::Grid(g) => g.iter_z_order().map(|t| t.slot).collect(),
-            // A tree can supply one too, now that it will hand back its handles in DFS order.
-            // Its `refs` table maps slot -> handle, which is the wrong way round, so invert it
-            // here: O(N) once per migration, and nothing at all in steady state. The
-            // alternative — storing the slot alongside every item, the way the grid backend has
-            // to — would cost 4 bytes per item on the query hot path forever, to save work that
-            // happens twice in a thousand frames.
-            Held2::Keep(t, refs) => {
-                let mut slot_of = vec![u32::MAX; refs.iter().map(|r| r.0).filter(|&h| h != u32::MAX).max().map_or(0, |m| m as usize + 1)];
-                for (slot, r) in refs.iter().enumerate() {
-                    if r.0 != u32::MAX && (r.0 as usize) < slot_of.len() { slot_of[r.0 as usize] = slot as u32; }
-                }
-                t.handles_dfs().iter()
-                    .filter_map(|h| slot_of.get(h.0 as usize).copied().filter(|&s| s != u32::MAX))
-                    .collect()
-            }
+            // Same as the 3D twin: the slot rides with every item now (canonical query order
+            // needs it on every result, not just at migration), so the handle -> slot inversion
+            // this used to do is gone.
+            Held2::Keep(t, _) => t.handles_dfs().iter().filter_map(|h| t.get_ref(*h).map(|g| g.slot)).collect(),
             _ => Vec::new(),
         }
     }
@@ -383,7 +409,7 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
                 let mut refs = vec![ItemRef(u32::MAX); items.len()];
                 for slot in visit {
                     if let Some(it) = &items[slot] {
-                        refs[slot] = t.insert_ref(it.clone()).unwrap_or(ItemRef(u32::MAX));
+                        refs[slot] = t.insert_ref(Tagged { slot: slot as u32, item: it.clone() }).unwrap_or(ItemRef(u32::MAX));
                     }
                 }
                 Held2::Keep(Box::new(t), refs)
@@ -405,7 +431,7 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
                 Held2::Grid(Box::new(g))
             }
             Backend::Static => Held2::Static(Box::new(KdTree2::from_items(leaf,
-                visit.filter_map(|slot| items[slot].clone()).collect()))),
+                visit.filter_map(|slot| items[slot].clone().map(|item| Tagged { slot: slot as u32, item })).collect()))),
         }
     }
 
@@ -432,6 +458,50 @@ mod tests {
     impl Positioned for P { fn position(&self) -> Point { self.p } }
 
     fn world() -> Rect { Rect::new(0.0, 0.0, 256.0, 256.0) }
+
+    /// ★ R1 in 2D. The twin of `every_backend_answers_in_the_same_canonical_order`, and it
+    /// exists because the anti-drift test compares which BACKEND each twin picks, not what
+    /// order it answers in — so it would not have noticed 2D missing the canonicalisation.
+    #[test]
+    fn every_backend_answers_in_the_same_canonical_order_2d() {
+        #[derive(Clone, Copy, Debug)]
+        struct Q { id: u32, p: Point }
+        impl Positioned for Q { fn position(&self) -> Point { self.p } }
+
+        let (w, leaf) = (world(), 8);
+        let mut ix: AdaptiveIndex2<Q> = AdaptiveIndex2::new(w, leaf);
+        let mut id = 0u32;
+        for i in 0..300u32 {
+            let f = i as f64;
+            ix.insert(Q { id, p: Point::new(20.0 + (f * 7.0) % 200.0, 20.0 + (f * 13.0) % 200.0) });
+            id += 1;
+        }
+        for _ in 0..5 { ix.insert(Q { id, p: Point::new(128.0, 128.0) }); id += 1; }
+        // Ties at the k-th distance: eight points on one circle, k = 4.
+        let c = Point::new(90.0, 90.0);
+        for (dx, dy) in [(10.0, 0.0), (-10.0, 0.0), (0.0, 10.0), (0.0, -10.0),
+                         (6.0, 8.0), (-6.0, -8.0), (8.0, 6.0), (-8.0, -6.0)] {
+            ix.insert(Q { id, p: Point::new(c.x + dx, c.y + dy) });
+            id += 1;
+        }
+
+        let probe = Circle::new(Point::new(120.0, 120.0), 60.0);
+        let items = ix.items.clone();
+        let (mut canon_cull, mut canon_knn, mut raw) = (None, None, Vec::new());
+        for backend in [Backend::Brute, Backend::KeepTree, Backend::Grid, Backend::Static] {
+            ix.held = AdaptiveIndex2::build_ordered(backend, &items, w, leaf, 0.0, &[]);
+            ix.dirty = false;
+            let cull: Vec<u32> = ix.cull(&probe).iter().map(|q| q.id).collect();
+            assert!(cull.len() > 20, "{backend:?}: the probe must hit plenty or this proves nothing");
+            match &canon_cull { None => canon_cull = Some(cull), Some(want) => assert_eq!(&cull, want, "{backend:?} culled a different SEQUENCE") }
+            let knn: Vec<(u64, u32)> = ix.knn(c, 4).iter().map(|(d, q)| (d.to_bits(), q.id)).collect();
+            assert_eq!(knn.len(), 4);
+            match &canon_knn { None => canon_knn = Some(knn), Some(want) => assert_eq!(&knn, want, "{backend:?} returned a different k-NN SET") }
+            raw.push(ix.cull_unordered(&probe).iter().map(|q| q.id).collect::<Vec<_>>());
+        }
+        assert!(raw.iter().any(|o| o != &raw[0]),
+            "no backend emitted a different raw order, so this cannot see canonicalisation working");
+    }
     trait Bits2 { fn to_bits2(&self) -> (u64, u64); }
     impl Bits2 for Point { fn to_bits2(&self) -> (u64, u64) { (self.x.to_bits(), self.y.to_bits()) } }
     fn pt(i: usize) -> Point {

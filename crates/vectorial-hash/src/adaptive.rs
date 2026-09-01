@@ -16,6 +16,42 @@
 //! | [`MortonGrid3`] | queries per item are high | a flat grid answers dense queries with fewer descents, and **keeps in place** now, so it no longer pays a rebuild per mutation |
 //! | [`KdTree3`] | nothing has moved for a while | build-once, best query on skewed data |
 //!
+//! ## The safety property: a query answers the same whoever is holding the data
+//!
+//! Switching structure under a running caller is only safe if the caller cannot tell. That is
+//! more than "the same set": [`cull`](AdaptiveIndex::cull) returns it in a **canonical order**
+//! (by [`Slot`], which is stable across migrations), and [`knn`](AdaptiveIndex::knn) returns a
+//! canonical *set* too.
+//!
+//! Order is not cosmetic, and the list of consumers it silently changes is longer than it looks:
+//!
+//! | consumer | what changes with iteration order |
+//! | --- | --- |
+//! | k-NN, or "up to N in radius" | truncation at a tie → a different SET |
+//! | "first valid target" | **which** entity gets picked |
+//! | summing floats over neighbours | FP addition is not associative → different bits |
+//! | early exit with a side effect | which one fired the effect |
+//! | anything emitting an ordered log | a different stream from the same state |
+//!
+//! **k-NN needs more than a sort**, which is the part worth knowing. Each backend truncates to
+//! `k` *inside* its own search, so when two items tie at the k-th distance the sets differ
+//! before any sort could see them — the property test confirms it by failing with
+//! *"KeepTree returned a different k-NN SET"* the moment the canonical path is removed. So
+//! `knn` re-derives instead: take the k-th distance from the backend, cull that radius (a set
+//! everyone agrees on), then order by `(distance, slot)`. One extra cull, and the answer stops
+//! depending on which structure happens to be live.
+//!
+//! Both have an explicit opt-out — [`cull_unordered`](AdaptiveIndex::cull_unordered) and
+//! [`knn_unordered`](AdaptiveIndex::knn_unordered) — for consumers *proven* order-insensitive.
+//! Opt-out rather than opt-in on purpose: nothing at a call site announces that the loop below
+//! truncates or accumulates, so the safe thing has to be the default and the unsafe thing has
+//! to be something you typed.
+//!
+//! The cost is one `u32` per item per backend. The grid already paid it; the tree and the k-d
+//! tree now do too, and a comment in `warm_order` that argued against exactly that — 4 bytes
+//! forever to save work happening twice in a thousand frames — has been re-decided, because the
+//! benefit is no longer a migration optimisation but whether a query has a defined answer.
+//!
 //! ## What it is actually worth — measured, and not flattering everywhere
 //!
 //! Two benchmarks, deliberately asking different questions.
@@ -111,7 +147,7 @@
 use crate::advisor::SpatialProfile;
 use crate::kdtree3::KdTree3;
 use crate::morton3::MortonGrid3;
-use crate::tree3::{Aabb, Crossing, ItemRef, Point3, Positioned3, Shape3, Tree3};
+use crate::tree3::{Aabb, Crossing, ItemRef, Point3, Positioned3, Shape3, Sphere3, Tree3};
 
 /// Which concrete structure is holding the items right now.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -378,9 +414,9 @@ pub(crate) const GRID_TARGET_PER_CELL: f64 = 8.0;
 
 enum Held<T: Positioned3> {
     Brute,
-    Keep(Box<Tree3<T>>, Vec<ItemRef>),
+    Keep(Box<Tree3<Tagged<T>>>, Vec<ItemRef>),
     Grid(Box<MortonGrid3<Tagged<T>>>),
-    Static(Box<KdTree3<T>>),
+    Static(Box<KdTree3<Tagged<T>>>),
 }
 
 /// An item in the grid backend, carrying the [`Slot`] it belongs to.
@@ -504,7 +540,7 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
         let mut stale = false;
         match &mut self.held {
             Held::Keep(t, refs) => {
-                let r = match t.insert_ref(item.clone()) { Some(r) => r, None => { stale = true; ItemRef(u32::MAX) } };
+                let r = match t.insert_ref(Tagged { slot, item: item.clone() }) { Some(r) => r, None => { stale = true; ItemRef(u32::MAX) } };
                 // `refs` is indexed BY SLOT, holes included, so a recycled slot writes in
                 // place rather than pushing and shifting everyone after it.
                 if refs.len() <= slot as usize { refs.resize(slot as usize + 1, ItemRef(u32::MAX)); }
@@ -557,7 +593,7 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
                     // `_tracked` so the policy learns the REAL relocation rate: how often a
                     // move actually crosses a leaf, which is the number that decides
                     // whether keeping the index still beats rebuilding it.
-                    match t.update_ref_tracked(r, |c| *c = item) {
+                    match t.update_ref_tracked(r, |c| c.item = item) {
                         Crossing::Stayed(_) => {}
                         Crossing::Moved { .. } => self.relocations += 1,
                         _ => self.dirty = true,
@@ -583,22 +619,92 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
     /// Everything inside `shape`. Rebuilds a stale backend first, so a caller never sees
     /// a partially-updated index.
     pub fn cull<S: Shape3>(&mut self, shape: &S) -> Vec<&T> {
+        self.note_cull(shape);
+        let mut v = self.cull_tagged(shape);
+        // Canonical order: by slot. Slot is stable across migrations by construction, so this
+        // is the one ordering every backend can agree on — and unlike sorting by position it
+        // is still total when two items sit on the same point, which is exactly the case that
+        // breaks a truncating consumer.
+        v.sort_unstable_by_key(|e| e.0);
+        v.into_iter().map(|e| e.1).collect()
+    }
+
+    /// Everything inside `shape`, in whatever order the live backend happened to produce.
+    ///
+    /// **Explicit opt-out of [`cull`](Self::cull)'s canonical order**, for callers whose
+    /// consumer is *proven* order-insensitive: membership tests, counts, sums of a commutative
+    /// integer quantity. It saves one sort of the result.
+    ///
+    /// It is opt-out rather than opt-in on purpose. Order-dependence is invisible at the call
+    /// site — nothing about `for it in index.cull(&s)` says whether the loop truncates, breaks
+    /// early, or accumulates floats — so the safe thing has to be what you get by default, and
+    /// the unsafe thing has to be something you typed. Opt-in-to-safety would rot.
+    ///
+    /// Things that are NOT order-insensitive, and have all been shipped as bugs somewhere:
+    /// taking the first N of the result, `break` on the first match when the loop has a side
+    /// effect, and summing floats (FP addition is not associative, so a different order is a
+    /// different number, bit for bit).
+    pub fn cull_unordered<S: Shape3>(&mut self, shape: &S) -> Vec<&T> {
+        self.note_cull(shape);
+        self.cull_tagged(shape).into_iter().map(|e| e.1).collect()
+    }
+
+    /// Counters and cell-size feedback for a cull, then bring a stale backend up to date.
+    fn note_cull<S: Shape3>(&mut self, shape: &S) {
         self.queries += 1;
         // What is this caller actually asking for? The grid's cells want to be about this big.
         let b = shape.bounding_box();
         let e = b.w.max(b.h).max(b.d);
         self.q_extent = if self.q_extent == 0.0 { e } else { self.q_extent + 0.1 * (e - self.q_extent) };
         self.refresh();
+    }
+
+    /// The raw hit set as `(slot, &item)`, in backend order. The slot is what makes the four
+    /// backends comparable at all: brute yields slot order, the tree yields its traversal, the
+    /// grid yields cell order and the k-d tree yields node order.
+    fn cull_tagged<S: Shape3>(&self, shape: &S) -> Vec<(u32, &T)> {
         match &self.held {
-            Held::Brute => self.items.iter().flatten().filter(|it| shape.contains_point(it.position())).collect(),
-            Held::Keep(t, _) => t.cull(shape),
-            Held::Grid(g) => g.cull(shape).into_iter().map(|t| &t.item).collect(),
-            Held::Static(k) => k.cull(shape),
+            Held::Brute => self.items.iter().enumerate()
+                .filter_map(|(i, o)| o.as_ref().map(|it| (i as u32, it)))
+                .filter(|(_, it)| shape.contains_point(it.position())).collect(),
+            Held::Keep(t, _) => t.cull(shape).into_iter().map(|g| (g.slot, &g.item)).collect(),
+            Held::Grid(g) => g.cull(shape).into_iter().map(|g| (g.slot, &g.item)).collect(),
+            Held::Static(k) => k.cull(shape).into_iter().map(|g| (g.slot, &g.item)).collect(),
         }
     }
 
-    /// k nearest to `q`, as `(distance, &item)` sorted by distance.
+    /// The k nearest to `q`, as `(distance, &item)` — canonically, so the RESULT SET does not
+    /// depend on which backend is live.
+    ///
+    /// Sorting a backend's answer is not enough here, and that is the subtle part. When two
+    /// items tie at the k-th distance, each backend truncates to a different one *inside* its
+    /// own search, so the sets differ before this ever sees them. So the canonical path asks
+    /// the backend for a radius and then re-derives the set: take the k-th distance, cull a
+    /// sphere of that radius (a set every backend agrees on), and order by `(distance, slot)`.
+    ///
+    /// That costs one extra cull. [`knn_unordered`](Self::knn_unordered) is the cheap backend
+    /// path for callers who do not care which of two equidistant items they get.
     pub fn knn(&mut self, q: Point3, k: usize) -> Vec<(f64, &T)> {
+        if k == 0 { return Vec::new(); }
+        let probe = self.knn_unordered(q, k);
+        let Some(&(far, _)) = probe.last() else { return Vec::new() };
+        // A hair of slack so the k-th item itself cannot fall outside its own radius through
+        // float rounding. Anything the slack pulls in sorts after it and is truncated away.
+        let r = far * (1.0 + 1e-12) + f64::EPSILON;
+        let mut v: Vec<(f64, u32, &T)> = self.cull_tagged(&Sphere3::new(q.x, q.y, q.z, r)).into_iter()
+            .map(|(slot, it)| { let p = it.position();
+                let (dx, dy, dz) = (p.x - q.x, p.y - q.y, p.z - q.z);
+                ((dx * dx + dy * dy + dz * dz).sqrt(), slot, it) })
+            .collect();
+        v.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        v.truncate(k);
+        v.into_iter().map(|(d, _, it)| (d, it)).collect()
+    }
+
+    /// k nearest, straight from the live backend: sorted by distance, but ties broken however
+    /// that backend's search happened to break them. See [`knn`](Self::knn) for why that makes
+    /// the SET and not merely the order backend-dependent.
+    pub fn knn_unordered(&mut self, q: Point3, k: usize) -> Vec<(f64, &T)> {
         self.queries += 1;
         self.refresh();
         match &self.held {
@@ -612,9 +718,9 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
                 v.truncate(k);
                 v
             }
-            Held::Keep(t, _) => t.knn(q, k),
-            Held::Grid(g) => g.knn(q, k).into_iter().map(|(d, t)| (d, &t.item)).collect(),
-            Held::Static(kd) => kd.knn(q, k),
+            Held::Keep(t, _) => t.knn(q, k).into_iter().map(|(d, g)| (d, &g.item)).collect(),
+            Held::Grid(g) => g.knn(q, k).into_iter().map(|(d, g)| (d, &g.item)).collect(),
+            Held::Static(kd) => kd.knn(q, k).into_iter().map(|(d, g)| (d, &g.item)).collect(),
         }
     }
 
@@ -758,7 +864,7 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
                 let mut refs = vec![ItemRef(u32::MAX); items.len()];
                 for slot in visit {
                     if let Some(it) = &items[slot] {
-                        refs[slot] = t.insert_ref(it.clone()).unwrap_or(ItemRef(u32::MAX));
+                        refs[slot] = t.insert_ref(Tagged { slot: slot as u32, item: it.clone() }).unwrap_or(ItemRef(u32::MAX));
                     }
                 }
                 Held::Keep(Box::new(t), refs)
@@ -787,7 +893,7 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
                 Held::Grid(Box::new(g))
             }
             Backend::Static => Held::Static(Box::new(KdTree3::from_items(leaf,
-                visit.filter_map(|slot| items[slot].clone()).collect()))),
+                visit.filter_map(|slot| items[slot].clone().map(|item| Tagged { slot: slot as u32, item })).collect()))),
         }
     }
 
@@ -825,21 +931,14 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
         if !self.th.warm_start { return Vec::new(); }
         let order: Vec<u32> = match &self.held {
             Held::Grid(g) => g.iter_z_order().map(|t| t.slot).collect(),
-            // A tree can supply one too, now that it will hand back its handles in DFS order.
-            // Its `refs` table maps slot -> handle, which is the wrong way round, so invert it
-            // here: O(N) once per migration, and nothing at all in steady state. The
-            // alternative — storing the slot alongside every item, the way the grid backend has
-            // to — would cost 4 bytes per item on the query hot path forever, to save work that
-            // happens twice in a thousand frames.
-            Held::Keep(t, refs) => {
-                let mut slot_of = vec![u32::MAX; refs.iter().map(|r| r.0).filter(|&h| h != u32::MAX).max().map_or(0, |m| m as usize + 1)];
-                for (slot, r) in refs.iter().enumerate() {
-                    if r.0 != u32::MAX && (r.0 as usize) < slot_of.len() { slot_of[r.0 as usize] = slot as u32; }
-                }
-                t.handles_dfs().iter()
-                    .filter_map(|h| slot_of.get(h.0 as usize).copied().filter(|&s| s != u32::MAX))
-                    .collect()
-            }
+            // A tree can supply one too, and cheaply now. This used to invert the `refs`
+            // table (slot -> handle) to recover a handle -> slot map, because the tree stored
+            // bare items; the comment here argued that storing the slot beside every item
+            // would cost 4 bytes forever to save work that happens twice in a thousand frames.
+            // That trade-off was re-decided for a different reason: canonical query order needs
+            // the slot on EVERY result, not just at migration, so it is stored now — and the
+            // inversion this used to do is simply gone.
+            Held::Keep(t, _) => t.handles_dfs().iter().filter_map(|h| t.get_ref(*h).map(|g| g.slot)).collect(),
             _ => Vec::new(),
         };
         if !order.is_empty() { self.warm_starts += 1; }
@@ -1166,14 +1265,80 @@ mod tests {
         }
     }
 
+    /// ★ R1 — the four backends must answer with the SAME SEQUENCE, not merely the same set.
+    ///
+    /// This is the property that makes it safe to swap a structure under a running caller. It is
+    /// tested with deliberate ties, because ties are where it actually breaks: identical
+    /// positions (so no position-based ordering can separate them) and, for k-NN, more items at
+    /// exactly the k-th distance than there is room for — so which ones come back depends on how
+    /// the backend's own search happened to truncate.
+    #[test]
+    fn every_backend_answers_in_the_same_canonical_order() {
+        #[derive(Clone, Copy, Debug)]
+        struct Q { id: u32, p: Point3 }
+        impl Positioned3 for Q { fn position(&self) -> Point3 { self.p } }
+
+        let (w, leaf) = (world(), 8);
+        let mut ix: AdaptiveIndex<Q> = AdaptiveIndex::new(w, leaf);
+        let mut id = 0u32;
+        // A scatter, plus COINCIDENT points: five items sharing one position cannot be ordered
+        // by where they are, only by which slot they occupy.
+        for i in 0..300u32 {
+            let f = i as f64;
+            ix.insert(Q { id, p: Point3::new(20.0 + (f * 7.0) % 200.0, 20.0 + (f * 13.0) % 200.0, 20.0 + (f * 29.0) % 200.0) });
+            id += 1;
+        }
+        for _ in 0..5 { ix.insert(Q { id, p: Point3::new(128.0, 128.0, 128.0) }); id += 1; }
+        // Eight items at exactly the same distance from the k-NN probe, so a k of 4 must choose.
+        let c = Point3::new(90.0, 90.0, 90.0);
+        for (dx, dy, dz) in [(10.0, 0.0, 0.0), (-10.0, 0.0, 0.0), (0.0, 10.0, 0.0), (0.0, -10.0, 0.0),
+                             (0.0, 0.0, 10.0), (0.0, 0.0, -10.0), (6.0, 8.0, 0.0), (-6.0, -8.0, 0.0)] {
+            ix.insert(Q { id, p: Point3::new(c.x + dx, c.y + dy, c.z + dz) });
+            id += 1;
+        }
+
+        let probe = Sphere3::new(120.0, 120.0, 120.0, 60.0);
+        let items = ix.items.clone();
+        let (mut canon_cull, mut canon_knn, mut raw_orders) = (None, None, Vec::new());
+
+        for backend in [Backend::Brute, Backend::KeepTree, Backend::Grid, Backend::Static] {
+            ix.held = AdaptiveIndex::build_ordered(backend, &items, w, leaf, 0.0, &[]);
+            ix.dirty = false;
+
+            let cull: Vec<u32> = ix.cull(&probe).iter().map(|q| q.id).collect();
+            assert!(cull.len() > 20, "{backend:?}: the probe must hit plenty or this proves nothing");
+            match &canon_cull {
+                None => canon_cull = Some(cull),
+                Some(want) => assert_eq!(&cull, want, "{backend:?} culled a different SEQUENCE"),
+            }
+
+            let knn: Vec<(u64, u32)> = ix.knn(c, 4).iter().map(|(d, q)| (d.to_bits(), q.id)).collect();
+            assert_eq!(knn.len(), 4);
+            match &canon_knn {
+                None => canon_knn = Some(knn),
+                Some(want) => assert_eq!(&knn, want, "{backend:?} returned a different k-NN SET (the tie broke elsewhere)"),
+            }
+
+            raw_orders.push(ix.cull_unordered(&probe).iter().map(|q| q.id).collect::<Vec<_>>());
+        }
+
+        // Non-vacuity: if every backend happened to emit in the same raw order anyway, the sort
+        // above is doing nothing and this test would pass with the canonicalisation deleted.
+        let mut sets: Vec<Vec<u32>> = raw_orders.iter().map(|v| { let mut c = v.clone(); c.sort_unstable(); c }).collect();
+        sets.dedup();
+        assert_eq!(sets.len(), 1, "the backends disagreed on the SET, which is a different bug");
+        assert!(raw_orders.iter().any(|o| o != &raw_orders[0]),
+            "no backend emitted a different raw order, so this test cannot see canonicalisation working");
+    }
+
     /// Cull whatever a `Held` is holding, as raw coordinates so the four backends are
     /// comparable without depending on item identity.
     fn held_cull(h: &Held<P>, s: &Sphere3, items: &[Option<P>]) -> Vec<(u64, u64, u64)> {
         match h {
             Held::Brute => items.iter().flatten().filter(|it| s.contains_point(it.position())).map(|it| it.p.to_bits3()).collect(),
-            Held::Keep(t, _) => t.cull(s).iter().map(|it| it.p.to_bits3()).collect(),
+            Held::Keep(t, _) => t.cull(s).iter().map(|it| it.item.p.to_bits3()).collect(),
             Held::Grid(g) => g.cull(s).iter().map(|t| t.item.p.to_bits3()).collect(),
-            Held::Static(k) => k.cull(s).iter().map(|it| it.p.to_bits3()).collect(),
+            Held::Static(k) => k.cull(s).iter().map(|it| it.item.p.to_bits3()).collect(),
         }
     }
 }
