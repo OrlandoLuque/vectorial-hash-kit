@@ -18,7 +18,7 @@
 //! `Backend`, `Slot` and `Thresholds` are dimension-agnostic and are re-exported from
 //! [`crate::adaptive`] rather than duplicated: one calibration file configures both.
 
-use crate::adaptive::{Backend, Slot, Thresholds};
+use crate::adaptive::{Backend, Slot, Thresholds, SwitchStats, backend_ix, Distribution, Hints};
 use crate::advisor::SpatialProfile;
 use crate::kdtree2::KdTree2;
 use crate::morton::MortonGrid;
@@ -71,6 +71,8 @@ pub struct AdaptiveIndex2<T: Positioned + Clone> {
     queries: u64,
     /// Smoothed queries per item per tick: the variable the backend choice turns on.
     q_per_item: f64,
+    stats: SwitchStats,
+    frozen: bool,
     /// Smoothed moves per item per tick — see the 3D twin.
     m_per_item: f64,
     /// The live count the grid backend's cell size was derived from.
@@ -105,7 +107,7 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
         AdaptiveIndex2 {
             items: Vec::new(), free: Vec::new(), live: 0, world, leaf: leaf.max(1), held: Held2::Brute,
             profile: SpatialProfile::default(), th, pending: None, cooling: 0,
-            dirty: false, switches: 0, moves: 0, relocations: 0, queries: 0, q_per_item: 0.0,
+            dirty: false, switches: 0, moves: 0, relocations: 0, queries: 0, q_per_item: 0.0, stats: SwitchStats::default(), frozen: false,
             m_per_item: 0.0, grid_for: 0, q_extent: 0.0,
         }
     }
@@ -116,6 +118,33 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
     }
     /// How many migrations have happened — a flapping policy shows up here.
     pub fn switch_count(&self) -> u32 { self.switches }
+    /// Per-pair switch counts, time in each backend and near-misses — the same
+    /// [`SwitchStats`] type the 3D twin reports, shared rather than copied.
+    pub fn stats(&self) -> &SwitchStats { &self.stats }
+    /// Is the backend choice pinned? See [`freeze`](Self::freeze).
+    pub fn is_frozen(&self) -> bool { self.frozen }
+
+    /// Pre-select from what the caller knows is coming. Same contract as the 3D twin's
+    /// [`crate::AdaptiveIndex::prepare`], including the warning: **pair it with
+    /// [`freeze`](Self::freeze)** for a bulk load, or the population climbing from zero will
+    /// argue with the destination you just chose.
+    pub fn prepare(&mut self, h: Hints) {
+        if let Some(n) = h.expected_count { self.items.reserve(n.saturating_sub(self.items.len())); }
+        if let Some(q) = h.queries_per_item { self.q_per_item = q; }
+        if let Some(c) = h.churn { self.m_per_item = c; }
+        if let Some(e) = h.query_extent { self.q_extent = e; }
+        let promised = h.expected_count.unwrap_or(self.live);
+        let want = self.desired_at(promised as f64);
+        if want != self.backend() { self.migrate(want); }
+        if let (Some(Distribution::Clustered), Backend::Grid) = (h.distribution, self.backend()) {
+            self.dirty = true;
+        }
+    }
+
+    /// Pin the current backend until [`thaw`](Self::thaw). The detector keeps observing.
+    pub fn freeze(&mut self) { self.frozen = true; }
+    /// Release [`freeze`](Self::freeze); the next tick may migrate immediately.
+    pub fn thaw(&mut self) { self.frozen = false; }
     pub fn len(&self) -> usize { self.live }
     pub fn is_empty(&self) -> bool { self.live == 0 }
     /// Slots allocated, holes included. `len()` is what you almost always want; this one is
@@ -307,6 +336,7 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
             let (a, b) = (self.live.max(1) as f64, self.grid_for as f64);
             if a / b > 4.0 || b / a > 4.0 { self.dirty = true; self.grid_for = self.live; }
         }
+        self.stats.ticks_in[backend_ix(self.backend())] += 1;
         let (want, decisive) = self.desired_with_confidence();
         if want == self.backend() { self.pending = None; return self.backend(); }
         let held = match self.pending {
@@ -314,10 +344,12 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
             _ => 1,
         };
         self.pending = Some((want, held));
-        if decisive || (held >= self.th.hold_ticks && self.cooling == 0) {
+        if !self.frozen && (decisive || (held >= self.th.hold_ticks && self.cooling == 0)) {
             self.migrate(want);
             self.pending = None;
             self.cooling = self.th.cooldown;
+        } else {
+            self.stats.near_misses += 1;
         }
         self.backend()
     }
@@ -344,8 +376,10 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
         (want, decisive)
     }
 
-    fn desired(&self) -> Backend {
-        let n = self.live as f64;
+    fn desired(&self) -> Backend { self.desired_at(self.live as f64) }
+
+    /// The policy, parameterised on population — see the 3D twin.
+    fn desired_at(&self, n: f64) -> Backend {
         let m = self.th.margin;
         let cur = self.backend();
         // Leaving brute costs a build, so demand a clearly bigger population than the one
@@ -364,6 +398,7 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
     }
 
     fn migrate(&mut self, to: Backend) {
+        self.stats.pairs[backend_ix(self.backend())][backend_ix(to)] += 1;
         self.switches += 1;
         let order = self.warm_order();
         self.held = Self::build_ordered(to, &self.items, self.world, self.leaf, self.q_extent, &order);

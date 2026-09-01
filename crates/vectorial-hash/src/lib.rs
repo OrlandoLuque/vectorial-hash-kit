@@ -57,7 +57,7 @@ pub use itree::{INode, INodeId, IPoint, IPositioned, IRect, IUpdateStrategy, Int
 pub use tree3::{Aabb, Crossing, ItemRef, Node3, Node3Id, Point3, Polyhedron3, Positioned3, Segment3, Shape3, Sphere3, Tree3, VoxelRaster};
 pub use octree3::{OCrossing, ONode, ONodeId, Octree3};
 pub use stencil::{Alignment, Row, SphereStencil};
-pub use adaptive::{AdaptiveIndex, Backend, Slot, Thresholds};
+pub use adaptive::{AdaptiveIndex, Backend, Distribution, Hints, Slot, SwitchStats, Thresholds};
 pub use adaptive2::AdaptiveIndex2;
 pub use kdtree2::KdTree2;
 pub use kdtree3::KdTree3;

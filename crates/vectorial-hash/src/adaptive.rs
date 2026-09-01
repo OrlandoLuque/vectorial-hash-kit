@@ -432,6 +432,82 @@ impl<T: Positioned3> Positioned3 for Tagged<T> {
     fn position(&self) -> Point3 { self.item.position() }
 }
 
+/// What the switcher has actually been doing — the counters a caller needs to tell a policy
+/// that is working from one that is thrashing.
+///
+/// `switch_count` alone cannot distinguish "migrated twice, correctly" from "oscillated between
+/// two backends all night", and the second is a *misconfiguration*, not a performance problem.
+/// So: which pair it moved between, how long it sat in each, and — the one that actually
+/// diagnoses a badly-placed threshold — how often the policy WANTED to move and the hysteresis
+/// stopped it. A high near-miss count with few switches means the band is sitting right on top
+/// of the workload.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SwitchStats {
+    /// `[from][to]` in [`Backend`] order: Brute, KeepTree, Grid, Static.
+    pub pairs: [[u32; 4]; 4],
+    /// Ticks spent holding each backend, same order.
+    pub ticks_in: [u64; 4],
+    /// Ticks where the policy preferred a different backend but hysteresis (hold, cooldown or
+    /// margin) kept it where it was. Not a failure — it is what the band is FOR — but the rate
+    /// is the signal.
+    pub near_misses: u64,
+}
+
+impl SwitchStats {
+    /// Total migrations, i.e. the old `switch_count`.
+    pub fn switches(&self) -> u32 { self.pairs.iter().flatten().sum() }
+    /// The busiest pair and its count, if anything has moved at all. A rate alarm reads this.
+    pub fn hottest_pair(&self) -> Option<(Backend, Backend, u32)> {
+        let order = [Backend::Brute, Backend::KeepTree, Backend::Grid, Backend::Static];
+        let mut best: Option<(Backend, Backend, u32)> = None;
+        for (i, row) in self.pairs.iter().enumerate() {
+            for (j, &n) in row.iter().enumerate() {
+                if n > 0 && best.is_none_or(|(_, _, b)| n > b) { best = Some((order[i], order[j], n)); }
+            }
+        }
+        best
+    }
+}
+
+pub(crate) fn backend_ix(b: Backend) -> usize {
+    match b { Backend::Brute => 0, Backend::KeepTree => 1, Backend::Grid => 2, Backend::Static => 3 }
+}
+
+/// What a caller knows about what is coming, so a bulk moment does not thrash the switcher.
+///
+/// The policy learns from what it has already seen, which means a bulk load walks it up through
+/// every backend on the way to the right one: a hundred items look like a scan, ten thousand
+/// like a tree, and it migrates at each boundary — paying a rebuild for a state that lasted a
+/// few hundred microseconds. A caller loading a level, or receiving a batch, usually knows the
+/// answer before the first insert. This is how it says so.
+///
+/// Every field is optional because a partial hint is still worth having: `expected_count` alone
+/// skips most of the thrash.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Hints {
+    /// How many items are about to arrive (total, not delta).
+    pub expected_count: Option<usize>,
+    /// Roughly how they will be spread. Decides grid cells and whether a median split pays.
+    pub distribution: Option<Distribution>,
+    /// Expected moves per item per tick once loaded. 0.0 means "static once built".
+    pub churn: Option<f64>,
+    /// Expected queries per item per tick.
+    pub queries_per_item: Option<f64>,
+    /// Typical query size in world units — the grid sizes its cells to this.
+    pub query_extent: Option<f64>,
+}
+
+/// The shape of the incoming data, as much as the caller knows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Distribution {
+    /// Spread evenly through the world.
+    Uniform,
+    /// Concentrated in blobs, with empty space between them.
+    Clustered,
+    /// Strung along a path or a surface — thin in at least one axis.
+    Linear,
+}
+
 /// A stable handle into an [`AdaptiveIndex`]. Survives migrations.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Slot(pub u32);
@@ -468,6 +544,8 @@ pub struct AdaptiveIndex<T: Positioned3 + Clone> {
     queries: u64,
     /// Smoothed queries per item per tick: the variable the backend choice turns on.
     q_per_item: f64,
+    stats: SwitchStats,
+    frozen: bool,
     /// Smoothed MOVES per item per tick. Deliberately not `relocation_rate`, which counts
     /// leaf crossings and is therefore only observable while the tree backend is loaded — a
     /// policy rule that reads it can never fire on any other backend, which is exactly how the
@@ -506,7 +584,7 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
         AdaptiveIndex {
             items: Vec::new(), free: Vec::new(), live: 0, world, leaf: leaf.max(1), held: Held::Brute, warm_starts: 0,
             profile: SpatialProfile::default(), th, pending: None, cooling: 0,
-            dirty: false, switches: 0, moves: 0, relocations: 0, queries: 0, q_per_item: 0.0,
+            dirty: false, switches: 0, moves: 0, relocations: 0, queries: 0, q_per_item: 0.0, stats: SwitchStats::default(), frozen: false,
             m_per_item: 0.0, grid_for: 0, q_extent: 0.0,
         }
     }
@@ -517,6 +595,68 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
     }
     /// How many migrations have happened — a flapping policy shows up here.
     pub fn switch_count(&self) -> u32 { self.switches }
+    /// Per-pair switch counts, time in each backend and near-misses. See [`SwitchStats`].
+    pub fn stats(&self) -> &SwitchStats { &self.stats }
+    /// Is the backend choice currently pinned? See [`freeze`](Self::freeze).
+    pub fn is_frozen(&self) -> bool { self.frozen }
+
+    /// Tell the index what is about to arrive, and let it pick the right backend NOW rather
+    /// than discover it one migration at a time.
+    ///
+    /// Without this, a bulk load walks the policy up through every backend on the way to the
+    /// right one, paying a rebuild at each boundary for a state that lasts microseconds. With
+    /// it, the destination is chosen from the hints and the load arrives into the structure it
+    /// was always going to end up in.
+    ///
+    /// The hints seed the same detector state the policy would otherwise have had to measure,
+    /// so they decay naturally: if the caller says 10 000 and 30 turn up, the EMAs pull the
+    /// estimate back toward reality within `detector_alpha`'s horizon and the policy corrects
+    /// itself. Being wrong costs a migration — the same one it would have paid anyway.
+    ///
+    /// **Pair it with [`freeze`](Self::freeze) for a bulk load.** On its own it is not enough
+    /// and can be actively worse: the population still climbs from zero, so the policy sees a
+    /// handful of items, decides a scan is right, and migrates *away* from the destination you
+    /// just chose — then back again once the count catches up. Measured on a 4 000-item load,
+    /// `prepare` alone took **4** migrations where the cold load took 2; `prepare` + `freeze`
+    /// takes **0**. The sequence is:
+    ///
+    /// ```ignore
+    /// ix.prepare(hints);   // pick the destination now
+    /// ix.freeze();         // and stop the climb from arguing with it
+    /// for item in batch { ix.insert(item); }
+    /// ix.thaw();           // back to normal, decisions resume on real data
+    /// ```
+    pub fn prepare(&mut self, h: Hints) {
+        if let Some(n) = h.expected_count { self.items.reserve(n.saturating_sub(self.items.len())); }
+        // Seed the detector rather than fake it: these are the very quantities `tick` smooths,
+        // so a hint is just an observation the index has not made yet.
+        if let Some(q) = h.queries_per_item { self.q_per_item = q; }
+        if let Some(c) = h.churn { self.m_per_item = c; }
+        if let Some(e) = h.query_extent { self.q_extent = e; }
+        // `live` is what the population rules read, and the items are not here yet, so pick the
+        // destination against the promised count and migrate to it before they arrive.
+        let promised = h.expected_count.unwrap_or(self.live);
+        let want = self.desired_at(promised as f64);
+        if want != self.backend() { self.migrate(want); }
+        // The grid's cells are sized at build time; a clustered load wants them smaller than a
+        // uniform one at the same count. Only a nudge — `build` still measures occupancy.
+        if let (Some(Distribution::Clustered), Backend::Grid) = (h.distribution, self.backend()) {
+            self.dirty = true;
+        }
+    }
+
+    /// Pin the current backend: no migration until [`thaw`](Self::thaw).
+    ///
+    /// For windows where a switch would be wrong even if the policy is right — a bulk load
+    /// whose midpoint looks like a different workload than its end, or a section where a
+    /// rebuild's latency is unacceptable. The detector keeps observing throughout, so the
+    /// decision waiting on the other side of `thaw` is made on real data, not stale data.
+    pub fn freeze(&mut self) { self.frozen = true; }
+
+    /// Release [`freeze`](Self::freeze). The next [`tick`](Self::tick) may migrate immediately:
+    /// the hysteresis counters kept running, so a workload that changed during the freeze does
+    /// not have to re-earn its hold time.
+    pub fn thaw(&mut self) { self.frozen = false; }
     pub fn len(&self) -> usize { self.live }
     pub fn is_empty(&self) -> bool { self.live == 0 }
     /// Slots allocated, holes included. `len()` is what you almost always want; this one is
@@ -745,6 +885,7 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
             let (a, b) = (self.live.max(1) as f64, self.grid_for as f64);
             if a / b > 4.0 || b / a > 4.0 { self.dirty = true; self.grid_for = self.live; }
         }
+        self.stats.ticks_in[backend_ix(self.backend())] += 1;
         let (want, decisive) = self.desired_with_confidence();
         if want == self.backend() { self.pending = None; return self.backend(); }
         let held = match self.pending {
@@ -752,11 +893,18 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
             _ => 1,
         };
         self.pending = Some((want, held));
-        if decisive || (held >= self.th.hold_ticks && self.cooling == 0) {
+        if !self.frozen && (decisive || (held >= self.th.hold_ticks && self.cooling == 0)) {
             self.migrate(want);
             self.pending = None;
             self.cooling = self.th.cooldown;
+        } else {
+            // Wanted to move and did not. Counting these is what separates "the policy is
+            // settled" from "the threshold is sitting on top of the workload and the only
+            // reason it looks calm is the hysteresis".
+            self.stats.near_misses += 1;
         }
+        // A freeze suppresses the migration, not the observation: `pending` and the EMAs keep
+        // running above, so `thaw` lands on a decision made from the whole window.
         self.backend()
     }
 
@@ -787,8 +935,12 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
         (want, decisive)
     }
 
-    fn desired(&self) -> Backend {
-        let n = self.live as f64;
+    fn desired(&self) -> Backend { self.desired_at(self.live as f64) }
+
+    /// The policy, parameterised on population so [`prepare`](Self::prepare) can ask what it
+    /// would want at a size it has not reached yet. One policy, asked two ways — duplicating it
+    /// for the hint path would guarantee the two drifted.
+    fn desired_at(&self, n: f64) -> Backend {
         let m = self.th.margin;
         let cur = self.backend();
         // Leaving brute costs a build, so demand a clearly bigger population than the one
@@ -821,6 +973,7 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
     pub fn warm_starts(&self) -> u32 { self.warm_starts }
 
     fn migrate(&mut self, to: Backend) {
+        self.stats.pairs[backend_ix(self.backend())][backend_ix(to)] += 1;
         self.switches += 1;
         let order = self.warm_order();
         self.held = Self::build_ordered(to, &self.items, self.world, self.leaf, self.q_extent, &order);
@@ -1263,6 +1416,99 @@ mod tests {
                 assert_eq!(got, want, "{backend:?} answered differently with the {name} order hint");
             }
         }
+    }
+
+    /// `prepare` must save the walk up through the backends, and `freeze` must actually stop a
+    /// migration the policy would otherwise make.
+    #[test]
+    fn prepare_skips_the_thrash_and_freeze_holds_the_line() {
+        let load = |ix: &mut AdaptiveIndex<P>| {
+            let probe = Sphere3::new(120.0, 120.0, 120.0, 70.0);
+            for i in 0..4000 {
+                ix.insert(P { p: pt(i) });
+                // A query every few inserts, so the policy has something to react to on the
+                // way up — which is exactly what makes a cold load migrate repeatedly.
+                if i % 25 == 0 { for _ in 0..8 { ix.cull(&probe); } ix.tick(); }
+            }
+        };
+
+        let mut cold: AdaptiveIndex<P> = AdaptiveIndex::new(world(), 8);
+        load(&mut cold);
+
+        let hints = Hints { expected_count: Some(4000), queries_per_item: Some(8.0 / 4000.0),
+                            churn: Some(0.0), query_extent: Some(140.0),
+                            distribution: Some(Distribution::Uniform) };
+
+        // prepare ALONE is not enough, and the number is the reason the docs say so: the
+        // population still climbs from zero, so the policy migrates away from the destination
+        // and back. Asserted, not hand-waved, so nobody "simplifies" the freeze away.
+        let mut hinted: AdaptiveIndex<P> = AdaptiveIndex::new(world(), 8);
+        hinted.prepare(hints);
+        load(&mut hinted);
+
+        // prepare + freeze is the documented sequence.
+        let mut warm: AdaptiveIndex<P> = AdaptiveIndex::new(world(), 8);
+        warm.prepare(hints);
+        // The one migration `prepare` makes is its whole job, and it is paid here — on an
+        // EMPTY index, where a rebuild costs nothing. That is the difference between one
+        // migration and one migration that matters.
+        let at_prepare = warm.switch_count();
+        assert_eq!(at_prepare, 1, "prepare should move once, to the destination");
+        assert!(warm.is_empty(), "and it should do it before the items arrive");
+        warm.freeze();
+        load(&mut warm);
+        warm.thaw();
+
+        assert!(cold.switch_count() > 0, "the cold load must actually thrash or this proves nothing");
+        assert!(hinted.switch_count() >= cold.switch_count(),
+            "if a bare hint stopped costing extra, the docs' warning is stale (cold {}, hinted {})",
+            cold.switch_count(), hinted.switch_count());
+        assert_eq!(warm.switch_count(), at_prepare,
+            "prepare + freeze should load straight in: not one migration after the empty one");
+
+        // And the freeze: pin a backend the policy is actively trying to leave.
+        let mut ix: AdaptiveIndex<P> = AdaptiveIndex::new(world(), 8);
+        for i in 0..500 { ix.insert(P { p: pt(i) }); }
+        let probe = Sphere3::new(120.0, 120.0, 120.0, 70.0);
+        for _ in 0..40 { for _ in 0..8 { ix.cull(&probe); } ix.tick(); }
+        let pinned = ix.backend();
+        ix.freeze();
+        assert!(ix.is_frozen());
+        let before = ix.switch_count();
+        // Invert the workload: heavy movement, no queries — the policy wants to leave.
+        for _ in 0..200 {
+            for i in 0..500 { ix.update(Slot(i), |p| p.p.x = (p.p.x + 3.0) % 250.0); }
+            ix.tick();
+        }
+        assert_eq!(ix.backend(), pinned, "a frozen index must not migrate");
+        assert_eq!(ix.switch_count(), before, "a frozen index must not migrate");
+        assert!(ix.stats().near_misses > 0, "it must have WANTED to move, or the freeze proved nothing");
+
+        // Thawing lets the decision land, on data gathered during the freeze.
+        ix.thaw();
+        for _ in 0..40 { ix.tick(); }
+        assert_ne!(ix.backend(), pinned, "after thaw the pending decision should take effect");
+    }
+
+    /// The counters must separate a settled policy from one that is only calm because the
+    /// hysteresis is holding it down. Both look identical through `switch_count`.
+    #[test]
+    fn switch_stats_tell_a_settled_policy_from_a_suppressed_one() {
+        let mut ix: AdaptiveIndex<P> = AdaptiveIndex::new(world(), 8);
+        for i in 0..400 { ix.insert(P { p: pt(i) }); }
+        let probe = Sphere3::new(120.0, 120.0, 120.0, 70.0);
+        // Query hard so the policy wants the grid, and move nothing, so it also wants Static.
+        for _ in 0..60 { for _ in 0..8 { ix.cull(&probe); } ix.tick(); }
+
+        let st = ix.stats().clone();
+        assert_eq!(st.switches(), ix.switch_count(), "the two counters must agree");
+        assert!(st.ticks_in.iter().sum::<u64>() >= 60, "every tick must be attributed to a backend");
+        assert!(st.switches() > 0, "this script must migrate or the test proves nothing");
+        let (from, to, n) = st.hottest_pair().expect("something moved");
+        assert_ne!(from, to, "a switch to itself is not a switch");
+        assert!(n > 0);
+        // The pair matrix and the flat count must be the same event seen twice.
+        assert_eq!(st.pairs.iter().flatten().sum::<u32>(), st.switches());
     }
 
     /// ★ R1 — the four backends must answer with the SAME SEQUENCE, not merely the same set.
