@@ -20,7 +20,7 @@
 //! No combat yet (phase 2: towers, wall HP, breaches, infection, waves).
 
 use vectorial_hash::morton3::Crossed;
-use vectorial_hash::{Aabb, ItemRef, Point3, Positioned3, Shape3, Sphere3, Tree3};
+use vectorial_hash::{Aabb, AdaptiveIndex, Hints, ItemRef, Point3, Positioned3, Shape3, Slot, Sphere3, Tree3};
 
 pub use crate::siege_sim::Rng;
 
@@ -655,6 +655,11 @@ pub struct Horde {
     pub units: Vec<Zombie>,
     pub structures: Vec<Structure>,
     pub zindex: Tree3<IZombie>,
+    /// The third `M` mode: one index that changes structure underneath the sim as the horde
+    /// goes from a dormant carpet to an assault. `zslots` is its handle table, the same shape
+    /// as `handles` and `zlast`.
+    pub zadapt: AdaptiveIndex<IZombie>,
+    zslots: Vec<Option<Slot>>,
     handles: Vec<Option<ItemRef>>,
     pub sindex: Tree3<IStruct>,
     pub noise: NoiseGrid,
@@ -768,18 +773,28 @@ pub struct Horde {
 /// no in-place handles, so its side of the switch is a clear+reinsert of every
 /// LIVE zombie per frame — the rebuild-vs-keep comparison, watchable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ZMode { Tree, Morton }
+pub enum ZMode { Tree, Morton, Adaptive }
 impl ZMode {
-    pub fn label(self) -> &'static str { match self { Self::Tree => "TREE3", Self::Morton => "MORTON" } }
-    pub fn next(self) -> ZMode { match self { Self::Tree => Self::Morton, Self::Morton => Self::Tree } }
+    pub fn label(self) -> &'static str { match self { Self::Tree => "TREE3", Self::Morton => "MORTON", Self::Adaptive => "ADAPTIVE" } }
+    pub fn next(self) -> ZMode { match self { Self::Tree => Self::Morton, Self::Morton => Self::Adaptive, Self::Adaptive => Self::Tree } }
 }
 
 /// A borrow of whichever zombie index is live — one query surface so the wake
 /// blasts / separation / towers / defenders don't care which structure answers.
-pub enum ZQuery<'a> { Tree(&'a Tree3<IZombie>), Morton(&'a vectorial_hash::MortonGrid3<IZombie>) }
+pub enum ZQuery<'a> {
+    Tree(&'a Tree3<IZombie>),
+    Morton(&'a vectorial_hash::MortonGrid3<IZombie>),
+    /// The index that picks its own structure. Read through the `_ref` verbs: every system in
+    /// this sim queries behind `&`, which is exactly the wall `settle()`/`cull_ref()` exist for.
+    Adaptive(&'a AdaptiveIndex<IZombie>),
+}
 impl<'a> ZQuery<'a> {
-    pub fn cull<S: Shape3>(&self, s: &S) -> Vec<&'a IZombie> { match self { Self::Tree(t) => t.cull(s), Self::Morton(m) => m.cull(s) } }
-    pub fn knn(&self, p: Point3, k: usize) -> Vec<(f64, &'a IZombie)> { match self { Self::Tree(t) => t.knn(p, k), Self::Morton(m) => m.knn(p, k) } }
+    pub fn cull<S: Shape3>(&self, s: &S) -> Vec<&'a IZombie> {
+        match self { Self::Tree(t) => t.cull(s), Self::Morton(m) => m.cull(s), Self::Adaptive(a) => a.cull_ref(s) }
+    }
+    pub fn knn(&self, p: Point3, k: usize) -> Vec<(f64, &'a IZombie)> {
+        match self { Self::Tree(t) => t.knn(p, k), Self::Morton(m) => m.knn(p, k), Self::Adaptive(a) => a.knn_ref(p, k) }
+    }
 }
 
 /// The base layout: a stone wall ring with 4 cardinal gates and towers every
@@ -1098,6 +1113,7 @@ impl Horde {
         let mut h = Horde {
             units, structures,
             zindex: Tree3::new(world, 8), handles: vec![None; n],
+            zadapt: AdaptiveIndex::new(world, 8), zslots: vec![None; n],
             sindex, noise: NoiseGrid::new(96), flow,
             pending: Vec::new(), corpses: Vec::new(), tracers: Vec::new(),
             tower_reload: vec![0.0; ns], free_slots: Vec::new(),
@@ -1385,12 +1401,46 @@ impl Horde {
                     }
                 }
             }
+            // The adaptive index owns its items in a slot table, so this arm looks like the
+            // tree's — insert once, update in place, remove on death — and the STRUCTURE
+            // underneath is not this code's business. `settle` at the end is what makes the
+            // frame's readers safe; without it every system would need `&mut`.
+            ZMode::Adaptive => {
+                if self.zslots.len() != self.units.len() { self.zslots.resize(self.units.len(), None); }
+                for (i, z) in self.units.iter_mut().enumerate() {
+                    match (self.zslots[i], z.alive()) {
+                        (Some(sl), false) => { self.zadapt.remove(sl); self.zslots[i] = None; }
+                        (None, false) => {}
+                        (None, true) => { self.zslots[i] = Some(self.zadapt.insert(IZombie::of(i, z))); }
+                        (Some(sl), true) => {
+                            if z.moved { let it = IZombie::of(i, z); self.zadapt.update(sl, |c| *c = it); }
+                        }
+                    }
+                    z.moved = false;
+                }
+                self.zadapt.settle();
+            }
         }
+    }
+
+    /// Close the adaptive index's frame: tell it about the queries the systems made behind `&`
+    /// (it cannot count those itself) and let it decide. A no-op in the other two modes.
+    ///
+    /// Separate from `sync_index` because it belongs at the END of the frame, after the reads —
+    /// reporting the load before it happens would hand the policy last frame's numbers.
+    pub fn zadapt_tick(&mut self, queries: u32, extent: f64) {
+        if self.zmode != ZMode::Adaptive { return; }
+        self.zadapt.note_queries(queries, extent);
+        self.zadapt.tick();
     }
 
     /// The live index the queries should hit right now (`M` toggle).
     pub fn zq(&self) -> ZQuery<'_> {
-        match self.zmode { ZMode::Tree => ZQuery::Tree(&self.zindex), ZMode::Morton => ZQuery::Morton(&self.zmorton) }
+        match self.zmode {
+            ZMode::Tree => ZQuery::Tree(&self.zindex),
+            ZMode::Morton => ZQuery::Morton(&self.zmorton),
+            ZMode::Adaptive => ZQuery::Adaptive(&self.zadapt),
+        }
     }
 
     /// Switch the zombie-index structure live. Both sides start empty and the
@@ -1403,7 +1453,18 @@ impl Horde {
         self.handles = vec![None; self.units.len()];
         self.zmorton = vectorial_hash::MortonGrid3::new(zgrid_world(), ZGRID_LEVELS);
         self.zlast = vec![None; self.units.len()];
+        // Told what is coming, and pinned while it arrives — `prepare` alone is measurably
+        // WORSE than nothing here, because the population climbing from zero makes the policy
+        // migrate away from the destination and back. See AdaptiveIndex::prepare.
+        self.zadapt = AdaptiveIndex::new(Aabb::new(0.0, -8.0, 0.0, WORLD, SKY + 8.0, WORLD), 8);
+        self.zslots = vec![None; self.units.len()];
+        if m == ZMode::Adaptive {
+            self.zadapt.prepare(Hints { expected_count: Some(self.units.len()),
+                                        query_extent: Some(MAX_HEAR), ..Hints::default() });
+            self.zadapt.freeze();
+        }
         self.sync_index(); // queryable immediately (renderers cull between steps)
+        self.zadapt.thaw();
     }
 
     /// The `O` toggle — flow-field goal mode: single CC vs multi-building
@@ -1462,6 +1523,18 @@ impl Horde {
     pub fn step(&mut self, dt: f64) {
         self.now += dt;
         self.frame += 1;
+        // Close the PREVIOUS frame's adaptive accounting before this one mutates anything: the
+        // policy has to be told about queries the systems made behind `&`, and the count it
+        // needs is the one that just happened, not the one about to.
+        //
+        // `active_n` is an ESTIMATE of that count and is labelled as one. The dominant query in
+        // this sim is one cull per awake unit in `decide`, with towers and noise events on top,
+        // so it is the right order and the right SHAPE — it swings with the front, which is the
+        // whole reason this demo is interesting to the policy. An exact count would mean
+        // threading a counter through every call site, and the policy smooths its input over
+        // ~10 frames anyway.
+        let est_queries = self.active_n.min(u32::MAX as usize) as u32;
+        self.zadapt_tick(est_queries, MAX_HEAR);
         self.sync_index();
         // Reconcile the active-front counter with the truth ~1 Hz: the incremental
         // path counts wakes but not deaths / re-sleeps, so it drifts high (safe —
@@ -1527,7 +1600,9 @@ impl Horde {
         // 2) decide — read-only on the indices, each zombie writes only itself:
         //    fans out over rayon on native, serial on wasm (no threads there).
         {
-            let index = match self.zmode { ZMode::Tree => ZQuery::Tree(&self.zindex), ZMode::Morton => ZQuery::Morton(&self.zmorton) };
+            // Inline, not `self.zq()`: that borrows all of `self` and the loops below need
+            // `&mut self.units`. Borrowing the one field keeps them disjoint.
+            let index = match self.zmode { ZMode::Tree => ZQuery::Tree(&self.zindex), ZMode::Morton => ZQuery::Morton(&self.zmorton), ZMode::Adaptive => ZQuery::Adaptive(&self.zadapt) };
             let index = &index;
             let (sindex, structures, flow) = (&self.sindex, &self.structures, &self.flow);
             let defenders = &self.defenders;
@@ -1912,7 +1987,8 @@ impl Horde {
         let gate_pts: Vec<(f64, f64)> = self.gates.iter().filter(|&&g| self.structures[g].hp > 0.0).map(|&g| (self.structures[g].p.x, self.structures[g].p.z)).collect();
         // Field-precise borrows the defenders' iter_mut can live beside: the
         // live zombie index (either mode) + the pass grid for the walk slide.
-        let zq = match self.zmode { ZMode::Tree => ZQuery::Tree(&self.zindex), ZMode::Morton => ZQuery::Morton(&self.zmorton) };
+        // Inline for the same reason as above: disjoint field borrows.
+        let zq = match self.zmode { ZMode::Tree => ZQuery::Tree(&self.zindex), ZMode::Morton => ZQuery::Morton(&self.zmorton), ZMode::Adaptive => ZQuery::Adaptive(&self.zadapt) };
         let (pg2, pn2, pc2, sc, seed) = (&self.pass_grid, self.pass_n, self.pass_cell, self.scenario, self.seed);
         let pass2 = move |x: f64, z: f64| pg2[((z / pc2) as usize).min(pn2 - 1) * pn2 + ((x / pc2) as usize).min(pn2 - 1)];
         let walk = move |d: &mut Defender, tx: f64, tz: f64, dt: f64| -> f64 {
@@ -2737,6 +2813,63 @@ mod tests {
         assert!(live_goals >= 2, "should still have the CC + one house alive");
         assert!(check_all_bearings_hit_a_live_building(&h) >= 10, "after demolition the field must re-route to the survivors, not dead buildings");
     }
+
+    #[test]
+fn adaptive_mode_matches_the_others_and_actually_switches() {
+        // The third `M` mode. Two things have to hold and they are different claims: the
+        // ANSWERS must match the other two structures (it is the same query, whoever holds the
+        // data), and the policy must actually MOVE — a demo where it silently sat on one
+        // backend all night would pass an equivalence test and demonstrate nothing.
+        let mut h = Horde::new(23, 3000);
+        h.trigger_wave(); h.trigger_wave();
+        for _ in 0..120 { h.step(1.0 / 30.0); }
+        h.sync_index();
+        let probes = [(WORLD / 2.0, 0.0, WORLD / 2.0, BASE_R + 80.0), (WORLD / 2.0 + 200.0, 0.0, WORLD / 2.0, 150.0)];
+        let cull_ids = |h: &Horde| -> Vec<Vec<u32>> {
+            probes.iter().map(|&(x, y, z, r)| {
+                let mut v: Vec<u32> = h.zq().cull(&Sphere3::new(x, y, z, r)).iter().map(|it| it.id).collect();
+                v.sort(); v
+            }).collect()
+        };
+        let tree_ids = cull_ids(&h);
+        assert!(tree_ids.iter().any(|v| v.len() > 20), "the probes must hit plenty or this proves nothing");
+        let counts0 = h.counts();
+
+        h.set_zmode(ZMode::Adaptive);
+        assert_eq!(h.zmode, ZMode::Adaptive);
+        assert_eq!(cull_ids(&h), tree_ids, "adaptive culls diverge from the tree's");
+        assert_eq!(h.counts(), counts0, "the switch must not touch the sim");
+
+        // Run a real battle on it: wakes, kills, spawns — the churn the policy is supposed to
+        // react to. Then check the answers still hold against BRUTE FORCE, not just against
+        // another index, so a shared bug could not hide.
+        let start_backend = h.zadapt.backend();
+        for _ in 0..240 { h.step(1.0 / 30.0); }
+        h.sync_index();
+        for (k, &(x, y, z, r)) in probes.iter().enumerate() {
+            let mut brute: Vec<u32> = h.units.iter().enumerate()
+                .filter(|(_, u)| u.alive() && { let (dx, dy, dz) = (u.p.x - x, u.p.y - y, u.p.z - z); dx * dx + dy * dy + dz * dz <= r * r })
+                .map(|(i, _)| i as u32).collect();
+            brute.sort();
+            let mut got: Vec<u32> = h.zq().cull(&Sphere3::new(x, y, z, r)).iter().map(|it| it.id).collect();
+            got.sort();
+            assert_eq!(got, brute, "probe {k} on the adaptive index != brute force");
+        }
+
+        // And it has to have DONE something: either it migrated, or it at least wanted to.
+        // Asserting only "no crash" would let this demo become decoration.
+        let st = h.zadapt.stats().clone();
+        assert!(st.switches() > 0 || st.near_misses > 0,
+            "the policy neither moved nor wanted to over a whole battle — it is not being fed              a workload, and this demo would be proving nothing (started on {start_backend:?})");
+        assert!(st.ticks_in.iter().sum::<u64>() > 0, "ticks must be attributed");
+
+        // Back to the tree, which must also survive the transition.
+        h.set_zmode(ZMode::Tree);
+        for _ in 0..60 { h.step(1.0 / 30.0); }
+        assert!(h.counts().0 + h.counts().1 > 0, "the sim must still be alive after switching back");
+    }
+
+
 
     #[test]
     fn morton_mode_matches_the_tree_and_brute_force() {

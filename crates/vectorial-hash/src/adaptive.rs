@@ -934,6 +934,29 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
     pub fn knn_unordered(&mut self, q: Point3, k: usize) -> Vec<(f64, &T)> {
         self.queries += 1;
         self.refresh();
+        self.knn_backend(q, k)
+    }
+
+    /// The canonical k-NN from a settled index — the `&`-only twin of [`knn`](Self::knn).
+    /// Same re-derivation, so the set does not depend on the live backend.
+    pub fn knn_ref(&self, q: Point3, k: usize) -> Vec<(f64, &T)> {
+        debug_assert!(!self.dirty, "knn_ref on a stale index — call settle() after mutating");
+        if k == 0 { return Vec::new(); }
+        let Some(&(far, _)) = self.knn_backend(q, k).last() else { return Vec::new() };
+        let r = far * (1.0 + 1e-12) + f64::EPSILON;
+        let mut v: Vec<(f64, u32, &T)> = self.cull_tagged(&Sphere3::new(q.x, q.y, q.z, r)).into_iter()
+            .map(|(slot, it)| { let p = it.position();
+                let (dx, dy, dz) = (p.x - q.x, p.y - q.y, p.z - q.z);
+                ((dx * dx + dy * dy + dz * dz).sqrt(), slot, it) })
+            .collect();
+        v.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        v.truncate(k);
+        v.into_iter().map(|(d, _, it)| (d, it)).collect()
+    }
+
+    /// Whatever the live backend's own k-NN returns, from a settled index. Shared by the `&mut`
+    /// and `&` paths so the two cannot answer differently.
+    fn knn_backend(&self, q: Point3, k: usize) -> Vec<(f64, &T)> {
         match &self.held {
             Held::Brute => {
                 let mut v: Vec<(f64, &T)> = self.items.iter().flatten().map(|it| {

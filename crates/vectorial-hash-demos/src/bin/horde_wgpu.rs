@@ -445,6 +445,17 @@ const ZNAMES: [&str; 5] = ["walker", "runner", "chubby/slime", "venom", "harpy"]
 /// Bumped by hand on every build handed to the user. Three rounds of "it looks the same" against
 /// binaries verified to differ meant the first thing to rule out was whether we were even looking
 /// at the same process — and a title you can read beats any amount of reasoning about it.
+/// The index label for the title. In ADAPTIVE mode it names the structure currently LIVE —
+/// the whole point of that mode is watching it change as the horde wakes, and a label that
+/// only ever said "ADAPTIVE" would hide the one thing worth seeing.
+fn zlabel(sim: &vectorial_hash_demos::horde_sim::Horde) -> String {
+    use vectorial_hash_demos::horde_sim::ZMode;
+    match sim.zmode {
+        ZMode::Adaptive => format!("ADAPTIVE({:?}, {} sw)", sim.zadapt.backend(), sim.zadapt.stats().switches()),
+        other => other.label().to_string(),
+    }
+}
+
 const BUILD_TAG: &str = "R12-heading-sign";
 
 fn ztweak(c: ZClass) -> (f32, f32) {
@@ -2135,7 +2146,7 @@ async fn run() {
                         if std::env::var_os("SHOT").is_some() { window.set_title("vhshot"); }
                         else {
                         let (d, a) = st.sim.counts();
-                        window.set_title(&format!("vectorial-hash — horde (wgpu) · map {} [G] · index {} [M] · goal {} [O]{} · sleep {d} | awake {a} | kills {} · run {} · {:.0} fps{} · yaw[{}]={:.0}° [Y/U] · imp {} [J] impyaw {:.0}° [I] · build {}", st.sim.scenario.label(), st.sim.zmode.label(), if st.sim.flow_multi() { "BUILDINGS" } else { "CC" }, if st.night { " · NIGHT [L]" } else { "" }, st.sim.kills, st.sim.run, st.fps, if st.paused { " · PAUSED" } else { "" }, ZNAMES[st.zyaw_sel], st.zyaw[st.zyaw_sel].to_degrees(), if st.lod { "ON" } else { "OFF" }, st.imp_yaw.to_degrees(), BUILD_TAG));
+                        window.set_title(&format!("vectorial-hash — horde (wgpu) · map {} [G] · index {} [M] · goal {} [O]{} · sleep {d} | awake {a} | kills {} · run {} · {:.0} fps{} · yaw[{}]={:.0}° [Y/U] · imp {} [J] impyaw {:.0}° [I] · build {}", st.sim.scenario.label(), zlabel(&st.sim), if st.sim.flow_multi() { "BUILDINGS" } else { "CC" }, if st.night { " · NIGHT [L]" } else { "" }, st.sim.kills, st.sim.run, st.fps, if st.paused { " · PAUSED" } else { "" }, ZNAMES[st.zyaw_sel], st.zyaw[st.zyaw_sel].to_degrees(), if st.lod { "ON" } else { "OFF" }, st.imp_yaw.to_degrees(), BUILD_TAG));
                         }
                     }
                     #[cfg(not(target_arch = "wasm32"))]

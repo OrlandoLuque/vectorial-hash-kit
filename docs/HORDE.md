@@ -367,6 +367,39 @@ exists but is smaller than one wall, and the expected tower and gate counts. Bot
 have shipped before (walls skipped entirely; then jammed together), and neither was caught
 reliably by looking at a screenshot. Verified to fail when the fit's `ceil` becomes `floor`.
 
+## `M`: the third index mode is one that picks itself
+
+`M` used to toggle Tree3 ↔ Morton. It now cycles a third: **ADAPTIVE**, an `AdaptiveIndex` that
+changes structure underneath the sim as the battle does. The title names the structure currently
+live and the switch count — `ADAPTIVE(Grid, 3 sw)` — because a label that only ever said
+"ADAPTIVE" would hide the one thing worth watching.
+
+This demo is the workload that layer exists for, and the reason it is worth wiring here rather
+than anywhere else: the horde swings from a dormant carpet that never moves and is barely queried
+to a 50k assault where everything relocates and every awake unit culls its neighbourhood. That is
+the churn × query-load plane traversed live, in one run, without anyone scripting it.
+
+Two things it needed from the library, both of which were missing and are general:
+
+- **`settle()` + `cull_ref()`.** Every system here queries behind `&`, and `cull` takes `&mut`
+  because it counts the query as it answers it. Splitting the observing from the answering is
+  what lets a dozen systems read one index in a frame.
+- **`note_queries`.** The reads through `cull_ref` cannot count themselves, and a policy that
+  cannot see the queries is worse than one with none: it concludes the workload is idle and
+  migrates for something that is not happening. The sim reports `active_n` as the count, which is
+  an estimate — one cull per awake unit is the dominant query — and is labelled as one where it
+  is passed.
+
+`set_zmode(Adaptive)` uses the documented bulk sequence: `prepare` the expected population,
+`freeze` while the units are loaded in, `thaw` after. Without the freeze the population climbing
+from zero makes the policy migrate away from the destination and back, which is measurably worse
+than not hinting at all.
+
+**Tested, and not only for equivalence.** `adaptive_mode_matches_the_others_and_actually_switches`
+checks the answers against the tree AND against brute force after a real battle — but it also
+asserts the policy moved or at least wanted to. A demo where the switcher silently sat on one
+backend all night would pass an equivalence test while demonstrating nothing.
+
 ## Looking at it without eyes (`$HORDE_SHOT`)
 
 The renderer can take its own screenshot, so a question like *"does the wall actually meet the
