@@ -75,13 +75,20 @@
 //!
 //! | index | ms/step | |
 //! | --- | ---: | --- |
-//! | `Tree3` pinned | 2.064 | the best fixed choice |
-//! | `MortonGrid3` pinned | 8.007 | the *wrong* fixed choice, 3.9x worse |
-//! | adaptive | 2.119 | **1.03x the best**, found without being told |
+//! | `Tree3` pinned | 1.611 | the best fixed choice |
+//! | `MortonGrid3` pinned | 6.087 | the *wrong* fixed choice, 3.8x worse |
+//! | adaptive | 2.220 | **1.38x the best** (range 1.34-1.61), found without being told |
 //!
 //! Three switches and 29 near-misses over the battle. That is the shape of the case for the
-//! layer, stated fairly: it did not beat the best fixed choice, it cost 3 % more than one — and
-//! it cost 3.8x *less* than the fixed choice a reasonable person might have made instead.
+//! layer, stated fairly: it did not beat the best fixed choice, it cost ~38 % more than one —
+//! and it cost 2.7x *less* than the fixed choice a reasonable person might have made instead.
+//!
+//! **That row first read 1.03x, and the correction is the more useful part.** The example ran
+//! each arm once, to completion, in a fixed order; five runs of it gave 1.03, 1.36, 1.47, 1.67,
+//! 1.63, and 1.03 is simply the luckiest draw. A 900-frame battle is long enough for the machine
+//! to drift underneath the three arms. Rotating the arm order per round and quoting the median
+//! of the *per-round* ratios is `MEASURING.md` § 7 applied at macro scale — the same fix
+//! `common::compare2` makes at micro scale, in an example written by the person who wrote § 7.
 //!
 //! So: on a workload that does not change, the policy costs nothing and picks correctly. On one
 //! that changes, migrating and noticing are both real costs and it currently loses to the best

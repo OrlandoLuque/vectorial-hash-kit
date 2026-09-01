@@ -400,13 +400,26 @@ the ranking, the absolute milliseconds are whatever machine ran it):
 
 | index | ms/step | |
 | --- | ---: | --- |
-| `Tree3` pinned | 2.064 | the best fixed choice here |
-| `MortonGrid3` pinned | 8.007 | the wrong fixed choice, **3.9x worse** |
-| adaptive | 2.119 | **1.03x the best**, found without being told |
+| `Tree3` pinned | 1.611 | the best fixed choice here |
+| `MortonGrid3` pinned | 6.087 | the wrong fixed choice, **3.8x worse** |
+| adaptive | 2.220 | **1.38x the best** (range 1.34–1.61), found without being told |
 
-Three switches, 29 near-misses. It did not beat the best fixed choice — it cost 3 % more than
-one, and 3.8x *less* than the other one. That is the argument for the layer stated fairly: it is
+Three switches, 29 near-misses. It did not beat the best fixed choice — it cost ~38 % more than
+one, and 2.7x *less* than the other one. That is the argument for the layer stated fairly: it is
 worth having when you cannot know which of those two you would have picked.
+
+*(This first read 1.03×, from an example that ran each arm once in a fixed order. Five runs of
+that version gave 1.03–1.67; the published figure was the best draw. It now rotates the arm order
+per round and quotes the median with its range.)*
+
+**An open contradiction, recorded rather than smoothed over.** `grid_tree_frontier` maps the
+(churn × query-load) plane on uniform data and says the grid should win *by 1.9×* at this very
+point — the horde reports `0.0599 q/item, 0.0564 mv/item`, which lands squarely in that cell. The
+horde measures the opposite, by 3.8×. Two of our own measurements disagree by a factor of ~7 at
+the same coordinates, so at least one instrument is wrong about something: the likely suspects
+are the horde's grid being sized by a fixed `ZGRID_LEVELS` rather than to its query mix (whose
+radii range from ~3 to 288), and clustered versus uniform data. Until that is settled, the
+frontier's conclusion must NOT be used to retune `rebuild_query_ratio`.
 
 **Tested, and not only for equivalence.** `adaptive_mode_matches_the_others_and_actually_switches`
 checks the answers against the tree AND against brute force after a real battle — but it also
