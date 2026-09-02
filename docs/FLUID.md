@@ -113,14 +113,22 @@ FLUID_HEADLESS=400 FLUID_INDEX=adaptive cargo run -p vectorial-hash-demos --bin 
 | LinearQuadTree rebuild | 151.4 | 1 616.0 | 1 111.1 | 2 878.6 | 347 |
 | **AdaptiveIndex2** (picks the grid) | 135.9 | **1 360.5** | 1 104.9 | **2 601.2** | **384** |
 
-**The fluid is the counterexample that keeps `Thresholds::grid_min_hits` switched off.** That veto
-(added 2026-09-02) refuses the grid when a typical query is not expected to find much, which is
-measured and correct in general — and enabling it sends *this* demo from the grid to the keep-tree,
-the arm the bake-off ranks last. An SPH kernel is designed so a query holds tens of neighbours, so
-the veto should never have fired here; it fired because the policy estimates density from the
-**declared world volume** and a fluid occupies a fraction of its box. Re-check this demo before
-that default is ever flipped on: `VH_CALIBRATION` pointing at a file containing
-`grid_min_hits = 9.0`, then `FLUID_BAKEOFF=1 FLUID_HEADLESS=120 FLUID_INDEX=adaptive`.
+**The fluid was the counterexample that kept `Thresholds::grid_min_hits` switched off — and then
+it was the acceptance test that turned it on.** That veto refuses the grid when a typical query is
+not expected to find much. Enabling it originally sent *this* demo from the grid to the keep-tree,
+the arm the bake-off ranks last: an SPH kernel is designed so a query holds tens of neighbours, and
+the policy was estimating density from the **declared world volume** while a fluid occupies a
+fraction of its box. `expected_hits` now reports what culls actually returned, and this demo picks
+the **grid either way** — the veto no longer misfires here.
+
+It stays the demo to re-check whenever that rule is touched, because it is the shape that broke it:
+
+```bash
+# one file containing `grid_min_hits = 9.0`, and one containing `grid_min_hits = 0.0`
+VH_CALIBRATION=… FLUID_HEADLESS=500 FLUID_INDEX=adaptive cargo run -p vectorial-hash-demos --bin fluid_wgpu --release
+```
+
+Both must report `-> grid`. If one says `tree`, the veto is misfiring again.
 
 It shares `Fluid::step` with the interactive path rather than reimplementing the loop — a
 headless mode that reimplements the simulation measures the reimplementation. The warm-up is not

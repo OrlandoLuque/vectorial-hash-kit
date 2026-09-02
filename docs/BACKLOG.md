@@ -55,13 +55,19 @@ this i7 laptop · the horde's `M` key gained an ADAPTIVE third mode.
    than retuning the scalar. The scalar is still worth re-deriving *now that the veto exists* —
    the two rules interact, and 0.2 was fitted while the grid could be chosen for queries that
    found nothing.
-4. **#154 — density from the data rather than from the declared world.** The one known
-   inaccuracy in `grid_min_hits`, and now **quantified by counting**: `expected_hits` is accurate
-   to **0.8 %** on uniform data (13.81 predicted, 13.70 returned) and **7.9x low** on slab data
-   (13.81 against 108.53). Both are tests, and the slab one asserts the *failure*, so fixing the
-   estimator breaks it rather than quietly passing. Needs a density estimate available on every
-   backend, not only the grid: sampling the keep-tree's leaf boxes is the obvious candidate and is
-   unmeasured. Do `rebuild_query_ratio` in the same pass.
+4. ~~**#154 — density from the data rather than from the declared world.**~~ **DONE, and the
+   answer was to stop estimating.** The plan was a better density estimate (occupancy, leaf-box
+   sampling). The right move was simpler: `expected_hits` reports what culls **returned**, which
+   is the quantity the rule wanted and which the structure computes anyway — no density, no world
+   volume, no distribution assumption. Slab error **7.9x → 0.2 %** (108.31 predicted against
+   108.53), uniform unchanged at 0.8 %. The slab test's own failure message said to invert rather
+   than delete, and it was inverted. `grid_min_hits` now ships **enabled at 9.0**, with
+   `fluid_wgpu` choosing the grid with the veto on and off alike as the acceptance test.
+   Implementation notes worth keeping: the counters had to be **atomics, not `Cell`s** (the demos
+   hold an `AdaptiveIndex` in a `Sync` type, and the build said so immediately), and the EMA lives
+   in fixed point so no `f64` sits in an atomic. **Still open from this item:** re-derive
+   `rebuild_query_ratio`, which was fitted while the grid could be chosen for queries that found
+   nothing.
 4. **Re-measure on the main machine when it returns.** Everything above was measured on the i7
    laptop with the main disk attached externally; `calibrations/` exists so the two can be
    compared rather than argued about.

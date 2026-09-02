@@ -95,6 +95,10 @@ pub struct AdaptiveIndex2<T: Positioned + Clone> {
     /// grid is built for the typical one. Zero until a query has been seen, in which case the
     /// occupancy rule stands in.
     q_extent: f64,
+    /// The 2D twin of [`AdaptiveIndex`](crate::AdaptiveIndex)'s observed-hit counters — see there
+    /// for why they are atomics rather than `Cell`s and why the EMA is fixed point.
+    hits_ema_q10: std::sync::atomic::AtomicU64,
+    hit_samples: std::sync::atomic::AtomicU64,
 }
 
 impl<T: Positioned + Clone> AdaptiveIndex2<T> {
@@ -109,6 +113,7 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
             profile: SpatialProfile::default(), th, pending: None, cooling: 0,
             dirty: false, switches: 0, moves: 0, relocations: 0, queries: 0, q_per_item: 0.0, stats: SwitchStats::default(), frozen: false,
             m_per_item: 0.0, grid_for: 0, q_extent: 0.0,
+            hits_ema_q10: std::sync::atomic::AtomicU64::new(0), hit_samples: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -149,12 +154,15 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
         debug_assert!(!self.dirty, "cull_ref on a stale index — call settle() after mutating");
         let mut v = self.cull_tagged(shape);
         v.sort_unstable_by_key(|e| e.0);
+        self.note_hits(v.len());
         v.into_iter().map(|e| e.1).collect()
     }
     /// Backend order, from a settled index.
     pub fn cull_ref_unordered<S: Shape>(&self, shape: &S) -> Vec<&T> {
         debug_assert!(!self.dirty, "cull_ref on a stale index — call settle() after mutating");
-        self.cull_tagged(shape).into_iter().map(|e| e.1).collect()
+        let v = self.cull_tagged(shape);
+        self.note_hits(v.len());
+        v.into_iter().map(|e| e.1).collect()
     }
     /// Report queries made through [`cull_ref`](Self::cull_ref), which cannot count themselves.
     pub fn note_queries(&mut self, n: u32, extent: f64) {
@@ -278,6 +286,7 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
         self.note_cull(shape);
         let mut v = self.cull_tagged(shape);
         v.sort_unstable_by_key(|e| e.0);
+        self.note_hits(v.len());
         v.into_iter().map(|e| e.1).collect()
     }
 
@@ -286,7 +295,9 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
     /// truncation, early exit with a side effect and float accumulation all are not.
     pub fn cull_unordered<S: Shape>(&mut self, shape: &S) -> Vec<&T> {
         self.note_cull(shape);
-        self.cull_tagged(shape).into_iter().map(|e| e.1).collect()
+        let v = self.cull_tagged(shape);
+        self.note_hits(v.len());
+        v.into_iter().map(|e| e.1).collect()
     }
 
     fn note_cull<S: Shape>(&mut self, shape: &S) {
@@ -437,10 +448,36 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
     /// [`AdaptiveIndex::expected_hits`](crate::AdaptiveIndex::expected_hits): a disc, not a
     /// sphere. Infinity until a cull has been seen, so an unknown extent vetoes nothing.
     pub fn expected_hits(&self, n: f64) -> f64 {
+        // Observation beats geometry once there is any — see the 3D twin for the measurement that
+        // made this the default (0.8 % accurate on uniform data, 7.9x wrong on a slab).
+        if self.hit_samples.load(std::sync::atomic::Ordering::Relaxed) >= Self::HIT_WARMUP {
+            return self.hits_mean() * (n / (self.live as f64).max(1.0));
+        }
         let area = self.world.width * self.world.height;
         if area <= 0.0 || self.q_extent <= 0.0 { return f64::INFINITY; }
         let r = self.q_extent * 0.5;
         (n / area) * std::f64::consts::PI * r * r
+    }
+
+    /// Culls needed before observation is trusted over geometry.
+    const HIT_WARMUP: u64 = 8;
+
+    fn note_hits(&self, n: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let h = ((n as u64) << 10) as i64;
+        let prev = self.hits_ema_q10.load(Relaxed) as i64;
+        let next = if self.hit_samples.load(Relaxed) == 0 { h } else { prev + (h - prev) / 10 };
+        self.hits_ema_q10.store(next.max(0) as u64, Relaxed);
+        self.hit_samples.fetch_add(1, Relaxed);
+    }
+
+    fn hits_mean(&self) -> f64 {
+        self.hits_ema_q10.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1024.0
+    }
+
+    /// The mean number of items recent culls actually returned, and how many were sampled.
+    pub fn observed_hits(&self) -> (f64, u64) {
+        (self.hits_mean(), self.hit_samples.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// The EMA of observed cull extents (the longer side of the query's bounding rectangle).

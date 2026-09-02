@@ -98,22 +98,15 @@
 //! while a tree prunes empty space for free. This is why the horde — whose commonest cull has
 //! radius 3 — is right to prefer the tree while the two-axis rule said grid.
 //!
-//! **It ships OFF (`grid_min_hits = 0.0`), and that is the most useful thing in this section.**
-//! Three workloads were checked by running the same binary with the veto on and off through
-//! `VH_CALIBRATION`. On two of them it is inert: `adaptive_vs_pinned` picks the identical
-//! sequence either way and the horde's arm reports the same 3 switches and 29 near-misses,
-//! because `rebuild_query_ratio` refuses the grid first. On the third — `fluid_wgpu`, the SPH
-//! demo, *precisely* the high-load small-query shape this rule was built for — it fires, moves
-//! the choice from grid to keep-tree, and the demo's own counterbalanced bake-off ranks that
-//! keep-tree **last of the four fixed arms** (7 632 µs against the grid's 7 037; repeated, same
-//! ordering). Maintenance does improve 2.4x (125 µs against 305, four A/B pairs, no overlap) and
-//! the query cost is inside noise — but the total is worse, and the total is what a caller pays.
-//!
-//! The diagnosis is the estimator, not the threshold. An SPH kernel is *designed* so a query
-//! holds tens of neighbours, so `expected_hits` should read ~30 for the fluid and never fire; it
-//! fired because density comes from the **declared world volume** and the fluid occupies a
-//! fraction of its box. Lowering 9.0 would be tuning a constant to compensate for a broken input.
-//! See [`Thresholds::grid_min_hits`] and #154.
+//! **It shipped OFF for a day, and the reason it is on now is a fix to the INPUT, not the
+//! constant.** Checked against three real workloads by running one binary with the veto on and
+//! off through `VH_CALIBRATION`: inert on `adaptive_vs_pinned` and the horde (`rebuild_query_
+//! ratio` refuses the grid first in both), and on **`fluid_wgpu` — the SPH demo, precisely the
+//! shape this rule was built for** — it fired and picked the arm that demo's own counterbalanced
+//! bake-off ranks last. The estimate said its queries would find under one neighbour; an SPH
+//! kernel is designed to hold tens. So `expected_hits` was rewritten to report what culls
+//! **returned** rather than to predict it from the declared world volume, which took the slab
+//! error from 7.9x to 0.2 % and made the fluid pick the same backend with the veto on and off.
 //!
 //! Worth noting how close this came to reading as a success: the horde's ratio moved 1.38x ->
 //! 1.34x in the same window, while `MortonGrid3` — an arm this change cannot touch — moved 6.087
@@ -322,32 +315,24 @@ pub struct Thresholds {
     /// grid pays its hash lookups whether or not the cells hold anything, while a tree prunes
     /// empty space for free, so the quantity to threshold is `density x query volume`.
     ///
-    /// **Default 0.0 — the veto is OFF**, and the reason is a measured counterexample rather
-    /// than caution. 9.0 (between the two crossovers) is the value to set when enabling it.
+    /// **Default 9.0, between the two measured crossovers**, and enabled — but it shipped
+    /// disabled for a day, and that day is the useful part of this doc comment.
     ///
-    /// The rule is sound; its *input* is not. Density is computed from the **declared world
-    /// volume**, so data occupying a fraction of its box reads far sparser than it is. Turned on,
-    /// this sends `fluid_wgpu` — the SPH demo, exactly the high-load small-query shape the rule
-    /// was built for — from the grid to the keep-tree, which its own bake-off ranks **last** of
-    /// the four fixed arms (7 632 µs against the grid's 7 037, repeated with the arms
-    /// counterbalanced, consistent across runs). An SPH kernel is *designed* so that a query
-    /// holds tens of neighbours; `expected_hits` should read ~30 there and never fire. It fired
-    /// because the estimator was wrong, which is why the fix is [#154], not a smaller threshold:
-    /// **a better constant for a rule with a broken input is still a rule with a broken input.**
+    /// The rule was right and its *input* was not. `expected_hits` derived density from the
+    /// **declared world volume**, which is accurate to 0.8 % on uniform data and **7.9x low** on
+    /// a slab — the horde's carpet across a cube, a fluid in its container. Turned on, it sent
+    /// `fluid_wgpu` (the SPH demo, exactly the shape this rule was built for) from the grid to
+    /// the keep-tree, the arm that demo's own counterbalanced bake-off ranks **last**. An SPH
+    /// kernel is *designed* so a query holds tens of neighbours; the estimate said under one.
     ///
-    /// **How wrong, exactly** (`expected_hits_predicts_the_real_hit_count_on_uniform_data` and its
-    /// slab twin, both counting rather than timing): on uniform data the estimate is accurate to
-    /// **0.8 %** — 13.81 predicted against 13.70 returned. On slab data, the same points squeezed
-    /// into a layer 1/32 of the world's height, it predicts the same 13.81 and the culls return
-    /// **108.53** — **7.9x** out, in the direction that vetoes a grid that would have been right.
-    /// The slab case is asserted *as a failure* so that fixing it breaks the test rather than
-    /// silently passing it.
+    /// The fix was not a smaller constant. `expected_hits` now reports what culls **returned**,
+    /// which is the quantity the rule wanted all along and which the structure computes anyway;
+    /// geometry survives only as a fallback for the first few queries. On the slab test it went
+    /// from 7.9x out to **0.2 %**, and `fluid_wgpu` then chose the grid with the veto on and off
+    /// alike. That equality was the acceptance test for turning it on.
     ///
-    /// [`MortonGrid3::occupancy`](crate::MortonGrid3::occupancy) is the honest estimator and only
-    /// exists while a grid is live, so this needs a density estimate every backend can produce —
-    /// the same constraint that sank the first version of the `scan_budget` rule.
-    ///
-    /// [#154]: https://github.com/orlandoluque/vectorial-hash-kit/blob/main/docs/BACKLOG.md
+    /// Set to 0.0 to disable — the two tests that need to reach a grid regardless of whether a
+    /// grid is *wise* for their data do exactly that, and say so.
     pub grid_min_hits: f64,
     /// **How many point-tests a linear scan may cost before an index is worth maintaining**,
     /// expressed as a multiple of the per-item maintenance cost. This is the variable
@@ -437,10 +422,10 @@ impl Default for Thresholds {
             // machine. Was 0.1, which switched to the grid roughly twice as early as the
             // measurement supports.
             rebuild_query_ratio: 0.2,
-            // OFF by default. The crossover is measured at 8.63-10.23 (`examples/extent_axis`)
-            // and the rule is sound, but its density input is not yet trustworthy enough to act
-            // on — see the field docs for the fluid counterexample. Set it to 9.0 to enable.
-            grid_min_hits: 0.0,
+            // Measured crossover, `examples/extent_axis`: 8.63 and 10.23 expected points per
+            // query at two densities 4x apart. Shipped disabled for one day while the input was
+            // an estimate; enabled once it became an observation (#154).
+            grid_min_hits: 9.0,
             scan_budget: 60.0,
             static_ticks: crate::advisor::STATIC_TICKS,
             margin: 0.25,
@@ -689,6 +674,25 @@ pub struct AdaptiveIndex<T: Positioned3 + Clone> {
     /// grid is built for the typical one. Zero until a query has been seen, in which case the
     /// occupancy rule stands in.
     q_extent: f64,
+    /// EMA of how many items culls actually RETURN, and how many samples it has seen.
+    ///
+    /// The rule that reads this wants to know whether a query finds enough to be worth a grid's
+    /// lookups. Deriving that from density was an estimate with a known failure mode; counting
+    /// what the culls returned is the quantity itself. See [`Self::expected_hits`].
+    /// Interior mutability, because the count is only known once the result vector exists — and
+    /// that vector borrows the index, so `&mut self` is unavailable at exactly the moment there
+    /// is something to record.
+    ///
+    /// **Atomics rather than `Cell`, and that was not a free choice.** `Cell` is not `Sync`, and
+    /// the demos crate holds an `AdaptiveIndex` inside a type it requires to be `Sync`; the build
+    /// broke immediately, which is the right outcome for a change that silently narrows a public
+    /// type's auto-traits. The EMA is kept as fixed point (1/1024ths of a hit) so no `f64` has to
+    /// live in an atomic — hits are counts, and a thousandth of one is precision to spare.
+    ///
+    /// `Relaxed` throughout: these are statistics feeding a heuristic, and no other field is
+    /// ordered against them.
+    hits_ema_q10: std::sync::atomic::AtomicU64,
+    hit_samples: std::sync::atomic::AtomicU64,
 }
 
 impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
@@ -701,7 +705,7 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
         AdaptiveIndex {
             items: Vec::new(), free: Vec::new(), live: 0, world, leaf: leaf.max(1), held: Held::Brute, warm_starts: 0,
             profile: SpatialProfile::default(), th, pending: None, cooling: 0,
-            dirty: false, switches: 0, moves: 0, relocations: 0, queries: 0, q_per_item: 0.0, stats: SwitchStats::default(), frozen: false,
+            dirty: false, switches: 0, moves: 0, relocations: 0, queries: 0, q_per_item: 0.0, hits_ema_q10: std::sync::atomic::AtomicU64::new(0), hit_samples: std::sync::atomic::AtomicU64::new(0), stats: SwitchStats::default(), frozen: false,
             m_per_item: 0.0, grid_for: 0, q_extent: 0.0,
         }
     }
@@ -791,6 +795,7 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
         debug_assert!(!self.dirty, "cull_ref on a stale index — call settle() after mutating");
         let mut v = self.cull_tagged(shape);
         v.sort_unstable_by_key(|e| e.0);
+        self.note_hits(v.len());
         v.into_iter().map(|e| e.1).collect()
     }
 
@@ -798,7 +803,9 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
     /// when that is safe.
     pub fn cull_ref_unordered<S: Shape3>(&self, shape: &S) -> Vec<&T> {
         debug_assert!(!self.dirty, "cull_ref on a stale index — call settle() after mutating");
-        self.cull_tagged(shape).into_iter().map(|e| e.1).collect()
+        let v = self.cull_tagged(shape);
+        self.note_hits(v.len());
+        v.into_iter().map(|e| e.1).collect()
     }
 
     /// Tell the policy about queries made through [`cull_ref`](Self::cull_ref), which could not
@@ -970,6 +977,7 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
         // is still total when two items sit on the same point, which is exactly the case that
         // breaks a truncating consumer.
         v.sort_unstable_by_key(|e| e.0);
+        self.note_hits(v.len());
         v.into_iter().map(|e| e.1).collect()
     }
 
@@ -990,7 +998,26 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
     /// different number, bit for bit).
     pub fn cull_unordered<S: Shape3>(&mut self, shape: &S) -> Vec<&T> {
         self.note_cull(shape);
-        self.cull_tagged(shape).into_iter().map(|e| e.1).collect()
+        let v = self.cull_tagged(shape);
+        self.note_hits(v.len());
+        v.into_iter().map(|e| e.1).collect()
+    }
+
+    /// Fold one cull's result count into the running mean. Same EMA weight as the other rates,
+    /// so they lag together rather than one leading the others across a threshold.
+    fn note_hits(&self, n: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let h = ((n as u64) << 10) as i64;
+        let prev = self.hits_ema_q10.load(Relaxed) as i64;
+        // Same 0.1 weight as the other rates, in integer arithmetic so it can live in an atomic.
+        let next = if self.hit_samples.load(Relaxed) == 0 { h } else { prev + (h - prev) / 10 };
+        self.hits_ema_q10.store(next.max(0) as u64, Relaxed);
+        self.hit_samples.fetch_add(1, Relaxed);
+    }
+
+    /// The EMA, back in hits.
+    fn hits_mean(&self) -> f64 {
+        self.hits_ema_q10.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1024.0
     }
 
     /// Counters and cell-size feedback for a cull, then bring a stale backend up to date.
@@ -1197,11 +1224,37 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
     /// extent must not veto anything, so the rule falls back to exactly its pre-extent behaviour
     /// rather than to a guess. A k-NN-only caller therefore never trips it.
     pub fn expected_hits(&self, n: f64) -> f64 {
+        // Once enough culls have run, the honest answer is what they RETURNED. No geometry, no
+        // world volume, no distribution assumption -- the quantity the rule wants, measured.
+        //
+        // This replaced a density estimate that was accurate to 0.8 % on uniform data and 7.9x
+        // low on a slab, because density came from the DECLARED world and a carpet occupies a
+        // sliver of its box. Estimating the input to a threshold, when the input is something the
+        // structure already computes on every call, was the mistake.
+        if self.hit_samples.load(std::sync::atomic::Ordering::Relaxed) >= Self::HIT_WARMUP {
+            // Scaled for `prepare`, which asks about a population not yet reached: hold the
+            // spatial distribution fixed and hits move with density, i.e. with n.
+            let live = (self.live as f64).max(1.0);
+            return self.hits_mean() * (n / live);
+        }
+        // Before that: the geometric fallback, so a fresh index still answers. Infinity when even
+        // that is unavailable, because an unknown input must veto nothing.
         let w = &self.world;
         let vol = w.w * w.h * w.d;
         if vol <= 0.0 || self.q_extent <= 0.0 { return f64::INFINITY; }
         let r = self.q_extent * 0.5;
         (n / vol) * (4.0 / 3.0) * std::f64::consts::PI * r * r * r
+    }
+
+    /// Culls needed before [`expected_hits`](Self::expected_hits) trusts observation over
+    /// geometry. Small on purpose: the EMA is already smoothing, and the geometric fallback is
+    /// the thing being escaped from.
+    const HIT_WARMUP: u64 = 8;
+
+    /// The mean number of items recent culls actually returned, and how many were sampled.
+    /// `(0.0, 0)` before the first cull.
+    pub fn observed_hits(&self) -> (f64, u64) {
+        (self.hits_mean(), self.hit_samples.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// The EMA of observed cull extents (the largest side of the query's bounding box), 0 until
@@ -1584,18 +1637,21 @@ mod tests {
         assert!(actual > 5.0, "the workload must actually hit something: {actual:.2}");
     }
 
-    /// ★★ The same check on SLAB-shaped data, where it fails — deliberately asserted as a
-    /// failure so the defect cannot be forgotten and so fixing it breaks this test.
+    /// ★★ The same check on SLAB-shaped data — the shape that broke the first estimator.
     ///
-    /// Density comes from the *declared world volume*, so points filling a thin layer of a large
-    /// box read far sparser than they are. This is the horde's carpet (30k units across
-    /// 1800x72x1800 declared cubic) and the fluid in its container, and it is why
-    /// `Thresholds::grid_min_hits` currently ships at 0.0.
+    /// Points filling a thin layer of a large box (the horde carpet: 30k units across
+    /// 1800x72x1800 declared cubic; a fluid in its container) read far sparser than they are when
+    /// density is taken from the *declared world volume*. That version predicted 13.81 where the
+    /// culls returned 108.53 — 7.9x low, in the direction that vetoes a grid that would have been
+    /// right, and the reason `Thresholds::grid_min_hits` shipped disabled.
     ///
-    /// When #154 estimates density from the data, this assertion must be inverted rather than
-    /// deleted — the sign of the error is the whole content of the test.
+    /// This test was written asserting that failure, with a message telling whoever fixed it to
+    /// INVERT rather than delete. #154 did, by observing what culls return instead of predicting
+    /// it from geometry, and the assertion below is the inverted one: 108.31 predicted against
+    /// 108.53 returned, 0.2 %. Same 1.10 band as the uniform twin, because the point of the fix
+    /// is that the shape of the data stopped mattering.
     #[test]
-    fn expected_hits_underestimates_slab_data_which_is_154() {
+    fn expected_hits_now_tracks_slab_data_too_which_was_154() {
         let (n, r, thickness) = (4000usize, 24.0, 8.0);
         let mut ix: AdaptiveIndex<P> = AdaptiveIndex::new(world(), 8);
         let mut rng = 0x1234_ABCDu64;
@@ -1612,11 +1668,13 @@ mod tests {
         let actual = hits as f64 / Q as f64;
         let predicted = ix.expected_hits(ix.len() as f64);
         assert!(actual > 5.0, "the workload must actually hit something: {actual:.2}");
-        assert!(predicted * 5.0 < actual,
-                "KNOWN DEFECT #154 appears to be FIXED: expected_hits predicted {predicted:.2} \
-                 and the culls returned {actual:.2} on slab data. If density now comes from the \
-                 DATA rather than the declared world, invert this assertion (and re-enable \
-                 Thresholds::grid_min_hits); do not delete it.");
+        let err = if predicted > actual { predicted / actual } else { actual / predicted };
+        assert!(err < 1.10,
+                "expected_hits predicted {predicted:.2} but the culls returned {actual:.2} on                  slab data, {err:.2}x out. The geometric estimator read 7.9x here; a regression                  toward that means the observed-hits path is no longer being reached.");
+        // Non-vacuity: it must be reading OBSERVATION, not geometry that happens to agree.
+        let (ema, samples) = ix.observed_hits();
+        assert!(samples >= 8 && (ema - actual).abs() < actual * 0.2,
+                "the observed-hits path was not exercised: ema {ema:.2}, samples {samples}");
     }
 
     /// The two rate estimates, against the events that produced them. Cheap, exact, and the

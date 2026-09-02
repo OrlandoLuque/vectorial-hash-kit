@@ -379,7 +379,14 @@ proptest! {
         // Thresholds tuned so migrations actually happen inside a short op sequence: the
         // shipped defaults need hundreds of ticks to move, which would make this test
         // exercise one backend and prove nothing.
-        let th = Thresholds { brute_max: 40, static_ticks: 6, hold_ticks: 2, cooldown: 0, ..Default::default() };
+        // `grid_min_hits: 0.0` disables the extent veto. This test is about ANSWERS being
+        // correct across migrations, and the phase assertions below are non-vacuity guards that
+        // each backend was actually visited. With the veto live, whether a randomly generated
+        // point set makes a grid worthwhile is up to proptest, so the guard would fail on inputs
+        // that are perfectly fine — a flaky test that says nothing about correctness. The veto
+        // has its own two-direction test in `adaptive.rs`.
+        let th = Thresholds { brute_max: 40, static_ticks: 6, hold_ticks: 2, cooldown: 0,
+                              grid_min_hits: 0.0, ..Default::default() };
         let mut ix = AdaptiveIndex::with_thresholds(Aabb::new(0.0, 0.0, 0.0, W, W, W), 6, th);
         // The model is a SLOT TABLE, not a list, because the index's is: after a removal
         // index j must still mean slot j or the update op would move a different item in
