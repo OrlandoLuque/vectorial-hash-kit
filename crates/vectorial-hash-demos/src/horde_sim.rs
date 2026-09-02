@@ -169,6 +169,29 @@ impl Zombie {
 /// the `Vec<Zombie>`.
 #[derive(Clone, Copy)]
 pub struct IZombie { pub id: u32, pub p: Point3, pub class: ZClass, pub dormant: bool }
+/// Exact, machine-independent instrumentation for "how much work does the index actually do".
+///
+/// Under `--features sim-counters` every `position()` the index asks for is counted. That is the
+/// same trick `tests/work_counts.rs` uses, applied to the REAL query mix of a real battle instead
+/// of to a synthetic one — which matters here, because the question it answers (why does the
+/// Morton arm cost several times the tree arm?) could not be settled from per-query tables
+/// without knowing how often each query shape is actually issued. Off by default: it costs a
+/// thread-local increment on the hottest call in the simulation.
+#[cfg(feature = "sim-counters")]
+pub mod counters {
+    use std::cell::Cell;
+    thread_local! { pub(crate) static POS: Cell<u64> = const { Cell::new(0) }; }
+    /// Points the index has asked the position of since the last [`take`], on this thread.
+    pub fn take() -> u64 { POS.with(|c| c.replace(0)) }
+    /// Read without resetting.
+    pub fn peek() -> u64 { POS.with(|c| c.get()) }
+}
+
+#[cfg(feature = "sim-counters")]
+impl Positioned3 for IZombie {
+    fn position(&self) -> Point3 { counters::POS.with(|c| c.set(c.get() + 1)); self.p }
+}
+#[cfg(not(feature = "sim-counters"))]
 impl Positioned3 for IZombie { fn position(&self) -> Point3 { self.p } }
 impl IZombie {
     fn of(i: usize, z: &Zombie) -> IZombie { IZombie { id: i as u32, p: z.p, class: z.class, dormant: z.dormant() } }
@@ -529,10 +552,12 @@ impl FlowField {
 /// and lose somewhere. Cube L6 is the only one that never drops below 1.63x. L7 and L8 win the
 /// tiny separation cull outright and then collapse on the rings (down to 0.09x), which is the
 /// occupancy rule biting from the other side.
-fn zgrid_world() -> Aabb { Aabb::new(0.0, -8.0, 0.0, WORLD, WORLD, WORLD) }
+/// Public so a bench can build a grid with EXACTLY the geometry the sim uses, rather than
+/// duplicating the numbers and drifting from them.
+pub fn zgrid_world() -> Aabb { Aabb::new(0.0, -8.0, 0.0, WORLD, WORLD, WORLD) }
 /// See [`zgrid_world`] — 6 is the measured balance, and it is only reachable because the cells
 /// are cubes.
-const ZGRID_LEVELS: u32 = 6;
+pub const ZGRID_LEVELS: u32 = 6;
 
 pub const TOWER_RANGE: f64 = 84.0; // reach a bit further down the funnel
 pub const TOWER_DMG: f64 = 150.0;
@@ -760,7 +785,9 @@ pub struct Horde {
     /// Zombie-index mode (the `M` toggle): keep-maintained Tree3, or a
     /// rebuilt-per-frame MortonGrid3 — the structure trade-off, live.
     pub zmode: ZMode,
-    zmorton: vectorial_hash::MortonGrid3<IZombie>,
+    /// Public so `examples/horde_query_counts` can put the SAME query shapes through the tree
+    /// and the grid and count what each costs. Reading an index is harmless; the sim owns writes.
+    pub zmorton: vectorial_hash::MortonGrid3<IZombie>,
     /// Where each unit currently sits IN THE GRID — the grid's answer to `handles`. A uniform
     /// grid has nothing to hand back, but `update`/`remove` only need the old position, so one
     /// `Point3` per unit buys the same keep-in-place path the tree gets from `ItemRef`.

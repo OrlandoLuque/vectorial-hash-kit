@@ -10,6 +10,12 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
+# Counts every `position()` the spatial index requests during a horde battle, so the work an
+# index does can be compared EXACTLY rather than timed. Pairs with vectorial-hash's `grid-stats`
+# (cells looked up), which is the grid's half of the same picture. Native benches only — it adds
+# a thread-local increment to the hottest call in the sim.
+sim-counters = []
+grid-stats = ["vectorial-hash/grid-stats"]
 # Propagates to vectorial-hash so the LcaRopes update strategy is compiled in
 # (otherwise it silently degrades to Lca).
 neighbors = ["vectorial-hash/neighbors"]

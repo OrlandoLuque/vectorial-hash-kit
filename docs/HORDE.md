@@ -432,6 +432,43 @@ cause — the grid still beats the tree on clustered data at radius 36 and 90.
 Re-run either side: `--example grid_tree_frontier -- radius=8`, or
 `--example pick_a_structure -- n=30000 churn=0.056 queries=0.06 radius=3`.
 
+**Counted, not timed** (`--example horde_query_counts --features sim-counters,grid-stats`): over
+one 900-frame battle the grid asks for **6.51×** the points the tree does, and looks up **140 M
+cells**. Two hypotheses were tested against that and both are refuted:
+
+| suspect | verdict |
+| --- | --- |
+| k-NN (towers k=8, commander k=48) | **innocent** — 1.6–1.9× the tree's points, 18–30 cells |
+| index maintenance (a grid `update` scans a cell) | **innocent** — with waves off and **peak awake = 0** the ratio *grows* to 8.18× |
+
+What is left is the standing defence sweeping the map with **large rings that find nothing**. Per
+query, at the front:
+
+| call site | tree pts | grid pts | grid cells | hits |
+| --- | ---: | ---: | ---: | ---: |
+| separation (r 3) | 15 | 15 | 2 | 0 |
+| guard ring (r 55) | 159 | 315 | 60 | 207 |
+| tower ring (r 84) | 203 | 354 | 196 | 548 |
+| pack ring (r 110) | 152 | 291 | 360 | 774 |
+| **wave ring (r 300)** | **325** | 1 001 | **6 072** | 4 341 |
+| k-NN k=8 | 59 | 95 | 18 | 8 |
+| k-NN k=48 | 129 | 239 | 30 | 48 |
+
+The horde's *most frequent* query, separation at radius 3, is a dead heat — 15 points each. The
+cost is in the rings, and it is cell lookups rather than point tests, which no `position()`
+counter alone could have shown.
+
+So the horde **confirms the mechanism** behind `Thresholds::grid_min_hits` (a grid pays for cells
+whether or not they hold anything) while also being the data shape whose density that rule
+estimates wrongly — a carpet is a slab in a cube. Right mechanism, wrong input: #154.
+
+*A note on the demo itself, found by a non-vacuity guard in that example:* running the same seed
+under `M`=tree and `M`=grid does **not** produce the same battle. They diverged by three units at
+radius 55 after 400 frames, because the two indexes return hits in different orders and the sim
+picks targets from that order. Harmless for the demo, and the reason the per-query table builds
+its grid *from* the tree's contents rather than from a second battle. It is also, precisely, the
+R1 canonical-ordering problem `AdaptiveIndex` solves and the raw structures do not.
+
 **The policy learned it — and it changed nothing here, which is worth saying.**
 `Thresholds::grid_min_hits` now vetoes the grid when a typical cull is not expected to find much;
 `examples/extent_axis` puts the crossover at ~9 expected points per query, measured at two
