@@ -4,6 +4,39 @@ Future work queued for review. Nothing here is committed scope — prune,
 reprioritise, or drop freely. Items graduate into the per-crate roadmaps
 (e.g. `crates/vectorial-hash/README.md`) once picked up.
 
+## ★ 2026-09-02/03 — cooperative night 11: numbers you can trust on a machine you don't know
+
+Worked under one constraint the user set — *we are on a weaker laptop, be careful with
+measurements* — which chose the queue: prefer results that are **counts**, not clocks.
+
+**Landed.** `src/machine.rs`: baselines and calibrations now record the machine that produced
+them, the gate **refuses a verdict** against a foreign or unfingerprinted baseline, and
+`--save --local` keeps a per-machine baseline beside the committed one. Its first run caught the
+false alarm it was built for (`_calib` 11.9 ms here against a committed 5.5; seven k-NN ops at
++41 % to +60 %, none of them regressions) · the policy's **estimates are checked against ground
+truth by counting** · **#154 closed by deleting the estimate**: `expected_hits` reports what culls
+returned, slab error **7.9× → 0.2 %**, `grid_min_hits` now ships **enabled** with `fluid_wgpu`
+choosing the same backend with it on and off · `examples/horde_query_counts` · a **decision
+ratchet** pinning the sequence of backends the policy picks.
+
+**Two hypotheses of mine refuted by their own experiments**, which is the entry worth reading.
+The horde's grid disadvantage is *not* k-NN (1.6–1.9× points, 18–30 cells) and *not* maintenance
+(with waves off and **peak awake = 0** the ratio grows to 8.18×); it is the standing defence
+sweeping with rings that find nothing — radius-300 costs the tree **325** point tests and the grid
+**1001 points + 6072 cells**, while the most frequent query is a dead heat at 15 each.
+
+**Open, in priority order:**
+
+1. **#158 — re-derive `rebuild_query_ratio` now that `grid_min_hits` is live.** The two rules
+   interact, and 0.2 was fitted while the grid could still be chosen for queries that found
+   nothing. **Timing-sensitive: wants the main desktop**, and #155 now makes any calibration say
+   which machine produced it.
+2. **#149 — close the 0.70×**: detector lag plus the migration's own rebuild (shadow-build and
+   atomic swap).
+3. **#98 D\* Lite — the user's call**, unchanged: ~1 ms of a 25 ms frame, only in the moving-goal
+   mode that is not currently used.
+4. **#83 / #95 need eyes**: `building_tweak` per-model scale, and the touch UI on a device.
+
 ## ★ 2026-09-01/02 — cooperative night 10: the adaptive layer, and two of my own numbers
 
 **Landed.** R1 canonical ordering by `Slot` (default) with `cull_unordered`/`knn_unordered` as the
