@@ -1677,6 +1677,59 @@ mod tests {
                 "the observed-hits path was not exercised: ema {ema:.2}, samples {samples}");
     }
 
+
+    /// ★ The policy's DECISIONS, pinned. A ratchet, in the spirit of `tests/work_counts.rs`.
+    ///
+    /// Everything else about the policy is asserted as a band — a rate within 0.1, a ratio under
+    /// 1.10 — because the quantities are estimates. The *choices* are not estimates: for a fixed
+    /// script the sequence of backends is a deterministic function of the thresholds, and it is
+    /// the thing a caller actually experiences. Nothing was pinning it, so this week two default
+    /// changes altered real decisions and the suite stayed green; the damage showed up only when
+    /// a demo was run by hand.
+    ///
+    /// If this fails, the policy changed its mind about something. That is often correct — read
+    /// the new sequence, decide whether it is an improvement, and bless it deliberately. What it
+    /// must not be is a surprise.
+    #[test]
+    fn the_policy_makes_the_same_decisions_on_a_fixed_script() {
+        // Four acts whose character differs, so more than one rule gets a turn: a small quiet
+        // population (a scan should serve it), growth with churn and light queries, a query storm
+        // wide enough to find things, then stillness.
+        let th = Thresholds { brute_max: 40, hold_ticks: 2, cooldown: 0, static_ticks: 8, ..Default::default() };
+        let mut ix = AdaptiveIndex::with_thresholds(world(), 8, th);
+        let mut all: Vec<P> = Vec::new();
+        let mut seen: Vec<Backend> = vec![ix.backend()];
+        let note = |ix: &AdaptiveIndex<P>, seen: &mut Vec<Backend>| {
+            if *seen.last().unwrap() != ix.backend() { seen.push(ix.backend()); }
+        };
+
+        for i in 0..30 { let p = P { p: pt(i) }; all.push(p); ix.insert(p); }
+        for _ in 0..10 { let _ = ix.cull(&Sphere3::new(60.0, 60.0, 60.0, 20.0)); ix.tick(); note(&ix, &mut seen); }
+
+        for i in 30..900 { let p = P { p: pt(i) }; all.push(p); ix.insert(p); }
+        for t in 0..30 {
+            for k in 0..300 { mv(&mut ix, &mut all, k, scatter(t, k)); }
+            for k in 0..30 { let p = pt(k); let _ = ix.cull(&Sphere3::new(p.x, p.y, p.z, 20.0)); }
+            ix.tick(); note(&ix, &mut seen);
+        }
+
+        for t in 30..70 {
+            for k in 0..300 { mv(&mut ix, &mut all, k, scatter(t, k)); }
+            for k in 0..900 { let p = pt(k); let _ = ix.cull(&Sphere3::new(p.x, p.y, p.z, 40.0)); }
+            ix.tick(); note(&ix, &mut seen);
+        }
+
+        for _ in 0..40 { let _ = ix.cull(&Sphere3::new(60.0, 60.0, 60.0, 40.0)); ix.tick(); note(&ix, &mut seen); }
+
+        // Blessed sequence. Bless a new one on purpose, never to make a red test green.
+        let expected = [Backend::Brute, Backend::KeepTree, Backend::Grid, Backend::Static];
+        assert_eq!(seen.as_slice(), &expected[..],
+                   "the policy changed its decisions on this script. If that is an improvement,                     update the blessed sequence and say why in the commit; if it is not, the                     threshold you just touched is the cause.");
+        // Non-vacuity: a script that never migrates would satisfy any single-element sequence.
+        assert!(seen.len() >= 3, "the script must exercise several backends, saw {seen:?}");
+        assert_matches_brute(&mut ix, &all);
+    }
+
     /// The two rate estimates, against the events that produced them. Cheap, exact, and the
     /// kind of thing that is obviously true until the day it is not.
     #[test]
