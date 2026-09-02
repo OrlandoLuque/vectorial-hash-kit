@@ -55,9 +55,13 @@ this i7 laptop · the horde's `M` key gained an ADAPTIVE third mode.
    than retuning the scalar. The scalar is still worth re-deriving *now that the veto exists* —
    the two rules interact, and 0.2 was fitted while the grid could be chosen for queries that
    found nothing.
-4. **#154 (new) — density from `occupancy()` rather than from the declared world.** The one
-   known inaccuracy in `grid_min_hits`. Needs a density estimate available on every backend, not
-   only the grid: sampling the keep-tree's leaf boxes is the obvious candidate and is unmeasured.
+4. **#154 — density from the data rather than from the declared world.** The one known
+   inaccuracy in `grid_min_hits`, and now **quantified by counting**: `expected_hits` is accurate
+   to **0.8 %** on uniform data (13.81 predicted, 13.70 returned) and **7.9x low** on slab data
+   (13.81 against 108.53). Both are tests, and the slab one asserts the *failure*, so fixing the
+   estimator breaks it rather than quietly passing. Needs a density estimate available on every
+   backend, not only the grid: sampling the keep-tree's leaf boxes is the obvious candidate and is
+   unmeasured. Do `rebuild_query_ratio` in the same pass.
 4. **Re-measure on the main machine when it returns.** Everything above was measured on the i7
    laptop with the main disk attached externally; `calibrations/` exists so the two can be
    compared rather than argued about.

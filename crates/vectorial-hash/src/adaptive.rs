@@ -335,6 +335,14 @@ pub struct Thresholds {
     /// because the estimator was wrong, which is why the fix is [#154], not a smaller threshold:
     /// **a better constant for a rule with a broken input is still a rule with a broken input.**
     ///
+    /// **How wrong, exactly** (`expected_hits_predicts_the_real_hit_count_on_uniform_data` and its
+    /// slab twin, both counting rather than timing): on uniform data the estimate is accurate to
+    /// **0.8 %** — 13.81 predicted against 13.70 returned. On slab data, the same points squeezed
+    /// into a layer 1/32 of the world's height, it predicts the same 13.81 and the culls return
+    /// **108.53** — **7.9x** out, in the direction that vetoes a grid that would have been right.
+    /// The slab case is asserted *as a failure* so that fixing it breaks the test rather than
+    /// silently passing it.
+    ///
     /// [`MortonGrid3::occupancy`](crate::MortonGrid3::occupancy) is the honest estimator and only
     /// exists while a grid is live, so this needs a density estimate every backend can produce —
     /// the same constraint that sank the first version of the `scan_budget` rule.
@@ -1536,6 +1544,104 @@ mod tests {
         }
         assert_eq!(ix.backend(), Backend::KeepTree, "400 queried items should be indexed");
         assert_matches_brute(&mut ix, &all);
+    }
+
+    /// ★ Do the policy's INPUTS mean what they claim? Answered by COUNTING, not by timing.
+    ///
+    /// Every threshold in [`Thresholds`] is compared against an estimate, and nothing checked
+    /// that the estimates estimate the right thing. That gap shipped a defect: `grid_min_hits`
+    /// was given a threshold measured to a tenth (8.63 and 10.23 points per query) and then fed
+    /// `expected_hits`, which told it the SPH fluid's queries would find under one neighbour when
+    /// an SPH kernel is designed to hold tens. The constant was right and the input was wrong.
+    ///
+    /// A count is the right instrument here for two reasons: it is exact, so there is no noise to
+    /// hide behind, and it is machine-independent, so this runs in CI and on a laptop and means
+    /// the same thing on both.
+    #[test]
+    fn expected_hits_predicts_the_real_hit_count_on_uniform_data() {
+        let (n, r) = (4000usize, 24.0);
+        let mut ix: AdaptiveIndex<P> = AdaptiveIndex::new(world(), 8);
+        let mut rng = 0x51ED_2701u64;
+        let mut next = |lo: f64, hi: f64| { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+                                            lo + (rng >> 11) as f64 / (1u64 << 53) as f64 * (hi - lo) };
+        for _ in 0..n { ix.insert(P { p: Point3::new(next(0.0, 256.0), next(0.0, 256.0), next(0.0, 256.0)) }); }
+
+        // Query centres are kept in the INTERIOR. A sphere against a wall loses part of its
+        // volume to the outside and would make the estimator look wrong for a reason that has
+        // nothing to do with the estimator.
+        let mut hits = 0usize;
+        const Q: usize = 300;
+        for _ in 0..Q {
+            let c = Point3::new(next(r, 256.0 - r), next(r, 256.0 - r), next(r, 256.0 - r));
+            hits += ix.cull(&Sphere3::new(c.x, c.y, c.z, r)).len();
+        }
+        let actual = hits as f64 / Q as f64;
+        let predicted = ix.expected_hits(ix.len() as f64);
+        let err = if predicted > actual { predicted / actual } else { actual / predicted };
+        assert!(err < 1.10, "expected_hits predicted {predicted:.2} but the culls returned \
+                             {actual:.2} on uniform data — {err:.2}x out");
+        // Non-vacuity: a query that finds nothing would satisfy any ratio assertion by accident.
+        assert!(actual > 5.0, "the workload must actually hit something: {actual:.2}");
+    }
+
+    /// ★★ The same check on SLAB-shaped data, where it fails — deliberately asserted as a
+    /// failure so the defect cannot be forgotten and so fixing it breaks this test.
+    ///
+    /// Density comes from the *declared world volume*, so points filling a thin layer of a large
+    /// box read far sparser than they are. This is the horde's carpet (30k units across
+    /// 1800x72x1800 declared cubic) and the fluid in its container, and it is why
+    /// `Thresholds::grid_min_hits` currently ships at 0.0.
+    ///
+    /// When #154 estimates density from the data, this assertion must be inverted rather than
+    /// deleted — the sign of the error is the whole content of the test.
+    #[test]
+    fn expected_hits_underestimates_slab_data_which_is_154() {
+        let (n, r, thickness) = (4000usize, 24.0, 8.0);
+        let mut ix: AdaptiveIndex<P> = AdaptiveIndex::new(world(), 8);
+        let mut rng = 0x1234_ABCDu64;
+        let mut next = |lo: f64, hi: f64| { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+                                           lo + (rng >> 11) as f64 / (1u64 << 53) as f64 * (hi - lo) };
+        for _ in 0..n { ix.insert(P { p: Point3::new(next(0.0, 256.0), next(0.0, thickness), next(0.0, 256.0)) }); }
+
+        let mut hits = 0usize;
+        const Q: usize = 300;
+        for _ in 0..Q {
+            let c = Point3::new(next(r, 256.0 - r), next(0.0, thickness), next(r, 256.0 - r));
+            hits += ix.cull(&Sphere3::new(c.x, c.y, c.z, r)).len();
+        }
+        let actual = hits as f64 / Q as f64;
+        let predicted = ix.expected_hits(ix.len() as f64);
+        assert!(actual > 5.0, "the workload must actually hit something: {actual:.2}");
+        assert!(predicted * 5.0 < actual,
+                "KNOWN DEFECT #154 appears to be FIXED: expected_hits predicted {predicted:.2} \
+                 and the culls returned {actual:.2} on slab data. If density now comes from the \
+                 DATA rather than the declared world, invert this assertion (and re-enable \
+                 Thresholds::grid_min_hits); do not delete it.");
+    }
+
+    /// The two rate estimates, against the events that produced them. Cheap, exact, and the
+    /// kind of thing that is obviously true until the day it is not.
+    #[test]
+    fn the_rate_estimates_track_the_events_they_count() {
+        let th = Thresholds { brute_max: 10, hold_ticks: 2, cooldown: 0, ..Default::default() };
+        let mut ix = AdaptiveIndex::with_thresholds(world(), 8, th);
+        let mut all = Vec::new();
+        for i in 0..500 { let p = P { p: pt(i) }; all.push(p); ix.insert(p); }
+
+        // A fixed script: 250 culls and 125 moves per tick against 500 items, i.e. 0.5 and 0.25.
+        for t in 0..120 {
+            for k in 0..125 { mv(&mut ix, &mut all, k, scatter(t, k)); }
+            for k in 0..250 { let p = pt(k); let _ = ix.cull(&Sphere3::new(p.x, p.y, p.z, 12.0)); }
+            ix.tick();
+        }
+        let (n, q, m) = ix.observed();
+        assert_eq!(n, 500);
+        // The EMA is deliberately lagging, so the band is loose — but a rate that drifted by an
+        // order of magnitude, or counted culls as moves, would not survive it.
+        assert!((q - 0.5).abs() < 0.1, "queries/item read {q:.3}, script says 0.5");
+        assert!((m - 0.25).abs() < 0.1, "moves/item read {m:.3}, script says 0.25");
+        // ...and they must not be the same number, which would mean one is reading the other.
+        assert!((q - m).abs() > 0.15, "q {q:.3} and m {m:.3} are suspiciously equal");
     }
 
     /// ★ The extent veto, in BOTH directions from one workload.
