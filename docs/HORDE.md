@@ -412,6 +412,13 @@ worth having when you cannot know which of those two you would have picked.
 that version gave 1.03–1.67; the published figure was the best draw. It now rotates the arm order
 per round and quotes the median with its range.)*
 
+*(And the honest figure is **~1.4×, 1.34–1.47 across sessions**, not any single session's median.
+Rotating the arms fixed drift *within* a run — a later session read a range of 1.46–1.47, tight —
+but it cannot fix the difference between one evening's machine and another's, where the same three
+arms read `Tree3` 1.485/1.611/1.831 and `MortonGrid3` 4.643/6.087/8.233 ms/step. The switch
+statistics, being counts, were identical in all three: 3 switches, 29 near-misses,
+`Brute→KeepTree ×1`. **Quote the counts as facts and the ratio as a range.**)*
+
 **A contradiction, and its resolution: the missing axis was QUERY EXTENT.** `grid_tree_frontier`
 maps the (churn × query-load) plane and said the grid should win *by 1.9×* at this very point —
 the horde reports `0.0599 q/item, 0.0564 mv/item`, landing squarely in that cell — while the horde
