@@ -98,16 +98,27 @@
 //! while a tree prunes empty space for free. This is why the horde — whose commonest cull has
 //! radius 3 — is right to prefer the tree while the two-axis rule said grid.
 //!
-//! **And on both benches we have, the new rule is currently inert.** `VH_CALIBRATION` with
-//! `grid_min_hits = 0.0` runs the same binary under the old policy, and `adaptive_vs_pinned`
-//! chooses the identical sequence either way (`[Brute, KeepTree]`); the horde's adaptive arm
-//! reports the same 3 switches and 29 near-misses before and after. `rebuild_query_ratio` refuses
-//! the grid first in both, so the veto never becomes the binding constraint. It is a correct rule
-//! that our own workloads do not exercise — which is worth stating plainly, because "I added a
-//! rule and the number improved" was available here and would have been wrong: the pinned Grid
-//! arm read 2 617 ms and 3 293 ms on two runs of the same binary, a 26 % spread that swamps
-//! anything the policy did. The workload that WOULD exercise it is high query load with small
-//! query volumes — SPH-shaped — and none of our benches sits there.
+//! **It ships OFF (`grid_min_hits = 0.0`), and that is the most useful thing in this section.**
+//! Three workloads were checked by running the same binary with the veto on and off through
+//! `VH_CALIBRATION`. On two of them it is inert: `adaptive_vs_pinned` picks the identical
+//! sequence either way and the horde's arm reports the same 3 switches and 29 near-misses,
+//! because `rebuild_query_ratio` refuses the grid first. On the third — `fluid_wgpu`, the SPH
+//! demo, *precisely* the high-load small-query shape this rule was built for — it fires, moves
+//! the choice from grid to keep-tree, and the demo's own counterbalanced bake-off ranks that
+//! keep-tree **last of the four fixed arms** (7 632 µs against the grid's 7 037; repeated, same
+//! ordering). Maintenance does improve 2.4x (125 µs against 305, four A/B pairs, no overlap) and
+//! the query cost is inside noise — but the total is worse, and the total is what a caller pays.
+//!
+//! The diagnosis is the estimator, not the threshold. An SPH kernel is *designed* so a query
+//! holds tens of neighbours, so `expected_hits` should read ~30 for the fluid and never fire; it
+//! fired because density comes from the **declared world volume** and the fluid occupies a
+//! fraction of its box. Lowering 9.0 would be tuning a constant to compensate for a broken input.
+//! See [`Thresholds::grid_min_hits`] and #154.
+//!
+//! Worth noting how close this came to reading as a success: the horde's ratio moved 1.38x ->
+//! 1.34x in the same window, while `MortonGrid3` — an arm this change cannot touch — moved 6.087
+//! -> 4.643 ms/step, so the machine had simply gone quiet. **A number that improves alongside
+//! your change is not evidence your change did it; check the arm you did not touch.**
 //!
 //! **That row first read 1.03x, and the correction is the more useful part.** The example ran
 //! each arm once, to completion, in a fixed order; five runs of it gave 1.03, 1.36, 1.47, 1.67,
@@ -311,15 +322,24 @@ pub struct Thresholds {
     /// grid pays its hash lookups whether or not the cells hold anything, while a tree prunes
     /// empty space for free, so the quantity to threshold is `density x query volume`.
     ///
-    /// Default 9.0, between the two measured crossovers.
+    /// **Default 0.0 — the veto is OFF**, and the reason is a measured counterexample rather
+    /// than caution. 9.0 (between the two crossovers) is the value to set when enabling it.
     ///
-    /// **Its known weakness, stated because it decides where this is safe:** density comes from
-    /// the declared world volume, so data occupying a thin slice of a large box (the horde's
-    /// carpet — 30k units across 1800x72x1800 declared as a cube) reads far sparser than it is.
-    /// That errs toward the tree, which is the safe direction here but is still an error;
-    /// [`MortonGrid3::occupancy`](crate::MortonGrid3::occupancy) is the honest estimator and is
-    /// only available while a grid is live. Set to 0.0 to disable the veto entirely and get the
-    /// pre-2026-09-02 behaviour.
+    /// The rule is sound; its *input* is not. Density is computed from the **declared world
+    /// volume**, so data occupying a fraction of its box reads far sparser than it is. Turned on,
+    /// this sends `fluid_wgpu` — the SPH demo, exactly the high-load small-query shape the rule
+    /// was built for — from the grid to the keep-tree, which its own bake-off ranks **last** of
+    /// the four fixed arms (7 632 µs against the grid's 7 037, repeated with the arms
+    /// counterbalanced, consistent across runs). An SPH kernel is *designed* so that a query
+    /// holds tens of neighbours; `expected_hits` should read ~30 there and never fire. It fired
+    /// because the estimator was wrong, which is why the fix is [#154], not a smaller threshold:
+    /// **a better constant for a rule with a broken input is still a rule with a broken input.**
+    ///
+    /// [`MortonGrid3::occupancy`](crate::MortonGrid3::occupancy) is the honest estimator and only
+    /// exists while a grid is live, so this needs a density estimate every backend can produce —
+    /// the same constraint that sank the first version of the `scan_budget` rule.
+    ///
+    /// [#154]: https://github.com/orlandoluque/vectorial-hash-kit/blob/main/docs/BACKLOG.md
     pub grid_min_hits: f64,
     /// **How many point-tests a linear scan may cost before an index is worth maintaining**,
     /// expressed as a multiple of the per-item maintenance cost. This is the variable
@@ -409,9 +429,10 @@ impl Default for Thresholds {
             // machine. Was 0.1, which switched to the grid roughly twice as early as the
             // measurement supports.
             rebuild_query_ratio: 0.2,
-            // Measured, `examples/extent_axis`: the tree/grid crossover sits at 8.63 and 10.23
-            // expected points per query at two densities 4x apart.
-            grid_min_hits: 9.0,
+            // OFF by default. The crossover is measured at 8.63-10.23 (`examples/extent_axis`)
+            // and the rule is sound, but its density input is not yet trustworthy enough to act
+            // on — see the field docs for the fluid counterexample. Set it to 9.0 to enable.
+            grid_min_hits: 0.0,
             scan_budget: 60.0,
             static_ticks: crate::advisor::STATIC_TICKS,
             margin: 0.25,
@@ -1520,7 +1541,10 @@ mod tests {
     #[test]
     fn query_extent_vetoes_the_grid_and_wide_queries_restore_it() {
         let run = |r: f64| {
-            let th = Thresholds { brute_max: 10, hold_ticks: 2, cooldown: 0, rebuild_query_ratio: 0.1, ..Default::default() };
+            // Opts IN: the shipped default is 0.0 (off). This tests the mechanism, which is
+            // correct; whether it should be ON by default is a separate question the fluid
+            // counterexample currently answers no.
+            let th = Thresholds { brute_max: 10, hold_ticks: 2, cooldown: 0, rebuild_query_ratio: 0.1, grid_min_hits: 9.0, ..Default::default() };
             let mut ix = AdaptiveIndex::with_thresholds(world(), 8, th);
             let mut all = Vec::new();
             for i in 0..2000 { let p = P { p: pt(i) }; all.push(p); ix.insert(p); }
@@ -1551,8 +1575,9 @@ mod tests {
     /// 1.0), so this test drives the variable that actually decides.
     #[test]
     fn query_heavy_workload_switches_to_the_rebuilt_grid() {
-        // `grid_min_hits: 0.0` disables the extent veto, and that is the POINT of this test,
-        // not a workaround. 300 items in a 256^3 world with radius-10 culls expect 0.075 hits a
+        // `grid_min_hits: 0.0` disables the extent veto explicitly — redundant against today's
+        // default, and deliberately kept so this test does not start failing the day that
+        // default flips. It is the POINT of the test, not a workaround. 300 items in a 256^3 world with radius-10 culls expect 0.075 hits a
         // query: no query shape justifies a grid at that population, so with the veto live this
         // workload can never reach one. This test asserts the OTHER half of the grid rule — that
         // query load, not churn, is what moves it — and needs the veto out of the way to do it.

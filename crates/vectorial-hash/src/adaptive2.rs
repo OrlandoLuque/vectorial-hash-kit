@@ -773,8 +773,9 @@ mod tests {
     /// 1.0), so this test drives the variable that actually decides.
     #[test]
     fn query_heavy_workload_switches_to_the_rebuilt_grid() {
-        // `grid_min_hits: 0.0` disables the extent veto, and that is the POINT of this test,
-        // not a workaround. 300 items in a 256^2 world with radius-10 culls expect 0.96 hits a
+        // `grid_min_hits: 0.0` disables the extent veto explicitly — redundant against today's
+        // default, and deliberately kept so this test does not start failing the day that
+        // default flips. It is the POINT of the test, not a workaround. 300 items in a 256^2 world with radius-10 culls expect 0.96 hits a
         // query: no query shape justifies a grid at that population, so with the veto live this
         // workload can never reach one. This test asserts the OTHER half of the grid rule — that
         // query load, not churn, is what moves it — and needs the veto out of the way to do it.
