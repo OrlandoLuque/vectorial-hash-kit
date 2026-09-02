@@ -451,7 +451,16 @@ impl Thresholds {
     /// — what the `calibrate` example writes after measuring the local machine.
     pub fn from_env() -> Self {
         match std::env::var("VH_CALIBRATION").ok().and_then(|p| std::fs::read_to_string(p).ok()) {
-            Some(text) => Self::parse(&text),
+            Some(text) => {
+                // A calibration is a set of measured crossovers, worth exactly as much as the
+                // machine that measured them. Warn rather than refuse: a foreign calibration is
+                // still a better guess than compiled-in defaults, and someone deliberately
+                // shipping one file to a fleet should not be blocked by it.
+                if let crate::machine::Provenance::OtherMachine(m) = crate::machine::verdict(&text) {
+                    eprintln!("vectorial-hash: VH_CALIBRATION was measured on {m}, running on {}: these thresholds are a guess here — re-run `cargo run --example calibrate`.", crate::machine::machine_id());
+                }
+                Self::parse(&text)
+            }
             None => Self::default(),
         }
     }
@@ -492,10 +501,11 @@ impl Thresholds {
     /// the one number the tool exists to produce.
     pub fn to_text(&self) -> String {
         format!(
-            "# vectorial-hash adaptive-index calibration\n\
+            "# vectorial-hash adaptive-index calibration\n{}\
              brute_max = {}\nhigh_churn = {}\nrebuild_query_ratio = {}\nscan_budget = {}\ngrid_min_hits = {}\n\
              static_ticks = {}\nmargin = {}\nhold_ticks = {}\ncooldown = {}\n\
              decisive_factor = {}\ndetector_alpha = {}\nwarm_start = {}\n",
+            crate::machine::machine_line(),
             self.brute_max, self.high_churn, self.rebuild_query_ratio, self.scan_budget, self.grid_min_hits,
             self.static_ticks, self.margin, self.hold_ticks, self.cooldown, self.decisive_factor,
             self.detector_alpha, self.warm_start)

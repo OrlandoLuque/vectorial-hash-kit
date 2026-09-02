@@ -25,6 +25,30 @@ committed) and it does not fail a build.
 timings (min-of-N, not statistical), checked against a **committed** baseline
 (`benches/baseline.tsv`), exiting non-zero when an op regresses past a threshold.
 
+### Whose numbers is it judging? (2026-09-03)
+
+Every file the gate writes now carries a `# machine = os/arch Nc HOST` line, and the gate
+**refuses to report a regression** against a baseline from anywhere else — it prints the whole
+table, marks it ORIENTATION ONLY, and exits 0. Before this, running the gate on a second machine
+produced confident verdicts about the hardware: on its first run here the calibration loop read
+**11.9 ms against the committed baseline's 5.5 ms**, and seven k-NN ops showed +41 % to +60 %.
+None of that was a regression.
+
+`_calib` does not rescue it. It is a fixed CPU loop, so it cancels *clock speed* — cache size,
+memory bandwidth and core count divide straight through it, and on a spatial index those are most
+of the difference between two machines.
+
+So a machine may keep **its own baseline beside the committed one**:
+
+```bash
+cargo run -p vectorial-hash --example regression_gate --release -- --save --local
+# -> benches/baseline.<os>-<arch>-<cores>c-<host>.tsv, and the committed one is not touched
+```
+
+It is picked up automatically on that machine from then on. `$VH_BASELINE` overrides both. The
+`--local` flag exists so a second machine cannot silently overwrite the first one's numbers: a
+baseline is compared against for months, so losing it is expensive and completely quiet.
+
 ```bash
 # capture the baseline on THIS machine, ideally quiet (close heavy apps):
 cargo run -p vectorial-hash --example regression_gate --release -- --save

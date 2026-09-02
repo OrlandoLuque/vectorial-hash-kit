@@ -45,6 +45,8 @@ pub mod linear_quadtree;
 pub mod morton3;
 pub mod morton;
 pub mod adaptive;
+/// Provenance for hardware-specific measured files (baselines, calibrations).
+pub mod machine;
 pub mod adaptive2;
 pub mod advisor;
 
@@ -58,6 +60,7 @@ pub use tree3::{Aabb, Crossing, ItemRef, Node3, Node3Id, Point3, Polyhedron3, Po
 pub use octree3::{OCrossing, ONode, ONodeId, Octree3};
 pub use stencil::{Alignment, Row, SphereStencil};
 pub use adaptive::{AdaptiveIndex, Backend, Distribution, Hints, Slot, SwitchStats, Thresholds};
+pub use machine::{machine_id, machine_line, machine_of, machine_slug, Provenance};
 pub use adaptive2::AdaptiveIndex2;
 pub use kdtree2::KdTree2;
 pub use kdtree3::KdTree3;

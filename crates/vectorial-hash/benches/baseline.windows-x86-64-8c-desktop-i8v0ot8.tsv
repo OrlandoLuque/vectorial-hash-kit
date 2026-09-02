@@ -1,0 +1,34 @@
+# vectorial-hash regression baseline — op<TAB>nanoseconds (min over passes, each itself min-of-N).
+# _calib is a fixed CPU loop; the gate compares op/_calib ratios to cancel clock scaling.
+# Regenerate with `--save [--passes N]`. More passes is strictly better: each one can only
+# lower a number toward the machine's uncontended floor, never raise it.
+# machine = windows/x86_64 8c DESKTOP-I8V0OT8
+_calib	11934700
+build_tree3	9102200
+build_octree3	7387900
+build_morton3	2502500
+build_kdtree3	5305600
+build_linear_octree3	3282100
+cull_tree3_x64	251100
+cull_octree3_x64	231500
+cull_morton3_x64	116900
+cull_kdtree3_x64	177400
+cull_linear_octree3_x64	299000
+knn_tree3_k16_x256	1189700
+knn_kdtree3_k16_x256	1035000
+knn_linear_octree3_k16_x256	1372600
+knn_morton3_k16_x256	1259300
+knn_octree3_k16_x256	1040700
+update_predicate_frame	5251100
+update_ref_frame	1074900
+build_tree2	8888300
+build_quadtree2	7962600
+build_linear_quadtree	3600400
+cull_tree2_x64	162200
+cull_quadtree2_x64	133100
+cull_linear_quadtree_x64	164600
+knn_tree2_k16_x256	688100
+knn_quadtree2_k16_x256	586400
+knn_kdtree2_k16_x256	618300
+knn_linear_quadtree_k16_x256	806900
+knn_morton2_k16_x256	1409500

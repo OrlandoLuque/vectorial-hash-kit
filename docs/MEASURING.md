@@ -501,3 +501,43 @@ demotes `Thresholds::rebuild_query_ratio` from "a threshold fitted at maximum ch
 threshold fitted at maximum churn **and one query extent**" — the policy reads two axes of a
 three-axis surface. See § 8d for the other shape of this mistake: there, a ratio that *did* move
 turned out to depend on something not in the model either.
+
+## 10. A measured file must say which machine measured it
+
+Two files in this repo hold measured values that a later run is judged against: the regression
+gate's `benches/baseline.tsv` and the adaptive index's `calibrations/*.txt`. Both are
+hardware-specific, and until 2026-09-03 **neither recorded the hardware**. The gate's own header
+said to treat cross-machine numbers as orientation only, and CI marked its run informational for
+exactly that reason — so the knowledge existed, in prose, where the tool could not read it.
+
+Running the gate on a second machine therefore printed a full table of confident verdicts about
+nothing. Measured on the first run of the check: the calibration loop read **11.9 ms** here
+against the committed baseline's **5.5 ms**, and seven k-NN ops came out **+41 % to +60 %**. All
+of it would have been reported as regression.
+
+**Clock normalisation is not provenance.** `_calib` is a fixed CPU loop, so dividing by it cancels
+clock speed and nothing else. Cache sizes, memory bandwidth and core counts pass through the
+division untouched, and on a spatial-index workload they are most of what separates two machines.
+A normalised number from elsewhere is still a number from elsewhere.
+
+The fix is `src/machine.rs`: a coarse, dependency-free fingerprint (`os/arch Nc HOST`) written
+into both file formats, and three states rather than two —
+
+| | what it means | may a verdict be issued? |
+| --- | --- | --- |
+| `SameMachine` | fingerprint matches | yes |
+| `OtherMachine(id)` | measured elsewhere, and it says where | no |
+| `Unknown` | file predates the fingerprint | **no** |
+
+`Unknown` being distinct from `SameMachine` is the part worth copying. Every file written before
+the check existed has no fingerprint, and treating "no evidence" as "matches" would have left the
+whole problem in place for precisely the files most likely to be stale.
+
+Refusing is only half a fix, though: a developer working for weeks on a second machine would
+simply have no gate. So a machine keeps **its own baseline beside the committed one**
+(`--save --local` → `baseline.<slug>.tsv`, auto-selected there afterwards), and `--local` is
+explicit so a second machine cannot silently overwrite the first one's numbers.
+
+The general form: **a number and the conditions it was taken under are one object.** Splitting
+them — number in the file, conditions in a comment, in a README, or in a colleague's memory — is
+how a measurement becomes a memory (§ 8f) and how a comparison becomes a fabrication.

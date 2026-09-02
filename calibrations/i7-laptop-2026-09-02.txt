@@ -1,4 +1,5 @@
 # vectorial-hash adaptive-index calibration
+# machine = windows/x86_64 8c DESKTOP-I8V0OT8
 brute_max = 182
 high_churn = 0
 rebuild_query_ratio = 0.2048

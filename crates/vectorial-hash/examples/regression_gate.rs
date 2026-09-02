@@ -14,8 +14,11 @@
 //! ```
 //!
 //! The baseline file is `benches/baseline.tsv` (op<TAB>nanoseconds). It is
-//! hardware-specific: regenerate with `--save` when you change machines, and
-//! treat cross-machine numbers as orientation only. The gate compares *ratios*,
+//! hardware-specific, and the file says so: every baseline carries a
+//! `# machine = ...` line and the gate REFUSES to report a regression against
+//! one from elsewhere (or one with no fingerprint at all), printing the table as
+//! orientation only. Keep a second machine's numbers beside the committed ones
+//! with `--save --local`. The gate compares *ratios*,
 //! so it is robust to absolute speed as long as the baseline was taken here.
 
 // The `x < lo || x > hi` bounce test reads clearer than `!(lo..=hi).contains()`.
@@ -38,6 +41,22 @@ const VISION_2D: f64 = 12.0;
 const MARGIN: f64 = 4.0;
 const REPS: usize = 40;
 const BASELINE: &str = "crates/vectorial-hash/benches/baseline.tsv";
+
+/// Which baseline file this run uses.
+///
+/// The committed `baseline.tsv` belongs to whichever machine last ran `--save`, and on any other
+/// machine it can only ever be orientation. So a machine may keep its own beside it,
+/// `baseline.<machine-slug>.tsv`, preferred automatically when present. `$VH_BASELINE` overrides
+/// both, for someone who keeps baselines elsewhere entirely.
+///
+/// The point of `--local` is that a second machine must not silently overwrite the first one's
+/// numbers — a baseline is judged against for months, so losing it is expensive and quiet.
+fn baseline_path(local: bool) -> String {
+    if let Ok(p) = std::env::var("VH_BASELINE") { return p; }
+    let mine = format!("crates/vectorial-hash/benches/baseline.{}.tsv", vectorial_hash::machine_slug());
+    if local || std::path::Path::new(&mine).exists() { return mine; }
+    BASELINE.to_string()
+}
 
 struct Rng(u64);
 impl Rng {
@@ -239,10 +258,15 @@ fn main() {
         s.push_str("# _calib is a fixed CPU loop; the gate compares op/_calib ratios to cancel clock scaling.\n");
         s.push_str("# Regenerate with `--save [--passes N]`. More passes is strictly better: each one can only\n");
         s.push_str("# lower a number toward the machine's uncontended floor, never raise it.\n");
+        // WHICH machine. Absolute nanoseconds are meaningless anywhere else, and `_calib`
+        // normalisation does not rescue them: it cancels clock speed, not cache size or memory
+        // bandwidth. Without this line the gate happily judged a laptop against a desktop.
+        s.push_str(&vectorial_hash::machine_line());
         s.push_str(&format!("_calib\t{best_calib:.0}\n"));
         for (name, _) in &results { s.push_str(&format!("{name}\t{:.0}\n", best[name])); }
-        std::fs::write(BASELINE, &s).unwrap_or_else(|e| panic!("cannot write {BASELINE}: {e}"));
-        println!("\nsaved baseline -> {BASELINE}");
+        let path = baseline_path(argv.iter().any(|a| a == "--local"));
+        std::fs::write(&path, &s).unwrap_or_else(|e| panic!("cannot write {path}: {e}"));
+        println!("\nsaved baseline -> {path}");
         println!("  {:<24} {:>12.0} ns (calibration yardstick)", "_calib", best_calib);
         for (name, first) in &results {
             let b = best[name];
@@ -252,10 +276,12 @@ fn main() {
         return;
     }
 
-    let base = match std::fs::read_to_string(BASELINE) {
+    let path = baseline_path(false);
+    let base = match std::fs::read_to_string(&path) {
         Ok(s) => s,
-        Err(_) => { eprintln!("no baseline at {BASELINE} — run with --save first."); std::process::exit(2); }
+        Err(_) => { eprintln!("no baseline at {path} — run with --save first."); std::process::exit(2); }
     };
+    if path != BASELINE { println!("baseline: {path} (this machine's own, not the committed one)"); }
     let mut baseline = std::collections::HashMap::new();
     for line in base.lines() {
         if line.starts_with('#') || line.trim().is_empty() { continue; }
@@ -265,6 +291,25 @@ fn main() {
 
     // Normalise current op times by how much the CPU itself shifted since the
     // baseline run: scale > 1 ⟹ machine is slower now ⟹ shrink current numbers.
+    // Whose numbers are these? A verdict is only available when the answer is "this machine".
+    let prov = vectorial_hash::machine::verdict(&base);
+    match &prov {
+        vectorial_hash::Provenance::SameMachine => {}
+        vectorial_hash::Provenance::OtherMachine(m) => {
+            println!("!! this baseline was captured on {m}");
+            println!("!! you are on {}", vectorial_hash::machine_id());
+            println!("!! absolute times do not transfer between machines — `_calib` cancels clock");
+            println!("!! speed, not cache size or memory bandwidth. The table below is ORIENTATION");
+            println!("!! ONLY and no regression will be reported. Keep your own alongside it with");
+            println!("!! `--save --local`, which never overwrites the committed one.");
+            println!("!! or run on the machine above.\n");
+        }
+        vectorial_hash::Provenance::Unknown => {
+            println!("!! this baseline predates machine fingerprinting, so its origin is unknown.");
+            println!("!! Treating it as unverified: the table below is ORIENTATION ONLY. Re-save");
+            println!("!! it with `--save --local` on the machine you intend to gate with.\n");
+        }
+    }
     let base_calib = baseline.get("_calib").copied().unwrap_or(calib);
     let scale = base_calib / calib;
     println!("calibration: baseline {base_calib:.0} ns vs current {calib:.0} ns → scale ×{scale:.3} (clock-normalised)\n");
@@ -285,6 +330,21 @@ fn main() {
     }
 
     let pct = (threshold * 100.0) as i64;
+    // A regression is a claim that THIS code got slower. Against a baseline from another machine
+    // (or one with no fingerprint at all) the same table is a claim about the hardware, so the
+    // run reports what it saw and stops there. Everything above still prints: orientation is
+    // useful, a verdict would be a fabrication.
+    if !prov.may_judge() {
+        if !regressed.is_empty() {
+            println!("
+{} op(s) are over +{pct}% against that baseline — NOT reported as a", regressed.len());
+            println!("regression, because the comparison is not between two runs of this machine:");
+            for (n, d) in &regressed { println!("  {n}: {:+.1}%", d * 100.0); }
+        }
+        println!("
+NO VERDICT: baseline provenance is {prov:?}. Re-run with --save here to gate.");
+        return;
+    }
     // ---------------------------------------------------------------- confirm before failing
     //
     // A single timed pass on a shared desktop is a coin flip, and this gate proved it on itself:
