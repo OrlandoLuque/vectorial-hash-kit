@@ -30,15 +30,27 @@ this i7 laptop · the horde's `M` key gained an ADAPTIVE third mode.
 
 **Open, in priority order:**
 
-1. **#153 (new) — the policy observes two axes of a three-axis surface.** `Hints::query_extent`
-   exists; `observed()` does not report extent and `rebuild_query_ratio` cannot express it. The
-   fix is to record the mean cull extent in `note_cull` (the shapes already pass through it) and
-   make the grid rule read extent relative to cell size. Do NOT retune the scalar first — a better
-   value for a rule that is missing an axis is still missing an axis.
+1. ~~**#153 — the policy observes two axes of a three-axis surface.**~~ **DONE, and the axis was
+   not the one it looked like.** The extent was already observed (`note_cull` has kept an EMA of
+   it since it was written, to size grid cells); what was missing was the *rule*. And extent is
+   only a proxy: `examples/extent_axis` sweeps two densities 4× apart, whose predictions disagree
+   — if radius decides they flip in the same column, if expected *points per query* decides they
+   flip at the same points and therefore at different radii. Measured **24 / 16** at **8.63 /
+   10.23** points. `Thresholds::grid_min_hits` (default 9.0) is the new veto, in both twins, with
+   a test that drives one workload at two radii and is verified failing with the veto disabled.
+   Known weakness, documented at the field: density comes from the *declared world volume*, so a
+   thin slab in a big box reads sparser than it is — safe direction here, still an error;
+   `MortonGrid3::occupancy` is the honest estimator and only exists while a grid is live.
 2. **#149 — close the 0.70×**: detector lag plus the migration's own rebuild (shadow-build and
    atomic swap, which is R2's §2.4 pattern in miniature).
 3. **#152 — `rebuild_query_ratio` is a vertical line through a diagonal frontier.** Measured and
-   left unchanged deliberately; now superseded in scope by #153.
+   left unchanged deliberately; superseded in scope by #153, which added the missing axis rather
+   than retuning the scalar. The scalar is still worth re-deriving *now that the veto exists* —
+   the two rules interact, and 0.2 was fitted while the grid could be chosen for queries that
+   found nothing.
+4. **#154 (new) — density from `occupancy()` rather than from the declared world.** The one
+   known inaccuracy in `grid_min_hits`. Needs a density estimate available on every backend, not
+   only the grid: sampling the keep-tree's leaf boxes is the obvious candidate and is unmeasured.
 4. **Re-measure on the main machine when it returns.** Everything above was measured on the i7
    laptop with the main disk attached externally; `calibrations/` exists so the two can be
    compared rather than argued about.

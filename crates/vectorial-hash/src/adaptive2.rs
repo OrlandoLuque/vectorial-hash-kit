@@ -425,9 +425,26 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
         // Query INTENSITY decides, not churn — measured, see `rebuild_query_ratio`. Same
         // widening: once on the grid, stay until the query load drops well under.
         let edge = self.th.rebuild_query_ratio * if cur == Backend::Grid { 1.0 - m } else { 1.0 + m };
-        if self.q_per_item > edge { return Backend::Grid; }
+        // ...and query EXTENT vetoes it, exactly as in 3D — see `Thresholds::grid_min_hits`. The
+        // only difference is that a query sweeps an AREA here, so the same threshold in "points a
+        // query is expected to find" corresponds to a quite different radius.
+        let hits_edge = self.th.grid_min_hits * if cur == Backend::Grid { 1.0 - m } else { 1.0 + m };
+        if self.q_per_item > edge && self.expected_hits(n) >= hits_edge { return Backend::Grid; }
         Backend::KeepTree
     }
+
+    /// How many points a typical observed cull is expected to return. The 2D twin of
+    /// [`AdaptiveIndex::expected_hits`](crate::AdaptiveIndex::expected_hits): a disc, not a
+    /// sphere. Infinity until a cull has been seen, so an unknown extent vetoes nothing.
+    pub fn expected_hits(&self, n: f64) -> f64 {
+        let area = self.world.width * self.world.height;
+        if area <= 0.0 || self.q_extent <= 0.0 { return f64::INFINITY; }
+        let r = self.q_extent * 0.5;
+        (n / area) * std::f64::consts::PI * r * r
+    }
+
+    /// The EMA of observed cull extents (the longer side of the query's bounding rectangle).
+    pub fn query_extent(&self) -> f64 { self.q_extent }
 
     fn migrate(&mut self, to: Backend) {
         self.stats.pairs[backend_ix(self.backend())][backend_ix(to)] += 1;
@@ -633,6 +650,14 @@ mod tests {
             }
             ix.tick();
         }
+        // Workload alone can no longer reach the grid at this population: the extent veto
+        // (`grid_min_hits`) is right that 300 items with radius-8 culls do not justify one, and
+        // no query shape at 256^2 would. But `remove` on the grid still has to be tested, and
+        // driving there explicitly is exactly what `migrate_to` exists for — the policy is a
+        // default, not a requirement. `freeze` then holds it there for the duration, which is
+        // the documented use of the pair. The assertion below is unchanged and still fails if
+        // the index is sitting on some other backend.
+        if ix.backend() != want { ix.migrate_to(want); ix.freeze(); }
         assert_eq!(ix.backend(), want, "could not reach {want:?}");
     }
 
@@ -748,7 +773,13 @@ mod tests {
     /// 1.0), so this test drives the variable that actually decides.
     #[test]
     fn query_heavy_workload_switches_to_the_rebuilt_grid() {
-        let th = Thresholds { brute_max: 10, hold_ticks: 2, cooldown: 0, rebuild_query_ratio: 0.1, ..Default::default() };
+        // `grid_min_hits: 0.0` disables the extent veto, and that is the POINT of this test,
+        // not a workaround. 300 items in a 256^2 world with radius-10 culls expect 0.96 hits a
+        // query: no query shape justifies a grid at that population, so with the veto live this
+        // workload can never reach one. This test asserts the OTHER half of the grid rule — that
+        // query load, not churn, is what moves it — and needs the veto out of the way to do it.
+        // The veto itself is covered by `query_extent_vetoes_the_grid_and_wide_queries_restore_it`.
+        let th = Thresholds { brute_max: 10, hold_ticks: 2, cooldown: 0, rebuild_query_ratio: 0.1, grid_min_hits: 0.0, ..Default::default() };
         let mut ix = AdaptiveIndex2::with_thresholds(world(), 8, th);
         let mut all = Vec::new();
         for i in 0..300 { let p = P { p: pt(i) }; all.push(p); ix.insert(p); }

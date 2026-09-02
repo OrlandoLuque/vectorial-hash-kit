@@ -432,6 +432,13 @@ cause — the grid still beats the tree on clustered data at radius 36 and 90.
 Re-run either side: `--example grid_tree_frontier -- radius=8`, or
 `--example pick_a_structure -- n=30000 churn=0.056 queries=0.06 radius=3`.
 
+**The policy learned it.** `Thresholds::grid_min_hits` now vetoes the grid when a typical cull is
+not expected to find much — `examples/extent_axis` puts the crossover at ~9 expected points per
+query, measured at two densities 4× apart so that radius and points-per-query made *different*
+predictions and only one could survive. The horde's own operating point sits far below that, so
+the adaptive mode's preference for the tree here is now something the policy derives rather than
+something it stumbles into.
+
 **Tested, and not only for equivalence.** `adaptive_mode_matches_the_others_and_actually_switches`
 checks the answers against the tree AND against brute force after a real battle — but it also
 asserts the policy moved or at least wanted to. A demo where the switcher silently sat on one

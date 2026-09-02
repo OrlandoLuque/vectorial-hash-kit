@@ -83,15 +83,20 @@
 //! layer, stated fairly: it did not beat the best fixed choice, it cost ~38 % more than one —
 //! and it cost 2.7x *less* than the fixed choice a reasonable person might have made instead.
 //!
-//! **`rebuild_query_ratio` is fitted at one query extent, and that is its real limitation.** The
-//! table it comes from was swept at radius 36 — one grid cell wide, the extent most flattering to
-//! a grid — where the grid wins every cell. At radius 8 the same table flips to the tree almost
-//! everywhere. So the threshold is not merely "a vertical line through a diagonal frontier"
-//! (#152); the frontier it cuts is a **surface in three axes** (churn x query load x query
-//! extent) and the policy observes only two of them. [`Hints::query_extent`] exists and
-//! [`AdaptiveIndex::observed`] does not report it. That is the honest next move, and it is why
-//! the horde -- whose commonest cull has radius 3 -- is right to prefer the tree while the plane
-//! says grid.
+//! **The grid rule reads two quantities, because one was not enough.** `rebuild_query_ratio` was
+//! fitted against a table swept at radius 36 — one grid cell wide, i.e. a value taken from the
+//! grid arm itself — where the grid wins all 42 cells. At radius 8 the same table flips to the
+//! tree in 34 of them. The frontier is a **surface in three axes** (churn x query load x query
+//! extent) and the policy was reading two.
+//!
+//! Extent turned out to be a proxy for the thing that decides. `examples/extent_axis` sweeps two
+//! densities 4x apart, which is what makes it a test: if radius decides they flip in the same
+//! column, and if expected *points per query* decides they flip at the same points and therefore
+//! at different radii. Measured: radius **24** and **16**, at **8.63** and **10.23** points per
+//! query. So [`Thresholds::grid_min_hits`] thresholds `density x query volume`, and the mechanism
+//! it encodes is that a grid pays a hash lookup per cell whether the cells hold anything or not,
+//! while a tree prunes empty space for free. This is why the horde — whose commonest cull has
+//! radius 3 — is right to prefer the tree while the two-axis rule said grid.
 //!
 //! **That row first read 1.03x, and the correction is the more useful part.** The example ran
 //! each arm once, to completion, in a fixed order; five runs of it gave 1.03, 1.36, 1.47, 1.67,
@@ -278,6 +283,33 @@ pub struct Thresholds {
     /// always keeps. That corner is a known, bounded loss of at most ~1.13×, and closing it
     /// would mean a fifth backend whose only difference is a rebuild.
     pub rebuild_query_ratio: f64,
+    /// The other half of the grid rule: how much a query must be expected to FIND before a grid
+    /// is worth having. Below this, take the tree.
+    ///
+    /// `rebuild_query_ratio` alone reads query *load* and is blind to query *extent*, and the
+    /// table it was fitted against was swept at one radius — one cell width, a value derived from
+    /// the grid arm itself (`docs/MEASURING.md` § 8i). Adding extent as an axis showed the grid
+    /// losing every cell at radius 8 and winning every cell at radius 36, at identical churn and
+    /// query load.
+    ///
+    /// **Extent is not the predictor, though; it is a proxy.** `examples/extent_axis` sweeps two
+    /// densities 4x apart, whose predictions disagree: if radius decides, they flip in the same
+    /// column; if expected *points per query* decides, they flip at the same points/query and
+    /// therefore at different radii. Measured: radius **24** and **16**, at **8.63** and **10.23**
+    /// points per query — 1.5x apart in radius, 1.19x apart in points. The mechanism is that a
+    /// grid pays its hash lookups whether or not the cells hold anything, while a tree prunes
+    /// empty space for free, so the quantity to threshold is `density x query volume`.
+    ///
+    /// Default 9.0, between the two measured crossovers.
+    ///
+    /// **Its known weakness, stated because it decides where this is safe:** density comes from
+    /// the declared world volume, so data occupying a thin slice of a large box (the horde's
+    /// carpet — 30k units across 1800x72x1800 declared as a cube) reads far sparser than it is.
+    /// That errs toward the tree, which is the safe direction here but is still an error;
+    /// [`MortonGrid3::occupancy`](crate::MortonGrid3::occupancy) is the honest estimator and is
+    /// only available while a grid is live. Set to 0.0 to disable the veto entirely and get the
+    /// pre-2026-09-02 behaviour.
+    pub grid_min_hits: f64,
     /// **How many point-tests a linear scan may cost before an index is worth maintaining**,
     /// expressed as a multiple of the per-item maintenance cost. This is the variable
     /// `brute_max` alone was missing.
@@ -366,6 +398,9 @@ impl Default for Thresholds {
             // machine. Was 0.1, which switched to the grid roughly twice as early as the
             // measurement supports.
             rebuild_query_ratio: 0.2,
+            // Measured, `examples/extent_axis`: the tree/grid crossover sits at 8.63 and 10.23
+            // expected points per query at two densities 4x apart.
+            grid_min_hits: 9.0,
             scan_budget: 60.0,
             static_ticks: crate::advisor::STATIC_TICKS,
             margin: 0.25,
@@ -401,6 +436,7 @@ impl Thresholds {
                 "brute_max" => if let Ok(x) = v.parse() { t.brute_max = x },
                 "high_churn" => if let Ok(x) = v.parse() { t.high_churn = x },
                 "rebuild_query_ratio" => if let Ok(x) = v.parse() { t.rebuild_query_ratio = x },
+                "grid_min_hits" => if let Ok(x) = v.parse() { t.grid_min_hits = x },
                 "scan_budget" => if let Ok(x) = v.parse() { t.scan_budget = x },
                 "static_ticks" => if let Ok(x) = v.parse() { t.static_ticks = x },
                 "margin" => if let Ok(x) = v.parse() { t.margin = x },
@@ -425,10 +461,10 @@ impl Thresholds {
     pub fn to_text(&self) -> String {
         format!(
             "# vectorial-hash adaptive-index calibration\n\
-             brute_max = {}\nhigh_churn = {}\nrebuild_query_ratio = {}\nscan_budget = {}\n\
+             brute_max = {}\nhigh_churn = {}\nrebuild_query_ratio = {}\nscan_budget = {}\ngrid_min_hits = {}\n\
              static_ticks = {}\nmargin = {}\nhold_ticks = {}\ncooldown = {}\n\
              decisive_factor = {}\ndetector_alpha = {}\nwarm_start = {}\n",
-            self.brute_max, self.high_churn, self.rebuild_query_ratio, self.scan_budget,
+            self.brute_max, self.high_churn, self.rebuild_query_ratio, self.scan_budget, self.grid_min_hits,
             self.static_ticks, self.margin, self.hold_ticks, self.cooldown, self.decisive_factor,
             self.detector_alpha, self.warm_start)
     }
@@ -1096,9 +1132,33 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
         // Query INTENSITY decides, not churn — measured, see `rebuild_query_ratio`. Same
         // widening: once on the grid, stay until the query load drops well under.
         let edge = self.th.rebuild_query_ratio * if cur == Backend::Grid { 1.0 - m } else { 1.0 + m };
-        if self.q_per_item > edge { return Backend::Grid; }
+        // ...and query EXTENT vetoes it: a grid is only worth its lookups when the queries find
+        // something. See `grid_min_hits` for the measurement, and for why the quantity is expected
+        // hits rather than the radius that stands in for it.
+        let hits_edge = self.th.grid_min_hits * if cur == Backend::Grid { 1.0 - m } else { 1.0 + m };
+        if self.q_per_item > edge && self.expected_hits(n) >= hits_edge { return Backend::Grid; }
         Backend::KeepTree
     }
+
+    /// How many points a typical observed cull is expected to return, from the density implied by
+    /// `n` in the declared world and the EMA of observed query extents.
+    ///
+    /// Returns infinity when no cull has been seen yet (or the world is degenerate): an unknown
+    /// extent must not veto anything, so the rule falls back to exactly its pre-extent behaviour
+    /// rather than to a guess. A k-NN-only caller therefore never trips it.
+    pub fn expected_hits(&self, n: f64) -> f64 {
+        let w = &self.world;
+        let vol = w.w * w.h * w.d;
+        if vol <= 0.0 || self.q_extent <= 0.0 { return f64::INFINITY; }
+        let r = self.q_extent * 0.5;
+        (n / vol) * (4.0 / 3.0) * std::f64::consts::PI * r * r * r
+    }
+
+    /// The EMA of observed cull extents (the largest side of the query's bounding box), 0 until
+    /// the first cull. Exposed for the same reason [`observed`](Self::observed) is: a caller
+    /// driving the switch themselves needs the policy's whole input, and this was the input the
+    /// policy itself was not reading.
+    pub fn query_extent(&self) -> f64 { self.q_extent }
 
     /// How many times the policy has changed backend. A migration is the one event a warm
     /// start affects, so any claim about it divides by this rather than by frames.
@@ -1315,6 +1375,14 @@ mod tests {
             }
             ix.tick();
         }
+        // Workload alone can no longer reach the grid at this population: the extent veto
+        // (`grid_min_hits`) is right that 300 items with radius-8 culls do not justify one, and
+        // no query shape at 256^3 would. But `remove` on the grid still has to be tested, and
+        // driving there explicitly is exactly what `migrate_to` exists for — the policy is a
+        // default, not a requirement. `freeze` then holds it there for the duration, which is
+        // the documented use of the pair. The assertion below is unchanged and still fails if
+        // the index is sitting on some other backend.
+        if ix.backend() != want { ix.migrate_to(want); ix.freeze(); }
         assert_eq!(ix.backend(), want, "could not reach {want:?}");
     }
 
@@ -1428,13 +1496,57 @@ mod tests {
         assert_matches_brute(&mut ix, &all);
     }
 
+    /// ★ The extent veto, in BOTH directions from one workload.
+    ///
+    /// The two arms differ in exactly one thing — the radius of the culls — and everything else
+    /// (population, world, churn, query COUNT, thresholds) is identical. That is what makes it a
+    /// test of `grid_min_hits` rather than a demonstration: if the veto did nothing, both arms
+    /// would land on the grid, and if it vetoed unconditionally, neither would.
+    ///
+    /// The numbers come from `examples/extent_axis`, not from tuning until it passed: 2000 items
+    /// in a 256^3 world is a density of 1.19e-4, so radius 6 expects **0.11** points a query and
+    /// radius 40 expects **31.9**, either side of the measured 8.63-10.23 crossover.
+    #[test]
+    fn query_extent_vetoes_the_grid_and_wide_queries_restore_it() {
+        let run = |r: f64| {
+            let th = Thresholds { brute_max: 10, hold_ticks: 2, cooldown: 0, rebuild_query_ratio: 0.1, ..Default::default() };
+            let mut ix = AdaptiveIndex::with_thresholds(world(), 8, th);
+            let mut all = Vec::new();
+            for i in 0..2000 { let p = P { p: pt(i) }; all.push(p); ix.insert(p); }
+            for t in 0..80 {
+                for k in 0..2000 { mv(&mut ix, &mut all, k, scatter(t, k)); }
+                for k in 0..800 { let _ = ix.cull(&Sphere3::new(k as f64 % 250.0, 40.0, 40.0, r)); }
+                ix.tick();
+            }
+            (ix.backend(), ix.expected_hits(ix.len() as f64), ix.queries_per_item())
+        };
+        let (narrow, hits_n, q_n) = run(6.0);
+        let (wide, hits_w, q_w) = run(40.0);
+
+        // Both arms must clear the OTHER half of the rule, or the narrow arm would be choosing
+        // the tree for a reason that has nothing to do with extent and the test would pass for
+        // the wrong reason.
+        assert!(q_n > 0.3 && q_w > 0.3, "both arms must be query-heavy: {q_n:.3} and {q_w:.3}");
+        assert!(hits_n < 1.0, "narrow arm should expect almost nothing: {hits_n:.3}");
+        assert!(hits_w > 20.0, "wide arm should expect plenty: {hits_w:.3}");
+
+        assert_eq!(narrow, Backend::KeepTree, "narrow queries find nothing; a grid is not worth its lookups");
+        assert_eq!(wide, Backend::Grid, "wide queries find plenty; the grid should win");
+    }
+
     /// A QUERY-HEAVY workload — roughly one cull per item per tick, the shape SPH has —
     /// is where a rebuilt grid beats keeping the tree. Churn alone never flips it (the
     /// calibration swept both: churn moved keep's margin from 116x to 6.4x but never past
     /// 1.0), so this test drives the variable that actually decides.
     #[test]
     fn query_heavy_workload_switches_to_the_rebuilt_grid() {
-        let th = Thresholds { brute_max: 10, hold_ticks: 2, cooldown: 0, rebuild_query_ratio: 0.1, ..Default::default() };
+        // `grid_min_hits: 0.0` disables the extent veto, and that is the POINT of this test,
+        // not a workaround. 300 items in a 256^3 world with radius-10 culls expect 0.075 hits a
+        // query: no query shape justifies a grid at that population, so with the veto live this
+        // workload can never reach one. This test asserts the OTHER half of the grid rule — that
+        // query load, not churn, is what moves it — and needs the veto out of the way to do it.
+        // The veto itself is covered by `query_extent_vetoes_the_grid_and_wide_queries_restore_it`.
+        let th = Thresholds { brute_max: 10, hold_ticks: 2, cooldown: 0, rebuild_query_ratio: 0.1, grid_min_hits: 0.0, ..Default::default() };
         let mut ix = AdaptiveIndex::with_thresholds(world(), 8, th);
         let mut all = Vec::new();
         for i in 0..300 { let p = P { p: pt(i) }; all.push(p); ix.insert(p); }
@@ -1499,6 +1611,7 @@ mod tests {
             brute_max: 777, high_churn: 0.42, rebuild_query_ratio: 0.37, scan_budget: 42.0,
             static_ticks: 13, margin: 0.11, hold_ticks: 9, cooldown: 5, decisive_factor: 9.0,
             detector_alpha: 0.33,
+            grid_min_hits: 3.5,
             warm_start: true,
         };
         let parsed = Thresholds::parse(&(th.to_text() + "future_key = 12\n# a comment\n"));
@@ -1510,6 +1623,7 @@ mod tests {
         assert!((parsed.scan_budget - th.scan_budget).abs() < 1e-9);
         assert!((parsed.decisive_factor - th.decisive_factor).abs() < 1e-9);
         assert!((parsed.detector_alpha - th.detector_alpha).abs() < 1e-9);
+        assert!((parsed.grid_min_hits - th.grid_min_hits).abs() < 1e-9);
         assert_eq!(parsed.static_ticks, th.static_ticks);
         assert!((parsed.margin - th.margin).abs() < 1e-9);
         assert_eq!(parsed.hold_ticks, th.hold_ticks);
@@ -1521,7 +1635,8 @@ mod tests {
             && (th.rebuild_query_ratio - d.rebuild_query_ratio).abs() > 1e-9
             && (th.scan_budget - d.scan_budget).abs() > 1e-9
             && (th.decisive_factor - d.decisive_factor).abs() > 1e-9
-            && (th.detector_alpha - d.detector_alpha).abs() > 1e-9,
+            && (th.detector_alpha - d.detector_alpha).abs() > 1e-9
+            && (th.grid_min_hits - d.grid_min_hits).abs() > 1e-9,
             "the test values must differ from the defaults or this proves nothing");
     }
 
