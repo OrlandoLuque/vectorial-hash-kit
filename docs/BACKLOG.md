@@ -41,6 +41,11 @@ this i7 laptop · the horde's `M` key gained an ADAPTIVE third mode.
    Known weakness, documented at the field: density comes from the *declared world volume*, so a
    thin slab in a big box reads sparser than it is — safe direction here, still an error;
    `MortonGrid3::occupancy` is the honest estimator and only exists while a grid is live.
+   **Currently inert on every bench we have.** `VH_CALIBRATION` with `grid_min_hits = 0.0` runs
+   the old policy from the same binary: `adaptive_vs_pinned` picks the identical sequence either
+   way, and the horde's switch stats are unchanged. `rebuild_query_ratio` refuses the grid first
+   in both. The case it would bite is heavy query load with *small* query volumes (SPH-shaped),
+   and we do not have a bench there — worth building before trusting the threshold in the field.
 2. **#149 — close the 0.70×**: detector lag plus the migration's own rebuild (shadow-build and
    atomic swap, which is R2's §2.4 pattern in miniature).
 3. **#152 — `rebuild_query_ratio` is a vertical line through a diagonal frontier.** Measured and

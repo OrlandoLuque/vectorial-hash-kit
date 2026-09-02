@@ -98,6 +98,17 @@
 //! while a tree prunes empty space for free. This is why the horde — whose commonest cull has
 //! radius 3 — is right to prefer the tree while the two-axis rule said grid.
 //!
+//! **And on both benches we have, the new rule is currently inert.** `VH_CALIBRATION` with
+//! `grid_min_hits = 0.0` runs the same binary under the old policy, and `adaptive_vs_pinned`
+//! chooses the identical sequence either way (`[Brute, KeepTree]`); the horde's adaptive arm
+//! reports the same 3 switches and 29 near-misses before and after. `rebuild_query_ratio` refuses
+//! the grid first in both, so the veto never becomes the binding constraint. It is a correct rule
+//! that our own workloads do not exercise — which is worth stating plainly, because "I added a
+//! rule and the number improved" was available here and would have been wrong: the pinned Grid
+//! arm read 2 617 ms and 3 293 ms on two runs of the same binary, a 26 % spread that swamps
+//! anything the policy did. The workload that WOULD exercise it is high query load with small
+//! query volumes — SPH-shaped — and none of our benches sits there.
+//!
 //! **That row first read 1.03x, and the correction is the more useful part.** The example ran
 //! each arm once, to completion, in a fixed order; five runs of it gave 1.03, 1.36, 1.47, 1.67,
 //! 1.63, and 1.03 is simply the luckiest draw. A 900-frame battle is long enough for the machine
