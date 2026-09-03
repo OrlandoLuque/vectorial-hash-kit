@@ -27,15 +27,34 @@ sweeping with rings that find nothing — radius-300 costs the tree **325** poin
 
 **Open, in priority order:**
 
-1. **#158 — re-derive `rebuild_query_ratio` now that `grid_min_hits` is live.** The two rules
+1. **★ #159 (new) — a DEMO whose load actually varies.** Checked 2026-09-03: **no demo exercises
+   what `AdaptiveIndex` is for.** Only two use it — `fluid_wgpu`, whose workload never changes
+   character, and the horde, which does change but whose adaptive arm goes `Brute→KeepTree` and
+   never reaches `Grid` or `Static` (3 switches, 29 near-misses, the same sequence every run). The
+   one varying-load workload in the repo is `examples/adaptive_vs_pinned`, headless and synthetic,
+   and it reports the index at **0.68–0.70×** the best pinned choice.
+
+   Build one the viewer drives: population (crosses `brute_max`), query load (crosses
+   `rebuild_query_ratio`), freeze/thaw (crosses `static_ticks`), query radius (crosses
+   `grid_min_hits`) — with a HUD showing the live backend, switches and near-misses,
+   `observed()`, `expected_hits` against the actual mean hit count, and a `C`-style bake-off
+   against all four pinned backends so you can see whether the choice was *right*.
+
+   Why a demo and not another bench: the 0.70 × loss is attributed to detector lag plus the
+   migration's own rebuild (#149), and **that attribution has never been watched happening**.
+   Flapping, lag and a plain wrong pick are indistinguishable in a total and obvious on screen.
+   It would also have caught this week's two default changes, which altered real decisions with
+   the whole suite green.
+
+2. **#158 — re-derive `rebuild_query_ratio` now that `grid_min_hits` is live.** The two rules
    interact, and 0.2 was fitted while the grid could still be chosen for queries that found
    nothing. **Timing-sensitive: wants the main desktop**, and #155 now makes any calibration say
    which machine produced it.
-2. **#149 — close the 0.70×**: detector lag plus the migration's own rebuild (shadow-build and
-   atomic swap).
-3. **#98 D\* Lite — the user's call**, unchanged: ~1 ms of a 25 ms frame, only in the moving-goal
+3. **#149 — close the 0.70×**: detector lag plus the migration's own rebuild (shadow-build and
+   atomic swap). #159 is the instrument for it.
+4. **#98 D\* Lite — the user's call**, unchanged: ~1 ms of a 25 ms frame, only in the moving-goal
    mode that is not currently used.
-4. **#83 / #95 need eyes**: `building_tweak` per-model scale, and the touch UI on a device.
+5. **#83 / #95 need eyes**: `building_tweak` per-model scale, and the touch UI on a device.
 
 ## ★ 2026-09-01/02 — cooperative night 10: the adaptive layer, and two of my own numbers
 
