@@ -75,10 +75,15 @@ sweeping with rings that find nothing — radius-300 costs the tree **325** poin
    `k` whatever the density**. Now pinned by a test and documented at the field. The remaining
    asymmetry is fine and written down: a *mixed* caller's `q_per_item` counts k-NN while its hit
    estimate averages culls only — different rules, different economics.
-6. **#160 — publish `adaptive_lab` to the web + the mobile overlay.** It is the best explainer of
-   the whole adaptive layer and it is native-only. Eight wgpu demos for `build-wgpu-web.sh` then,
-   plus a `check-web-fresh.sh` pass; the four sliders need ± pairs on `mobile-controls.js` because
-   the on-canvas ones are mouse-driven.
+6. ~~**#160 — publish `adaptive_lab` to the web + the mobile overlay.**~~ **DONE.** Eighth wgpu
+   demo in `build-wgpu-web.sh`, registered in `check-web-fresh.sh`, index card, and touch controls
+   built from the demo's real key handler (the four ± pairs grouped so the auto-fill grid cannot
+   split them). The freshness check earned its keep on the way: it caught `fluid_wgpu` **and**
+   `horde_wgpu` as stale, because tonight's edits touched `ui2d.rs` and `horde_sim.rs` — neither of
+   which is the binary the site serves, and neither of which I would have thought to rebuild.
+   `shot.rs` gained `$SHOT_W` (downscale before writing) because the PNG encoder stores
+   uncompressed, so a full-window shot is megabytes; the thumbnail is 174 KB at 260 px, in line
+   with the largest existing one.
 7. ~~**#163 — a policy trace (`$LAB_TRACE`).**~~ **DONE.** One CSV row per step; `held` against
    `wanted` is the lag. `awk -F, 'NR>1 && $2!=$3' lab.csv | wc -l` reads **102**, which makes
    three independent counts of one event agree — the lab's `LagStats`, the library's

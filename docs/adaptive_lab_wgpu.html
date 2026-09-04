@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>adaptive index lab — vectorial-hash</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #05070d; color: #cdd2dc;
+      font-family: system-ui, -apple-system, sans-serif; overflow: hidden; }
+    #msg { position: fixed; inset: 0; z-index: 10; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; text-align: center; padding: 2rem; gap: .5rem; }
+    #msg a { color: #7ab8ff; }
+    #msg .small { color: #8b93a3; font-size: .85rem; max-width: 34rem; }
+    canvas { display: block; touch-action: none; }
+  </style>
+</head>
+<body>
+  <div id="msg">
+    <div>Starting the lab…</div>
+    <div class="small">Four sliders, one per threshold the adaptive index reasons about, and a
+      <b>timeline strip</b> along the bottom coloured by whichever structure was live each step —
+      grey brute scan, blue keep-tree, amber grid, green build-once. It opens on
+      <b>autopilot</b> (<b>A</b> hands you the controls), which walks five regimes so the strip
+      draws the whole argument. Watch the fourth band: same population, same query load, only the
+      <b>radius</b> changes, and the policy leaves the grid because its queries stop finding
+      anything. <b>C</b> races every structure pinned, so you can see whether the choice was
+      <i>right</i> and not just what it was.</div>
+  </div>
+  <script type="module">
+    import { setupMobileControls } from './mobile-controls.js';
+    // The on-canvas sliders are mouse-driven, so touch gets the keyboard pairs instead. Each
+    // pair is one grid item (minus first) so the auto-fill layout cannot split it — the lesson
+    // from the 2026-08-03 device session.
+    const MOBILE_KEYS = [
+      { label: 'Auto', code: 'KeyA', key: 'a', keyCode: 65, cycle: [{ name: 'on' }, { name: 'manual' }] },
+      { label: 'Freeze', code: 'KeyF', key: 'f', keyCode: 70, cycle: [{ name: 'moving' }, { name: 'frozen', cost: 0.2 }] },
+      { label: 'Pause', code: 'KeyP', key: 'p', keyCode: 80, cycle: [{ name: 'running' }, { name: 'paused' }] },
+      { label: 'Race', code: 'KeyC', key: 'c', keyCode: 67, cost: 0.9 },
+      { label: 'Reset', code: 'KeyR', key: 'r', keyCode: 82 },
+      { slider: { steps: 17, start: 2, fmt: i => Math.round(8 * Math.pow(20000 / 8, i / 16)) },
+        group: 'pop', label: 'Pop −', code: 'BracketLeft', key: '[', keyCode: 219, cost: 0.15 },
+      { group: 'pop', label: 'Pop +', code: 'BracketRight', key: ']', keyCode: 221, cost: 0.85 },
+      { slider: { steps: 17, start: 3, fmt: i => (i * 0.12).toFixed(2) },
+        group: 'q', label: 'Queries −', code: 'Comma', key: ',', keyCode: 188, cost: 0.15 },
+      { group: 'q', label: 'Queries +', code: 'Period', key: '.', keyCode: 190, cost: 0.85 },
+      { slider: { steps: 17, start: 3, fmt: i => Math.round(2 + i * 7.1) },
+        group: 'r', label: 'Radius −', code: 'Minus', key: '-', keyCode: 189, cost: 0.15 },
+      { group: 'r', label: 'Radius +', code: 'Equal', key: '=', keyCode: 187, cost: 0.85 },
+      { slider: { steps: 17, start: 8, fmt: i => Math.round(i * 6.25) + '%' },
+        group: 'churn', label: 'Churn −', code: 'Semicolon', key: ';', keyCode: 186, cost: 0.15 },
+      { group: 'churn', label: 'Churn +', code: 'Quote', key: "'", keyCode: 222, cost: 0.85 },
+    ];
+    const msg = document.getElementById('msg');
+    if (!navigator.gpu) {
+      msg.innerHTML = '<div>This demo needs <b>WebGPU</b>.</div>' +
+        '<div class="small">Open it in a recent <b>Chrome</b> or <b>Edge</b> (or Firefox Nightly with WebGPU enabled). ' +
+        'Meanwhile the other demos on the <a href="./index.html">index</a> run anywhere.</div>';
+    } else {
+      // Same shim as the other wgpu shells: drop requested limits the adapter doesn't
+      // advertise (spec churn, e.g. maxInterStageShaderComponents).
+      const _requestDevice = GPUAdapter.prototype.requestDevice;
+      GPUAdapter.prototype.requestDevice = function (desc) {
+        if (desc && desc.requiredLimits) {
+          for (const key of Object.keys(desc.requiredLimits)) {
+            if (!(key in this.limits)) delete desc.requiredLimits[key];
+          }
+        }
+        return _requestDevice.call(this, desc);
+      };
+      import('./adaptive/adaptive_lab_wgpu.js')
+        .then(m => m.default())
+        .then(() => { setTimeout(() => msg.remove(), 1600); setupMobileControls({ title: 'Adaptive lab', keys: MOBILE_KEYS }); })
+        .catch(e => { msg.innerHTML = '<div>Failed to start.</div><div class="small">' + e + '</div>'; console.error(e); });
+    }
+  </script>
+</body>
+</html>

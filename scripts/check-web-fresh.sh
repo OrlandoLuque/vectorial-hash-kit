@@ -26,6 +26,7 @@ declare -A DEPS=(
   [docs/siege.wasm]="crates/vectorial-hash-demos/src/bin/siege.rs crates/vectorial-hash-demos/src/siege_sim.rs"
   [docs/wgpu/siege_wgpu_bg.wasm]="crates/vectorial-hash-demos/src/bin/siege_wgpu.rs crates/vectorial-hash-demos/src/siege_sim.rs"
   [docs/horde/horde_wgpu_bg.wasm]="crates/vectorial-hash-demos/src/bin/horde_wgpu.rs crates/vectorial-hash-demos/src/horde_sim.rs"
+  [docs/adaptive/adaptive_lab_wgpu_bg.wasm]="crates/vectorial-hash-demos/src/bin/adaptive_lab_wgpu.rs crates/vectorial-hash-demos/src/adaptive_lab.rs crates/vectorial-hash-demos/src/ui2d.rs"
   [docs/formations/formations_wgpu_bg.wasm]="crates/vectorial-hash-demos/src/bin/formations_wgpu.rs crates/vectorial-hash-demos/src/formations_sim.rs"
   [docs/fluid/fluid_wgpu_bg.wasm]="crates/vectorial-hash-demos/src/bin/fluid_wgpu.rs"
   [docs/pointcloud/pointcloud_wgpu_bg.wasm]="crates/vectorial-hash-demos/src/bin/pointcloud_wgpu.rs"

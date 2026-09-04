@@ -26,6 +26,7 @@ declare -A OUT=(
   [pointcloud_wgpu]=pointcloud
   [stealth_wgpu]=stealth
   [gpu_storm]=gpu
+  [adaptive_lab_wgpu]=adaptive
 )
 
 BINS=("$@")

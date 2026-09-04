@@ -42,6 +42,10 @@ pub struct Shot {
 impl Shot {
     /// Read `$<PREFIX>_SHOT` (the output path) and `$<PREFIX>_SHOT_AFTER` (frames to wait,
     /// default 90). Returns `None` when the demo is running normally.
+    ///
+    /// `$SHOT_W` (not prefixed — it applies to whichever demo is shooting) downscales the result
+    /// before writing, for a web thumbnail: the encoder stores uncompressed, so a full window is
+    /// megabytes.
     pub fn from_env(prefix: &str) -> Option<Shot> {
         let path = std::env::var(format!("{prefix}_SHOT")).ok()?;
         let after = std::env::var(format!("{prefix}_SHOT_AFTER")).ok()
@@ -140,6 +144,27 @@ impl Target {
                         }
                         drop(data);
                         buf.unmap();
+                        // `$<PREFIX>_SHOT_W` downscales before writing. The PNG encoder here
+                        // stores raw deflate blocks (no compression — the right trade for a frame
+                        // a developer looks at once), so a full-window shot is megabytes and
+                        // unusable as a web thumbnail. Nearest-neighbour is enough: this is a
+                        // thumbnail, and a box filter would only make dark UI text mushier.
+                        let (w, h, rgba) = match std::env::var("SHOT_W").ok().and_then(|s| s.parse::<u32>().ok()) {
+                            Some(tw) if tw > 0 && tw < w => {
+                                let th = (h as f64 * tw as f64 / w as f64).round().max(1.0) as u32;
+                                let mut out = Vec::with_capacity((tw * th * 4) as usize);
+                                for y in 0..th {
+                                    let sy = (y as u64 * h as u64 / th as u64) as usize;
+                                    for x in 0..tw {
+                                        let sx = (x as u64 * w as u64 / tw as u64) as usize;
+                                        let i = (sy * w as usize + sx) * 4;
+                                        out.extend_from_slice(&rgba[i..i + 4]);
+                                    }
+                                }
+                                (tw, th, out)
+                            }
+                            _ => (w, h, rgba),
+                        };
                         match std::fs::write(&path, crate::png::encode_rgba(w, h, &rgba)) {
                             Ok(()) => println!("shot -> {path} ({w}x{h})"),
                             Err(e) => eprintln!("shot: cannot write {path}: {e}"),

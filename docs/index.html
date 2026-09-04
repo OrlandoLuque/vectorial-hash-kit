@@ -120,6 +120,19 @@
       cross-checked. This is where the median-split <b>KdTree3</b> earns its keep. Needs <b>WebGPU</b>.</span>
       </div>
     </a>
+    <a class="card" href="adaptive_lab_wgpu.html">
+      <img class="thumb" src="shots/adaptive_lab_wgpu.png" alt="Thousands of dots coloured by how many queries found them, four sliders, and a strip along the bottom coloured by which structure was live" loading="lazy">
+      <div class="body">
+      <span class="tag">wgpu &middot; WebGPU &middot; interactive</span>
+      <h2>Adaptive index lab &rarr;</h2>
+      <span class="d"><b>Four sliders, one per threshold</b>, and a <b>timeline strip</b> along the bottom
+      coloured by whichever structure was live each step &mdash; grey brute scan, blue keep-tree, amber
+      grid, green build-once. The index picks for itself and you can watch it change its mind.
+      Look at the fourth band: same population, same query load, only the <b>radius</b> changes, and it
+      leaves the grid because the queries stop finding anything. <b>C</b> races every structure pinned,
+      so you see whether the choice was <i>right</i> and not just what it was. Needs <b>WebGPU</b>.</span>
+      </div>
+    </a>
     <a class="card" href="fluid_wgpu.html">
       <img class="thumb" src="shots/fluid_wgpu.jpg" alt="A 2D fluid of thousands of droplets settling in a tank, with per-phase timing bars" loading="lazy">
       <div class="body">
