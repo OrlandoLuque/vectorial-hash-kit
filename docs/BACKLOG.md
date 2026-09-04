@@ -27,14 +27,16 @@ sweeping with rings that find nothing — radius-300 costs the tree **325** poin
 
 **Open, in priority order:**
 
-1. **★ #161 — use `adaptive_lab` to actually close #149.** The 0.70x is *attributed* to detector
-   lag plus the migration's own rebuild, and that attribution has never been measured — which is
-   why #159 was built. The lab can now compare `backend()` against `recommended()` every step and
-   count how long the policy WANTS a backend before hysteresis lets it move, and time the
-   migration apart from the steps around it. The frozen act already showed a **120-tick cooldown**
-   holding a wanted migration; what is missing is its price. Then decide whether the shadow-build
-   and atomic swap of #149 is worth building, or whether the loss is mostly hysteresis and a
-   cheaper threshold change.
+1. **★ #161 — use `adaptive_lab` to close #149. HALF DONE.** The 0.70x is *attributed* to
+   detector lag plus the migration's own rebuild, and that attribution had never been measured.
+   **The countable half now is**: over 570 steps, **102 (17.9 %)** are spent holding a backend the
+   policy had already rejected, a typical migration waits **20 steps** first, the worst waited
+   **90** — and `$LAB_TRACE` (#163) puts it in a CSV, `held` against `wanted`, one row per step.
+   What is still missing is the **price**: what those 102 steps cost against having migrated at
+   once. That needs the pinned-arm costs **per act**, not only on the final state — the bake-off
+   answers "what would each backend cost *now*", and the lag is spread across five regimes.
+   Then decide whether #149's shadow-build and atomic swap is worth building, or whether the loss
+   is mostly hysteresis and a cheaper threshold change.
 2. ~~**#162 — `expected_hits` never learns from k-NN.**~~ **CLOSED — the premise was wrong.**
    Checked before changing anything: `q_extent` is written by `note_cull` alone, so a k-NN-only
    index leaves it at 0, `expected_hits` takes its *unknown input vetoes nothing* branch, and
@@ -48,10 +50,10 @@ sweeping with rings that find nothing — radius-300 costs the tree **325** poin
    the whole adaptive layer and it is native-only. Eight wgpu demos for `build-wgpu-web.sh` then,
    plus a `check-web-fresh.sh` pass; the four sliders need ± pairs on `mobile-controls.js` because
    the on-canvas ones are mouse-driven.
-4. **#163 — a policy trace (`$LAB_TRACE`).** The strip shows a shape; a CSV of step / backend /
-   recommended / rates / hits / times can be plotted, diffed and attached to a bug report. Makes
-   #161 arithmetic rather than eyeballing. Buffer and write once — a per-step write inside the
-   loop is setup inside the clock (§ 8g).
+4. ~~**#163 — a policy trace (`$LAB_TRACE`).**~~ **DONE.** One CSV row per step; `held` against
+   `wanted` is the lag. `awk -F, 'NR>1 && $2!=$3' lab.csv | wc -l` reads **102**, which makes
+   three independent counts of one event agree — the lab's `LagStats`, the library's
+   `near_misses`, and rows written by a third code path.
 5. ~~**★ #159 — a DEMO whose load actually varies.**~~ **DONE** — `adaptive_lab_wgpu`, see
    [ADAPTIVE_LAB.md](ADAPTIVE_LAB.md). The strip made `grid_min_hits` visible for the first time
    (same population, same query load, only the radius changed, and the policy leaves the grid at
