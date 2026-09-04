@@ -541,3 +541,46 @@ explicit so a second machine cannot silently overwrite the first one's numbers.
 The general form: **a number and the conditions it was taken under are one object.** Splitting
 them — number in the file, conditions in a comment, in a README, or in a colleague's memory — is
 how a measurement becomes a memory (§ 8f) and how a comparison becomes a fabrication.
+
+## 11. A partitioning schedule is a display bug only where the display reads the sample
+
+`adaptive_lab` picked its query centres with a stride plus a per-step offset. That makes
+consecutive frames select **disjoint** sets, and the demo flickered: half the agents were a
+guaranteed hit on even steps and half on odd ones, so two complementary colourings alternated at
+frame rate. The first fix — slide a contiguous window a full width per step — has the same
+property in different clothing (300 queries over 600 agents alternates between the two halves) and
+a test measured **75 % of agents changing state per step** and failed it. The window creeps an
+eighth of a width now; consecutive frames share seven eighths of their centres.
+
+Partitioning is *correct* for spreading work, so the interesting question is not "is this a
+stride?" but **"does anything observable read the sample?"** That was the audit (#165), and it
+came out three different ways:
+
+| site | schedule | verdict |
+| --- | --- | --- |
+| `adaptive_lab` query centres | stride, then full-width window | **bug** — the sample *was* the picture |
+| horde decision buckets, `(frame + id) % decide_n` | partition by construction | **fine, and measured** |
+| siege dragon circling, `id & 1` | not a per-frame sample at all — a permanent per-unit property | fine |
+| `formations_sim`'s `frame % 30` | inside a *test*, choosing when to assert | fine |
+
+The horde's is the one that needed measuring rather than reasoning: position advances every frame
+on cached velocity, so nothing a viewer sees is sampled — but a *fixed phase* could still put a
+class of units in a fixed relationship to another periodic system (tower reload, the commander's
+1 Hz sweep). `examples/horde_bucket_phase` runs six seeded battles with the stride and again with
+the phase scattered through a hash of the id, same rate either way:
+
+| | kills (6 seeds) | mean | standing |
+| --- | --- | ---: | ---: |
+| strided | 210 · 218 · 244 · 184 · 244 · 244 | 224 | 95.0 |
+| hashed | 189 · 208 · 209 · 186 · 231 · 246 | 212 | 94.8 |
+
+**The gap between arms (12 kills) is a fifth of the spread across seeds within either arm (60).**
+No aliasing to find. The outcomes are integers from deterministic arithmetic, so this says the
+same thing on any machine — which is the only kind of claim worth making on a laptop whose timings
+move several percent between runs.
+
+One oddity, recorded rather than smoothed: in the strided arm three of the six seeds produced
+*byte-identical* outcomes (244/95/20381) while the hashed arm gave six distinct ones. Different
+battles converging on the same coarse totals is plausible — the active-front cap quantises how
+much can happen — but it does mean the strided arm's six seeds are worth fewer than six
+independent samples. It does not change the verdict, because both arms show the same spread.

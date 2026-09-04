@@ -735,6 +735,16 @@ pub struct Horde {
     /// Larger = cheaper decide pass, staler steering — movement/heard/swings and
     /// near-wall (combat) units always run at full rate regardless.
     decide_n: u64,
+    /// Scatter the decision phase by a HASH of the id instead of by the id itself.
+    ///
+    /// `(frame + id) % decide_n` is a stride: consecutive frames select disjoint sets, each unit
+    /// re-decides on a fixed phase, and that phase is a linear function of its id. Correct for
+    /// spreading work — and #165 asks whether it ALIASES, because a fixed phase can land a whole
+    /// class of units in a fixed relationship to some other periodic system (tower reload, the
+    /// commander's 1 Hz sweep). Hashing the id breaks any such relationship while keeping the
+    /// same per-unit rate, so the two can be compared on OUTCOMES rather than argued about.
+    /// `$HORDE_DECIDE_HASH=1`.
+    decide_hash: bool,
     pub seed: f64,
     /// Woken-this-frame counter (for HUD/telemetry).
     pub woken_last: usize,
@@ -1150,6 +1160,7 @@ impl Horde {
             game_over: None, run: 1, kills: 0,
             rng, now: 0.0, frame: 0,
             decide_n: std::env::var("HORDE_DECIDE_N").ok().and_then(|s| s.parse().ok()).filter(|&n| n >= 1).unwrap_or(DECIDE_N_DEFAULT),
+            decide_hash: std::env::var("HORDE_DECIDE_HASH").is_ok(),
             seed: fseed, woken_last: 0, dormant_epoch: 1,
             active_cap: std::env::var("HORDE_ACTIVE_CAP").ok().and_then(|s| s.parse().ok())
                 .unwrap_or_else(|| default_active_cap(pop)),
@@ -1635,6 +1646,7 @@ impl Horde {
             let defenders = &self.defenders;
             let frame = self.frame;
             let decide_n = self.decide_n;
+            let decide_hash = self.decide_hash;
             let (units, cx, cz) = (&mut self.units, WORLD / 2.0, WORLD / 2.0);
             let decide_one = |i: usize, z: &mut Zombie| {
                 if !z.alive() { return; }
@@ -1656,7 +1668,14 @@ impl Horde {
                 {
                     let (dx0, dz0) = (z.p.x - cx, z.p.z - cz);
                     let near_combat = (dx0 * dx0 + dz0 * dz0).sqrt() < BASE_R + 60.0;
-                    if !near_combat && (frame + i as u64) % decide_n != 0 { return; } // keep cached vel
+                    // Stride by default; hashed phase under `$HORDE_DECIDE_HASH` so #165 can
+                    // compare outcomes instead of reasoning about aliasing. Same rate either way.
+                    let phase = if decide_hash {
+                        let mut h = i as u64 ^ 0x9E37_79B9_7F4A_7C15;
+                        h ^= h >> 33; h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD); h ^= h >> 29;
+                        h
+                    } else { i as u64 };
+                    if !near_combat && (frame + phase) % decide_n != 0 { return; } // keep cached vel
                 }
                 // Target acquisition near the base: nearest LIVE structure in
                 // reach (k-NN on the static index; venom's 36-wu standoff spit

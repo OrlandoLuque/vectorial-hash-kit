@@ -27,17 +27,16 @@ sweeping with rings that find nothing — radius-300 costs the tree **325** poin
 
 **Open, in priority order:**
 
-0. **★ #165 — audit every per-frame SUBSAMPLE for alternation.** The lab's colour flicker was a
-   *sampling* bug, not a rendering one: query centres strided with a per-step offset change parity
-   every step, so two complementary colourings alternate. The first fix — slide a contiguous
-   window by a full width — was the identical defect in different clothing (300 queries over 600
-   agents alternates between halves), and the test measured **75 % of agents changing hit-state
-   per step** and failed it. Any demo picking a subset per frame can have this: the horde's
-   decision buckets *are* a stride schedule, stealth samples, siege and formations have per-frame
-   subsets. The tell: does the sampled set at *t* overlap the set at *t+1*, or partition it? A
-   partition is right for spreading work and wrong for anything a human watches — and it can alias
-   with the simulation's own periods. Reuse the lab's test shape: run frozen, correlate consecutive
-   frames, refuse to pass on a sample that never moves.
+0. ~~**★ #165 — audit every per-frame SUBSAMPLE for alternation.**~~ **DONE, with one bug and one
+   null result.** The rule that came out of it, in [MEASURING.md](MEASURING.md) § 11: *a
+   partitioning schedule is a display bug only where the display reads the sample.* The lab's
+   query centres were the bug (the sample **was** the picture). The horde's decision buckets
+   partition by construction, but position advances every frame on cached velocity so nothing
+   visible is sampled — and the residual risk, a fixed phase aliasing with another periodic
+   system, was **measured and found absent**: `examples/horde_bucket_phase` runs six seeded
+   battles strided and again with the phase hashed, and the gap between arms (12 kills) is a fifth
+   of the spread across seeds within either arm (60). Siege's `id & 1` is a permanent per-unit
+   property, not a sample; `formations_sim`'s `frame % 30` is inside a test.
 1. **#166 — audit every per-frame unbounded rebuild.** The lab hung for seconds because `resize`
    ran inside the frame (40 → 4 000 is 3 960 inserts in one step). Same shape elsewhere and worth
    checking rather than assuming: the horde's population slider, its `G` scenario switch (terrain +
