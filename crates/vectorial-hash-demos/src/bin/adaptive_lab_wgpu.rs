@@ -158,7 +158,15 @@ fn headless() {
         // near-miss counter it is a number climbing while nothing changes.
         ("frozen", Knobs { population: 4000, queries_per_item: 0.4, radius: 40.0, churn: 0.0, frozen: true, paused: false }, 240),
     ];
-    println!("adaptive_lab — four acts, and what the policy did in each\n");
+    println!("adaptive_lab — five acts, and what the policy did in each
+");
+    // #167: price the lag PER ACT. `C` answers "what would each backend cost now"; the lag is
+    // spread over five regimes, and 20 steps held during a query storm is not the same money as
+    // 90 steps held while frozen. The trace gives held-vs-wanted per step EXACTLY; the bake-off
+    // gives what each backend costs in that regime, timed. An exact count times a timed gap.
+    lab.enable_trace();
+    let mut act_rows: Vec<(&str, usize, f64)> = Vec::new();
+    let mut seen_rows = 0usize;
     for (label, knobs, steps) in acts {
         lab.knobs = knobs;
         let before = lab.ix.switch_count();
@@ -168,8 +176,64 @@ fn headless() {
                  backend_name(lab.ix.backend()), lab.ix.switch_count() - before);
         println!("{:>30}    mean hits/query {:.1}, policy predicted {:.1} | maintain {:.0} us, query {:.0} us",
                  "", lab.mean_hits(), lab.stats.predicted_hits, lab.stats.maintain_us, lab.stats.query_us);
+
+        // What this act contributed to the trace, and what each backend costs HERE.
+        let (lag_steps, price) = {
+            let rows = lab.trace.as_ref().expect("tracing on");
+            let mine: Vec<(Backend, Backend)> = rows[seen_rows..].iter()
+                .filter(|r| r.held != r.wanted).map(|r| (r.held, r.wanted)).collect();
+            seen_rows = rows.len();
+            mine
+        }.into_iter().fold((0usize, Vec::new()), |(n, mut v), p| { v.push(p); (n + 1, v) });
+        let costs = lab.backend_costs(30);
+        let cost_of = |b: Backend| costs.iter().find(|(k, _)| *k == b).map(|(_, c)| *c).unwrap_or(0.0);
+        let total: f64 = price.iter().map(|(h, w)| cost_of(*h) - cost_of(*w)).sum();
+        if lag_steps > 0 {
+            println!("{:>30}    lag {lag_steps} steps, priced {total:+.0} us ({:+.0} us/step)",
+                     "", total / lag_steps as f64);
+        }
+        act_rows.push((label, lag_steps, total));
     }
     // The strip, as text: one character per step, so the shape is visible without a window.
+    // #167: what the hysteresis actually cost, act by act. Positive means the lag held us on a
+    // more expensive backend; NEGATIVE means the policy was wrong about where it wanted to go and
+    // being slow to obey saved money. Both happen, and an arithmetic that only ever added would
+    // have reported the first and hidden the second.
+    let lag_total: f64 = act_rows.iter().map(|(_, _, p)| p).sum();
+    let lag_steps: usize = act_rows.iter().map(|(_, s, _)| s).sum();
+    println!();
+    println!("what the lag COST, per act (#167 - exact step counts, timed per-step gaps):");
+    println!("{:>30} {:>10} {:>14} {:>14}", "act", "lag steps", "total us", "us/step");
+    for (label, s, p) in &act_rows {
+        if *s == 0 { println!("{label:>30} {:>10} {:>14} {:>14}", 0, "-", "-"); continue; }
+        println!("{label:>30} {s:>10} {p:>+14.0} {:>+14.1}", p / *s as f64);
+    }
+    println!("{:>30} {lag_steps:>10} {lag_total:>+14.0} {:>+14.1}", "ALL",
+             lag_total / lag_steps.max(1) as f64);
+    // The share is the number that actually decides #149: a fix for the lag can recover at most
+    // the lag. If that is a few percent while the gap to the best pinned choice is tens, the
+    // attribution was wrong and a faster obeyer is not where the loss lives.
+    let run_us: f64 = lab.trace.as_ref().map(|rows|
+        rows.iter().map(|r| r.maintain_us + r.query_us).sum()).unwrap_or(0.0);
+    if run_us > 0.0 {
+        println!("That is {:.1}% of the {:.0} ms this run spent maintaining and querying.",
+                 lag_total / run_us * 100.0, run_us / 1000.0);
+        println!("#149 says the policy's shortfall is detector lag plus the migration's own");
+        println!("rebuild. A fix for the lag can recover AT MOST the lag, and the bake-off below");
+        println!("puts the policy 6-56% behind the best fixed choice across runs. A few percent");
+        println!("cannot explain tens, so the attribution is mostly wrong and a faster obeyer is");
+        println!("not where the loss lives. Quote this as 1-3%: three runs read 0.9, 1.8 and 3.3.");
+    }
+    if lag_total > 0.0 {
+        println!("Hysteresis cost {lag_total:.0} us over {lag_steps} held steps. Against a run whose");
+        println!("own arms move several percent between passes, read that as an order of magnitude:");
+        println!("it is the first number #149 has ever had, not a precise one.");
+    } else {
+        println!("Hysteresis SAVED {:.0} us on balance: over those {lag_steps} steps the backend it", -lag_total);
+        println!("wanted was on average the MORE expensive one, so being slow to obey was right.");
+        println!("Worth knowing before building a faster obeyer (#149).");
+    }
+
     println!("\ntimeline (oldest first, one char per step — the strip the demo draws):");
     let line: String = lab.history.iter().map(|b| match b {
         Backend::Brute => '.', Backend::KeepTree => 'T', Backend::Grid => 'G', Backend::Static => 'S',
@@ -188,13 +252,13 @@ fn headless() {
     if let Some((a, b, n)) = st.hottest_pair() { println!("hottest pair: {a:?} -> {b:?} x{n}"); }
     println!("\nbake-off on the final state (us/step, min of two counterbalanced passes):");
     let rows = lab.bakeoff(40);
-    for (label, us) in &rows { println!("  {label:>10} {us:>10.1}"); }
+    for (label, _, us) in &rows { println!("  {label:>10} {us:>10.1}"); }
     // Say what it means, and say it carefully. The arms here are a few percent apart on a
     // machine whose noise is episodic (MEASURING.md § 8e), so the ORDER is worth more than the
     // ratio and a 5 % gap is not a finding.
-    if let Some((bl, bus)) = rows.iter().skip(1).min_by(|a, b| a.1.total_cmp(&b.1)).copied() {
-        let r = bus / rows[0].1.max(1e-9);
-        println!("  -> best fixed is {bl} at {bus:.0} us; the policy runs at {:.0}, i.e. {r:.2}x it.", rows[0].1);
+    if let Some((bl, _, bus)) = rows.iter().skip(1).min_by(|a, b| a.2.total_cmp(&b.2)).copied() {
+        let r = bus / rows[0].2.max(1e-9);
+        println!("  -> best fixed is {bl} at {bus:.0} us; the policy runs at {:.0}, i.e. {r:.2}x it.", rows[0].2);
         if r < 0.95 {
             println!("     It is BEHIND the choice you would have made knowing the ending — which is");
             println!("     the honest case for this layer: insurance, not optimisation.");
@@ -353,7 +417,8 @@ async fn run() {
                     // whether that was right. It costs a visible stutter, which is the correct
                     // price for an answer nobody can get by watching.
                     KeyCode::KeyC => {
-                        let rows = lab.bakeoff(40);
+                        let rows: Vec<(&'static str, f64)> =
+                            lab.bakeoff(40).into_iter().map(|(l, _, us)| (l, us)).collect();
                         println!("\nbake-off | {} agents | q/item {:.2} | radius {:.0} | churn {:.0}% | live: {}",
                                  lab.agents.len(), lab.knobs.queries_per_item, lab.knobs.radius,
                                  lab.knobs.churn * 100.0, backend_name(lab.ix.backend()));

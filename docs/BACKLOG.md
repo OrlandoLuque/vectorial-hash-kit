@@ -44,11 +44,14 @@ sweeping with rings that find nothing — radius-300 costs the tree **325** poin
    passability + flow field) and `M` index toggle, siege and formations population sliders. Where
    the work genuinely cannot be spread, say so on screen — a one-frame `REBUILDING` is honest, a
    three-second stall is indistinguishable from a hang, which is exactly how it was reported.
-2. **#167 — bake off PER ACT**, the other half of #161. `C` answers "what would each backend cost
-   *now*"; the lag is spread across five regimes, and 20 steps held during a query storm is not the
-   same price as 90 steps held while frozen. Multiply each act's lag-steps by that act's per-step
-   gap and #149 becomes a decision rather than an assumption. Quote a range: on this laptop the
-   arms move several percent between runs and even the winner changes.
+2. ~~**#167 — bake off PER ACT.**~~ **DONE, and it refutes #149.** Each act now bakes off at its
+   end and the lag is priced against that regime's per-step gaps: **102 held steps, +48 044 µs,
+   which is 1–3 % of the run** (three runs: 0.9 %, 1.8 %, 3.3 %). The policy measures **0.64–0.94×**
+   the best fixed choice — 6–56 % behind. **A fix for the lag can recover at most the lag, and a
+   few percent cannot explain tens**, so #149's premise is mostly wrong and a shadow-build with an
+   atomic swap would buy a couple of percent of a much larger gap. The arithmetic is signed on
+   purpose: holding A while wanting B costs `cost(A) − cost(B)`, negative when the policy was
+   wrong about B, and a sum that only added would have hidden that hysteresis sometimes *saves*.
 3. **#164 — the lab's act table exists twice**, once in `headless` and once in the autopilot, and
    they already differ in shape. Lift it into `adaptive_lab`. Three separate bugs this month have
    been two copies of one table.
@@ -109,8 +112,11 @@ sweeping with rings that find nothing — radius-300 costs the tree **325** poin
    interact, and 0.2 was fitted while the grid could still be chosen for queries that found
    nothing. **Timing-sensitive: wants the main desktop**, and #155 now makes any calibration say
    which machine produced it.
-10. **#149 — close the 0.70×**: detector lag plus the migration's own rebuild (shadow-build and
-   atomic swap). #159 is the instrument for it.
+10. **#149 — close the 0.70×. RE-SCOPED by #167.** The lag it blames is measured at **1–3 % of
+    the run** while the gap is 6–56 %, so the shadow-build and atomic swap are not the fix. What
+    is left to explain is the rest, and the likeliest suspect is unglamorous: the policy picking a
+    backend that is simply not best for that regime — a thresholds question (#158), not a latency
+    one. Do not build the swap until something says the lag is bigger than this.
 11. **#98 D\* Lite — the user's call**, unchanged: ~1 ms of a 25 ms frame, only in the moving-goal
    mode that is not currently used.
 12. **#83 / #95 need eyes**: `building_tweak` per-model scale, and the touch UI on a device.

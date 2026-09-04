@@ -366,7 +366,9 @@ impl Lab {
     /// **Counterbalanced**: the arms run forward and then in reverse, each keeping its minimum,
     /// so a machine that drifts mid-race cannot favour whoever went first. That is
     /// `docs/MEASURING.md` § 8e applied to five arms, the same way `fluid_wgpu`'s bake-off does.
-    pub fn bakeoff(&self, frames: usize) -> Vec<(&'static str, f64)> {
+    /// The `Option<Backend>` is `None` for the live policy and `Some` for each pinned arm, so a
+    /// caller can price a specific backend instead of parsing a label back into one.
+    pub fn bakeoff(&self, frames: usize) -> Vec<(&'static str, Option<Backend>, f64)> {
         let arms: [(&'static str, Option<Backend>); 5] = [
             ("ADAPTIVE", None),
             ("BRUTE", Some(Backend::Brute)),
@@ -386,7 +388,7 @@ impl Lab {
             let us = t.elapsed().as_secs_f64() * 1e6 / frames.max(1) as f64;
             best[i] = best[i].min(us);
         }
-        arms.iter().zip(best).map(|((l, _), us)| (*l, us)).collect()
+        arms.iter().zip(best).map(|((l, b), us)| (*l, *b, us)).collect()
     }
 
     /// A fresh `Lab` holding the same agents, for one arm of a race.
@@ -418,6 +420,16 @@ impl Lab {
                 r.predicted_hits, r.mean_hits, r.maintain_us, r.query_us));
         }
         s
+    }
+
+    /// What one step costs on each backend in the CURRENT regime, as a lookup.
+    ///
+    /// The pinned arms of [`bakeoff`](Self::bakeoff), keyed. Used to price the lag: holding
+    /// backend A for a step while wanting B costs `cost(A) - cost(B)` — which is **negative when
+    /// the policy was wrong about B**. Hysteresis can save money, and an arithmetic that assumes
+    /// it only ever costs would never find that out.
+    pub fn backend_costs(&self, frames: usize) -> Vec<(Backend, f64)> {
+        self.bakeoff(frames).into_iter().filter_map(|(_, b, us)| b.map(|b| (b, us))).collect()
     }
 
     /// Brute-force reference for a query, for the tests and for anyone who does not trust the

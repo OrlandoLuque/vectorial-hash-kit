@@ -191,6 +191,36 @@ lag: 102 of 570 steps (17.9%) held on a backend the policy had already rejected
 Nearly **a fifth of the run** is spent on a structure the policy has already decided against — the
 hold window and the 120-tick cooldown holding it there. The worst single wish waited **90 steps**.
 
+### ★★ What the lag COSTS — and it refutes #149's premise
+
+The lag is a count; its price needs the per-step gap between the backend held and the one wanted,
+**in that regime**. `LAB_HEADLESS` now bakes off at the end of every act and multiplies:
+
+| act | lag steps | total µs | µs/step |
+| --- | ---: | ---: | ---: |
+| quiet, tiny | 0 | — | — |
+| grown, churning, few queries | 0 | — | — |
+| query storm, wide | 12 | +11 706 | +975 |
+| query storm, NARROW | 0 | — | — |
+| frozen | 90 | +36 338 | +404 |
+| **ALL** | **102** | **+48 044** | **+471** |
+
+**That is 1–3 % of the run** (three runs read 0.9 %, 1.8 % and 3.3 % of ~3.2 s of maintain+query).
+And the policy measures **0.64–0.94×** the best fixed choice, i.e. 6–56 % behind.
+
+A fix for the lag can recover at most the lag. A few percent cannot explain tens, so **#149's
+attribution — "the 0.70× is detector lag plus the migration's own rebuild" — is mostly wrong**,
+and building a faster obeyer (shadow-build, atomic swap) would buy a couple of percent of a much
+larger gap. Where the rest lives is the open question, and the likeliest answer is unglamorous:
+the policy sometimes picks a backend that is simply not the best one for that regime, which is a
+*thresholds* problem, not a *latency* problem.
+
+Two details that keep this honest. The arithmetic is a **signed** sum: holding A while wanting B
+costs `cost(A) − cost(B)`, which goes **negative when the policy was wrong about B** — hysteresis
+can save money, and a sum that only ever added would have hidden that. And the per-step gaps are
+timed on a laptop whose arms move several percent between passes, so the *conclusion* survives the
+spread (a few percent versus tens) while the *number* should be quoted as a range.
+
 `$LAB_TRACE=<path>` writes one CSV row per step — `step, held, wanted, items, q_per_item,
 mv_per_item, predicted_hits, mean_hits, maintain_us, query_us` — so the lag is arithmetic rather
 than eyeballing:
