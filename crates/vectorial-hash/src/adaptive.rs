@@ -1249,6 +1249,14 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
         (n / vol) * (4.0 / 3.0) * std::f64::consts::PI * r * r * r
     }
 
+    /// **k-NN deliberately feeds none of this.** The question the rule asks is "when this index is
+    /// culled, does the cull find enough to repay a grid's lookups?", and a k-NN answers a
+    /// different one: it returns `k` whatever the density, so counting it as hits would report a
+    /// constant and mean nothing. An index queried only with k-NN therefore has `q_extent == 0`,
+    /// `expected_hits` returns infinity, and the veto is inert — the correct outcome, pinned by
+    /// `a_knn_only_index_is_never_vetoed_by_the_cull_rule` because it currently holds by accident
+    /// of which method writes `q_extent`, and the obvious-looking symmetry would break it.
+    ///
     /// Culls needed before [`expected_hits`](Self::expected_hits) trusts observation over
     /// geometry. Small on purpose: the EMA is already smoothing, and the geometric fallback is
     /// the thing being escaped from.
@@ -1730,6 +1738,40 @@ mod tests {
                    "the policy changed its decisions on this script. If that is an improvement,                     update the blessed sequence and say why in the commit; if it is not, the                     threshold you just touched is the cause.");
         // Non-vacuity: a script that never migrates would satisfy any single-element sequence.
         assert!(seen.len() >= 3, "the script must exercise several backends, saw {seen:?}");
+        assert_matches_brute(&mut ix, &all);
+    }
+
+
+    /// ★ A k-NN-only index must not be vetoed by a rule about CULLS — and today it is not, by
+    /// accident rather than by contract, which is what this pins.
+    ///
+    /// `grid_min_hits` asks "when this index is culled, does the cull find enough to repay a
+    /// grid's lookups?". An index queried only with k-NN has never answered that question. It
+    /// escapes today because `q_extent` is written by `note_cull` alone, so it stays 0 and
+    /// `expected_hits` takes its "unknown input vetoes nothing" branch.
+    ///
+    /// That is the right behaviour and the wrong reason: anyone adding extent tracking to the
+    /// k-NN path — an obvious-looking symmetry — would silently start vetoing grids on the
+    /// strength of a number that means something else. k is not a hit count in this sense; a
+    /// k-NN returns k whatever the density, which is exactly what the rule needs to know.
+    #[test]
+    fn a_knn_only_index_is_never_vetoed_by_the_cull_rule() {
+        let th = Thresholds { brute_max: 10, hold_ticks: 2, cooldown: 0, grid_min_hits: 9.0, ..Default::default() };
+        let mut ix = AdaptiveIndex::with_thresholds(world(), 8, th);
+        let mut all = Vec::new();
+        for i in 0..2000 { let p = P { p: pt(i) }; all.push(p); ix.insert(p); }
+        for t in 0..60 {
+            for k in 0..600 { mv(&mut ix, &mut all, k, scatter(t, k)); }
+            for k in 0..800 { let p = pt(k); let _ = ix.knn(p, 8); }
+            ix.tick();
+        }
+        assert!(ix.queries_per_item() > 0.3, "the workload must be query-heavy: {:.3}", ix.queries_per_item());
+        assert_eq!(ix.query_extent(), 0.0, "k-NN must not write the cull extent");
+        assert_eq!(ix.observed_hits().1, 0, "k-NN must not feed the cull-hit estimator");
+        assert!(ix.expected_hits(ix.len() as f64).is_infinite(),
+                "an index that has never been culled must not claim to know what a cull would find");
+        // The veto being inert here is the point: the policy is free to choose on the other rules.
+        assert_ne!(ix.backend(), Backend::Brute, "2000 queried items should still be indexed");
         assert_matches_brute(&mut ix, &all);
     }
 
