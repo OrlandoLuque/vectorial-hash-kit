@@ -227,8 +227,9 @@ the right thing to charge a *switching* policy against.
 | right but slow (the lag) | 102 | +64 504 |
 | **obeyed and still wrong** | **468** | **+320 496** |
 
-**The choice accounts for 81–86 % of the shortfall and the lag for 14–19 %** (three runs: 82/18,
-81/19, 86/14). Only the lag is a latency problem. The other four fifths is the policy being given
+**The choice accounts for 76–86 % of the shortfall and the lag for 14–24 %** (four runs: 82/18,
+81/19, 86/14, 76/24 — the step counts are identical every time, 102 and 468; it is the timed
+per-step gaps that move). Only the lag is a latency problem. The other four fifths is the policy being given
 exactly what it asked for and asking for the wrong thing — a **thresholds** problem (#158), not a
 faster-obeyer problem (#149).
 

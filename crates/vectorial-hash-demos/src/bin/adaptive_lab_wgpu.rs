@@ -44,7 +44,7 @@ use bytemuck::{Pod, Zeroable};
 use glam::Mat4;
 use winit::{event::*, event_loop::EventLoop, keyboard::{KeyCode, PhysicalKey}, window::WindowBuilder};
 use vectorial_hash::Backend;
-use vectorial_hash_demos::adaptive_lab::{Knobs, Lab, HISTORY, H, MAX_N, W};
+use vectorial_hash_demos::adaptive_lab::{act_at, Knobs, Lab, ACTS, HISTORY, H, MAX_N, W};
 use vectorial_hash_demos::ui2d::{push_frame, push_quad, push_text, text_width, UiVertex};
 
 #[repr(C)]
@@ -144,20 +144,7 @@ fn headless() {
     // rather than eyeballing. Buffered and written once, never per step (MEASURING 8g).
     let trace_path = std::env::var("LAB_TRACE").ok();
     if trace_path.is_some() { lab.enable_trace(); }
-    // Each act is (label, knobs, steps). They are the same regimes `adaptive_vs_pinned` uses,
-    // because the point is to be able to compare the two.
-    let acts: [(&str, Knobs, usize); 5] = [
-        ("quiet, tiny", Knobs { population: 40, queries_per_item: 0.4, radius: 26.0, churn: 0.5, frozen: false, paused: false }, 60),
-        ("grown, churning, few queries", Knobs { population: 4000, queries_per_item: 0.05, radius: 26.0, churn: 1.0, frozen: false, paused: false }, 90),
-        ("query storm, wide", Knobs { population: 4000, queries_per_item: 1.0, radius: 70.0, churn: 0.3, frozen: false, paused: false }, 90),
-        ("query storm, NARROW", Knobs { population: 4000, queries_per_item: 1.0, radius: 4.0, churn: 0.3, frozen: false, paused: false }, 90),
-        // 240 steps, not 90, and the difference is a lesson rather than a tuning: at 90 this act
-        // ended on GRID because the default `cooldown` is 120 ticks, so the policy WANTED the
-        // build-once backend and was not allowed to move yet. That is the lag this demo exists to
-        // make visible — on screen it is a band of amber that turns green late, and in the
-        // near-miss counter it is a number climbing while nothing changes.
-        ("frozen", Knobs { population: 4000, queries_per_item: 0.4, radius: 40.0, churn: 0.0, frozen: true, paused: false }, 240),
-    ];
+    // The five acts live in `adaptive_lab::ACTS`, shared with the renderer's autopilot.
     println!("adaptive_lab — five acts, and what the policy did in each
 ");
     // #167: price the lag PER ACT. `C` answers "what would each backend cost now"; the lag is
@@ -168,7 +155,7 @@ fn headless() {
     let mut act_rows: Vec<(&str, usize, f64)> = Vec::new();
     let mut act_choice: Vec<(&str, usize, f64)> = Vec::new();
     let mut seen_rows = 0usize;
-    for (label, knobs, steps) in acts {
+    for (label, knobs, steps) in ACTS {
         lab.knobs = knobs;
         let before = lab.ix.switch_count();
         for _ in 0..steps { lab.step(1.0 / 60.0); }
@@ -478,26 +465,11 @@ async fn run() {
                         // One act per 110 frames — comfortably past the 120-tick cooldown only
                         // in the last act, on purpose: the earlier ones show the policy arriving
                         // late, which is the behaviour a total would hide.
-                        let acts: [Knobs; 5] = [
-                            Knobs { population: 40, queries_per_item: 0.4, radius: 26.0, churn: 0.5, frozen: false, paused: false },
-                            Knobs { population: 4000, queries_per_item: 0.05, radius: 26.0, churn: 1.0, frozen: false, paused: false },
-                            Knobs { population: 4000, queries_per_item: 1.0, radius: 70.0, churn: 0.3, frozen: false, paused: false },
-                            Knobs { population: 4000, queries_per_item: 1.0, radius: 4.0, churn: 0.3, frozen: false, paused: false },
-                            Knobs { population: 4000, queries_per_item: 0.4, radius: 40.0, churn: 0.0, frozen: true, paused: false },
-                        ];
-                        // Per-act lengths, and the sequence CYCLES. The first version divided by
-                        // a fixed 110 and clamped to the last act, which parks the demo forever
-                        // in the frozen one -- nothing moves, and it reads as a hang rather than
-                        // as the build-once regime. The frozen act also needs longer than the
-                        // others: the default cooldown is 120 ticks, so at 110 frames it barely
-                        // reaches BUILD-ONCE before the act ends.
-                        const LENS: [usize; 5] = [110, 130, 130, 130, 260];
-                        let cycle: usize = LENS.iter().sum();
-                        let mut t = auto_step % cycle;
-                        let mut i = 0;
-                        while t >= LENS[i] { t -= LENS[i]; i += 1; }
+                        // `adaptive_lab::ACTS` — the same table the headless run walks, so the
+                        // strip on screen and the text timeline are provably one script.
+                        let i = act_at(auto_step);
                         let paused = lab.knobs.paused;
-                        lab.knobs = acts[i];
+                        lab.knobs = ACTS[i].1;
                         lab.knobs.paused = paused;
                         auto_step += 1;
                     }

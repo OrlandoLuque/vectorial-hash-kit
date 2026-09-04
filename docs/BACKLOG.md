@@ -61,8 +61,8 @@ sweeping with rings that find nothing — radius-300 costs the tree **325** poin
    assumed.** The lag is exact (102 of 570 steps held on a rejected backend, mean 20, worst 90);
    pricing it per act against that regime's costs puts it at **1–3 % of the run**. Splitting every
    step into *right but slow* against *obeyed and still wrong*, charged against a **per-act oracle**
-   (tighter than any pinned arm, since a pin cannot switch), gives **81–86 % choice, 14–19 % lag**
-   across three runs. Four fifths of the shortfall is the policy asking for the wrong backend, not
+   (tighter than any pinned arm, since a pin cannot switch), gives **76–86 % choice, 14–24 % lag**
+   across four runs — the step counts (102, 468) are identical every time; only the timed gaps move. Four fifths of the shortfall is the policy asking for the wrong backend, not
    being slow to get it. Latency work (#149) can address at most a fifth; the rest is thresholds
    (#158).
 5. ~~**#162 — `expected_hits` never learns from k-NN.**~~ **CLOSED — the premise was wrong.**
@@ -106,14 +106,14 @@ sweeping with rings that find nothing — radius-300 costs the tree **325** poin
    It would also have caught this week's two default changes, which altered real decisions with
    the whole suite green.
 
-9. **★ #158 — re-derive `rebuild_query_ratio`. NOW THE MAIN LEAD.** #161 puts **81–86 %** of
+9. **★ #158 — re-derive `rebuild_query_ratio`. NOW THE MAIN LEAD.** #161 puts **76–86 %** of
    the adaptive index's shortfall in the *choice*, not the latency — the policy is obeyed and
    still not on the cheapest backend for that regime. That is this item. The two rules also
    interact now, and 0.2 was fitted while the grid could be chosen for queries that found
    nothing. **Timing-sensitive: wants the main desktop**, and #155 makes any calibration say
    which machine produced it.
 10. **#149 — close the 0.70×. RE-SCOPED by #161/#167.** The lag it blames is measured at **1–3 %
-    of the run**, and only **14–19 %** of the shortfall against a per-act oracle. Do not build the
+    of the run**, and only **14–24 %** of the shortfall against a per-act oracle. Do not build the
     shadow-build and atomic swap: it can address at most a fifth of the gap. What is left to
     explain is the choice itself, which is #158.
 11. **#98 D\* Lite — the user's call**, unchanged: ~1 ms of a 25 ms frame, only in the moving-goal

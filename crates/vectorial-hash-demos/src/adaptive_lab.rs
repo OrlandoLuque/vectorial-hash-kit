@@ -47,6 +47,46 @@ pub const RESIZE_PER_STEP: usize = 400;
 
 pub fn world() -> Rect { Rect::new(0.0, 0.0, W, H) }
 
+/// The scripted tour: five regimes, each with the number of steps it needs.
+///
+/// **One table, used by the headless run AND the renderer's autopilot.** They were written
+/// separately and had already drifted — different lengths on the same acts — which is the third
+/// instance this month of two copies of one table. The headless text timeline and the on-screen
+/// strip are now provably the same script.
+///
+/// The lengths are not uniform because the acts are not equally interesting. The frozen one runs
+/// **240** because the default `cooldown` is 120 ticks: at 90 it ended on `Grid` with the policy
+/// already wanting `Static` and not allowed to move, which reads as the demo being wrong rather
+/// than as the lag it is.
+pub const ACTS: [(&str, Knobs, usize); 5] = [
+    ("quiet, tiny",
+     Knobs { population: 40, queries_per_item: 0.4, radius: 26.0, churn: 0.5, frozen: false, paused: false }, 60),
+    ("grown, churning, few queries",
+     Knobs { population: 4000, queries_per_item: 0.05, radius: 26.0, churn: 1.0, frozen: false, paused: false }, 90),
+    ("query storm, wide",
+     Knobs { population: 4000, queries_per_item: 1.0, radius: 70.0, churn: 0.3, frozen: false, paused: false }, 90),
+    // Same population, same query load as the act above; ONLY the radius changes. The policy
+    // leaves the grid because its queries now find ~1.2 items each, which is `grid_min_hits` and
+    // the single most legible thing in the whole demo.
+    ("query storm, NARROW",
+     Knobs { population: 4000, queries_per_item: 1.0, radius: 4.0, churn: 0.3, frozen: false, paused: false }, 90),
+    ("frozen",
+     Knobs { population: 4000, queries_per_item: 0.4, radius: 40.0, churn: 0.0, frozen: true, paused: false }, 240),
+];
+
+/// Total steps in one pass of [`ACTS`] — the autopilot's cycle length.
+pub fn acts_cycle() -> usize { ACTS.iter().map(|(_, _, n)| n).sum() }
+
+/// Which act a given step of the autopilot is in, wrapping.
+pub fn act_at(step: usize) -> usize {
+    let mut t = step % acts_cycle();
+    for (i, (_, _, len)) in ACTS.iter().enumerate() {
+        if t < *len { return i; }
+        t -= len;
+    }
+    ACTS.len() - 1
+}
+
 /// One indexed agent. `id` is its own, stable across everything; `Slot` is the index's handle.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Agent {
