@@ -439,6 +439,26 @@ cause — the grid still beats the tree on clustered data at radius 36 and 90.
 Re-run either side: `--example grid_tree_frontier -- radius=8`, or
 `--example pick_a_structure -- n=30000 churn=0.056 queries=0.06 radius=3`.
 
+### What `G` and the population slider actually cost (#166)
+
+`adaptive_lab` hung for seconds because it rebuilt inside a frame, so the horde was checked for the
+same shape — `set_population` and `set_scenario` both call `Horde::with_scenario`. Measured
+(`--example horde_rebuild_cost`, min of 3):
+
+| pop | OPEN | FOREST | PATCHES | frames @ 60 Hz |
+| ---: | ---: | ---: | ---: | ---: |
+| 2 000 | 20 ms | 17 | 56 | 3 |
+| 30 000 | 68 | 48 | 93 | 6 |
+| 100 000 | 77 | 60 | 99 | 6 |
+
+**Worst case ~103 ms — a hitch, not a hang**, so the suspicion was wrong and nothing needs
+spreading. Two things worth keeping from it anyway. The cost is **nearly flat in population** (77 ms
+at 100 k against 20 ms at 2 k on the same scenario) and rises with scenario complexity instead:
+what is expensive is generating the world — the passability grid and PATCHES' connectivity flood —
+not placing zombies in it. And the measurement covers `Horde::with_scenario` only; a real `G` press
+also rebuilds the terrain mesh and re-uploads GPU buffers, so the number is a floor for the stall,
+not the whole of it.
+
 **Counted, not timed** (`--example horde_query_counts --features sim-counters,grid-stats`): over
 one 900-frame battle the grid asks for **6.51×** the points the tree does, and looks up **140 M
 cells**. Two hypotheses were tested against that and both are refuted:

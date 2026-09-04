@@ -37,12 +37,14 @@ sweeping with rings that find nothing — radius-300 costs the tree **325** poin
    battles strided and again with the phase hashed, and the gap between arms (12 kills) is a fifth
    of the spread across seeds within either arm (60). Siege's `id & 1` is a permanent per-unit
    property, not a sample; `formations_sim`'s `frame % 30` is inside a test.
-1. **#166 — audit every per-frame unbounded rebuild.** The lab hung for seconds because `resize`
-   ran inside the frame (40 → 4 000 is 3 960 inserts in one step). Same shape elsewhere and worth
-   checking rather than assuming: the horde's population slider, its `G` scenario switch (terrain +
-   passability + flow field) and `M` index toggle, siege and formations population sliders. Where
-   the work genuinely cannot be spread, say so on screen — a one-frame `REBUILDING` is honest, a
-   three-second stall is indistinguishable from a hang, which is exactly how it was reported.
+1. ~~**#166 — audit every per-frame unbounded rebuild.**~~ **DONE, and the suspicion was wrong.**
+   The horde has the lab's *shape* (`set_population` and `set_scenario` both rebuild the world in
+   one frame) but not its magnitude: **worst case ~103 ms**, a six-frame hitch rather than the
+   lab's multi-second freeze, so there is nothing to spread and nothing to announce. Two things
+   worth keeping: the cost is **nearly flat in population** (77 ms at 100 k against 20 ms at 2 k)
+   and scales with *scenario* complexity instead — generating the world is the expense, not placing
+   zombies in it — and the figure covers `Horde::with_scenario` only, so a real `G` press (terrain
+   mesh + GPU upload on top) is a floor, not the whole stall. `--example horde_rebuild_cost`.
 2. ~~**#167 — bake off PER ACT.**~~ **DONE, and it refutes #149.** Each act now bakes off at its
    end and the lag is priced against that regime's per-step gaps: **102 held steps, +48 044 µs,
    which is 1–3 % of the run** (three runs: 0.9 %, 1.8 %, 3.3 %). The policy measures **0.64–0.94×**
