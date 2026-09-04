@@ -27,7 +27,34 @@ sweeping with rings that find nothing — radius-300 costs the tree **325** poin
 
 **Open, in priority order:**
 
-1. **★ #161 — use `adaptive_lab` to close #149. HALF DONE.** The 0.70x is *attributed* to
+0. **★ #165 — audit every per-frame SUBSAMPLE for alternation.** The lab's colour flicker was a
+   *sampling* bug, not a rendering one: query centres strided with a per-step offset change parity
+   every step, so two complementary colourings alternate. The first fix — slide a contiguous
+   window by a full width — was the identical defect in different clothing (300 queries over 600
+   agents alternates between halves), and the test measured **75 % of agents changing hit-state
+   per step** and failed it. Any demo picking a subset per frame can have this: the horde's
+   decision buckets *are* a stride schedule, stealth samples, siege and formations have per-frame
+   subsets. The tell: does the sampled set at *t* overlap the set at *t+1*, or partition it? A
+   partition is right for spreading work and wrong for anything a human watches — and it can alias
+   with the simulation's own periods. Reuse the lab's test shape: run frozen, correlate consecutive
+   frames, refuse to pass on a sample that never moves.
+1. **#166 — audit every per-frame unbounded rebuild.** The lab hung for seconds because `resize`
+   ran inside the frame (40 → 4 000 is 3 960 inserts in one step). Same shape elsewhere and worth
+   checking rather than assuming: the horde's population slider, its `G` scenario switch (terrain +
+   passability + flow field) and `M` index toggle, siege and formations population sliders. Where
+   the work genuinely cannot be spread, say so on screen — a one-frame `REBUILDING` is honest, a
+   three-second stall is indistinguishable from a hang, which is exactly how it was reported.
+2. **#167 — bake off PER ACT**, the other half of #161. `C` answers "what would each backend cost
+   *now*"; the lag is spread across five regimes, and 20 steps held during a query storm is not the
+   same price as 90 steps held while frozen. Multiply each act's lag-steps by that act's per-step
+   gap and #149 becomes a decision rather than an assumption. Quote a range: on this laptop the
+   arms move several percent between runs and even the winner changes.
+3. **#164 — the lab's act table exists twice**, once in `headless` and once in the autopilot, and
+   they already differ in shape. Lift it into `adaptive_lab`. Three separate bugs this month have
+   been two copies of one table.
+
+
+4. **★ #161 — use `adaptive_lab` to close #149. HALF DONE.** The 0.70x is *attributed* to
    detector lag plus the migration's own rebuild, and that attribution had never been measured.
    **The countable half now is**: over 570 steps, **102 (17.9 %)** are spent holding a backend the
    policy had already rejected, a typical migration waits **20 steps** first, the worst waited
@@ -37,7 +64,7 @@ sweeping with rings that find nothing — radius-300 costs the tree **325** poin
    answers "what would each backend cost *now*", and the lag is spread across five regimes.
    Then decide whether #149's shadow-build and atomic swap is worth building, or whether the loss
    is mostly hysteresis and a cheaper threshold change.
-2. ~~**#162 — `expected_hits` never learns from k-NN.**~~ **CLOSED — the premise was wrong.**
+5. ~~**#162 — `expected_hits` never learns from k-NN.**~~ **CLOSED — the premise was wrong.**
    Checked before changing anything: `q_extent` is written by `note_cull` alone, so a k-NN-only
    index leaves it at 0, `expected_hits` takes its *unknown input vetoes nothing* branch, and
    `grid_min_hits` is inert. Right behaviour, wrong reason — it held by accident of which method
@@ -46,15 +73,15 @@ sweeping with rings that find nothing — radius-300 costs the tree **325** poin
    `k` whatever the density**. Now pinned by a test and documented at the field. The remaining
    asymmetry is fine and written down: a *mixed* caller's `q_per_item` counts k-NN while its hit
    estimate averages culls only — different rules, different economics.
-3. **#160 — publish `adaptive_lab` to the web + the mobile overlay.** It is the best explainer of
+6. **#160 — publish `adaptive_lab` to the web + the mobile overlay.** It is the best explainer of
    the whole adaptive layer and it is native-only. Eight wgpu demos for `build-wgpu-web.sh` then,
    plus a `check-web-fresh.sh` pass; the four sliders need ± pairs on `mobile-controls.js` because
    the on-canvas ones are mouse-driven.
-4. ~~**#163 — a policy trace (`$LAB_TRACE`).**~~ **DONE.** One CSV row per step; `held` against
+7. ~~**#163 — a policy trace (`$LAB_TRACE`).**~~ **DONE.** One CSV row per step; `held` against
    `wanted` is the lag. `awk -F, 'NR>1 && $2!=$3' lab.csv | wc -l` reads **102**, which makes
    three independent counts of one event agree — the lab's `LagStats`, the library's
    `near_misses`, and rows written by a third code path.
-5. ~~**★ #159 — a DEMO whose load actually varies.**~~ **DONE** — `adaptive_lab_wgpu`, see
+8. ~~**★ #159 — a DEMO whose load actually varies.**~~ **DONE** — `adaptive_lab_wgpu`, see
    [ADAPTIVE_LAB.md](ADAPTIVE_LAB.md). The strip made `grid_min_hits` visible for the first time
    (same population, same query load, only the radius changed, and the policy leaves the grid at
    1.2 hits/query) and surfaced the cooldown as lag. Original entry:
@@ -78,15 +105,15 @@ sweeping with rings that find nothing — radius-300 costs the tree **325** poin
    It would also have caught this week's two default changes, which altered real decisions with
    the whole suite green.
 
-6. **#158 — re-derive `rebuild_query_ratio` now that `grid_min_hits` is live.** The two rules
+9. **#158 — re-derive `rebuild_query_ratio` now that `grid_min_hits` is live.** The two rules
    interact, and 0.2 was fitted while the grid could still be chosen for queries that found
    nothing. **Timing-sensitive: wants the main desktop**, and #155 now makes any calibration say
    which machine produced it.
-7. **#149 — close the 0.70×**: detector lag plus the migration's own rebuild (shadow-build and
+10. **#149 — close the 0.70×**: detector lag plus the migration's own rebuild (shadow-build and
    atomic swap). #159 is the instrument for it.
-8. **#98 D\* Lite — the user's call**, unchanged: ~1 ms of a 25 ms frame, only in the moving-goal
+11. **#98 D\* Lite — the user's call**, unchanged: ~1 ms of a 25 ms frame, only in the moving-goal
    mode that is not currently used.
-9. **#83 / #95 need eyes**: `building_tweak` per-model scale, and the touch UI on a device.
+12. **#83 / #95 need eyes**: `building_tweak` per-model scale, and the touch UI on a device.
 
 ## ★ 2026-09-01/02 — cooperative night 10: the adaptive layer, and two of my own numbers
 
