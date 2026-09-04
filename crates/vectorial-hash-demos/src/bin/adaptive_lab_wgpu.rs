@@ -171,6 +171,12 @@ fn headless() {
 
     let st = lab.ix.stats();
     println!("\n{} migrations over {} steps, {} near-misses", lab.ix.switch_count(), lab.steps, st.near_misses);
+    // #161: how long the policy spends KNOWING BETTER. A count of steps, so it means the same on
+    // every machine -- which is why it is measured here rather than in milliseconds on a laptop.
+    println!("lag: {} of {} steps ({:.1}%) held on a backend the policy had already rejected",
+             lab.lag.wanting, lab.steps, lab.lag.wanting_fraction(lab.steps) * 100.0);
+    println!("     {:.0} steps of wanting before a typical migration, worst {}",
+             lab.lag.mean_lag(), lab.lag.max_lag());
     if let Some((a, b, n)) = st.hottest_pair() { println!("hottest pair: {a:?} -> {b:?} x{n}"); }
     println!("\nbake-off on the final state (us/step, min of two counterbalanced passes):");
     let rows = lab.bakeoff(40);

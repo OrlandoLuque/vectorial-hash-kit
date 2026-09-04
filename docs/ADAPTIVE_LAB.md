@@ -87,29 +87,57 @@ clones the live state and runs every backend **pinned** — `migrate_to` + `free
 code path with the decision switched off, rather than four separately-built structures. Arms run
 forward then in reverse, each keeping its minimum ([`MEASURING.md`](MEASURING.md) § 8e).
 
-On the final (frozen) state of the autopilot run, this laptop:
+Five runs of the headless script on this laptop, final (frozen) state:
 
-| arm | µs/step |
-| --- | ---: |
-| ADAPTIVE | 9 064 |
-| BRUTE | 22 504 |
-| KEEPTREE | 10 049 |
-| **GRID** | **8 550** |
-| STATIC | 8 869 |
+| arm | µs/step, across five runs |
+| --- | --- |
+| ADAPTIVE | 6 331 · 6 621 · 7 668 · 9 064 · 9 477 |
+| BRUTE | 15 531 · 16 490 · 21 276 · 22 043 · 22 504 |
+| KEEPTREE | 6 897 · 7 700 · 9 587 · 9 672 · 10 049 |
+| GRID | 5 415 · 5 799 · 6 858 · 7 644 · 8 550 |
+| STATIC | 4 887 · 5 147 · 5 212 · 7 213 · 8 869 |
 
-The policy is **6 % behind** the best fixed choice — and the best fixed choice is the one you
-could only have made by knowing how the run would end. That is the honest case for the layer,
-stated the way the module docs state it: *insurance, not optimisation*. Treat the ordering as the
-result and not the 6 %: these arms are a few percent apart on a machine whose noise is episodic.
+**Read the ordering, not the numbers.** The adaptive arm lands at **0.64 · 0.76 · 0.78 · 0.82 ·
+0.94** of the best fixed choice — median 0.78, and a spread far too wide to quote a figure from.
+Even *which* arm is best moves: `STATIC` wins four of the five, `GRID` the other. This machine's
+noise is episodic (`MEASURING.md` § 8e), so a single run of this table is a story.
+
+What *is* stable across all five is the thing the layer is actually for: **`BRUTE` costs 2.4–3.4×
+the best**, every time. The policy is behind the choice you could only have made knowing how the
+run ends, and far ahead of the choice a reasonable person might have pinned instead. That is
+*insurance, not optimisation*, demonstrated rather than asserted.
+
+## The lag, counted
+
+`#149` blames the adaptive index's shortfall on detector lag plus the migration's own rebuild.
+The lab measures the first half **exactly**, because it is a count of steps and not a duration:
+
+```
+5 migrations over 570 steps, 102 near-misses
+lag: 102 of 570 steps (17.9%) held on a backend the policy had already rejected
+     20 steps of wanting before a typical migration, worst 90
+```
+
+Nearly **a fifth of the run** is spent on a structure the policy has already decided against — the
+hold window and the 120-tick cooldown holding it there. The worst single wish waited **90 steps**.
+
+That `102` is also `SwitchStats::near_misses`, and deliberately so: the lab counts the same event
+independently and a test asserts the two agree, so each is a check on the other. What the library
+counter cannot give is the **distribution** — a policy that waits 20 steps five times and one that
+waits 100 steps once produce the same total and want completely different fixes.
 
 ## Why the tests are in `adaptive_lab`, not in the binary
 
 `src/adaptive_lab.rs` is graphics-free, like `horde_sim` and `siege_sim`, and the renderer and the
-tests drive the same `Lab::step`. Five tests, brute-force gated:
+tests drive the same `Lab::step`. Six tests, brute-force gated:
 
 - every reachable backend answers **identically to brute force** — the gate on all the rest;
 - the knobs actually move the policy (asserting `≥ 2` migrations, so it cannot pass by standing
   still);
 - a **pinned arm does not migrate**, or the bake-off would be racing the policy against itself;
 - resizing keeps the slot table honest — shrink to 80, regrow to 300, every agent still findable;
-- the history buffer is bounded and does not advance while paused.
+- the history buffer is bounded and does not advance while paused;
+- **the lag counter agrees with the library own near-miss counter**, and the per-migration
+  distribution accounts for every waiting step. Two counters of the same event, written
+  independently: agreeing, each is evidence for the other; disagreeing, one is a bug and there
+  would be no way to tell which without the other.

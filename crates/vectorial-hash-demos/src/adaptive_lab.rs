@@ -92,6 +92,46 @@ impl Rng {
     fn range(&mut self, lo: f64, hi: f64) -> f64 { lo + self.f() * (hi - lo) }
 }
 
+/// How long the policy spends WANTING a backend it is not allowed to take yet.
+///
+/// `#149` blames the adaptive index's 0.70x on detector lag plus the migration's own rebuild, and
+/// that was an attribution, never a measurement. This is the half that can be measured **exactly**
+/// — it is a count of steps, identical on every machine, so it is worth more here than a
+/// millisecond figure from an unfamiliar laptop.
+///
+/// The quantity is `backend() != recommended()`: the policy has decided, and hysteresis (the hold
+/// window, the cooldown) is holding it.
+///
+/// **`wanting` deliberately duplicates the library's `SwitchStats::near_misses`**, which counts
+/// the same event from inside `tick`. I measured it here first and only then found the existing
+/// counter — and rather than delete one, the two are cross-checked by a test. A hand-rolled
+/// counter that agrees with the library's is a check on both; one that quietly disagrees is a bug
+/// in whichever is wrong, and there would be no way to tell without the other.
+///
+/// What is genuinely new is `lags`: near-misses is one running total, and this is the
+/// **distribution** — how long each individual wish waited. A policy that waits 20 steps five
+/// times and one that waits 100 once produce the same total and want completely different fixes.
+#[derive(Clone, Debug, Default)]
+pub struct LagStats {
+    /// Steps on which the live backend was not the recommended one.
+    pub wanting: u64,
+    /// For each migration, how many consecutive steps it had been wanted first.
+    pub lags: Vec<u32>,
+    /// Consecutive steps the CURRENT unfulfilled wish has lasted.
+    pub run: u32,
+}
+
+impl LagStats {
+    pub fn mean_lag(&self) -> f64 {
+        if self.lags.is_empty() { 0.0 } else { self.lags.iter().map(|&l| l as f64).sum::<f64>() / self.lags.len() as f64 }
+    }
+    pub fn max_lag(&self) -> u32 { self.lags.iter().copied().max().unwrap_or(0) }
+    /// Share of all steps spent on a backend the policy had already rejected.
+    pub fn wanting_fraction(&self, steps: u64) -> f64 {
+        if steps == 0 { 0.0 } else { self.wanting as f64 / steps as f64 }
+    }
+}
+
 pub struct Lab {
     pub ix: AdaptiveIndex2<Agent>,
     /// The mirror of what the index holds, in `id` order — the brute-force reference the tests
@@ -102,6 +142,8 @@ pub struct Lab {
     pub stats: FrameStats,
     /// Backend per recent step, oldest first. The timeline strip is this, drawn.
     pub history: Vec<Backend>,
+    /// See [`LagStats`] — how much of the run is spent knowing better.
+    pub lag: LagStats,
     /// Steps taken. Migrations divided by this is the flap rate.
     pub steps: u64,
     next_id: u32,
@@ -121,6 +163,7 @@ impl Lab {
             knobs: Knobs::default(),
             stats: FrameStats::default(),
             history: Vec::new(),
+            lag: LagStats::default(),
             steps: 0,
             next_id: 0,
             rng: Rng(seed | 1),
@@ -197,7 +240,20 @@ impl Lab {
             for a in &mut self.agents { if hit_ids.binary_search(&a.id).is_ok() { a.hit = true; } }
         }
 
+        let before = self.ix.backend();
         self.ix.tick();
+        let after = self.ix.backend();
+        // Measured AFTER the tick, so a wish granted this step is not also counted as unmet.
+        if after != before {
+            // It moved: whatever it had been wanting for, that is the lag it paid.
+            self.lag.lags.push(self.lag.run);
+            self.lag.run = 0;
+        } else if after != self.ix.recommended() {
+            self.lag.run += 1;
+            self.lag.wanting += 1;
+        } else {
+            self.lag.run = 0;
+        }
         self.steps += 1;
         self.history.push(self.ix.backend());
         if self.history.len() > HISTORY { self.history.remove(0); }
@@ -251,7 +307,7 @@ impl Lab {
         let mut lab = Lab {
             ix: AdaptiveIndex2::with_thresholds(world(), 8, *self.ix.thresholds()),
             agents: Vec::new(), slots: Vec::new(),
-            knobs: self.knobs, stats: FrameStats::default(), history: Vec::new(),
+            knobs: self.knobs, stats: FrameStats::default(), history: Vec::new(), lag: LagStats::default(),
             steps: 0, next_id: self.next_id, rng: Rng(0xBEEF),
         };
         for a in &self.agents { lab.slots.push(lab.ix.insert(*a)); lab.agents.push(*a); }
@@ -374,6 +430,32 @@ mod tests {
             let found = lab.indexed(a.p, 0.5);
             assert!(found.contains(&a.id), "agent {} vanished from the index after resizing", a.id);
         }
+    }
+
+    /// ★ The lag counter against the library's own, which counts the same event from inside
+    /// `tick`. Neither is evidence on its own; agreeing, they are evidence for both.
+    #[test]
+    fn the_lag_counter_agrees_with_the_librarys_near_misses() {
+        let th = Thresholds { hold_ticks: 4, cooldown: 30, static_ticks: 12, ..Default::default() };
+        let mut lab = Lab::with_thresholds(42, th);
+        // A script that actually provokes hysteresis: three regime changes, so wishes are formed,
+        // held, and eventually granted.
+        for (n, q, r, churn, frozen) in [(20usize, 0.3, 20.0, 0.5, false), (3000, 1.0, 60.0, 0.4, false),
+                                         (3000, 0.02, 60.0, 1.0, false), (3000, 0.5, 60.0, 0.0, true)] {
+            lab.knobs = Knobs { population: n, queries_per_item: q, radius: r, churn, frozen, paused: false };
+            for _ in 0..80 { lab.step(1.0 / 60.0); }
+        }
+        let near = lab.ix.stats().near_misses;
+        // Every step spent wanting either preceded a migration (and is in `lags`) or is still
+        // outstanding (`run`). Nothing may be lost or double-counted between the two.
+        let accounted: u64 = lab.lag.lags.iter().map(|&l| l as u64).sum::<u64>() + lab.lag.run as u64;
+        assert_eq!(lab.lag.wanting, near,
+                   "the lab counted {} steps of wanting, the library counted {near} near-misses", lab.lag.wanting);
+        assert_eq!(accounted, lab.lag.wanting,
+                   "lags {:?} + run {} does not account for {} wanting steps", lab.lag.lags, lab.lag.run, lab.lag.wanting);
+        // Non-vacuity: a run with no hysteresis pressure would satisfy all of that at zero.
+        assert!(near > 10, "the script must actually make the policy wait, saw {near} near-misses");
+        assert!(!lab.lag.lags.is_empty(), "no migration ever completed, so no lag was ever paid");
     }
 
     /// The history feeding the timeline strip must be bounded and must record every step.
