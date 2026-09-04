@@ -215,6 +215,26 @@ larger gap. Where the rest lives is the open question, and the likeliest answer 
 the policy sometimes picks a backend that is simply not the best one for that regime, which is a
 *thresholds* problem, not a *latency* problem.
 
+### ...and where the rest of it lives
+
+The same trace splits every step into two disjoint buckets, charged against a **per-act oracle**
+— the cheapest backend for that regime. No pinned arm can be that oracle, because a pin holds one
+backend for the whole run, so this is a tighter bound than the bake-off's "best fixed choice" and
+the right thing to charge a *switching* policy against.
+
+| | steps | µs |
+| --- | ---: | ---: |
+| right but slow (the lag) | 102 | +64 504 |
+| **obeyed and still wrong** | **468** | **+320 496** |
+
+**The choice accounts for 81–86 % of the shortfall and the lag for 14–19 %** (three runs: 82/18,
+81/19, 86/14). Only the lag is a latency problem. The other four fifths is the policy being given
+exactly what it asked for and asking for the wrong thing — a **thresholds** problem (#158), not a
+faster-obeyer problem (#149).
+
+That is the whole argument for having built this demo rather than a sixth bench: the two halves
+are one number in a total, and they want opposite work.
+
 Two details that keep this honest. The arithmetic is a **signed** sum: holding A while wanting B
 costs `cost(A) − cost(B)`, which goes **negative when the policy was wrong about B** — hysteresis
 can save money, and a sum that only ever added would have hidden that. And the per-step gaps are

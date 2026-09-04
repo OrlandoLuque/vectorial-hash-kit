@@ -166,6 +166,7 @@ fn headless() {
     // gives what each backend costs in that regime, timed. An exact count times a timed gap.
     lab.enable_trace();
     let mut act_rows: Vec<(&str, usize, f64)> = Vec::new();
+    let mut act_choice: Vec<(&str, usize, f64)> = Vec::new();
     let mut seen_rows = 0usize;
     for (label, knobs, steps) in acts {
         lab.knobs = knobs;
@@ -177,22 +178,41 @@ fn headless() {
         println!("{:>30}    mean hits/query {:.1}, policy predicted {:.1} | maintain {:.0} us, query {:.0} us",
                  "", lab.mean_hits(), lab.stats.predicted_hits, lab.stats.maintain_us, lab.stats.query_us);
 
-        // What this act contributed to the trace, and what each backend costs HERE.
-        let (lag_steps, price) = {
-            let rows = lab.trace.as_ref().expect("tracing on");
-            let mine: Vec<(Backend, Backend)> = rows[seen_rows..].iter()
-                .filter(|r| r.held != r.wanted).map(|r| (r.held, r.wanted)).collect();
-            seen_rows = rows.len();
-            mine
-        }.into_iter().fold((0usize, Vec::new()), |(n, mut v), p| { v.push(p); (n + 1, v) });
+        // Everything this act contributed to the trace, and what each backend costs HERE.
+        let act_start = seen_rows;
+        seen_rows = lab.trace.as_ref().expect("tracing on").len();
         let costs = lab.backend_costs(30);
         let cost_of = |b: Backend| costs.iter().find(|(k, _)| *k == b).map(|(_, c)| *c).unwrap_or(0.0);
-        let total: f64 = price.iter().map(|(h, w)| cost_of(*h) - cost_of(*w)).sum();
-        if lag_steps > 0 {
-            println!("{:>30}    lag {lag_steps} steps, priced {total:+.0} us ({:+.0} us/step)",
-                     "", total / lag_steps as f64);
+        // A per-act ORACLE: the cheapest backend for this regime. No pinned arm can be this,
+        // because a pin holds one backend for the whole run — so it is a tighter bound than the
+        // bake-off's "best fixed choice", and the right thing to charge a switching policy against.
+        let best_here = costs.iter().map(|(_, c)| *c).fold(f64::INFINITY, f64::min);
+
+        let (mut lag_steps, mut lag_price) = (0usize, 0.0f64);
+        let (mut obeyed, mut wrong_price) = (0usize, 0.0f64);
+        for r in &lab.trace.as_ref().expect("tracing on")[act_start..seen_rows] {
+            if r.held != r.wanted {
+                // "Right but slow": it had decided, and hysteresis held it. Signed, because the
+                // thing it wanted is sometimes the more expensive one.
+                lag_steps += 1;
+                lag_price += cost_of(r.held) - cost_of(r.wanted);
+            } else {
+                // "Obeyed and still wrong": it got exactly what it asked for, and what it asked
+                // for was not the cheapest available. Only this half is a thresholds problem.
+                obeyed += 1;
+                wrong_price += cost_of(r.held) - best_here;
+            }
         }
-        act_rows.push((label, lag_steps, total));
+        if lag_steps > 0 {
+            println!("{:>30}    lag {lag_steps} steps, priced {lag_price:+.0} us ({:+.0} us/step)",
+                     "", lag_price / lag_steps as f64);
+        }
+        if obeyed > 0 && wrong_price.abs() > 1.0 {
+            println!("{:>30}    obeyed {obeyed} steps, {wrong_price:+.0} us above the act's cheapest",
+                     "");
+        }
+        act_rows.push((label, lag_steps, lag_price));
+        act_choice.push((label, obeyed, wrong_price));
     }
     // The strip, as text: one character per step, so the shape is visible without a window.
     // #167: what the hysteresis actually cost, act by act. Positive means the lag held us on a
@@ -223,6 +243,24 @@ fn headless() {
         println!("puts the policy 6-56% behind the best fixed choice across runs. A few percent");
         println!("cannot explain tens, so the attribution is mostly wrong and a faster obeyer is");
         println!("not where the loss lives. Quote this as 1-3%: three runs read 0.9, 1.8 and 3.3.");
+    }
+
+    // ...and where the rest of it lives. Two disjoint buckets over the same steps: the policy
+    // was held against its will, or it was obeyed and still not cheapest. Charged against a
+    // per-act ORACLE that switches perfectly, so this is the whole shortfall of a switching
+    // policy, not the shortfall against one pinned arm.
+    let wrong_total: f64 = act_choice.iter().map(|(_, _, p)| p).sum();
+    let obeyed_total: usize = act_choice.iter().map(|(_, s, _)| s).sum();
+    println!();
+    println!("where the shortfall lives, against a per-act oracle:");
+    println!("  right but slow (lag)      {lag_steps:>5} steps   {lag_total:>+10.0} us");
+    println!("  obeyed and still wrong    {obeyed_total:>5} steps   {wrong_total:>+10.0} us");
+    let both = lag_total + wrong_total;
+    if both.abs() > 1.0 {
+        println!("  -> the choice accounts for {:.0}% of the two, the lag for {:.0}%.",
+                 wrong_total / both * 100.0, lag_total / both * 100.0);
+        println!("     Only the FIRST is a latency problem (#149); the second is a thresholds");
+        println!("     problem (#158). Build for whichever is larger, and it is not close.");
     }
     if lag_total > 0.0 {
         println!("Hysteresis cost {lag_total:.0} us over {lag_steps} held steps. Against a run whose");
