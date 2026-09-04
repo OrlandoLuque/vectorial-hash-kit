@@ -35,12 +35,15 @@ sweeping with rings that find nothing — radius-300 costs the tree **325** poin
    holding a wanted migration; what is missing is its price. Then decide whether the shadow-build
    and atomic swap of #149 is worth building, or whether the loss is mostly hysteresis and a
    cheaper threshold change.
-2. **#162 — `expected_hits` never learns from k-NN.** #154 made it an EMA of what culls *return*,
-   and `note_hits` fires from the four cull entry points only. An index queried exclusively with
-   k-NN never reaches the warm-up and keeps the world-volume estimate — the one measured **7.9x
-   low** on slab data, and exactly the horde's towers (k=8) and commander (k=48). Either record
-   `k` (which, unlike a cull, is known before the query runs) or make the fallback refuse to
-   answer, the way an unknown extent already does.
+2. ~~**#162 — `expected_hits` never learns from k-NN.**~~ **CLOSED — the premise was wrong.**
+   Checked before changing anything: `q_extent` is written by `note_cull` alone, so a k-NN-only
+   index leaves it at 0, `expected_hits` takes its *unknown input vetoes nothing* branch, and
+   `grid_min_hits` is inert. Right behaviour, wrong reason — it held by accident of which method
+   writes `q_extent`, and the obvious symmetry (teach the k-NN path to record extent and hits)
+   would have started vetoing grids on a number that means something else, since **a k-NN returns
+   `k` whatever the density**. Now pinned by a test and documented at the field. The remaining
+   asymmetry is fine and written down: a *mixed* caller's `q_per_item` counts k-NN while its hit
+   estimate averages culls only — different rules, different economics.
 3. **#160 — publish `adaptive_lab` to the web + the mobile overlay.** It is the best explainer of
    the whole adaptive layer and it is native-only. Eight wgpu demos for `build-wgpu-web.sh` then,
    plus a `check-web-fresh.sh` pass; the four sliders need ± pairs on `mobile-controls.js` because
