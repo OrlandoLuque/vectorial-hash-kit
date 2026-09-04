@@ -136,6 +136,11 @@ pub fn start() { console_error_panic_hook::set_once(); wasm_bindgen_futures::spa
 #[cfg(not(target_arch = "wasm32"))]
 fn headless() {
     let mut lab = Lab::new(7);
+    // $LAB_TRACE=<path> writes one CSV row per step. The strip shows a shape; this can be
+    // plotted, diffed and attached to a bug report -- and it is what makes the lag arithmetic
+    // rather than eyeballing. Buffered and written once, never per step (MEASURING 8g).
+    let trace_path = std::env::var("LAB_TRACE").ok();
+    if trace_path.is_some() { lab.enable_trace(); }
     // Each act is (label, knobs, steps). They are the same regimes `adaptive_vs_pinned` uses,
     // because the point is to be able to compare the two.
     let acts: [(&str, Knobs, usize); 5] = [
@@ -198,6 +203,17 @@ fn headless() {
     }
     println!("\nA total cannot tell flapping from lag from a plain wrong choice. The strip can,");
     println!("and the bake-off says whether the choice was right. That is the whole demo.");
+
+    if let Some(path) = trace_path {
+        let csv = lab.trace_csv();
+        let rows = csv.lines().count().saturating_sub(1);
+        match std::fs::write(&path, &csv) {
+            Ok(()) => println!("
+trace -> {path} ({rows} steps)"),
+            Err(e) => eprintln!("
+could not write {path}: {e}"),
+        }
+    }
 }
 
 async fn run() {

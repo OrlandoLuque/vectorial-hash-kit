@@ -132,6 +132,21 @@ impl LagStats {
     }
 }
 
+/// One row of the optional policy trace. See [`Lab::trace`].
+#[derive(Clone, Copy, Debug)]
+pub struct TraceRow {
+    pub step: u64,
+    pub held: Backend,
+    pub wanted: Backend,
+    pub items: usize,
+    pub q_per_item: f64,
+    pub mv_per_item: f64,
+    pub predicted_hits: f64,
+    pub mean_hits: f64,
+    pub maintain_us: f64,
+    pub query_us: f64,
+}
+
 pub struct Lab {
     pub ix: AdaptiveIndex2<Agent>,
     /// The mirror of what the index holds, in `id` order — the brute-force reference the tests
@@ -146,6 +161,13 @@ pub struct Lab {
     pub lag: LagStats,
     /// Steps taken. Migrations divided by this is the flap rate.
     pub steps: u64,
+    /// Per-step trace, when [`Lab::trace`] has been enabled.
+    ///
+    /// The strip shows a *shape*; it cannot be plotted, diffed, or attached to a bug report.
+    /// Buffered in memory and written once by the caller rather than appended per step: a file
+    /// write inside the loop would be setup inside the clock, which is `MEASURING.md` § 8g and
+    /// has already inverted one result in this repo.
+    pub trace: Option<Vec<TraceRow>>,
     next_id: u32,
     rng: Rng,
 }
@@ -165,6 +187,7 @@ impl Lab {
             history: Vec::new(),
             lag: LagStats::default(),
             steps: 0,
+            trace: None,
             next_id: 0,
             rng: Rng(seed | 1),
         };
@@ -262,6 +285,19 @@ impl Lab {
             maintain_us, query_us, queries, hits,
             predicted_hits: self.ix.expected_hits(self.ix.len() as f64),
         };
+        if self.trace.is_some() {
+            let (items, q, mv) = self.ix.observed();
+            let row = TraceRow {
+                step: self.steps, held: self.ix.backend(), wanted: self.ix.recommended(),
+                items, q_per_item: q, mv_per_item: mv,
+                predicted_hits: self.stats.predicted_hits, mean_hits: self.mean_hits(),
+                maintain_us, query_us,
+            };
+            // The row is built first, from immutable borrows of the index, and only then is the
+            // buffer borrowed mutably — which is why the guard above is a plain `is_some` and
+            // not an `if let` around the whole block.
+            if let Some(t) = self.trace.as_mut() { t.push(row); }
+        }
     }
 
     /// Mean items a query returned last step, or 0 when nobody asked.
@@ -307,11 +343,30 @@ impl Lab {
         let mut lab = Lab {
             ix: AdaptiveIndex2::with_thresholds(world(), 8, *self.ix.thresholds()),
             agents: Vec::new(), slots: Vec::new(),
-            knobs: self.knobs, stats: FrameStats::default(), history: Vec::new(), lag: LagStats::default(),
+            knobs: self.knobs, stats: FrameStats::default(), history: Vec::new(), lag: LagStats::default(), trace: None,
             steps: 0, next_id: self.next_id, rng: Rng(0xBEEF),
         };
         for a in &self.agents { lab.slots.push(lab.ix.insert(*a)); lab.agents.push(*a); }
         lab
+    }
+
+    /// Start recording a per-step trace. Off by default; the renderer turns it on for
+    /// `$LAB_TRACE`.
+    pub fn enable_trace(&mut self) { self.trace = Some(Vec::new()); }
+
+    /// The trace as CSV, header included. Empty string when tracing was never enabled — a caller
+    /// asking for a trace it did not record should get nothing, not a header implying zero steps.
+    pub fn trace_csv(&self) -> String {
+        let Some(rows) = &self.trace else { return String::new() };
+        let mut s = String::from("step,held,wanted,items,q_per_item,mv_per_item,predicted_hits,mean_hits,maintain_us,query_us
+");
+        for r in rows {
+            s.push_str(&format!("{},{:?},{:?},{},{:.4},{:.4},{:.3},{:.3},{:.1},{:.1}
+",
+                r.step, r.held, r.wanted, r.items, r.q_per_item, r.mv_per_item,
+                r.predicted_hits, r.mean_hits, r.maintain_us, r.query_us));
+        }
+        s
     }
 
     /// Brute-force reference for a query, for the tests and for anyone who does not trust the
@@ -456,6 +511,31 @@ mod tests {
         // Non-vacuity: a run with no hysteresis pressure would satisfy all of that at zero.
         assert!(near > 10, "the script must actually make the policy wait, saw {near} near-misses");
         assert!(!lab.lag.lags.is_empty(), "no migration ever completed, so no lag was ever paid");
+    }
+
+    /// A trace must be off unless asked for, must cover every step once asked, and must carry the
+    /// column that makes it worth having: `held` against `wanted`, which is the lag.
+    #[test]
+    fn the_trace_is_opt_in_and_complete() {
+        let mut lab = Lab::with_thresholds(13, Thresholds { hold_ticks: 4, cooldown: 20, ..Default::default() });
+        lab.knobs.population = 300;
+        for _ in 0..10 { lab.step(1.0 / 60.0); }
+        assert!(lab.trace.is_none() && lab.trace_csv().is_empty(), "tracing must be off by default");
+
+        lab.enable_trace();
+        lab.knobs = Knobs { population: 3000, queries_per_item: 1.0, radius: 60.0, churn: 0.5, frozen: false, paused: false };
+        for _ in 0..60 { lab.step(1.0 / 60.0); }
+        let rows = lab.trace.as_ref().expect("enabled").clone();
+        assert_eq!(rows.len(), 60, "every step after enabling must appear exactly once");
+        assert!(rows.windows(2).all(|w| w[1].step == w[0].step + 1), "steps must be contiguous");
+
+        let csv = lab.trace_csv();
+        assert_eq!(csv.lines().count(), 61, "header plus one row per step");
+        assert!(csv.starts_with("step,held,wanted,"), "the lag columns must come first: {:?}", &csv[..40]);
+        // Non-vacuity: a script where held always equals wanted would make the interesting column
+        // constant, and this test would pass while proving nothing about lag.
+        assert!(rows.iter().any(|r| r.held != r.wanted),
+                "the script must produce at least one step of the policy knowing better");
     }
 
     /// The history feeding the timeline strip must be bounded and must record every step.

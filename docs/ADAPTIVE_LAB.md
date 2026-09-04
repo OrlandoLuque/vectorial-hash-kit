@@ -121,7 +121,20 @@ lag: 102 of 570 steps (17.9%) held on a backend the policy had already rejected
 Nearly **a fifth of the run** is spent on a structure the policy has already decided against — the
 hold window and the 120-tick cooldown holding it there. The worst single wish waited **90 steps**.
 
-That `102` is also `SwitchStats::near_misses`, and deliberately so: the lab counts the same event
+`$LAB_TRACE=<path>` writes one CSV row per step — `step, held, wanted, items, q_per_item,
+mv_per_item, predicted_hits, mean_hits, maintain_us, query_us` — so the lag is arithmetic rather
+than eyeballing:
+
+```bash
+LAB_HEADLESS=1 LAB_TRACE=lab.csv cargo run -p vectorial-hash-demos --bin adaptive_lab_wgpu --release
+awk -F, 'NR>1 && $2!=$3' lab.csv | wc -l    # 102
+```
+
+Buffered and written once, never appended per step: a file write inside the loop is setup inside
+the clock ([`MEASURING.md`](MEASURING.md) § 8g), which has already inverted one result here.
+
+That `102` is **three independent counts agreeing** — the lab's own `LagStats`, the library's
+`SwitchStats::near_misses`, and now `held != wanted` rows in the CSV. Deliberately so: the lab counts the same event
 independently and a test asserts the two agree, so each is a check on the other. What the library
 counter cannot give is the **distribution** — a policy that waits 20 steps five times and one that
 waits 100 steps once produce the same total and want completely different fixes.
