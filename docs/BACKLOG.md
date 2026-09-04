@@ -27,7 +27,34 @@ sweeping with rings that find nothing — radius-300 costs the tree **325** poin
 
 **Open, in priority order:**
 
-1. **★ #159 (new) — a DEMO whose load actually varies.** Checked 2026-09-03: **no demo exercises
+1. **★ #161 — use `adaptive_lab` to actually close #149.** The 0.70x is *attributed* to detector
+   lag plus the migration's own rebuild, and that attribution has never been measured — which is
+   why #159 was built. The lab can now compare `backend()` against `recommended()` every step and
+   count how long the policy WANTS a backend before hysteresis lets it move, and time the
+   migration apart from the steps around it. The frozen act already showed a **120-tick cooldown**
+   holding a wanted migration; what is missing is its price. Then decide whether the shadow-build
+   and atomic swap of #149 is worth building, or whether the loss is mostly hysteresis and a
+   cheaper threshold change.
+2. **#162 — `expected_hits` never learns from k-NN.** #154 made it an EMA of what culls *return*,
+   and `note_hits` fires from the four cull entry points only. An index queried exclusively with
+   k-NN never reaches the warm-up and keeps the world-volume estimate — the one measured **7.9x
+   low** on slab data, and exactly the horde's towers (k=8) and commander (k=48). Either record
+   `k` (which, unlike a cull, is known before the query runs) or make the fallback refuse to
+   answer, the way an unknown extent already does.
+3. **#160 — publish `adaptive_lab` to the web + the mobile overlay.** It is the best explainer of
+   the whole adaptive layer and it is native-only. Eight wgpu demos for `build-wgpu-web.sh` then,
+   plus a `check-web-fresh.sh` pass; the four sliders need ± pairs on `mobile-controls.js` because
+   the on-canvas ones are mouse-driven.
+4. **#163 — a policy trace (`$LAB_TRACE`).** The strip shows a shape; a CSV of step / backend /
+   recommended / rates / hits / times can be plotted, diffed and attached to a bug report. Makes
+   #161 arithmetic rather than eyeballing. Buffer and write once — a per-step write inside the
+   loop is setup inside the clock (§ 8g).
+5. ~~**★ #159 — a DEMO whose load actually varies.**~~ **DONE** — `adaptive_lab_wgpu`, see
+   [ADAPTIVE_LAB.md](ADAPTIVE_LAB.md). The strip made `grid_min_hits` visible for the first time
+   (same population, same query load, only the radius changed, and the policy leaves the grid at
+   1.2 hits/query) and surfaced the cooldown as lag. Original entry:
+
+   **★ #159 (new) — a DEMO whose load actually varies.** Checked 2026-09-03: **no demo exercises
    what `AdaptiveIndex` is for.** Only two use it — `fluid_wgpu`, whose workload never changes
    character, and the horde, which does change but whose adaptive arm goes `Brute→KeepTree` and
    never reaches `Grid` or `Static` (3 switches, 29 near-misses, the same sequence every run). The
@@ -46,15 +73,15 @@ sweeping with rings that find nothing — radius-300 costs the tree **325** poin
    It would also have caught this week's two default changes, which altered real decisions with
    the whole suite green.
 
-2. **#158 — re-derive `rebuild_query_ratio` now that `grid_min_hits` is live.** The two rules
+6. **#158 — re-derive `rebuild_query_ratio` now that `grid_min_hits` is live.** The two rules
    interact, and 0.2 was fitted while the grid could still be chosen for queries that found
    nothing. **Timing-sensitive: wants the main desktop**, and #155 now makes any calibration say
    which machine produced it.
-3. **#149 — close the 0.70×**: detector lag plus the migration's own rebuild (shadow-build and
+7. **#149 — close the 0.70×**: detector lag plus the migration's own rebuild (shadow-build and
    atomic swap). #159 is the instrument for it.
-4. **#98 D\* Lite — the user's call**, unchanged: ~1 ms of a 25 ms frame, only in the moving-goal
+8. **#98 D\* Lite — the user's call**, unchanged: ~1 ms of a 25 ms frame, only in the moving-goal
    mode that is not currently used.
-5. **#83 / #95 need eyes**: `building_tweak` per-model scale, and the touch UI on a device.
+9. **#83 / #95 need eyes**: `building_tweak` per-model scale, and the touch UI on a device.
 
 ## ★ 2026-09-01/02 — cooperative night 10: the adaptive layer, and two of my own numbers
 
