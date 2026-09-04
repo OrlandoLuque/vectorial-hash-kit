@@ -64,6 +64,9 @@ cargo run -p vectorial-hash-demos --bin siege_wgpu --release
 cargo run -p vectorial-hash-demos --bin fluid_wgpu --release
 
 # point cloud: a big skewed scanned cloud coloured by local density, i.e. one
+# four sliders, one per threshold — watch the index change its mind (docs/ADAPTIVE_LAB.md)
+cargo run -p vectorial-hash-demos --bin adaptive_lab_wgpu --release
+
 # k-NN query per point — where KdTree3 earns its keep (docs/POINTCLOUD.md)
 cargo run -p vectorial-hash-demos --bin pointcloud_wgpu --release
 

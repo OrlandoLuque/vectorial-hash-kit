@@ -201,7 +201,10 @@ use crate::morton3::MortonGrid3;
 use crate::tree3::{Aabb, Crossing, ItemRef, Point3, Positioned3, Shape3, Sphere3, Tree3};
 
 /// Which concrete structure is holding the items right now.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+///
+/// `Hash` because a backend is a natural key: tallying time-in-structure, counting migrations
+/// per pair, or checking which backends a script actually reached all want it in a map or set.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Backend {
     /// A contiguous scan: no index at all.
     Brute,

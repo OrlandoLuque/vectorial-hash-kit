@@ -24,6 +24,12 @@ pub mod siege_sim;
 /// Shared, graphics-free simulation for the `horde` demo (They Are
 /// Billions-style zombie assault; wgpu renderer) — see `docs/HORDE_DESIGN.md`.
 pub mod horde_sim;
+/// A workload whose character the viewer CHANGES while it runs, so `AdaptiveIndex` can be
+/// watched deciding — the case every other demo here fails to exercise. See `docs/ADAPTIVE_LAB.md`.
+pub mod adaptive_lab;
+/// Screen-space overlay helpers for the wgpu demos: quads and a 3x5 bitmap font.
+/// wgpu draws no text, so a HUD is triangles; this is the one copy of that code.
+pub mod ui2d;
 /// Shared, graphics-free simulation for the `formations` demo (Total War-style
 /// automatic army battle; wgpu renderer) — see `docs/FORMATIONS_DESIGN.md`.
 pub mod formations_sim;
