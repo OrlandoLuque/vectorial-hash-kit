@@ -371,7 +371,7 @@ async fn run() {
                     fps = if fps == 0.0 { 1.0 / fdt } else { fps * 0.9 + 0.1 / fdt };
                     frame += 1;
 
-                    if auto {
+                    if auto && !lab.knobs.paused {
                         // One act per 110 frames — comfortably past the 120-tick cooldown only
                         // in the last act, on purpose: the earlier ones show the policy arriving
                         // late, which is the behaviour a total would hide.
@@ -413,14 +413,21 @@ async fn run() {
 
                     // Radius scales down as the crowd grows, or 20 000 agents is a solid block.
                     let r = (6.0 - (lab.agents.len() as f32).log10()).max(1.6);
-                    let peak = lab.agents.iter().map(|a| a.hits).max().unwrap_or(0);
+                    // Against the MEAN, not the peak. In the wide-radius act every agent is found
+                    // by tens of queries, so peak and mean are within a few percent and dividing
+                    // by the peak pins the whole field near 1.0 — reported as "some light yellow,
+                    // some slightly darker, you can hardly tell them apart". Mid-ramp is now the
+                    // typical agent, so what you see is variation ABOUT the typical, which is the
+                    // only thing there is to see once everything is being found.
+                    let total: u64 = lab.agents.iter().map(|a| a.hits as u64).sum();
+                    let mean = (total as f32 / lab.agents.len().max(1) as f32).max(0.001);
                     inst.clear();
                     for a in &lab.agents {
                         // Normalise against the busiest agent this step, so the picture keeps its
                         // contrast at any query load instead of saturating. `+1` keeps a quiet
                         // frame from dividing by zero and from exploding one stray hit into white.
                         inst.push(Inst { x: a.p.x as f32, y: a.p.y as f32, r,
-                                         heat: a.hits as f32 / (peak + 1) as f32 });
+                                         heat: (a.hits as f32 / (2.0 * mean)).min(1.0) });
                     }
                     queue.write_buffer(&inst_b, 0, bytemuck::cast_slice(&inst));
 
@@ -454,7 +461,10 @@ async fn run() {
                     let (n, q, m) = lab.ix.observed();
                     let sy = (44.0 + 4.0 * 22.0 + 6.0) * tp;
                     let rows = [
-                        format!("N {n}  Q/I {q:.2}  MV/I {m:.2}"),
+                        // `n` is what the index holds; the slider is the target. They differ while
+                        // the population walks toward it, and showing only one made that look wrong.
+                        format!("N {n}{}  Q/I {q:.2}  MV/I {m:.2}",
+                                if n != lab.knobs.population { format!("/{}", lab.knobs.population) } else { String::new() }),
                         format!("HITS {:.1} PREDICT {:.1}", lab.mean_hits(), lab.stats.predicted_hits),
                         format!("MAINTAIN {:.0}US", maint_us),
                         format!("QUERY {:.0}US", query_us),

@@ -37,6 +37,13 @@ pub const H: f64 = 760.0;
 pub const MAX_N: usize = 20_000;
 /// How many frames of backend history the timeline strip keeps.
 pub const HISTORY: usize = 600;
+/// Most agents a single step may add or remove.
+///
+/// Without it, dragging the population slider from 40 to 4 000 does 3 960 inserts inside one
+/// frame — and the demo visibly hangs for seconds, which was reported from the running window.
+/// The knob is a TARGET now and the population walks toward it. A pacing decision, not a
+/// measurement one: every step still does exactly the work its own population implies.
+pub const RESIZE_PER_STEP: usize = 400;
 
 pub fn world() -> Rect { Rect::new(0.0, 0.0, W, H) }
 
@@ -173,7 +180,6 @@ pub struct Lab {
     /// write inside the loop would be setup inside the clock, which is `MEASURING.md` § 8g and
     /// has already inverted one result in this repo.
     pub trace: Option<Vec<TraceRow>>,
-    next_id: u32,
     rng: Rng,
 }
 
@@ -193,15 +199,22 @@ impl Lab {
             lag: LagStats::default(),
             steps: 0,
             trace: None,
-            next_id: 0,
             rng: Rng(seed | 1),
         };
         lab.resize(lab.knobs.population);
         lab
     }
 
-    /// Grow or shrink to `n`, keeping everyone who stays. Shrinking removes the newest, so
-    /// dragging the slider down and back up does not reshuffle the whole scene under the viewer.
+    /// Grow or shrink to `n` **exactly**, keeping everyone who stays. Shrinking removes the
+    /// newest, so dragging down and back up does not reshuffle the scene under the viewer.
+    ///
+    /// `step` does not call this directly — see [`RESIZE_PER_STEP`]. Callers who want the
+    /// population *now* (setup, tests) call it here and pay for it in one frame.
+    ///
+    /// `id` is the agent's index by construction, and stays so because growth appends and
+    /// shrinkage pops. That is what lets the query loop count hits into a flat array instead of
+    /// collecting ids and sorting them — at one wide cull per item that was a quarter of a million
+    /// entries sorted per frame, my own bookkeeping charged to the index's reputation.
     pub fn resize(&mut self, n: usize) {
         let n = n.min(MAX_N);
         while self.agents.len() > n {
@@ -211,22 +224,27 @@ impl Lab {
         }
         while self.agents.len() < n {
             let a = Agent {
-                id: self.next_id,
+                id: self.agents.len() as u32,
                 p: Point::new(self.rng.range(0.0, W), self.rng.range(0.0, H)),
                 v: Point::new(self.rng.range(-90.0, 90.0), self.rng.range(-90.0, 90.0)),
                 hits: 0,
             };
-            self.next_id += 1;
             self.slots.push(self.ix.insert(a));
             self.agents.push(a);
         }
-        self.knobs.population = self.agents.len();
     }
 
     /// One step: move a churn-fraction, issue the query load, let the policy tick.
     pub fn step(&mut self, dt: f64) {
         if self.knobs.paused { return; }
-        if self.knobs.population != self.agents.len() { self.resize(self.knobs.population); }
+        // Walk toward the target rather than jumping to it. The knob is what the viewer asked
+        // for; `agents.len()` is what exists yet, and the HUD shows both.
+        let target = self.knobs.population.min(MAX_N);
+        if target != self.agents.len() {
+            let to = if target > self.agents.len() { (self.agents.len() + RESIZE_PER_STEP).min(target) }
+                     else { target.max(self.agents.len().saturating_sub(RESIZE_PER_STEP)) };
+            self.resize(to);
+        }
 
         let n = self.agents.len();
         let moving = if self.knobs.frozen { 0 } else { (n as f64 * self.knobs.churn).round() as usize };
@@ -254,37 +272,47 @@ impl Lab {
         }
         let maintain_us = t.elapsed().as_secs_f64() * 1e6;
 
-        for a in &mut self.agents { a.hits = 0; }
         let queries = ((n as f64 * self.knobs.queries_per_item).round() as usize).min(4096);
         let mut hits = 0usize;
-        let mut hit_ids: Vec<u32> = Vec::new();
+        // `id` IS the index, so a hit is one increment into a flat array — no ids collected, no
+        // sort, no allocation that grows with the result size.
+        let mut counts = vec![0u32; n];
+        // Where this step's window of query centres begins. It CREEPS — an eighth of a window per
+        // step — so consecutive frames share seven eighths of their centres.
+        //
+        // Advancing by a whole window was the second wrong version: with 300 queries over 600
+        // agents the window alternates between the two halves, which is the same two-set flicker
+        // the striding version had, just wearing contiguous blocks instead of parities. The test
+        // measured 75 % of agents changing hit-state every step. Overlap is the actual fix, and
+        // it costs only that a full sweep now takes eight times as many steps.
+        let creep = (queries / 8).max(1);
+        let win_start = if n == 0 { 0 } else { (self.steps as usize).wrapping_mul(creep) % n };
         let t = Instant::now();
         for q in 0..queries {
             // Query centres follow the agents, so the load lands where the data is. Probing
             // empty map would flatter a grid and measure nothing anybody does.
-            // Centres sample the population and SWEEP: pinning them to `agents[q]` meant that at
-            // one cull per item every agent was the centre of its own query and lit itself, so
-            // the field went uniformly yellow whatever the radius. The offset moves the sample
-            // each step, so what you see is where queries land rather than an enumeration.
-            let stride = (n.max(1) / queries.max(1)).max(1);
-            let c = self.agents[((q * stride + self.steps as usize * 7) % n.max(1)).min(n.saturating_sub(1))].p;
+            // A CONTIGUOUS window of agent indices, sliding one window per step.
+            //
+            // Two earlier versions were both wrong. `agents[q * n / queries]` pinned every agent
+            // as the centre of its own query at one cull per item, so the field went uniformly
+            // yellow. Striding with a per-step offset — `(q * stride + step * 7) % n` — fixed that
+            // and introduced a worse artefact: with `stride = 2` the covered indices alternate
+            // parity every step, so half the agents are guaranteed hits on even steps and the
+            // other half on odd ones, and the two colours visibly swap back and forth. Reported
+            // from the window as "the blues turn yellow and the yellows turn blue".
+            //
+            // A sliding contiguous block has no such structure: agent index is unrelated to
+            // position (they are placed at random), so a block of indices is a random spatial
+            // sample, and successive steps overlap rather than interleave.
+            let c = self.agents[(win_start + q) % n.max(1)].p;
             let found = self.ix.cull(&Circle::new(c, self.knobs.radius));
             hits += found.len();
-            hit_ids.extend(found.iter().map(|a| a.id));
+            for a in &found { counts[a.id as usize] += 1; }
         }
         let query_us = t.elapsed().as_secs_f64() * 1e6;
 
         // Marking is separate from querying so the clock above measures the index, not the paint.
-        if !hit_ids.is_empty() {
-            hit_ids.sort_unstable();
-            // `hit_ids` keeps duplicates on purpose: an agent found by six queries is drawn six
-            // times brighter than one found by one, which is the whole point of a count.
-            for a in &mut self.agents {
-                let lo = hit_ids.partition_point(|&id| id < a.id);
-                let hi = hit_ids.partition_point(|&id| id <= a.id);
-                a.hits = (hi - lo) as u32;
-            }
-        }
+        for (a, c) in self.agents.iter_mut().zip(&counts) { a.hits = *c; }
 
         let before = self.ix.backend();
         self.ix.tick();
@@ -367,7 +395,7 @@ impl Lab {
             ix: AdaptiveIndex2::with_thresholds(world(), 8, *self.ix.thresholds()),
             agents: Vec::new(), slots: Vec::new(),
             knobs: self.knobs, stats: FrameStats::default(), history: Vec::new(), lag: LagStats::default(), trace: None,
-            steps: 0, next_id: self.next_id, rng: Rng(0xBEEF),
+            steps: 0, rng: Rng(0xBEEF),
         };
         for a in &self.agents { lab.slots.push(lab.ix.insert(*a)); lab.agents.push(*a); }
         lab
@@ -493,6 +521,46 @@ mod tests {
     }
 
 
+
+    /// ★ The hit pattern must not ALTERNATE between two sets of agents.
+    ///
+    /// Reported from the window: "the blues turn yellow and the yellows turn blue". The cause was
+    /// striding the query centres with a per-step offset — with `stride = 2` the covered indices
+    /// change parity every step, so half the population is a guaranteed hit on even steps and the
+    /// other half on odd ones, and the picture flickers between two complementary colourings.
+    ///
+    /// The test is on the *correlation between consecutive steps*, because that is what a viewer
+    /// perceives as flicker. Nothing here freezes the agents: if the sample were static this
+    /// would pass trivially, so it also demands that the covered set moves at all.
+    #[test]
+    fn the_hit_pattern_does_not_flicker_between_two_sets() {
+        let mut lab = Lab::with_thresholds(31, Thresholds::default());
+        lab.knobs = Knobs { population: 600, queries_per_item: 0.5, radius: 18.0, churn: 0.0, frozen: true, paused: false };
+        lab.resize(600);
+        // Frozen, so the ONLY thing that can change between steps is which queries were issued —
+        // any alternation observed is the sampling pattern and nothing else.
+        let mut prev: Option<Vec<bool>> = None;
+        let (mut same, mut flipped, mut rounds) = (0usize, 0usize, 0usize);
+        for _ in 0..12 {
+            lab.step(1.0 / 60.0);
+            let cur: Vec<bool> = lab.agents.iter().map(|a| a.hits > 0).collect();
+            if let Some(p) = &prev {
+                let agree = p.iter().zip(&cur).filter(|(a, b)| a == b).count();
+                same += agree;
+                flipped += cur.len() - agree;
+                rounds += 1;
+            }
+            prev = Some(cur);
+        }
+        assert!(rounds > 0);
+        let flip_rate = flipped as f64 / (same + flipped) as f64;
+        assert!(flip_rate < 0.55,
+                "{:.0}% of agents change hit-state every step — that reads as flicker", flip_rate * 100.0);
+        // Non-vacuity: a sample that never moves would give a flip rate of 0 and prove nothing
+        // about coverage, so demand that the covered set does change.
+        assert!(flip_rate > 0.02, "the query window never moved ({:.3}); this test would pass on a frozen sample", flip_rate);
+    }
+
     /// ★ Churn must move a ROTATING subset, not a fixed prefix.
     ///
     /// Reported from the running demo: at churn below 1.0 a growing fraction of the dots became
@@ -536,9 +604,15 @@ mod tests {
     #[test]
     fn resizing_keeps_the_slot_table_honest() {
         let mut lab = Lab::with_thresholds(5, Thresholds::default());
+        // `resize` is the immediate form; `knobs.population` is the target `step` walks toward.
+        // Setting only one of them used to work because `resize` wrote the knob back — it no
+        // longer does, and this test failed the moment that changed, which is what it is for.
+        lab.knobs.population = 500;
         lab.resize(500);
         for _ in 0..10 { lab.step(1.0 / 60.0); }
+        lab.knobs.population = 80;
         lab.resize(80);
+        lab.knobs.population = 300;
         lab.resize(300);
         for _ in 0..10 { lab.step(1.0 / 60.0); }
         assert_eq!(lab.agents.len(), 300);

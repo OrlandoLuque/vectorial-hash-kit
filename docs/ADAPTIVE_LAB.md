@@ -78,6 +78,50 @@ whole field went yellow whatever the radius. Centres sweep now, and the dot colo
 behaviour lives. At radius 4 you now see a mostly-cold field with scattered warm dots, which is
 what `HITS 1.2` looks like.
 
+## What the dot colours mean
+
+**How many of last step's queries returned that agent.** Cold blue-grey = found by few or none,
+amber = found by around the typical number, near-white = found by many. It is normalised so
+**mid-ramp is the mean**, not the peak: in the wide-radius act every agent is found by tens of
+queries, so peak and mean sit within a few percent of each other and dividing by the peak pins the
+whole field at the top of the ramp — reported from the window as *"some light yellow, some
+slightly darker, you can hardly tell them apart"*. Against the mean you see variation about the
+typical, which is the only thing left to see once everything is being found.
+
+It took three tries to stop the picture lying, and each wrong version is instructive:
+
+| version | what it did | what it looked like |
+| --- | --- | --- |
+| boolean `hit` | flag per agent | uniformly yellow the moment the load reached one cull per item |
+| centres `agents[q*n/queries]` | every agent the centre of its own query | still uniformly yellow, whatever the radius |
+| centres strided with a per-step offset | covered indices change parity each step | **flicker**: "the blues turn yellow and the yellows turn blue" |
+| window advanced a full width per step | 300 queries over 600 agents alternates between halves | the same two-set flicker in contiguous clothing — measured at **75 %** of agents changing state per step |
+| **window creeping an eighth of a width** | consecutive frames share 7/8 of their centres | stable, and a full sweep takes eight times as long, which costs nothing |
+
+The flicker has a test now, and it is on the *correlation between consecutive steps* because that
+is what a viewer perceives. It runs frozen, so the only thing that can change between steps is
+which queries were issued, and it also refuses to pass on a sample that never moves at all.
+
+## Why it slows down in the grid act
+
+It should. That act is 4 000 agents, one cull per item, radius 70 — about **64 results per query
+and a quarter of a million results per step**. `QUERY 22 563 US` on this laptop, 41 FPS. The grid
+is not what makes it slow; the grid is what the policy reached for *because* that act is
+expensive. `C` is how to check whether it reached correctly.
+
+What was mine and is now fixed: the hit marking used to collect every result id into a `Vec` and
+sort it — a quarter of a million entries per frame, outside the query timer but inside the frame,
+charged to the index's reputation. `id` is the agent's index by construction, so a hit is one
+increment into a flat array.
+
+## Why the population walks instead of jumping
+
+Dragging the slider from 40 to 4 000 used to do 3 960 inserts inside one frame, and the window
+visibly hung for seconds. The knob is a **target** now and the population moves toward it by at
+most [`RESIZE_PER_STEP`] per step; the HUD shows `N 1240/4000` while it catches up. A pacing
+decision, not a measurement one — every step still does exactly the work its own population
+implies.
+
 ## What the HUD says, and why those numbers are next to each other
 
 ```
