@@ -51,10 +51,13 @@ use vectorial_hash_demos::ui2d::{push_frame, push_quad, push_text, text_width, U
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct Cam { vp: [[f32; 4]; 4] }
 
-/// One agent: position, radius, and a 0/1 flag for "a query returned me last step".
+/// One agent: position, radius, and how hard the queries hit it last step.
+///
+/// `heat` is a normalised COUNT, not a flag. As a flag the field went uniformly yellow the moment
+/// the query load reached one cull per item — every agent found by something, nothing to see.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
-struct Inst { x: f32, y: f32, r: f32, hit: f32 }
+struct Inst { x: f32, y: f32, r: f32, heat: f32 }
 
 /// The colour a backend is drawn in, everywhere — strip, HUD label and bake-off row.
 ///
@@ -410,9 +413,14 @@ async fn run() {
 
                     // Radius scales down as the crowd grows, or 20 000 agents is a solid block.
                     let r = (6.0 - (lab.agents.len() as f32).log10()).max(1.6);
+                    let peak = lab.agents.iter().map(|a| a.hits).max().unwrap_or(0);
                     inst.clear();
                     for a in &lab.agents {
-                        inst.push(Inst { x: a.p.x as f32, y: a.p.y as f32, r, hit: if a.hit { 1.0 } else { 0.0 } });
+                        // Normalise against the busiest agent this step, so the picture keeps its
+                        // contrast at any query load instead of saturating. `+1` keeps a quiet
+                        // frame from dividing by zero and from exploding one stray hit into white.
+                        inst.push(Inst { x: a.p.x as f32, y: a.p.y as f32, r,
+                                         heat: a.hits as f32 / (peak + 1) as f32 });
                     }
                     queue.write_buffer(&inst_b, 0, bytemuck::cast_slice(&inst));
 
@@ -550,7 +558,7 @@ async fn run() {
 const RENDER: &str = r#"
 struct Cam { vp: mat4x4<f32> };
 @group(0) @binding(0) var<uniform> cam: Cam;
-struct VO { @builtin(position) clip: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) hit: f32 };
+struct VO { @builtin(position) clip: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) heat: f32 };
 @vertex
 fn vs(@location(0) inst: vec4<f32>, @builtin(vertex_index) vi: u32) -> VO {
     var corners = array<vec2<f32>, 6>(vec2(-1.0,-1.0), vec2(1.0,-1.0), vec2(-1.0,1.0), vec2(-1.0,1.0), vec2(1.0,-1.0), vec2(1.0,1.0));
@@ -558,18 +566,22 @@ fn vs(@location(0) inst: vec4<f32>, @builtin(vertex_index) vi: u32) -> VO {
     var o: VO;
     o.clip = cam.vp * vec4<f32>(inst.xy + c * inst.z, 0.0, 1.0);
     o.uv = c;
-    o.hit = inst.w;
+    o.heat = inst.w;
     return o;
 }
 @fragment
 fn fs(v: VO) -> @location(0) vec4<f32> {
     let d = dot(v.uv, v.uv);
     if (d > 1.0) { discard; }
-    // Returned by a query this step = hot. Everything else is a dim dot, so the query load is
-    // legible as brightness: turn the slider up and the field lights.
-    let cold = vec3<f32>(0.22, 0.28, 0.42);
-    let hot = vec3<f32>(1.0, 0.80, 0.35);
-    return vec4<f32>(mix(cold, hot, v.hit), smoothstep(1.0, 0.3, d));
+    // How many queries found this agent, normalised: a RAMP, not a switch. A boolean saturated
+    // the whole field as soon as the load reached one cull per item, which is exactly where the
+    // interesting behaviour lives. Three stops so the busy middle stays distinguishable.
+    let cold = vec3<f32>(0.20, 0.26, 0.40);
+    let warm = vec3<f32>(0.95, 0.62, 0.22);
+    let hot = vec3<f32>(1.0, 0.97, 0.80);
+    let h = clamp(v.heat, 0.0, 1.0);
+    let col = select(mix(cold, warm, h / 0.5), mix(warm, hot, (h - 0.5) / 0.5), h > 0.5);
+    return vec4<f32>(col, smoothstep(1.0, 0.3, d));
 }
 "#;
 

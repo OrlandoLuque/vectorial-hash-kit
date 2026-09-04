@@ -58,6 +58,26 @@ agents, same one-cull-per-item — and the policy left the grid. Its queries wer
 each, and a grid pays a hash lookup per cell whether or not the cell holds anything. That is
 `Thresholds::grid_min_hits`, and this is the first place it can be *seen*.
 
+## Two defects the running demo found that no test would have
+
+Both were reported by watching it, and both were in the *simulation*, not the display:
+
+**Churn moved a fixed prefix.** `for i in 0..moving` picks the same agents every step, so
+`churn = 0.3` meant *30 % of the population is alive and 70 % are statues* rather than *each agent
+moves 30 % of the time*. On screen the field froze one act at a time and never came back. It also
+quietly flattered the measurement: relocating the same slots every step has cache and leaf
+locality a real 30 % churn does not, so the maintain column was timing a friendlier workload than
+the knob claimed. The moving window rotates now, and a test asserts everyone moves within a
+bounded number of steps, that one step still moves *about* the right fraction, and that `F` still
+freezes everything.
+
+**Query centres enumerated the agents.** Centres were `agents[q * n / queries]`, which at one cull
+per item is exactly `agents[q]` — every agent the centre of its own query, lighting itself, so the
+whole field went yellow whatever the radius. Centres sweep now, and the dot colour is a
+**normalised count** rather than a flag: a boolean saturates precisely where the interesting
+behaviour lives. At radius 4 you now see a mostly-cold field with scattered warm dots, which is
+what `HITS 1.2` looks like.
+
 ## What the HUD says, and why those numbers are next to each other
 
 ```

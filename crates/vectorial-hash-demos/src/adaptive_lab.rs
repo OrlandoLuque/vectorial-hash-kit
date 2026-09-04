@@ -46,8 +46,13 @@ pub struct Agent {
     pub id: u32,
     pub p: Point,
     pub v: Point,
-    /// Was this agent returned by any query on the last step? Purely for the renderer.
-    pub hit: bool,
+    /// How many of last step's queries returned this agent — a COUNT, not a flag.
+    ///
+    /// It was a `bool` and that made the display useless at high query load: with one cull per
+    /// item the whole field lights and stays lit, so the picture stops carrying information
+    /// exactly where the interesting behaviour is. A count shows where the queries actually
+    /// concentrate.
+    pub hits: u32,
 }
 impl Positioned for Agent { fn position(&self) -> Point { self.p } }
 
@@ -209,7 +214,7 @@ impl Lab {
                 id: self.next_id,
                 p: Point::new(self.rng.range(0.0, W), self.rng.range(0.0, H)),
                 v: Point::new(self.rng.range(-90.0, 90.0), self.rng.range(-90.0, 90.0)),
-                hit: false,
+                hits: 0,
             };
             self.next_id += 1;
             self.slots.push(self.ix.insert(a));
@@ -226,8 +231,16 @@ impl Lab {
         let n = self.agents.len();
         let moving = if self.knobs.frozen { 0 } else { (n as f64 * self.knobs.churn).round() as usize };
 
+        // **Which** agents move rotates every step. Moving `0..moving` was the first version and
+        // it is wrong twice over: on screen it makes a fixed fraction into permanent statues
+        // (reported from the running demo — "they freeze one act at a time and never come back"),
+        // and in the measurement it relocates the SAME slots every step, whose cache and leaf
+        // locality is nothing like a real churn of that rate. `churn` is meant to be *what
+        // fraction of the population moves per step*, not *which fraction is alive*.
         let t = Instant::now();
-        for i in 0..moving {
+        let base = if n == 0 { 0 } else { (self.steps as usize).wrapping_mul(moving.max(1)) % n };
+        for k in 0..moving {
+            let i = (base + k) % n;
             let mut a = self.agents[i];
             a.p.x += a.v.x * dt;
             a.p.y += a.v.y * dt;
@@ -241,7 +254,7 @@ impl Lab {
         }
         let maintain_us = t.elapsed().as_secs_f64() * 1e6;
 
-        for a in &mut self.agents { a.hit = false; }
+        for a in &mut self.agents { a.hits = 0; }
         let queries = ((n as f64 * self.knobs.queries_per_item).round() as usize).min(4096);
         let mut hits = 0usize;
         let mut hit_ids: Vec<u32> = Vec::new();
@@ -249,7 +262,12 @@ impl Lab {
         for q in 0..queries {
             // Query centres follow the agents, so the load lands where the data is. Probing
             // empty map would flatter a grid and measure nothing anybody does.
-            let c = self.agents[(q * n.max(1) / queries.max(1)).min(n.saturating_sub(1))].p;
+            // Centres sample the population and SWEEP: pinning them to `agents[q]` meant that at
+            // one cull per item every agent was the centre of its own query and lit itself, so
+            // the field went uniformly yellow whatever the radius. The offset moves the sample
+            // each step, so what you see is where queries land rather than an enumeration.
+            let stride = (n.max(1) / queries.max(1)).max(1);
+            let c = self.agents[((q * stride + self.steps as usize * 7) % n.max(1)).min(n.saturating_sub(1))].p;
             let found = self.ix.cull(&Circle::new(c, self.knobs.radius));
             hits += found.len();
             hit_ids.extend(found.iter().map(|a| a.id));
@@ -259,8 +277,13 @@ impl Lab {
         // Marking is separate from querying so the clock above measures the index, not the paint.
         if !hit_ids.is_empty() {
             hit_ids.sort_unstable();
-            hit_ids.dedup();
-            for a in &mut self.agents { if hit_ids.binary_search(&a.id).is_ok() { a.hit = true; } }
+            // `hit_ids` keeps duplicates on purpose: an agent found by six queries is drawn six
+            // times brighter than one found by one, which is the whole point of a count.
+            for a in &mut self.agents {
+                let lo = hit_ids.partition_point(|&id| id < a.id);
+                let hi = hit_ids.partition_point(|&id| id <= a.id);
+                a.hits = (hi - lo) as u32;
+            }
         }
 
         let before = self.ix.backend();
@@ -467,6 +490,45 @@ mod tests {
             let c = Point::new(500.0, 400.0);
             assert_eq!(arm.brute(c, 50.0), arm.indexed(c, 50.0), "{pin:?} arm answered wrongly");
         }
+    }
+
+
+    /// ★ Churn must move a ROTATING subset, not a fixed prefix.
+    ///
+    /// Reported from the running demo: at churn below 1.0 a growing fraction of the dots became
+    /// permanent statues, and by the frozen act everything had stopped. The cause was `0..moving`
+    /// — the same agents every step, so `churn = 0.3` meant "30 % of the population is alive"
+    /// rather than "each agent moves 30 % of the time".
+    ///
+    /// It was not only a display bug. Relocating the same slots every step has cache and leaf
+    /// locality that a real 30 % churn does not, so the maintenance column was measuring a
+    /// friendlier workload than the knob claimed.
+    #[test]
+    fn churn_moves_everyone_eventually_not_the_same_prefix() {
+        let mut lab = Lab::with_thresholds(21, Thresholds::default());
+        lab.knobs = Knobs { population: 400, queries_per_item: 0.0, radius: 20.0, churn: 0.25, frozen: false, paused: false };
+        lab.resize(400);
+        let start: Vec<Point> = lab.agents.iter().map(|a| a.p).collect();
+        // At 25 % a step, four steps is one nominal sweep; ten is generous and still bounded.
+        for _ in 0..10 { lab.step(1.0 / 60.0); }
+        let moved = lab.agents.iter().zip(&start)
+            .filter(|(a, s)| a.p.x != s.x || a.p.y != s.y).count();
+        assert_eq!(moved, lab.agents.len(),
+                   "only {moved} of {} agents ever moved — the rest are statues", lab.agents.len());
+
+        // ...and the rate must still be the rate: one step at 25 % moves about a quarter, not all.
+        let before: Vec<Point> = lab.agents.iter().map(|a| a.p).collect();
+        lab.step(1.0 / 60.0);
+        let one = lab.agents.iter().zip(&before)
+            .filter(|(a, s)| a.p.x != s.x || a.p.y != s.y).count();
+        assert!((90..=110).contains(&one), "one step at churn 0.25 moved {one} of 400, expected ~100");
+
+        // Frozen still means frozen — the rotation must not leak movement past the switch.
+        lab.knobs.frozen = true;
+        let held: Vec<Point> = lab.agents.iter().map(|a| a.p).collect();
+        for _ in 0..5 { lab.step(1.0 / 60.0); }
+        assert!(lab.agents.iter().zip(&held).all(|(a, s)| a.p.x == s.x && a.p.y == s.y),
+                "something moved while frozen");
     }
 
     /// Resizing must not corrupt the handle table: shrink and regrow, then check every agent is
