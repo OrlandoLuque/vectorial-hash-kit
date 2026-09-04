@@ -28,8 +28,14 @@ argument for building this rather than a sixth bench.
 | `;` `'` | churn | (no threshold; it sets what maintenance costs) |
 | `F` | freeze | `static_ticks` — has everything stopped moving? |
 
-`P` pause · `R` reset · `A` autopilot (walks the five acts) · `C` bake-off · sliders drag with
-the mouse. `$LAB_N`, `$LAB_Q`, `$LAB_R`, `$LAB_CHURN` set the opening state, so a bug report can
+`P` pause · `R` reset · `A` autopilot · `C` bake-off · sliders drag with the mouse.
+
+The autopilot **cycles** the five acts, and they have different lengths (110 · 130 · 130 · 130 ·
+260 frames) because they are not equally interesting: the frozen one needs longer than the default
+**120-tick cooldown** or `BUILD-ONCE` only gets a sliver of strip before the act ends. The first
+version clamped to the last act instead of wrapping, which parked the demo in the frozen state
+forever — nothing moving, and it reads as a hang rather than as the build-once regime. Turning the
+autopilot off also thaws, or `A` hands back a scene that is still frozen and looks broken. `$LAB_N`, `$LAB_Q`, `$LAB_R`, `$LAB_CHURN` set the opening state, so a bug report can
 be a command line rather than a list of instructions.
 
 The **population slider is logarithmic**. `brute_max` defaults to 64, which on a linear 8–20 000

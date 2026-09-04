@@ -336,7 +336,13 @@ async fn run() {
                     KeyCode::Minus => Knob::Radius.nudge(&mut lab.knobs, false),
                     KeyCode::Quote => Knob::Churn.nudge(&mut lab.knobs, true),
                     KeyCode::Semicolon => Knob::Churn.nudge(&mut lab.knobs, false),
-                    KeyCode::KeyA => { auto = !auto; auto_step = 0; }
+                    KeyCode::KeyA => {
+                        auto = !auto;
+                        auto_step = 0;
+                        // Handing control back inside the frozen act would leave the scene still
+                        // and the key looking broken. Thaw on the way out; `F` freezes again.
+                        if !auto { lab.knobs.frozen = false; }
+                    }
                     KeyCode::KeyF => lab.knobs.frozen = !lab.knobs.frozen,
                     KeyCode::KeyP => lab.knobs.paused = !lab.knobs.paused,
                     KeyCode::KeyR => { let k = lab.knobs; lab = Lab::new(0xA11CE); lab.knobs = k; bake = None; }
@@ -373,7 +379,17 @@ async fn run() {
                             Knobs { population: 4000, queries_per_item: 1.0, radius: 4.0, churn: 0.3, frozen: false, paused: false },
                             Knobs { population: 4000, queries_per_item: 0.4, radius: 40.0, churn: 0.0, frozen: true, paused: false },
                         ];
-                        let i = (auto_step / 110).min(acts.len() - 1);
+                        // Per-act lengths, and the sequence CYCLES. The first version divided by
+                        // a fixed 110 and clamped to the last act, which parks the demo forever
+                        // in the frozen one -- nothing moves, and it reads as a hang rather than
+                        // as the build-once regime. The frozen act also needs longer than the
+                        // others: the default cooldown is 120 ticks, so at 110 frames it barely
+                        // reaches BUILD-ONCE before the act ends.
+                        const LENS: [usize; 5] = [110, 130, 130, 130, 260];
+                        let cycle: usize = LENS.iter().sum();
+                        let mut t = auto_step % cycle;
+                        let mut i = 0;
+                        while t >= LENS[i] { t -= LENS[i]; i += 1; }
                         let paused = lab.knobs.paused;
                         lab.knobs = acts[i];
                         lab.knobs.paused = paused;
@@ -439,7 +455,7 @@ async fn run() {
                         push_text(&mut ui, pad + 4.0 * tp, sy + i as f32 * 9.0 * tp, tp * 0.8, [0.78, 0.84, 0.95, 0.95], t, cw, ch);
                     }
                     push_text(&mut ui, pad + 4.0 * tp, sy + 4.0 * 9.0 * tp, tp * 0.8, [0.55, 0.60, 0.72, 0.9],
-                              &format!("F FREEZE P PAUSE C RACE R RESET A AUTO{}", if auto { " *" } else { "" }), cw, ch);
+                              &format!("F FREEZE P PAUSE C RACE R RESET A AUTO{}", if auto { " ON" } else { "" }), cw, ch);
 
                     // ---- the timeline strip: one column per step, coloured by backend
                     let strip_h = 16.0 * tp;
