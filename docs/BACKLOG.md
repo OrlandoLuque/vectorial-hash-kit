@@ -276,6 +276,39 @@ the gates — so the anchor is right and only `building_tweak`'s per-model *scal
 human. That is the point of the capability: it does not replace the user's taste, it stops
 correctness questions from queueing behind it.
 
+## ★ 2026-09-10/11 — the space-filling-curve night
+
+Triggered by two questions: "is a 3D geohash just Morton?" (yes — and see `docs/SPACE_FILLING_CURVES.md`)
+and "check the Morton-vs-Hilbert conclusions against the literature". Four commits.
+
+**They agree, and better than agree — they reproduce the closed form.** Moon, Jagadish, Faloutsos &
+Saltz (TKDE 2001) give the Hilbert clustering number as surface area / 2·dimensions, i.e. `s²` for a
+3D cube of side `s`. Measured: 16, 65, 249, 993 against 16, 64, 256, 1024. The bench **asserts** it
+now, because a broken encoder still prints a plausible table.
+
+**And it caught a misreading of mine.** I had described Hilbert's advantage as *growing* with query
+size (M/H climbing 1.62 → 1.92). It converges: Xu & Tirthapura (PODS 2012) proved Z-order is within
+a constant factor of optimal, and the ratio settles at ~1.9. A constant near 2, once — not a
+different complexity class.
+
+**BIGMIN *and* LITMAX** (`examples/bigmin_litmax`), verified exhaustively (9 830 400 probes) and by
+walking boxes end to end. They are a pair: BIGMIN says where to resume, LITMAX where the run just
+left ended.
+
+**Run-aware scanning** (`box_ranges` in `cold_index_bench`) is exact — 1.00× over-scan against the
+span scan's 7 299× — but the finding is the precondition nobody states: the run count is `s²` in
+CELLS, so it is set by the KEY RESOLUTION. At 16 bits the demo's own bubble would need ~43 M ranges
+for ~780 points. And pushing the other way hits a floor at **6/π = 1.91**, the cube-over-sphere
+volume ratio. The knob has a floor, not a direction.
+
+**#168 closed as a negative.** A radix/PATRICIA trie over Morton keys *is* an octree with path
+compression, and `Octree3` beats it 3.6–5.2× on query, 1.5–2.5× on build. The reason is better than
+the verdict: path compression (the lever everyone names) is worth 8 %; the item limit (the one
+nobody names) is worth ~8×.
+
+**Still open here:** promote BIGMIN/LITMAX out of the example *if* an ordered-store index is ever
+built — today nothing in the kit uses a sorted key store, so they have no caller.
+
 ## Horde — parked 2026-09-01, resume when the main machine is back
 
 The wall/ring geometry is finished and gated by tests. What is left needs the user's screen and
