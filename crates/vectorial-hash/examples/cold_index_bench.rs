@@ -394,5 +394,7 @@ fn main() {
         println!("{:>9} | {:>14.2}  {:>15.2} {:>16.2} {:>14.2}", n, t_naive, t_probe, t_g, t_t);
     }
 
-    println!("\ndone. reading in the cold-index findings doc.");
+    println!("
+done — the conclusions, and the check against the published closed forms,");
+    println!("are written up in docs/SPACE_FILLING_CURVES.md.");
 }
