@@ -308,7 +308,9 @@ fn main() {
     //   - MortonGrid3 (HashMap, hot in-memory).
     //   - Tree3 (adaptive, hot).
     const LV: u32 = 5; // coarse cell level (32 cells/axis, cell ≈ 312 wu ≈ bubble)
-    let ccell = |v: f64| ((v / WORLD) * (1u32 << LV) as f64) as u32 & ((1 << LV) - 1);
+    // Clamped, not masked — the same defect corrected in `cell` above, three hundred lines away
+    // in the same file, found by sweeping for the signature rather than by remembering.
+    let ccell = |v: f64| (((v / WORLD) * (1u32 << LV) as f64) as i64).clamp(0, ((1u32 << LV) - 1) as i64) as u32;
     // ---------------------------------------------------------------- A3
     // A2 says the span scan is hopeless. The fix the literature reaches for is to scan the box's
     // RUNS instead — BIGMIN/LITMAX as a cursor, or equivalently the octree decomposition in

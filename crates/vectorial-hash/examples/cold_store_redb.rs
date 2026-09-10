@@ -28,7 +28,10 @@ fn morton3(x: u32, y: u32, z: u32) -> u64 {
     fn split(mut v: u64) -> u64 { v &= 0x1f_ffff; v = (v | v << 32) & 0x1f00000000ffff; v = (v | v << 16) & 0x1f0000ff0000ff; v = (v | v << 8) & 0x100f00f00f00f00f; v = (v | v << 4) & 0x10c30c30c30c30c3; v = (v | v << 2) & 0x1249249249249249; v }
     split(x as u64) | (split(y as u64) << 1) | (split(z as u64) << 2)
 }
-fn ccell(v: f64) -> u32 { ((v / WORLD) * (1u32 << LV) as f64) as u32 & ((1 << LV) - 1) }
+/// Clamped, not masked: a query bound (`centre ± radius`) leaves the world, and masking wraps it
+/// to the far side, silently turning the query into a different, enormous box. That defect inflated
+/// this file's sibling bench by 72x — see docs/SPACE_FILLING_CURVES.md.
+fn ccell(v: f64) -> u32 { (((v / WORLD) * (1u32 << LV) as f64) as i64).clamp(0, ((1u32 << LV) - 1) as i64) as u32 }
 
 struct Rng(u64);
 impl Rng { fn next(&mut self) -> u64 { let mut x = self.0; x ^= x << 13; x ^= x >> 7; x ^= x << 17; self.0 = x; x } fn unit(&mut self) -> f64 { (self.next() >> 11) as f64 / (1u64 << 53) as f64 } }
