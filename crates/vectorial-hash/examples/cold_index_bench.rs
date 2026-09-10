@@ -113,7 +113,7 @@ fn main() {
     // Locality metric 1: how many CONTIGUOUS key-runs does a box of side `s`
     // cells map to? (fewer = better locality = fewer/cheaper range scans).
     println!("== A1) box → contiguous key-runs (lower = better locality) ==");
-    println!("{:>10} | {:>16} {:>16} {:>10}", "box side", "Morton runs", "Hilbert runs", "M/H");
+    println!("{:>10} | {:>16} {:>16} {:>10} {:>8} {:>8}", "box side", "Morton runs", "Hilbert runs", "M/H", "H/s²", "M/s²");
     let mut rr = Rng(1);
     for &s in &[4u32, 8, 16, 32] {
         let (mut mruns, mut hruns, trials) = (0u64, 0u64, 200u32);
@@ -133,8 +133,21 @@ fn main() {
             hruns += runs(&|x, y, z| hilbert3(x, y, z, BITS));
         }
         let (m, h) = (mruns as f64 / trials as f64, hruns as f64 / trials as f64);
-        println!("{:>10} | {:>16.0} {:>16.0} {:>10.2}x", s, m, h, m / h);
+        // Checked against theory, not just reported. Moon, Jagadish, Faloutsos & Saltz (TKDE
+        // 2001) derive the Hilbert clustering number as the query's SURFACE AREA divided by
+        // twice the dimensionality; for a cube of side s in 3D that is 6s²/6 = **s² exactly**.
+        // If this drifts, either the hilbert3 encoder broke or the run counter did — and a
+        // silently wrong encoder still produces a plausible-looking table, which is the whole
+        // reason to assert it.
+        let theory = (s * s) as f64;
+        assert!((h / theory - 1.0).abs() < 0.10,
+            "Hilbert runs {h:.0} vs the closed form s²={theory:.0} — off by {:.0}%", 100.0 * (h / theory - 1.0).abs());
+        println!("{:>10} | {:>16.0} {:>16.0} {:>10.2}x {:>8.2} {:>8.2}", s, m, h, m / h, h / theory, m / theory);
     }
+    println!("  (last two columns: runs / s². Hilbert should sit at 1.00 — the Moon et al. closed");
+    println!("   form. Morton converges to a CONSTANT ~1.9, which is Xu & Tirthapura's result that");
+    println!("   Z-order is within a constant factor of optimal — it does not get worse without");
+    println!("   bound, and reading the small-box ratio as a growing gap is a mistake.)");
 
     // Locality metric 2: real sorted-key range scan over-scan on N points.
     // A box query scans keys in [min_box_code, max_box_code]; over-scan =
