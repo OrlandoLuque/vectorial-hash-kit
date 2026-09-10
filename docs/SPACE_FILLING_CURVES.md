@@ -104,8 +104,32 @@ ranges, bad sphere. Fine: geometric floor, exploding ranges. At 16 bits, A2's bu
 So "use Hilbert and scan the runs" is only half an answer. The other half is choosing the key
 resolution so that `s²` stays small — and nobody states that precondition in the same breath.
 
-BIGMIN/LITMAX themselves are still to write, as the cursor form for a real ordered store; the
-recursion above is what they should be checked against.
+## BIGMIN and LITMAX, and why they are a pair
+
+`cargo run -p vectorial-hash --example bigmin_litmax --release` implements the cursor form: the
+thing you want when you are dragging a cursor across a B-tree or a trie and need to know where to
+jump, rather than materialising every range up front.
+
+- **`BIGMIN(qlo, qhi, z)`** — the smallest key ≥ `z` inside the box. *Where to resume* once the
+  curve has wandered out.
+- **`LITMAX(qlo, qhi, z)`** — the largest key ≤ `z` inside the box. *Where the run you just left
+  actually ended.*
+
+Knowing only where to re-enter tells you nothing about where to cut, which is why every treatment
+introduces them together and why quoting one without the other is half an algorithm.
+
+The file is mostly verification, deliberately. The bit-twiddling is notorious for being subtly
+wrong in a way that still returns *a* key that is *usually* right — the failure hides at the box
+boundaries and surfaces as a query that silently drops a few points. So both are checked two
+independent ways: **exhaustively against brute force** (300 random boxes × all 32 768 keys at 5
+bits/axis = 9 830 400 probes, every one exact), and by **walking a box end to end with the pair**
+and comparing the runs against the enumerated truth (200 boxes, 50 126 runs, identical).
+
+One note on the verification itself, because it bit: written the obvious way — a linear `find` over
+the key space inside the probe loop — the check is quadratic in the key space, 3 × 10¹¹ operations,
+and never returns. The oracle is now built once per box and answered by binary search. **A
+verification that cannot finish verifies nothing**, and it fails silently by looking like a slow
+test rather than a broken one.
 
 ## What actually answers the query today
 
@@ -127,10 +151,9 @@ and 32.5–35.5) wider than the spread. A sorted key store is not only a disk sh
 
 ## Open
 
-- **BIGMIN / LITMAX as a cursor.** The recursive decomposition above already realises the run
-  count, so the remaining value is the streaming form: seeking a B-tree/trie cursor forward without
-  materialising every range first. `box_ranges` is the oracle to check it against — two independent
-  methods that must agree.
+- **Promote the pair out of the example** if an ordered-store index is ever built here. Today
+  nothing in the kit uses a sorted key store, so the algorithms have no caller and live where they
+  were measured.
 (The radix trie is answered below; the `radix` elsewhere in this repo is radix *sort*, for building
 the GPU LBVH — unrelated.)
 
