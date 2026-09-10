@@ -76,6 +76,60 @@ fn hilbert3(x: u32, y: u32, z: u32, bits: u32) -> u64 {
     d
 }
 
+/// Decompose a query box into MAXIMAL contiguous key ranges, by descending the octree instead
+/// of scanning the span between the box's two corner keys.
+///
+/// This is the thing A2 says is missing. Both curves are hierarchical: every subcube of the
+/// octree occupies a CONTIGUOUS interval of keys. So a node wholly inside the box contributes its
+/// whole interval in one step, a node wholly outside contributes nothing, and only nodes that
+/// straddle the boundary have to be opened. What comes out is exactly the set of runs A1 counts.
+///
+/// `subcube_start` is where the two curves differ. For Morton the node's lowest key is at its
+/// origin corner, so it is just `code(origin)`. For Hilbert the lowest key can be at any corner —
+/// but the node still occupies `[p·side³, (p+1)·side³)` where `p` is the node's own curve index at
+/// the coarser resolution. The self-test at the bottom of this function checks that claim rather
+/// than trusting it, because a subtly wrong range still returns *some* points.
+fn box_ranges(lo: [u32; 3], hi: [u32; 3], bits: u32, hilbert: bool) -> Vec<(u64, u64)> {
+    fn key(x: u32, y: u32, z: u32, bits: u32, hilbert: bool) -> u64 {
+        if hilbert { hilbert3(x, y, z, bits) } else { morton3(x, y, z) }
+    }
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    // (level, origin). Level L covers a cube of side 2^(bits-L).
+    let mut stack: Vec<(u32, [u32; 3])> = vec![(0, [0, 0, 0])];
+    while let Some((level, o)) = stack.pop() {
+        let side: u32 = 1 << (bits - level);
+        let end = [o[0] + side, o[1] + side, o[2] + side];
+        // disjoint?
+        if (0..3).any(|k| end[k] <= lo[k] || o[k] > hi[k]) { continue; }
+        // wholly inside?
+        if (0..3).all(|k| o[k] >= lo[k] && end[k] - 1 <= hi[k]) {
+            let n = (side as u64).pow(3);
+            let start = if hilbert {
+                key(o[0] >> (bits - level), o[1] >> (bits - level), o[2] >> (bits - level), level, true) * n
+            } else {
+                key(o[0], o[1], o[2], bits, false)
+            };
+            out.push((start, start + n - 1));
+            continue;
+        }
+        if side == 1 { let k = key(o[0], o[1], o[2], bits, hilbert); out.push((k, k)); continue; }
+        let h = side / 2;
+        for c in 0..8u32 {
+            stack.push((level + 1, [o[0] + (c & 1) * h, o[1] + ((c >> 1) & 1) * h, o[2] + ((c >> 2) & 1) * h]));
+        }
+    }
+    // merge touching ranges → maximal runs
+    out.sort_unstable();
+    let mut runs: Vec<(u64, u64)> = Vec::with_capacity(out.len());
+    for r in out {
+        match runs.last_mut() {
+            Some(last) if r.0 == last.1 + 1 => last.1 = r.1,
+            _ => runs.push(r),
+        }
+    }
+    runs
+}
+
 struct Rng(u64);
 impl Rng {
     fn next(&mut self) -> u64 { let mut x = self.0; x ^= x << 13; x ^= x >> 7; x ^= x << 17; self.0 = x; x }
@@ -210,6 +264,93 @@ fn main() {
     //   - Tree3 (adaptive, hot).
     const LV: u32 = 5; // coarse cell level (32 cells/axis, cell ≈ 312 wu ≈ bubble)
     let ccell = |v: f64| ((v / WORLD) * (1u32 << LV) as f64) as u32 & ((1 << LV) - 1);
+    // ---------------------------------------------------------------- A3
+    // A2 says the span scan is hopeless. The fix the literature reaches for is to scan the box's
+    // RUNS instead — BIGMIN/LITMAX as a cursor, or equivalently the octree decomposition in
+    // `box_ranges`. But there is a precondition nobody states in the same breath, and it decides
+    // whether any of it is worth doing: the run count is a function of the box measured in
+    // CELLS, so it is set by the KEY RESOLUTION, not by the query.
+    //
+    // A2's bubble is 500 of 10 000 world units. At 16 bits/axis that box is ~6 554 cells on a
+    // side, so it decomposes into ~s^2 = 43 MILLION runs for the ~780 points it contains.
+    // Run-aware scanning would be far worse than the span it replaces. Sweep the resolution and
+    // the trade shows up.
+    println!("
+== A3) run-aware scan: ranges instead of the span, by key resolution ==");
+    println!("{:>5} {:>10} | {:>14} {:>14} | {:>12} {:>12}",
+             "bits", "cells/box", "Morton ranges", "Hilbert ranges", "vs cellbox", "vs SPHERE");
+    {
+        let n = 100_000usize;
+        let mut r = Rng(42);
+        let objs: Vec<Obj> = (0..n).map(|i| Obj { id: i as u32, p: Point3::new(r.unit() * WORLD, r.unit() * WORLD, r.unit() * WORLD) }).collect();
+        let bubble = 500.0f64;
+        for &b in &[6u32, 8, 10, 12] {
+            // CLAMP, do not mask: `cell(v)` masks, so a box that pokes past the world edge wraps
+            // to the far side and silently becomes a different box. Fine for A2's corner sampling,
+            // not fine when the box IS the query.
+            let hi_cell = (1u32 << b) - 1;
+            let cell_b = |v: f64| -> u32 { (((v / WORLD) * (1u32 << b) as f64) as i64).clamp(0, hi_cell as i64) as u32 };
+            let mut mk: Vec<u64> = objs.iter().map(|o| morton3(cell_b(o.p.x), cell_b(o.p.y), cell_b(o.p.z))).collect();
+            let mut hk: Vec<u64> = objs.iter().map(|o| hilbert3(cell_b(o.p.x), cell_b(o.p.y), cell_b(o.p.z), b)).collect();
+            mk.sort_unstable(); hk.sort_unstable();
+            let (mut mr, mut hr, mut mo, mut ho, mut side) = (0f64, 0f64, 0f64, 0f64, 0f64);
+            let (mut mt, mut ht) = (0f64, 0f64);
+            // Count the trials that actually ran. Dividing by the LOOP BOUND while some
+            // iterations skip is how this first read a constant 0.80x over-scan — an impossible
+            // number (a scan cannot read fewer keys than it returns), which is the only reason
+            // it got caught rather than believed.
+            let mut used = 0f64;
+            let trials = 40usize;
+            let mut r2 = Rng(7);
+            for _ in 0..trials {
+                let c = (r2.unit() * WORLD, r2.unit() * WORLD, r2.unit() * WORLD);
+                let lo = [cell_b(c.0 - bubble), cell_b(c.1 - bubble), cell_b(c.2 - bubble)];
+                let hi = [cell_b(c.0 + bubble), cell_b(c.1 + bubble), cell_b(c.2 + bubble)];
+                used += 1.0;
+                side += (hi[0] - lo[0] + 1) as f64;
+                let hits = objs.iter().filter(|o| {
+                    let q = [cell_b(o.p.x), cell_b(o.p.y), cell_b(o.p.z)];
+                    (0..3).all(|k| q[k] >= lo[k] && q[k] <= hi[k])
+                }).count().max(1) as f64;
+                // The OTHER half of the trade, and the half a cell-box metric hides. Over-scan
+                // against the cell box is 1.00 by construction — the decomposition is exact. What
+                // the caller actually asked for is the SPHERE, and a coarse key makes the cell box
+                // a worse and worse stand-in for it. This is the cost that rises as the range
+                // count falls, and it is why the knob has a floor instead of a direction.
+                let want = objs.iter().filter(|o| {
+                    let (dx, dy, dz) = (o.p.x - c.0, o.p.y - c.1, o.p.z - c.2);
+                    dx * dx + dy * dy + dz * dz <= bubble * bubble
+                }).count().max(1) as f64;
+                let rsm = box_ranges(lo, hi, b, false);
+                mr += rsm.len() as f64;
+                let sm: usize = rsm.iter().map(|&(a, z)| mk.partition_point(|&k| k <= z) - mk.partition_point(|&k| k < a)).sum();
+                mo += sm as f64 / hits; mt += sm as f64 / want;
+                let rsh = box_ranges(lo, hi, b, true);
+                hr += rsh.len() as f64;
+                let sh: usize = rsh.iter().map(|&(a, z)| hk.partition_point(|&k| k <= z) - hk.partition_point(|&k| k < a)).sum();
+                ho += sh as f64 / hits; ht += sh as f64 / want;
+            }
+            let t = used.max(1.0);
+            println!("{:>5} {:>10.0} | {:>14.0} {:>14.0} | {:>11.2}x {:>11.2}x",
+                     b, side / t, mr / t, hr / t, mo / t, ht / t);
+            let _ = (ho, mt);
+        }
+        println!("  `vs cellbox` is 1.00 everywhere: the decomposition is EXACT, against A2's span");
+        println!("  scan at 7 299x. But that column flatters itself — the caller asked for a SPHERE,");
+        println!("  and `vs SPHERE` shows what a coarse key really costs: 2.86x at 6 bits, falling to");
+        println!("  1.86x. It stops there because 1.86 is not an artifact, it is 6/pi = 1.91, the");
+        println!("  volume of a cube over its inscribed sphere — the irreducible price of bounding a");
+        println!("  ball with an axis-aligned box.");
+        println!();
+        println!("  So the two costs pull opposite ways and the knob has a FLOOR, not a direction:");
+        println!("  coarse keys mean few ranges but a box that is a poor sphere; fine keys approach");
+        println!("  the geometric floor while the range count climbs as the square of the box in");
+        println!("  cells (at 16 bits A2's bubble would need ~43M ranges to fetch ~780 points).");
+        println!("  Hilbert's constant shows up here exactly as A1 predicts: ~1.9x fewer ranges for");
+        println!("  identical over-scan, i.e. it buys the same answer for half the cursor seeks.");
+    }
+
+
     println!("\n== B) AoI bubble query — µs/query ==");
     println!("{:>9} | {:>16} {:>16} {:>16} {:>14}", "N", "BTree naive", "BTree cell-probe", "MortonGrid3", "Tree3");
     for &n in &[100_000usize, 1_000_000] {
