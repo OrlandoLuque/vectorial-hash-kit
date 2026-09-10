@@ -131,10 +131,36 @@ and 32.5–35.5) wider than the spread. A sorted key store is not only a disk sh
   count, so the remaining value is the streaming form: seeking a B-tree/trie cursor forward without
   materialising every range first. `box_ranges` is the oracle to check it against — two independent
   methods that must agree.
-- **A radix / PATRICIA trie** over the same keys, next to `BTreeMap` — a prefix is a *subtree* there
-  rather than a range, path compression eats the long shared prefixes clustered data produces, and
-  in-order traversal is curve order for free. (The `radix` already in this repo is radix *sort*, for
-  building the GPU LBVH. Unrelated.)
+(The radix trie is answered below; the `radix` elsewhere in this repo is radix *sort*, for building
+the GPU LBVH — unrelated.)
+
+## The radix / PATRICIA trie: measured, and the question closes
+
+`cargo run -p vectorial-hash --example radix_trie_bench --release` — 200 000 points, 10 bits/axis,
+an 8-ary trie with path compression racing the kit's `Octree3` on the **same sphere**, with both
+answers asserted equal to brute force and to each other.
+
+| data | trie build | octree build | trie query | octree query |
+| --- | ---: | ---: | ---: | ---: |
+| uniform | 294 ms | **117 ms** | 43.6 µs | **12.2 µs** |
+| clustered | 177 ms | **119 ms** | 25.6 µs | **4.9 µs** |
+
+The hypothesis the bench was written to kill was that a radix trie over Morton keys at 3 bits per
+digit simply *is* an octree with path compression. It is: `Octree3` wins 3.6–5.2× on the query and
+1.5–2.5× on the build. The kit already has this structure, spelled better.
+
+**The reason matters more than the verdict, because the famous lever turns out to be the small
+one.** The trie pays **~1.4 nodes per item** — it descends to full depth for every point, so a leaf
+holds almost nothing. Path compression attacks the *depth* of sparse single-child chains and it
+does help exactly where predicted, clustered data keeping 263 k nodes against uniform's 288 k — but
+that is **8 %**. What the octree has instead is an **item limit**: stop subdividing at 8 items and
+the node count falls by nearly 8×. Adding that to the trie would not make it competitive; it would
+make it an octree.
+
+The ordered-store question is separate and stays open — that is what a `BTreeMap` (or a real
+on-disk B-tree) answers, and it is measured properly in `cold_index_bench` with range scans rather
+than per-cell probes. Deliberately not raced here: probing a 61-cell-wide box cell by cell is
+230 000 lookups, which is not a rival, it is a straw man.
 
 ## Sources
 
