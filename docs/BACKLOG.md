@@ -296,7 +296,7 @@ walking boxes end to end. They are a pair: BIGMIN says where to resume, LITMAX w
 left ended.
 
 **Run-aware scanning** (`box_ranges` in `cold_index_bench`) is exact — 1.00× over-scan against the
-span scan's 7 299× — but the finding is the precondition nobody states: the run count is `s²` in
+span scan's ~102× — but the finding is the precondition nobody states: the run count is `s²` in
 CELLS, so it is set by the KEY RESOLUTION. At 16 bits the demo's own bubble would need ~43 M ranges
 for ~780 points. And pushing the other way hits a floor at **6/π = 1.91**, the cube-over-sphere
 volume ratio. The knob has a floor, not a direction.

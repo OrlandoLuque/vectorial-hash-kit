@@ -47,19 +47,35 @@ in at ~1.9. The small-box ratios are below the asymptote, not on the way up to i
 Hilbert buys you a constant near 2, once, forever — worth having, and not a different complexity
 class.
 
-## …and it buys nothing at all if you scan the span
+## …and if you scan the span, Hilbert is actually WORSE
 
-The obvious way to use a sorted key store is to scan `[min_code, max_code]` for the box's corners:
+The obvious way to use a sorted key store is to scan `[min_code, max_code]` over the box:
 
 | N | Morton over-scan | Hilbert over-scan | avg hits |
 | ---: | ---: | ---: | ---: |
-| 100 000 | 7 299× | 7 251× | 78 |
-| 1 000 000 | 72 342× | 71 582× | 782 |
+| 100 000 | **102.0×** | 112.2× | 91 |
+| 1 000 000 | **101.4×** | 111.3× | 913 |
 
-Four orders of magnitude of waste, and **the two curves are indistinguishable** — 0.7 % apart. The
-locality advantage measured above is entirely about how many *runs* the box decomposes into; the
-*span* from the lowest to the highest key in the box covers nearly everything either way, because
-the corners are far apart along the curve whatever the curve does in between.
+Two orders of magnitude of waste, and the curve that wins on locality **loses here by 10 %**. That
+is not a contradiction, it is the distinction the whole page turns on: Hilbert's advantage is in how
+many *runs* the box decomposes into, and a span scan does not care about runs. It cares about the
+distance from the lowest key in the box to the highest — and Hilbert, not being monotone in the
+coordinates, can put those two further apart than Morton, whose extremes sit exactly on the box's
+low and high corners.
+
+So the summary is sharper than "the span scan is bad": **scanning the span throws away Hilbert's
+advantage and then charges you 10 % for having chosen it.**
+
+> **Correction, 2026-09-11.** This table first read 7 299× and 7 251× — "indistinguishable, four
+> orders of magnitude" — and both figures were wrong by ~72×. Two bugs, found when the extremes
+> were made exact. The cell mapping **masked** instead of clamping, so a query box overlapping the
+> world edge wrapped round to the far side and became an enormous different box; and Hilbert's
+> extremes were *sampled* from 8 corners and 6 face centres, with a comment admitting the sample
+> under-counted its advantage. The sampling error was real but small; the masking error was the 72×,
+> and it inflated both columns roughly equally, which is exactly why the wrong numbers looked
+> plausible — they preserved the ratio and only broke the magnitude. Both are fixed
+> (`box_extremes` walks the octree for the true min and max in O(8·depth), and `cell` clamps),
+> and only after that did the ordering between the curves become visible at all.
 
 This is the point at which the literature stops recommending the naive scan and reaches for
 **BIGMIN / LITMAX** (Tropf & Herzog 1981, later the UB-tree line of work). They are a pair and both
@@ -84,7 +100,7 @@ BIGMIN/LITMAX produce as a cursor; the recursion is easier to verify, so it goes
 Three things, and the third is the useful one.
 
 **It is exact.** Over-scan against the cell box is 1.00 at every resolution — the scan reads
-precisely the box, against the span scan's 7 299×. That also cross-checks the decomposition: the
+precisely the box, against the span scan's 102×. That also cross-checks the decomposition: the
 range counts reproduce `s²` again (45 vs 49, 610 vs 625, 9 358 vs 9 801, 153 282 vs 153 664), which
 is now the **third independent** confirmation of the same law, after A1's run counting and the
 published closed form.

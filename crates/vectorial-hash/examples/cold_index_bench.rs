@@ -130,6 +130,49 @@ fn box_ranges(lo: [u32; 3], hi: [u32; 3], bits: u32, hilbert: bool) -> Vec<(u64,
     runs
 }
 
+/// The exact minimum and maximum key over a box, in O(8 · depth) — without enumerating the runs.
+///
+/// `box_ranges` gives these as the first range's start and the last range's end, and that is what
+/// this function replaced: on A2's box (6 554 cells a side at 16 bits) the decomposition is ~43
+/// MILLION ranges, which is precisely the explosion A3 documents. Using it to extract two numbers
+/// was a fine idea applied at exactly the size where it does not work.
+///
+/// Descending is enough. Both curves are hierarchical, so a node's keys are a contiguous interval:
+/// to find the smallest key in the box, at each level take the intersecting child with the lowest
+/// interval start and recurse. The largest is the mirror.
+fn box_extremes(lo: [u32; 3], hi: [u32; 3], bits: u32, hilbert: bool) -> Option<(u64, u64)> {
+    fn node_start(o: [u32; 3], level: u32, bits: u32, hilbert: bool) -> u64 {
+        let n = 1u64 << (3 * (bits - level));
+        if hilbert { hilbert3(o[0] >> (bits - level), o[1] >> (bits - level), o[2] >> (bits - level), level) * n }
+        else { morton3(o[0], o[1], o[2]) }
+    }
+    // walk down for the extreme, `want_min` choosing the direction
+    let walk = |want_min: bool| -> Option<u64> {
+        let (mut o, mut level) = ([0u32; 3], 0u32);
+        loop {
+            let side = 1u32 << (bits - level);
+            if (0..3).any(|k| o[k] + side <= lo[k] || o[k] > hi[k]) { return None; }
+            if level == bits {
+                return Some(node_start(o, level, bits, hilbert));
+            }
+            let h = side / 2;
+            let mut best: Option<([u32; 3], u64)> = None;
+            for c in 0..8u32 {
+                let co = [o[0] + (c & 1) * h, o[1] + ((c >> 1) & 1) * h, o[2] + ((c >> 2) & 1) * h];
+                if (0..3).any(|k| co[k] + h <= lo[k] || co[k] > hi[k]) { continue; }
+                let st = node_start(co, level + 1, bits, hilbert);
+                let key = if want_min { st } else { st + (1u64 << (3 * (bits - level - 1))) - 1 };
+                let better = match best { None => true, Some((_, b)) => if want_min { key < b } else { key > b } };
+                if better { best = Some((co, key)); }
+            }
+            let (co, _) = best?;
+            o = co;
+            level += 1;
+        }
+    };
+    Some((walk(true)?, walk(false)?))
+}
+
 struct Rng(u64);
 impl Rng {
     fn next(&mut self) -> u64 { let mut x = self.0; x ^= x << 13; x ^= x >> 7; x ^= x << 17; self.0 = x; x }
@@ -141,7 +184,11 @@ impl Rng {
 struct Obj { id: u32, p: Point3 }
 impl Positioned3 for Obj { fn position(&self) -> Point3 { self.p } }
 
-fn cell(v: f64) -> u32 { ((v / WORLD) * (1u32 << BITS) as f64) as u32 & ((1 << BITS) - 1) }
+/// World coordinate → cell index. **Clamped, not masked.** Masking wraps a coordinate that pokes
+/// past the world edge round to the far side, which silently turns a query near the boundary into
+/// a different, enormous box. That inflated A2's over-scan by ~80x for a whole night before the
+/// exact-extremes rewrite made the discrepancy visible.
+fn cell(v: f64) -> u32 { (((v / WORLD) * (1u32 << BITS) as f64) as i64).clamp(0, ((1u32 << BITS) - 1) as i64) as u32 }
 
 fn main() {
     // ---- self-test the Hilbert encoder on a small grid: bijection + adjacency.
@@ -216,19 +263,17 @@ fn main() {
         let mut hkeys: Vec<u64> = objs.iter().map(|o| hilbert3(cell(o.p.x), cell(o.p.y), cell(o.p.z), BITS)).collect();
         mkeys.sort_unstable(); hkeys.sort_unstable();
         let bubble = 500.0f64;
-        let scan = |keys: &[u64], code: &dyn Fn(u32, u32, u32) -> u64, cxyz: (f64, f64, f64)| -> (usize, usize) {
+        let scan = |keys: &[u64], hilbert: bool, cxyz: (f64, f64, f64)| -> (usize, usize) {
             // box cell bounds of the bubble
             let (x0, x1) = (cell(cxyz.0 - bubble), cell(cxyz.0 + bubble));
             let (y0, y1) = (cell(cxyz.1 - bubble), cell(cxyz.1 + bubble));
             let (z0, z1) = (cell(cxyz.2 - bubble), cell(cxyz.2 + bubble));
-            // min/max code over the box cells (corners suffice for Morton;
-            // Hilbert isn't monotone, so sample the 8 corners + face centres —
-            // a cheap approximation of the true min/max that slightly
-            // UNDER-counts Hilbert's advantage, i.e. it's conservative).
-            let mut lo = u64::MAX; let mut hi = 0u64;
-            for &cx in &[x0, (x0 + x1) / 2, x1] { for &cy in &[y0, (y0 + y1) / 2, y1] { for &cz in &[z0, (z0 + z1) / 2, z1] {
-                let c = code(cx, cy, cz); lo = lo.min(c); hi = hi.max(c);
-            }}}
+            // TRUE min/max over the box, not a sample. This used to probe the 8 corners and the
+            // face centres and admit in a comment that it under-counted Hilbert's advantage —
+            // Hilbert is not monotone in the coordinates, so the extreme key can sit anywhere.
+            // `box_ranges` decomposes the box into its exact key intervals, so the first range's
+            // start and the last range's end ARE the extremes, by construction.
+            let Some((lo, hi)) = box_extremes([x0, y0, z0], [x1, y1, z1], BITS, hilbert) else { return (0, 0) };
             let s = keys.partition_point(|&k| k < lo);
             let e = keys.partition_point(|&k| k <= hi);
             let scanned = e - s;
@@ -245,8 +290,8 @@ fn main() {
             let (y0, y1) = (cell(c.1 - bubble), cell(c.1 + bubble));
             let (z0, z1) = (cell(c.2 - bubble), cell(c.2 + bubble));
             let hits = objs.iter().filter(|o| { let (a, b, d) = (cell(o.p.x), cell(o.p.y), cell(o.p.z)); a >= x0 && a <= x1 && b >= y0 && b <= y1 && d >= z0 && d <= z1 }).count().max(1);
-            let (ms, _) = scan(&mkeys, &|x, y, z| morton3(x, y, z), c);
-            let (hs, _) = scan(&hkeys, &|x, y, z| hilbert3(x, y, z, BITS), c);
+            let (ms, _) = scan(&mkeys, false, c);
+            let (hs, _) = scan(&hkeys, true, c);
             mo += ms as f64 / hits as f64; ho += hs as f64 / hits as f64; hitsum += hits;
         }
         println!("{:>9} | {:>16.1}x {:>16.1}x {:>18.0}", n, mo / trials as f64, ho / trials as f64, hitsum as f64 / trials as f64);
@@ -336,7 +381,7 @@ fn main() {
             let _ = (ho, mt);
         }
         println!("  `vs cellbox` is 1.00 everywhere: the decomposition is EXACT, against A2's span");
-        println!("  scan at 7 299x. But that column flatters itself — the caller asked for a SPHERE,");
+        println!("  scan at ~102x. But that column flatters itself — the caller asked for a SPHERE,");
         println!("  and `vs SPHERE` shows what a coarse key really costs: 2.86x at 6 bits, falling to");
         println!("  1.86x. It stops there because 1.86 is not an artifact, it is 6/pi = 1.91, the");
         println!("  volume of a cube over its inscribed sphere — the irreducible price of bounding a");
