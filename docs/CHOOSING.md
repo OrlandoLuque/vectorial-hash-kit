@@ -233,16 +233,43 @@ repeated passes** on an idle machine, via `cargo run -p bench-runner --release`:
   | 10 % | 2.07 ms | 2.20 ms | 1.06× | 7 236 |
   | 1 % | 0.237 ms | 2.29 ms | **9.67×** | 6 990 |
 
-  (A rebuild from the same points ends with 6 939 leaves.) The keep path costs more here than
-  on a flat grid and wins over a narrower band, because `from_items` is a fast bulk build while
-  `update` pays a leaf descent and possibly a subdivision.
+  The keep path costs more here than on a flat grid and wins over a narrower band, because
+  `from_items` is a fast bulk build while `update` pays a leaf descent and possibly a
+  subdivision.
 
   **The leaf column is why these trees also needed `try_merge_up`,** which the four pointer
   trees have always had and these never did — they had no removal, so nothing ever left a leaf
-  and there was nothing to collapse. Without it, over the same 300 frames: 23 385 / 18 822 /
-  10 756 leaves, and culls **1.37×** a fresh tree's at 10 % churn, still climbing when the run
-  ended. That is a slow leak, not a fixed tax — and a 20-frame window showed it as a mild 1.20×
-  and hid the trend entirely (see [`MEASURING.md`](MEASURING.md) § 8c).
+  and there was nothing to collapse. Without it, over the same 300 frames the same workload
+  reaches 23 385 / 18 822 / 10 756 leaves — **2.25× / 2.60× / 1.54×** what a rebuild produces,
+  and still climbing when the run ended. (Those ratios are the previously-measured no-merge
+  counts divided by the corrected baseline, not a fresh run: deleting `try_merge_up` cannot
+  change `from_items`, which never merges, so the two measured quantities compose. The
+  no-merge configuration has not been re-run since.) That is a slow leak, not a fixed tax, and a 20-frame
+  window showed only 13 914 leaves at 10 % churn and hid the trend entirely (see
+  [`MEASURING.md`](MEASURING.md) § 8c).
+
+  > **Correction, 2026-09-12.** This paragraph used to divide those counts by **6 939** and to
+  > say a rebuild "ends with 6 939 leaves". It does not: 6 939 is the leaf count of the
+  > *starting* distribution, and the workload is a **clamped** random walk, which piles points
+  > against the walls — so after 300 frames the points genuinely need more leaves than they did
+  > at the start, and that has nothing to do with the structure. Measured against the right
+  > baseline (`from_items` on the **current** contents), the kept tree's shape is not merely
+  > close, it is **exactly equal**: 10 375 / 7 236 / 6 990 against 10 375 / 7 236 / 6 990.
+  > **With the merge, the drift is zero**, and `grid_keep_bench` now asserts it row by row.
+  >
+  > The same paragraph also claimed culls ran **1.37×** a fresh tree's. That column was two
+  > independent `wall_ms` calls, not a pair: two runs of the same binary read 1.115× and 1.50×
+  > for one row. Paired through `compare2` it reads 0.94–1.01× with a 17–47 % spread — no
+  > measurable difference, which is what equal shapes must produce. See § 8j of
+  > [`MEASURING.md`](MEASURING.md).
+
+  **Why zero, and when it would not be.** `merge_limit == item_limit`, and the split planes are
+  **positional** (fixed octants, not a data-dependent median). So "this node is subdivided" is
+  equivalent to "this node holds more than the limit" — the same predicate a fresh build
+  evaluates, with no hysteresis band between splitting and merging for history to hide in. A
+  structure that split on a **median** could not have this property, which is the same reason
+  `KdTree2`/`KdTree3` cannot maintain at all. `examples/restructure_churn` measures this across
+  `Octree3`, `LinearOctree3` and `MortonGrid3` and asserts it for all three.
 
   The crossover sits near **70 % moving**, and note the movement here is deliberately harsh —
   40-unit steps against 15.6-unit cells, so 99 % of updates actually re-bucket. A workload

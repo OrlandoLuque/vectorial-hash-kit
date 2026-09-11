@@ -160,10 +160,18 @@ A ratchet nobody's build enables is a ratchet checking nothing.
 
 ## 8c. A short window hides a slow leak
 
-The linear trees' keep path was first measured over **20 frames**, and the shape drift looked
-like a mild fixed tax: 1.20x slower culls at 10 % churn, 13 914 leaves. Re-run over **300**, the
-same configuration reads 18 822 leaves and **1.37x, still climbing**. The effect was never a tax;
-it was an accumulation — every frame added subdivisions and none were ever given back.
+The linear trees' keep path, **with `try_merge_up` deleted**, was first measured over **20
+frames**: 13 914 leaves at 10 % churn. Re-run over **300**, the same configuration reads
+**18 822** — still climbing when the run ended. The effect was never a fixed tax; it was an
+accumulation, every frame adding subdivisions and none ever being given back.
+
+> **Correction, 2026-09-12.** This section originally led with a *cull ratio* — "1.20x slower
+> culls at 20 frames, 1.37x at 300" — and that pair of numbers was not evidence of anything. The
+> column was two independent `wall_ms` calls rather than a pair, and two runs of the same binary
+> read 1.115x and 1.50x for one row (§ 7). The leaf **counts** above are what carry the lesson,
+> and they always were: a count accumulates visibly, a noisy ratio can accumulate or not and you
+> cannot tell. Which is § 8's point arriving from a different direction — *the argument for
+> counting is not only that counts are cheaper, it is that a count can be believed at one run.*
 
 Twenty frames was plenty to measure a *rate* (maintain cost per frame, stable from the first
 frame) and far too short to measure a *state* that integrates over time. Both numbers came out
@@ -541,6 +549,40 @@ explicit so a second machine cannot silently overwrite the first one's numbers.
 The general form: **a number and the conditions it was taken under are one object.** Splitting
 them — number in the file, conditions in a comment, in a README, or in a colleague's memory — is
 how a measurement becomes a memory (§ 8f) and how a comparison becomes a fabrication.
+
+## 8j. "Kept vs rebuilt" must rebuild from the CURRENT contents, not the starting ones
+
+`grid_keep_bench` reported a maintained `LinearOctree3` holding **10 375** leaves against "a
+rebuild"'s **6 939**, and the kit published that 1.50x as the price of keeping an adaptive
+structure — in `CHOOSING.md`, in the rustdoc on `update` for both linear trees, and as the
+worked example in § 8c above.
+
+The 6 939 was `from_items(base)`: the **starting** point set. The workload is a *clamped* random
+walk, which is not measure-preserving — over 300 frames points pile up against the walls, so the
+final distribution genuinely needs more leaves than the initial one did, for reasons that have
+nothing to do with the structure under test. The number measured the workload, and was labelled
+as measuring the structure.
+
+Rebuilt from the **current** contents, the kept tree's leaf count is not close, it is **exactly
+equal** — 10 375 / 7 236 / 6 990 against 10 375 / 7 236 / 6 990, and equal again for `Octree3`
+and `MortonGrid3` across fifteen rows of `examples/restructure_churn`. **The drift is zero.**
+
+Three things worth keeping:
+
+- **The correct baseline was already in the file.** `fresh = from_items(items)` existed four
+  lines away, built from the current positions and used for the cull column; its `leaf_count()`
+  was simply never printed. The bug was not a missing measurement, it was a *printed* one and an
+  *unprinted* one sitting side by side, and the wrong one had the friendlier label.
+- **The test knew.** `merging_keeps_the_leaf_count_near_a_rebuild` compares against a rebuild
+  from the current points and records "402 = 402" — exact equality — while the bench next door
+  reported 1.50x drift. A test and a bench disagreeing about one structure is the same alarm as
+  two benches disagreeing (§ 8g): the instrument is a suspect, not just the machine.
+- **Ask what your baseline is a snapshot OF.** "Compared against a rebuild" is ambiguous in
+  exactly the place that matters: a rebuild *of what, as of when*. If the workload changes the
+  data's distribution — and any clamped, absorbing or bounded motion does — then a t=0 baseline
+  silently folds that change into whatever you are attributing to the structure.
+
+Both benches now `assert` the equality row by row, so this cannot quietly come back.
 
 ## 11. A partitioning schedule is a display bug only where the display reads the sample
 

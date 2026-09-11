@@ -1361,6 +1361,31 @@ Everything else in this file is **future** — left to triage later.
   when many are on screen at once.
 
 ## Index / algorithms
+- ~~**#169 Structural stability under motion — keyed key vs pointer tree**~~ —
+  **done, and the hypothesis was wrong in an interesting direction.**
+  `examples/restructure_churn` (+ the new `struct-stats` feature, which counts
+  **splits and merges** across all seven restructuring structures — the third
+  kind of work, after `work_counters`' point tests and `grid-stats`' cell
+  lookups). Written to show that a maintained *adaptive* tree drifts from a
+  rebuild while a fixed-resolution key cannot. **It does not drift: the shapes
+  are equal as integers,** for `Octree3`, `LinearOctree3` *and* `MortonGrid3`,
+  at every churn level, now asserted. The kit's trees split **positionally** and
+  use one threshold for both splitting and merging, so "subdivided" ⇔ "holds
+  more than the limit" — a property of the current points, not the history. A
+  median split could not do this, which is why the k-d trees cannot maintain.
+  The real difference is **work, not shape**: `restr/xing` reads 0.10 (`Octree3`)
+  / 0.15 (`LinearOctree3`) / **exactly 0** (grid).
+  → **It also caught a published figure being wrong.** `grid_keep_bench`'s
+  "1.50× drift" divided by the leaf count of the *starting* distribution; the
+  workload is a clamped random walk, which piles points against the walls, so
+  that baseline measured the workload and was labelled as measuring the
+  structure. The correct baseline was already in the file, four lines away, and
+  its leaf count was never printed. Its cull column was also two unpaired
+  `wall_ms` calls reading 1.115× and 1.50× on two runs of one binary; paired it
+  reads 0.94–1.01× with a 17–47 % spread. Both benches assert the equality now.
+  Corrected in `CHOOSING.md`, both linear trees' rustdoc (the 2D twin was
+  reprinting the 3D numbers as its own) and `MEASURING.md` § 8c, plus a new
+  **§ 8j** — *a "rebuild" baseline must be a rebuild of the CURRENT contents.*
 - ~~**Structure decision-map sweep**~~ — **done.** `critters3d_headless` now
   drives all four structures on one deterministic sim (per-structure maintain +
   cull) and `--sweep` prints the winner-per-cell map over world × pop ×

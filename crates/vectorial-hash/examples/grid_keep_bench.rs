@@ -151,7 +151,8 @@ fn main() {
     // from a rebuild's. The answers stay identical (tested); the question this measures is
     // whether the queries stay as fast.
     println!("\nLinearOctree3 — same sweep, plus what the shape drift costs");
-    println!("{:<10} {:>13} {:>13} {:>11} {:>10} {:>12}", "moving", "keep ms/frame", "rebuild ms", "speed-up", "leaves", "cull vs fresh");
+    println!("{:<10} {:>13} {:>13} {:>11} {:>10} {:>10} {:>12}",
+        "moving", "keep ms/frame", "rebuild ms", "speed-up", "kept lv", "fresh lv", "cull vs fresh");
     for pct in [100.0f64, 10.0, 1.0] {
         let movers = ((n as f64 * pct / 100.0) as usize).max(1);
         let mut script = Rng(0xA11CE);
@@ -199,18 +200,34 @@ fn main() {
 
         // The drift, priced: the same culls against the kept tree and against a fresh one
         // built from its own current contents.
+        //
+        // PAIRED (`compare2`), not two independent `wall_ms` calls. It used to be the latter,
+        // and the column was quoting noise: two runs of this same binary read 1.115x and 1.50x
+        // for the same row. A ratio between two separately-timed arms on this machine is not a
+        // measurement (MEASURING.md 7, 8e) -- `compare2` interleaves them A/B/B/A and reports
+        // the median per-round ratio with its spread, so an unstable one announces itself.
         let probes: Vec<Point3> = (0..200).map(|i| pos[(i * 7919) % pos.len()]).collect();
         let fresh = LinearOctree3::from_items(world, 16, 12, items.clone());
-        let cull_kept = common::wall_ms(5, || { for q in &probes { std::hint::black_box(kept.cull(&vectorial_hash::Sphere3::new(q.x, q.y, q.z, 30.0)).len()); } });
-        let cull_fresh = common::wall_ms(5, || { for q in &probes { std::hint::black_box(fresh.cull(&vectorial_hash::Sphere3::new(q.x, q.y, q.z, 30.0)).len()); } });
+        let (_, _, cull_drift, cull_spread) = common::compare2(
+            5,
+            || for q in &probes { std::hint::black_box(fresh.cull(&vectorial_hash::Sphere3::new(q.x, q.y, q.z, 30.0)).len()); },
+            || for q in &probes { std::hint::black_box(kept.cull(&vectorial_hash::Sphere3::new(q.x, q.y, q.z, 30.0)).len()); },
+        );
 
-        println!("{:<10} {keep_ms:>13.4} {rebuild_ms:>13.4} {:>10.2}x {:>10} {:>11.2}x",
-            format!("{pct}%"), rebuild_ms / keep_ms, kept.leaf_count(), cull_kept / cull_fresh);
+        println!("{:<10} {keep_ms:>13.4} {rebuild_ms:>13.4} {:>10.2}x {:>10} {:>10} {:>9.2}x +-{cull_spread:.0}%",
+            format!("{pct}%"), rebuild_ms / keep_ms, kept.leaf_count(), fresh.leaf_count(), cull_drift);
         println!("#M lin_moving{}.speedup {:.3} x", (pct * 10.0) as u32, rebuild_ms / keep_ms);
-        println!("#M lin_moving{}.cull_drift {:.3} x", (pct * 10.0) as u32, cull_kept / cull_fresh);
+        println!("#M lin_moving{}.cull_drift {cull_drift:.3} x", (pct * 10.0) as u32);
+        assert_eq!(kept.leaf_count(), fresh.leaf_count(),
+            "a maintained LinearOctree3 must have the SAME shape as a rebuild from its own current \
+             contents — if this fires, the 'no drift' finding below is wrong");
     }
-    println!("  (leaves: a rebuild at 100% moving ends with {} — the kept tree's count is the drift.)",
+    println!("  (kept lv vs fresh lv: EQUAL, and that is the finding. This footnote used to compare");
+    println!("   the kept tree against a rebuild from the STARTING points ({} leaves) and call the",
         LinearOctree3::from_items(world, 16, 12, base.clone()).leaf_count());
+    println!("   difference drift. It is not: a clamped random walk piles points against the walls,");
+    println!("   so the final distribution genuinely needs more leaves, and a rebuild produces");
+    println!("   exactly the number the kept tree already has. See docs/CHOOSING.md.)");
 
     println!("\nreading: a rebuild costs the same however few items moved, so the speed-up is roughly");
     println!("the reciprocal of the moving fraction — until the moving fraction is high enough that");
