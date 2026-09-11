@@ -636,6 +636,7 @@ impl<T: Positioned> Tree<T> {
             if combined > self.merge_limit {
                 return;
             }
+            crate::restructure::count_merge();
             let mut items_a = std::mem::take(&mut self.get_mut(a).items);
             let mut hs_a = std::mem::take(&mut self.get_mut(a).hs);
             let mut items_b = std::mem::take(&mut self.get_mut(b).items);
@@ -686,6 +687,7 @@ impl<T: Positioned> Tree<T> {
             n.hs = hs;
             return;
         }
+        crate::restructure::count_split();
 
         let (a_bbox, b_bbox) = pick_split(bbox, &items);
 

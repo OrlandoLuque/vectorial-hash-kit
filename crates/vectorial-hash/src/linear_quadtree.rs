@@ -123,24 +123,28 @@ impl<T: Positioned> LinearQuadTree<T> {
     /// do at all; if it has, it is re-inserted through the normal path, which subdivides the
     /// destination if that tips it over `capacity`.
     ///
-    /// **Its shape drifts from a rebuild's, but it does not run away.** A flat grid maintained
-    /// in place is byte-identical to a rebuilt one, because its cells are fixed. This one is
-    /// adaptive, so its leaves depend on where the points were — and [`Self::try_merge_up`]
-    /// collapses a parent back once its children between them fit in one leaf, which is what
-    /// stops the tree hoarding every subdivision it has ever made.
+    /// **Its shape does not drift at all — provided [`Self::try_merge_up`] is there.** That
+    /// method collapses a parent back once its children between them fit in one leaf, and with
+    /// it the maintained tree ends up holding *exactly* the leaves a rebuild from the same
+    /// current points would produce. Not approximately: the same integer.
     ///
-    /// Leaf counts after 300 maintained frames (a rebuild from the same points: 6 939):
+    /// The reason is that `capacity` is **both** thresholds — a node splits when it holds more
+    /// and merges when it holds no more — and the split lines are **positional** (fixed
+    /// quadrants, never a data-dependent median). So "subdivided" is equivalent to "holds more
+    /// than `capacity`", which is a property of the current point set with no hysteresis band
+    /// for history to hide in. A median split could not do this, which is exactly why
+    /// [`crate::KdTree2`] has no `update` at all.
     ///
-    /// | churn | without the merge | with it |
-    /// | ---: | ---: | ---: |
-    /// | 100 % | 23 385 | 10 375 |
-    /// | 10 % | 18 822 | 7 236 |
-    /// | 1 % | 10 756 | 6 990 |
+    /// The measured table lives on the 3D twin ([`crate::LinearOctree3::update`]) because that
+    /// is where the sweep was run; deleting the merge there takes the leaf count to 2.25x /
+    /// 2.60x / 1.54x a rebuild's at 100 / 10 / 1 % churn and it was still climbing. **These are
+    /// `LinearOctree3`'s numbers, not this type's** — the property is shared and the arithmetic
+    /// is not, and this doc used to reprint the 3D figures as if they were 2D measurements. What
+    /// is checked *here* is `merging_keeps_the_leaf_count_near_a_rebuild`, this module's own
+    /// test, which asserts the kept count stays within 1.10x of a rebuild from the current
+    /// points and fails at 1.26x with the call deleted.
     ///
-    /// Without it the count keeps climbing and the culls climb with it (1.37x a fresh tree's
-    /// at 10 % churn, and still rising when the run ended). With it the count settles and the
-    /// culls come back to parity. The merge costs on the write side — ~40-60 % more per
-    /// maintained frame — so which way it pays depends on your query load; but degradation
+    /// The merge costs on the write side — ~40-60 % more per maintained frame — but degradation
     /// with no bound is not a trade, which is why it is not optional.
     ///
     /// What holds either way is that this keeps giving the *same answers* as a rebuild: the
@@ -204,6 +208,7 @@ impl<T: Positioned> LinearQuadTree<T> {
                 combined += self.leaves.get(&child).map_or(0, |v| v.len());
             }
             if combined > self.capacity { return; }
+            crate::restructure::count_merge();
             let mut items = Vec::with_capacity(combined);
             for c in 0..4u64 {
                 if let Some(mut v) = self.leaves.remove(&((parent << 2) | c)) { items.append(&mut v); }
@@ -260,6 +265,7 @@ impl<T: Positioned> LinearQuadTree<T> {
             if !items.is_empty() { self.leaves.insert(key, items); }
             return;
         }
+        crate::restructure::count_split();
         self.internal.insert(key);
         let mut buckets: [Vec<T>; 4] = std::array::from_fn(|_| Vec::new());
         for it in items { buckets[quadrant_of(&rc, it.position()) as usize].push(it); }

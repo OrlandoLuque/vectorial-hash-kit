@@ -123,25 +123,37 @@ impl<T: Positioned3> LinearOctree3<T> {
     /// do at all; if it has, it is re-inserted through the normal path, which subdivides the
     /// destination if that tips it over `capacity`.
     ///
-    /// **Its shape drifts from a rebuild's, but it does not run away.** A flat grid maintained
-    /// in place is byte-identical to a rebuilt one, because its cells are fixed. This one is
-    /// adaptive, so its leaves depend on where the points were — and [`Self::try_merge_up`]
-    /// collapses a parent back once its children between them fit in one leaf, which is what
-    /// stops the tree hoarding every subdivision it has ever made.
+    /// **Its shape does not drift at all — provided [`Self::try_merge_up`] is there.** That
+    /// method collapses a parent back once its children between them fit in one leaf, and with
+    /// it the maintained tree ends up holding *exactly* the leaves a rebuild from the same
+    /// current points would produce. Not approximately: the same integer.
     ///
-    /// Leaf counts after 300 maintained frames (a rebuild from the same points: 6 939):
+    /// The reason is that `capacity` is **both** thresholds — a node splits when it holds more
+    /// and merges when it holds no more — and the split planes are **positional** (fixed
+    /// octants, never a data-dependent median). So "subdivided" is equivalent to "holds more
+    /// than `capacity`", which is a property of the current point set with no hysteresis band
+    /// for history to hide in. A median split could not do this, which is exactly why
+    /// [`crate::KdTree3`] has no `update` at all.
     ///
-    /// | churn | without the merge | with it |
-    /// | ---: | ---: | ---: |
-    /// | 100 % | 23 385 | 10 375 |
-    /// | 10 % | 18 822 | 7 236 |
-    /// | 1 % | 10 756 | 6 990 |
+    /// Leaf counts after 300 maintained frames, against a rebuild **from the tree's own
+    /// current contents** at that moment:
     ///
-    /// Without it the count keeps climbing and the culls climb with it (1.37x a fresh tree's
-    /// at 10 % churn, and still rising when the run ended). With it the count settles and the
-    /// culls come back to parity. The merge costs on the write side — ~40-60 % more per
-    /// maintained frame — so which way it pays depends on your query load; but degradation
-    /// with no bound is not a trade, which is why it is not optional.
+    /// | churn | without the merge | with it | rebuild |
+    /// | ---: | ---: | ---: | ---: |
+    /// | 100 % | 23 385 | **10 375** | **10 375** |
+    /// | 10 % | 18 822 | **7 236** | **7 236** |
+    /// | 1 % | 10 756 | **6 990** | **6 990** |
+    ///
+    /// Without the merge the count climbs to 2.25x / 2.60x / 1.54x the rebuild's and was still
+    /// rising when the run ended. The merge costs on the write side — ~40-60 % more per
+    /// maintained frame — but degradation with no bound is not a trade, which is why it is not
+    /// optional.
+    ///
+    /// (Earlier revisions of this table compared against 6 939, the leaf count of the
+    /// *starting* distribution, and reported a residual 1.50x drift that does not exist. The
+    /// workload is a clamped random walk, which piles points against the walls — see
+    /// `docs/MEASURING.md` § 8j. `examples/grid_keep_bench` and `examples/restructure_churn`
+    /// both assert the equality now.)
     ///
     /// What holds either way is that this keeps giving the *same answers* as a rebuild: the
     /// tests check cull sets and k-NN distances, and deliberately not leaf counts.
@@ -204,6 +216,7 @@ impl<T: Positioned3> LinearOctree3<T> {
                 combined += self.leaves.get(&child).map_or(0, |v| v.len());
             }
             if combined > self.capacity { return; }
+            crate::restructure::count_merge();
             let mut items = Vec::with_capacity(combined);
             for c in 0..8u64 {
                 if let Some(mut v) = self.leaves.remove(&((parent << 3) | c)) { items.append(&mut v); }
@@ -265,6 +278,7 @@ impl<T: Positioned3> LinearOctree3<T> {
             if !items.is_empty() { self.leaves.insert(key, items); }
             return;
         }
+        crate::restructure::count_split();
         self.internal.insert(key);
         let mut buckets: [Vec<T>; 8] = std::array::from_fn(|_| Vec::new());
         for it in items { buckets[octant_of(&bx, it.position()) as usize].push(it); }

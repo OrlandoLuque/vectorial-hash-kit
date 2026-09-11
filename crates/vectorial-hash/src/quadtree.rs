@@ -454,6 +454,7 @@ impl<T: Positioned> QuadTree<T> {
             if combined > self.merge_limit {
                 return;
             }
+            crate::restructure::count_merge();
             let mut merged: Vec<T> = Vec::with_capacity(combined);
             let mut merged_hs: Vec<u32> = Vec::with_capacity(combined);
             for &k in &kids {
@@ -494,6 +495,7 @@ impl<T: Positioned> QuadTree<T> {
             n.hs = hs;
             return;
         }
+        crate::restructure::count_split();
 
         let hw = bbox.width / 2.0;
         let hh = bbox.height / 2.0;

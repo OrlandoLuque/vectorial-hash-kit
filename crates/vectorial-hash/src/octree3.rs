@@ -259,6 +259,7 @@ impl<T: Positioned3> Octree3<T> {
             n.hs = hs;
             return;
         }
+        crate::restructure::count_split();
         let (hw, hh, hd) = (b.w / 2.0, b.h / 2.0, b.d / 2.0);
         let mut kids = [ONodeId(0); 8];
         let mut oi = 0;
@@ -398,6 +399,7 @@ impl<T: Positioned3> Octree3<T> {
             if kids.iter().any(|&k| self.get(k).children.is_some()) { return; }
             let combined: usize = kids.iter().map(|&k| self.get(k).items.len()).sum();
             if combined > self.merge_limit { return; }
+            crate::restructure::count_merge();
             let mut merged: Vec<T> = Vec::with_capacity(combined);
             let mut merged_hs: Vec<u32> = Vec::with_capacity(combined);
             for &k in &kids {

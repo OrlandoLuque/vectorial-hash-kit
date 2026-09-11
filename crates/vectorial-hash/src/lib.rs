@@ -45,6 +45,7 @@ pub mod linear_quadtree;
 pub mod morton3;
 pub mod morton;
 pub mod adaptive;
+pub mod restructure;
 /// Provenance for hardware-specific measured files (baselines, calibrations).
 pub mod machine;
 pub mod adaptive2;

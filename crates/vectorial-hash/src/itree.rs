@@ -609,6 +609,7 @@ impl<T: IPositioned> IntegerTree<T> {
             if self.get(a).children.is_some() || self.get(b).children.is_some() { return; }
             let combined = self.get(a).items.len() + self.get(b).items.len();
             if combined > self.merge_limit { return; }
+            crate::restructure::count_merge();
             let mut items_a = std::mem::take(&mut self.get_mut(a).items);
             let mut hs_a = std::mem::take(&mut self.get_mut(a).hs);
             let mut items_b = std::mem::take(&mut self.get_mut(b).items);
@@ -645,6 +646,7 @@ impl<T: IPositioned> IntegerTree<T> {
             n.hs = hs;
             return;
         }
+        crate::restructure::count_split();
         // Split policy mirrors the float tree's `pick_split`:
         // - rectangles split along the long axis,
         // - squares pick whichever axis distributes the items more evenly.

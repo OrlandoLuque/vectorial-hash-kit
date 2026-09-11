@@ -777,6 +777,7 @@ impl<T: Positioned3> Tree3<T> {
             n.hs = hs;
             return;
         }
+        crate::restructure::count_split();
         // Split the longest axis at its midpoint.
         let (a_box, b_box) = if bbox.w >= bbox.h && bbox.w >= bbox.d {
             let half = bbox.w / 2.0;
@@ -927,6 +928,7 @@ impl<T: Positioned3> Tree3<T> {
             if self.get(a).children.is_some() || self.get(b).children.is_some() { return; }
             let combined = self.get(a).items.len() + self.get(b).items.len();
             if combined > self.merge_limit { return; }
+            crate::restructure::count_merge();
             let mut ia = std::mem::take(&mut self.get_mut(a).items);
             let mut iha = std::mem::take(&mut self.get_mut(a).hs);
             let mut ib = std::mem::take(&mut self.get_mut(b).items);

@@ -29,6 +29,15 @@ parallel = ["dep:rayon"]
 # work on any point and is invisible to both — which is how a 2.3x speed-up landed with the
 # point count essentially unchanged, three separate times (docs/MEASURING.md 8b).
 grid-stats = []
+# Counts SPLITS and MERGES — the work a structure does changing its OWN SHAPE. Off by default
+# and genuinely absent when off, same contract as `grid-stats`.
+#
+# It exists because both existing counter families measure query work: `work_counters` counts
+# point tests and box classifications, `grid-stats` counts cell lookups. Restructuring is
+# neither — it happens on the MAINTENANCE path, it is caused by items moving, and it is the one
+# axis on which the kit's structures differ in KIND: a fixed-resolution key never restructures
+# at all, so a grid reading exactly zero is the evidence and a tree's count is the price.
+struct-stats = []
 
 [dependencies]
 # Keep this crate dependency-light on purpose: it is the core algorithm.
