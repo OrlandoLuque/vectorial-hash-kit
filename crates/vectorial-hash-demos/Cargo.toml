@@ -83,3 +83,12 @@ required-features = ["parallel"]
 [[example]]
 name = "gpu_lbvh_query_bench"
 required-features = ["parallel"]
+
+# Same reason, different feature — and this one was missed, so a bare
+# `cargo check --workspace --all-targets` failed on it: the example imports
+# `horde_sim::counters`, which only exists under `sim-counters`. Nothing in CI does a
+# workspace-wide all-targets build, so the gap was invisible there; it surfaced while
+# verifying an unrelated library change against the rest of the workspace.
+[[example]]
+name = "horde_query_counts"
+required-features = ["sim-counters"]
