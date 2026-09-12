@@ -1361,6 +1361,25 @@ Everything else in this file is **future** — left to triage later.
   when many are on screen at once.
 
 ## Index / algorithms
+- ~~**#173 The 2D half of the audit — and #138's sweep had missed a bench**~~ — **done.**
+  `linear_quadtree_bench`'s world is square, so no aspect handicap (and `decision2d`
+  sizes `levels` from the query deliberately). But its **maintain** section had three
+  arms — `QuadTree` keeping via `update_ref`, `MortonGrid` and `LinearQuadTree` each
+  doing a **full rebuild** — on the written grounds that the other two "have no in-place
+  handle". That stopped being true in **#122** and **#127**, and **#138**, the sweep whose
+  whole job was to find every such site, missed this one.
+  → **I predicted wrong, and it is the better finding.** I wrote the new summary line
+  asserting keeping would win for the other two. **Rebuilding wins, 3.5–3.6×**
+  (Morton 80 ms keep vs 22 ms rebuild; LinearQuadTree 137 vs 39). No contradiction of
+  #122/#127 — it is their curve at its far end, since this arm relocates **100 %** every
+  frame and `grid_keep_bench` puts the crossover near 70 %.
+  → What 2D adds is **why it loses so badly**, and it is `grid_update_cost`'s rule:
+  *update saves the calls you do not make, not the calls you do.* The jitter is ±0.5 wu
+  against ~15.6 wu cells so almost nothing changes cell — irrelevant, because each of
+  200 000 calls still pays a lookup plus a predicate scan over a bucket of ~49.
+  `QuadTree` wins outright only because `update_ref` is O(1). **The handle layer is what
+  makes keeping cheap, not the existence of `update`.** The old line had the right
+  ranking for the wrong reason.
 - ~~**#172 Audit every 3D bench for § 8i's signature — and it found a published ratio**~~ —
   **done.** #171's radius defect was a class, so every bench quoting a 3D query ratio was
   checked for "a fixed quantity chosen next to a parameter of one arm". Most were clean or

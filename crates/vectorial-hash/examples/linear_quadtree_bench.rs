@@ -16,7 +16,10 @@ use vectorial_hash::linear_quadtree::LinearQuadTree;
 use vectorial_hash::{Circle, KdTree2, MortonGrid, Point, Positioned, QuadTree, Rect};
 
 #[derive(Clone, Copy)]
-struct P { p: Point }
+/// The `id` exists so `MortonGrid::update` / `LinearQuadTree::update` have a predicate that
+/// identifies ONE item. Matching on position instead would be ambiguous the moment two points
+/// coincide, and this workload piles 67 % of them into eight blobs.
+struct P { id: u32, p: Point }
 impl Positioned for P { fn position(&self) -> Point { self.p } }
 
 struct Lcg(u64);
@@ -43,7 +46,7 @@ fn main() {
     let items: Vec<P> = (0..n).map(|i| {
         let p = if i % 3 == 0 { Point::new(r.r(0.0, 1000.0), r.r(0.0, 1000.0)) }
                 else { let (bx, by) = blobs[i % blobs.len()]; Point::new((bx + r.r(-30.0, 30.0)).clamp(0.0, 1000.0), (by + r.r(-30.0, 30.0)).clamp(0.0, 1000.0)) };
-        P { p }
+        P { id: i as u32, p }
     }).collect();
     let queries: Vec<Point> = (0..nq).map(|_| Point::new(r.r(0.0, 1000.0), r.r(0.0, 1000.0))).collect();
 
@@ -93,9 +96,22 @@ fn main() {
     println!("knn  speed   vs QuadTree {:.2}x   vs Morton {:.2}x", t_knn_qt / t_knn_lin, t_knn_mor / t_knn_lin);
 
     // ---- maintain (per-frame relocate ALL points): keep-index vs rebuild ----
-    // QuadTree relocates in place via the stable ItemRef (O(1) while an item stays in
-    // its leaf); Morton and LinearQuadTree have no in-place handle, so their "maintain"
-    // IS a full rebuild — the reason a rebuild-per-frame structure wants a cheap build.
+    //
+    // ★ CORRECTED 2026-09-13. This section used to have THREE arms — QuadTree keeping via
+    // `update_ref`, and Morton and LinearQuadTree each doing a full rebuild — on the stated
+    // grounds that "Morton and LinearQuadTree have no in-place handle". That stopped being true
+    // when `MortonGrid::update` landed (#122) and `LinearQuadTree::update` followed (#127), and
+    // the sweep that was supposed to catch every such site (#138) missed this bench. So the
+    // comparison was keep-vs-rebuild, read as a verdict about the structures.
+    //
+    // Both paths are now measured for all three, and the result is NOT what the fix was expected
+    // to show. I wrote the summary line asserting that keeping would win for the other two — it
+    // loses, 3-4x. The curve was already known (`grid_keep_bench`: crossover near 70 % moving) and
+    // this arm relocates 100 % of the population every frame, the one end where a rebuild wins.
+    // What the 2D numbers add is WHY it loses so badly: `update` still pays a lookup and a
+    // predicate scan per call even when the item has not changed cell, so at 100 % churn it is
+    // 200 000 lookups against a single sequential refill. `QuadTree` is exempt only because
+    // `update_ref` is O(1) — the handle layer, not the method, is what makes keeping cheap.
     let mut qk = QuadTree::new(world, 32);
     let refs: Vec<_> = items.iter().map(|it| qk.insert_ref(*it).unwrap()).collect();
     let mut jr = Lcg(0xBEEF);
@@ -107,9 +123,52 @@ fn main() {
     });
     let t_maint_mor = best(6, || { let mut g = MortonGrid::new(world, 6); for it in &items { g.insert(*it); } std::hint::black_box(&g); });
     let t_maint_lin = best(6, || { let g = LinearQuadTree::from_items(world, 32, 18, items.clone()); std::hint::black_box(&g); });
-    println!("\nmaintain, relocate all {n}/frame:  QuadTree keep-index {t_maint_qt:7.2} ms | Morton rebuild {t_maint_mor:7.2} ms | LinearQuadTree rebuild {t_maint_lin:7.2} ms");
-    println!("  → the 2D echo of the 3D decision map: the keep-index QuadTree beats the LinearQuadTree rebuild {:.2}× on relocate-all", t_maint_lin / t_maint_qt);
-    println!("    (so on MOVING data prefer the kept tree; LinearQuadTree's edge is STATIC/rebuild-often skewed data — cheap build, adaptive query)");
+
+    // The same jitter, through the KEEP path the other two structures also have.
+    let mut mk = MortonGrid::new(world, 6);
+    for it in &items { mk.insert(*it); }
+    let mut mpos: Vec<Point> = items.iter().map(|it| it.p).collect();
+    let t_keep_mor = best(6, || {
+        for (i, p) in mpos.iter_mut().enumerate() {
+            let np = Point::new((p.x + jr.r(-0.5, 0.5)).clamp(1.0, 999.0), (p.y + jr.r(-0.5, 0.5)).clamp(1.0, 999.0));
+            let id = i as u32;
+            mk.update(*p, |it: &P| it.id == id, |it: &mut P| it.p = np);
+            *p = np;
+        }
+    });
+    let mut lk = LinearQuadTree::from_items(world, 32, 18, items.clone());
+    let mut lpos: Vec<Point> = items.iter().map(|it| it.p).collect();
+    let t_keep_lin = best(6, || {
+        for (i, p) in lpos.iter_mut().enumerate() {
+            let np = Point::new((p.x + jr.r(-0.5, 0.5)).clamp(1.0, 999.0), (p.y + jr.r(-0.5, 0.5)).clamp(1.0, 999.0));
+            let id = i as u32;
+            lk.update(*p, |it: &P| it.id == id, |it: &mut P| it.p = np);
+            *p = np;
+        }
+    });
+
+    println!("\nmaintain, relocate all {n}/frame — both paths, for all three:");
+    println!("  {:<16} {:>10} {:>10}", "structure", "keep ms", "rebuild ms");
+    println!("  {:<16} {t_maint_qt:>10.2} {:>10}", "QuadTree", "—");
+    println!("  {:<16} {t_keep_mor:>10.2} {t_maint_mor:>10.2}", "MortonGrid");
+    println!("  {:<16} {t_keep_lin:>10.2} {t_maint_lin:>10.2}", "LinearQuadTree");
+    println!("  → and REBUILDING WINS for both of them: Morton {:.2}x, LinearQuadTree {:.2}x faster",
+             t_keep_mor / t_maint_mor, t_keep_lin / t_maint_lin);
+    println!("    to rebuild than to keep. That is not a contradiction of #122/#127, it is their");
+    println!("    curve read at its far end: `grid_keep_bench` puts the crossover near 70 % moving");
+    println!("    and this relocates 100 %, every frame. Rebuilding costs the same whatever moved.");
+    println!();
+    println!("    The mechanism is the one `grid_update_cost` named: UPDATE SAVES THE CALLS YOU DO");
+    println!("    NOT MAKE, NOT THE CALLS YOU DO. The jitter here is +-0.5 wu against ~15.6 wu");
+    println!("    cells, so almost nothing changes cell — and it does not matter, because each of");
+    println!("    the 200 000 calls still pays a lookup plus a predicate scan over its bucket");
+    println!("    (mean ~49 items at levels 6). `QuadTree` escapes that and wins outright because");
+    println!("    `update_ref` is O(1): the ItemRef IS the index, so there is nothing to look up.");
+    println!("    **The handle layer is what makes keeping cheap, not the existence of `update`.**");
+    println!();
+    println!("    So the old three-arm line got the RANKING right and the REASON wrong: it said the");
+    println!("    other two could not keep (true until #122/#127, false since) when the real point");
+    println!("    is that they can and, without handles and at this churn, should not.");
     // Machine-readable lines for `bench-runner`.
     println!("#M build_kdtree2 {t_build_kd:.3} ms");
     println!("#M build_quadtree {t_build_qt:.3} ms");
