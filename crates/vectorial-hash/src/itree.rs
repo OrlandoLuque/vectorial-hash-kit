@@ -383,6 +383,15 @@ impl<T: IPositioned> IntegerTree<T> {
     }
 
     /// O(1) relocation through a stable [`crate::ItemRef`] (no locate, no scan).
+    ///
+    /// **The maintained shape is not quite a rebuild's.** `divide` transcribes the float
+    /// tree's split policy, including the part that asks the DATA a question: for a **square**
+    /// node it counts which axis distributes the items more evenly, on whatever the node held at
+    /// the moment it split. Measured over 12 seeds (`tests/shape_is_history_free.rs`) it drifts
+    /// on **11 of 12**, worst **1.0340x** a rebuild's leaf count — a couple of leaves in ~740,
+    /// costing traversal and nothing else, since the answers are identical either way. See
+    /// [`crate::Tree::update_ref`] for the full account; the other seven maintainable structures
+    /// are exactly history-free.
     pub fn update_ref<M: FnOnce(&mut T)>(&mut self, r: ItemRef, mutator: M) -> bool {
         let Some(loc) = self.live_loc(r) else { return false }; // stale handle: item already gone
         let (node, slot) = (loc.node, loc.slot as usize);

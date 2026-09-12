@@ -1386,6 +1386,29 @@ Everything else in this file is **future** — left to triage later.
   Corrected in `CHOOSING.md`, both linear trees' rustdoc (the 2D twin was
   reprinting the 3D numbers as its own) and `MEASURING.md` § 8c, plus a new
   **§ 8j** — *a "rebuild" baseline must be a rebuild of the CURRENT contents.*
+- ~~**#170 The no-drift property, CI-gated across all nine — and it is NOT all nine**~~ —
+  **done.** `tests/shape_is_history_free.rs`, with a `struct-stats` CI job so the count
+  half actually runs. A bench is not a gate, and #169's claim was stated too broadly
+  **by me, an hour earlier**: sweeping **12 seeds** over every structure that can
+  maintain gives **seven exactly history-free** (0/12 seeds) and **two that are not** —
+  `Tree` **12/12** (worst 1.0143×) and `IntegerTree` **11/12** (worst 1.0340×). Both are
+  binary and choose a **square** node's split *axis* by counting which way distributes the
+  items better; that count is taken on whatever the node held when it split, so *a split
+  that asks the data a question remembers the answer*. `Tree3` is binary too and is exempt
+  only because it splits the longest axis on a `>=` tie-break. Not a bug — answers are
+  identical, it costs a little traversal — but now documented on both types rather than
+  contradicted by them.
+  → **A second mechanism the sweep found without being asked**: `divide` refuses to split
+  *coincident* items while `try_merge_up` only merges children that fit in one leaf. Two
+  predicates, so "spread, split, then coincide" is a **one-way door**, in all five pointer
+  trees. It surfaced as `QuadTree` drifting 2/12 because the test's own `clamp` pinned
+  escapees to exactly the wall (2D → four coincident corners; 3D needs all three axes at
+  once, which is why it hid). Reflecting instead of pinning → `QuadTree` 0/12 with `Tree`
+  still 12/12: one experiment, two mechanisms separated. **Left unfixed deliberately** —
+  closing it costs an O(combined) scan on the branch a *rejected* merge takes, i.e. the
+  common branch on the relocation hot path — and pinned by its own test, which says what to
+  do if someone does fix it. `MEASURING.md` **§ 8k**: *one instance can refute a property,
+  never establish one.*
 - ~~**Structure decision-map sweep**~~ — **done.** `critters3d_headless` now
   drives all four structures on one deterministic sim (per-structure maintain +
   cull) and `--sweep` prints the winner-per-cell map over world × pop ×

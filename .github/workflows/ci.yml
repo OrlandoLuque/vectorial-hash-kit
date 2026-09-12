@@ -58,6 +58,14 @@ jobs:
         # the ratchet would sit in the repo checking nothing.
         run: cargo test -p vectorial-hash --features grid-stats
 
+      - name: Test vectorial-hash (struct-stats — splits/merges, and the grids' exact zero)
+        # Same reason as the job above. `tests/shape_is_history_free.rs` passes either way, but
+        # only under this feature does it check the part that matters: that the two Morton grids
+        # restructure EXACTLY zero times while every adaptive arm really did split and merge.
+        # Without the counters that is an untested sentence, and the shapes matching proves
+        # nothing about a structure that was never disturbed.
+        run: cargo test -p vectorial-hash --features struct-stats
+
       # Gate: templates + cli tests. The fingerprint-regression test is now
       # portable — it hard-checks determinism + row structure everywhere, and
       # the fixture bytes within a cross-platform tolerance (libm ULPs at tangent

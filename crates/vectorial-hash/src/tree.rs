@@ -412,6 +412,20 @@ impl<T: Positioned> Tree<T> {
     /// O(1) relocation through a stable [`ItemRef`] — no locate walk, no
     /// predicate scan. Mutate in place; relocate (ascend-to-LCA) only if the
     /// item leaves its leaf. `false` (and the handle freed) if it left the root.
+    ///
+    /// **The maintained shape is not quite a rebuild's, and this is the one type in the kit
+    /// where that is worth knowing** (with [`crate::IntegerTree`], which shares the policy).
+    /// Seven of the nine maintainable structures end up holding *exactly* the nodes a rebuild
+    /// from their current contents would make; this one does not, because `pick_split` asks
+    /// the DATA a question — for a **square** node it counts which axis distributes the items
+    /// more evenly — and takes that count on whatever the node held at the moment it split.
+    /// Two histories arriving at one point set can disagree about the axis.
+    ///
+    /// Measured over 12 seeds (`tests/shape_is_history_free.rs`): drifts on **12 of 12**, worst
+    /// **1.0143x** the leaf count of a rebuild. A couple of leaves in ~740 — it costs a little
+    /// traversal and nothing else, since the *answers* are identical either way (gated against
+    /// brute force). [`crate::Tree3`] is binary as well and does not drift: it splits the
+    /// longest axis on a `>=` tie-break, which is geometry rather than a question.
     pub fn update_ref<M: FnOnce(&mut T)>(&mut self, r: ItemRef, mutator: M) -> bool {
         let Some(loc) = self.live_loc(r) else { return false }; // stale handle: item already gone
         let (node, slot) = (loc.node, loc.slot as usize);

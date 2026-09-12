@@ -19,12 +19,22 @@
 //! B reads `kept == fresh` as integer equality for all three arms at every churn level, and the
 //! bench now asserts it.
 //!
-//! The reason is worth stating because it is not obvious: the kit's trees split **positionally**
+//! The reason is worth stating because it is not obvious: **these three** split **positionally**
 //! (fixed octant midpoints, not a data-dependent median), and `merge_limit == item_limit`, so a
 //! node is subdivided *iff* it holds more than the limit — the same predicate a fresh build
 //! evaluates. Split and merge share one threshold, so there is no hysteresis band for history to
 //! hide in. A structure whose split point depended on the data (a k-d tree's median) could not do
 //! this, which is the same reason those two cannot maintain at all.
+//!
+//! **"These three" and not "the kit's trees", which is what this file first said.**
+//! `tests/shape_is_history_free.rs` sweeps twelve seeds across all nine maintainable structures
+//! and finds **seven** exactly history-free and **two** that are not: `Tree` and `IntegerTree` are
+//! binary, and for a **square** node they choose the split *axis* by counting which way
+//! distributes the items more evenly. That count is taken on whatever the node held at the moment
+//! it split, so it is a data-dependent decision after all — a small one (worst 1.014x / 1.034x)
+//! and a real one. `Tree3` is binary too and is exempt only because it splits the longest axis
+//! with a `>=` tie-break, pure geometry. One arm of a policy being geometric is not the same as
+//! the policy being geometric.
 //!
 //! So the difference between a keyed grid and an adaptive tree here is **not shape, it is work**:
 //! the trees pay 0.10-0.15 splits-plus-merges per boundary crossing and the grid pays exactly 0.
@@ -396,11 +406,17 @@ fn main() {
 
     println!("`kept` vs `fresh` is the shape after maintenance against the shape the same points");
     println!("would have produced from scratch. ALL THREE are asserted equal, which is the result:");
-    println!("this bench was written expecting the two adaptive arms to drift and they do not. The");
-    println!("kit's trees split positionally and use ONE threshold for both splitting and merging,");
+    println!("this bench was written expecting the two adaptive arms to drift and they do not.");
+    println!("These three split positionally and use ONE threshold for both splitting and merging,");
     println!("so \"subdivided iff it holds more than the limit\" is a property of the current points,");
     println!("not of the history. A data-dependent split (a k-d median) could not do this — which");
     println!("is the same reason those two structures cannot maintain at all.");
+    println!();
+    println!("It does NOT generalise to all nine maintainable structures, which is what this file");
+    println!("first claimed. tests/shape_is_history_free.rs sweeps 12 seeds over all of them: seven");
+    println!("are exactly history-free, and Tree and IntegerTree are not — being binary, they pick a");
+    println!("SQUARE node's split axis by counting which way distributes the items better, which is");
+    println!("data-dependent after all (worst 1.014x / 1.034x).");
     println!();
     println!("The difference is therefore not SHAPE but WORK: the `restr/xing` column in A. The");
     println!("grid reads exactly 0.0000 because it has no shape to change; the trees pay 0.10-0.15");

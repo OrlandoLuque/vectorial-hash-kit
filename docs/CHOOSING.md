@@ -263,13 +263,41 @@ repeated passes** on an idle machine, via `cargo run -p bench-runner --release`:
   > measurable difference, which is what equal shapes must produce. See § 8j of
   > [`MEASURING.md`](MEASURING.md).
 
-  **Why zero, and when it would not be.** `merge_limit == item_limit`, and the split planes are
-  **positional** (fixed octants, not a data-dependent median). So "this node is subdivided" is
-  equivalent to "this node holds more than the limit" — the same predicate a fresh build
-  evaluates, with no hysteresis band between splitting and merging for history to hide in. A
-  structure that split on a **median** could not have this property, which is the same reason
-  `KdTree2`/`KdTree3` cannot maintain at all. `examples/restructure_churn` measures this across
-  `Octree3`, `LinearOctree3` and `MortonGrid3` and asserts it for all three.
+  **Why zero, and which structures actually get it.** `merge_limit == item_limit`, and the split
+  planes are **positional** (fixed octants, not a data-dependent median). So "this node is
+  subdivided" is equivalent to "this node holds more than the limit" — the same predicate a fresh
+  build evaluates, with no hysteresis band between splitting and merging for history to hide in.
+  A structure that split on a **median** could not have this property, which is the same reason
+  `KdTree2`/`KdTree3` cannot maintain at all.
+
+  `tests/shape_is_history_free.rs` sweeps **12 seeds** across all nine structures that can
+  maintain, and the answer is not uniform:
+
+  | | seeds that drifted | worst | why |
+  | --- | ---: | ---: | --- |
+  | `QuadTree`, `Tree3`, `Octree3` | 0 / 12 | 1.0000× | position **and** axis chosen from the box |
+  | `LinearQuadTree`, `LinearOctree3` | 0 / 12 | 1.0000× | same, over a hash |
+  | `MortonGrid`, `MortonGrid3` | 0 / 12 | 1.0000× | no shape to change at all |
+  | **`Tree`** | **12 / 12** | 1.0143× | square node picks its **axis** by counting items |
+  | **`IntegerTree`** | **11 / 12** | 1.0340× | the same policy, transcribed to integers |
+
+  The two binary 2D trees ask the data a question — for a **square** node, `pick_split_by` counts
+  which axis distributes the items more evenly — and that count is taken on whatever the node held
+  at the moment it split. **A split that asks the data a question remembers the answer.** `Tree3`
+  is binary as well and is exempt only because it splits the *longest* axis on a `>=` tie-break,
+  which is pure geometry. The effect is a couple of leaves in ~740; the point is that it is not
+  zero, and that one seed said the opposite (the first seed tried had `IntegerTree` drifting and
+  `Tree` not, which reads as "the integer tree is the odd one out" — a conclusion about the wrong
+  thing, since the two share the policy verbatim).
+
+  **A second, rarer mechanism, in all five pointer trees.** `divide` refuses to split a node whose
+  items are **all at one point**; `try_merge_up` collapses children only when they *fit in one
+  leaf*. Different predicates, so "spread out, split, then became coincident" is a one-way door:
+  the maintained node stays subdivided where a rebuild would refuse to split at all. It needs
+  exact coincidence to bite, which is why it showed up in 2D (a clamped walk pins escapees onto
+  four exactly-coincident corners) and not in 3D (a point must clamp on all three axes at once).
+  Left as it is deliberately — closing it means an O(combined) scan on the branch a *rejected*
+  merge takes, which is the common branch on the relocation hot path. Pinned by its own test.
 
   The crossover sits near **70 % moving**, and note the movement here is deliberately harsh —
   40-unit steps against 15.6-unit cells, so 99 % of updates actually re-bucket. A workload

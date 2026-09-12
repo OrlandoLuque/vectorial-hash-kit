@@ -584,6 +584,32 @@ Three things worth keeping:
 
 Both benches now `assert` the equality row by row, so this cannot quietly come back.
 
+## 8k. One instance can refute a property. It cannot establish one.
+
+Having found that a maintained structure ends up the same shape as a rebuild (§ 8j), the next move
+was to gate it — and the first version of `tests/shape_is_history_free.rs` ran **one seed**. It
+reported eight structures equal and `IntegerTree` drifting, which reads as a clean story:
+*the integer tree is the odd one out.*
+
+It is not, and the story was about the wrong thing. `IntegerTree`'s split policy is a transcription
+of `Tree`'s, verbatim, including the part that decides a **square** node's axis by counting which
+way distributes the items more evenly. Sweeping **12 seeds** instead of one: `Tree` drifts on
+**12 / 12**, `IntegerTree` on **11 / 12**. One seed had found the mechanism and attributed it to
+the wrong structure, because the other structure that has it happened not to trip on that seed.
+
+The sweep then found a **second** mechanism nobody was looking for: `QuadTree`, whose quadrant
+splits are pure geometry, drifted on 2 of 12. That one was the workload — `v.clamp(lo, hi)` pins
+every escapee to *exactly* the wall, so in 2D points pile onto four exactly-coincident corners, and
+`divide` refuses to split coincident items while `try_merge_up` only merges children that fit in one
+leaf. Two different predicates, so it is a one-way door. Reflecting instead of pinning took
+`QuadTree` to 0 / 12 **while leaving `Tree` at 12 / 12** — one experiment separating two mechanisms,
+which is what makes it evidence rather than a guess.
+
+The asymmetry is the thing to remember. A single observation of drift **proves** a structure can
+drift. A single observation of *no* drift proves nothing at all — and it is the second kind of
+result that gets written into a doc as a property. Cheap rule: **if the claim is "always", the test
+sweeps; if the claim is "sometimes", one case is a proof.**
+
 ## 11. A partitioning schedule is a display bug only where the display reads the sample
 
 `adaptive_lab` picked its query centres with a stride plus a per-step offset. That makes
