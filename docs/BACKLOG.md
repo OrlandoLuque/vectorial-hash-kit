@@ -1361,6 +1361,29 @@ Everything else in this file is **future** — left to triage later.
   when many are on screen at once.
 
 ## Index / algorithms
+- ~~**#172 Audit every 3D bench for § 8i's signature — and it found a published ratio**~~ —
+  **done.** #171's radius defect was a class, so every bench quoting a 3D query ratio was
+  checked for "a fixed quantity chosen next to a parameter of one arm". Most were clean or
+  already aware (`grid_tree_frontier` and `extent_axis` sweep radius and size `levels` from
+  it deliberately; `grid_keep_bench` compares a structure against itself so cell size
+  cancels). **`linear_octree3_bench` was not.** Its world is **1000 × 300 × 1000** with one
+  `levels` for all axes, so `levels 5` gives cells of **31.25 × 9.375 × 31.25** — slabs — and
+  a radius-40 query spans **~121** cells instead of ~45.
+  → Declaring the index world a **cube** at the *same* levels (free: sparse hash, the layers
+  above y = 300 are never stored — 10 201 cells vs 28 589, items asserted equal) makes the
+  grid **1.45–1.96× faster**, and takes `LinearOctree3`'s published cull advantage from
+  **1.33–1.35×** to **1.04–1.09× — a tie**, three runs, the tightest reading in the table.
+  **The k-NN row survives** (1.33–1.77× vs the published 1.4–1.7×) and the reason is precise:
+  `MortonGrid3::knn` got per-axis expansion in #116, so its k-NN had already stopped caring
+  about aspect; `cull` never needed that fix and so never got one.
+  → **★ A concrete counterexample to reading `Occupancy` alone**, which #119 warned about
+  without a case. The slab's `mean` is **7.0**, squarely in the recommended band; the cube's
+  is **19.6**, apparently worse, and it is 2× faster. What ordered all three configurations
+  correctly was **cells a query must look up** — `prod(2r/cell_i + 1)`: cube L5 ~45 < slab
+  ~121 < cube L6 ~229, matching the measured speeds exactly. Now on `Occupancy::mean` itself.
+  → Finer is not automatically better either: cube **L6** has the best mean of the three
+  (4.4) and is **1.3–1.6× slower than the slab**. All three arms are reported rather than one
+  swapped in, so the handicap stays visible.
 - ~~**#171 The radix trie against the WHOLE 3D family, with radius as an axis**~~ — **done.**
   `#168` raced it against `Octree3` alone and concluded 3.6–5.2×; "how does it compare to
   the rest" was therefore an inference. Now all six answer the same `Sphere3`, rotated,

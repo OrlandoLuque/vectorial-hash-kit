@@ -3,6 +3,20 @@
 //! octree's niche is *adaptive depth without pointers* — this measures whether that
 //! actually pays against the two structures it sits between.
 //!
+//! **★ The grid arm was handicapped until 2026-09-13, and the cull ratio this bench publishes did
+//! not survive fixing it.** The world is 1000 x 300 x 1000 and `levels` is one number for all
+//! three axes, so `levels 5` means cells of 31.25 x 9.375 x 31.25 — slabs — and a radius-40 query
+//! spans ~121 cells instead of the ~45 cubic cells would span. Declaring the *index* world a cube
+//! costs nothing (sparse hash: the layers above y = 300 are never stored or traversed) and the
+//! grid gets **1.45-1.96x faster**, which takes `LinearOctree3`'s cull advantage from 1.4-1.9x to
+//! **1.04-1.09x — a tie**. The k-NN row survives, because `MortonGrid3::knn` already expands
+//! per-axis; `cull` never needed that fix and so never got one.
+//!
+//! All three grid configurations are reported rather than one being swapped in, because the slab
+//! row is now the evidence for two lessons: a good `Occupancy::mean` (7.0, in band) is **not** a
+//! fast grid, and finer is not automatically better either — cube `levels 6` has the best mean of
+//! the three (4.4) and is the slowest, at ~229 cells per query.
+//!
 //! ```bash
 //! cargo run -p vectorial-hash --example linear_octree3_bench --release
 //! ```
@@ -63,6 +77,39 @@ fn main() {
     let mut mor = MortonGrid3::new(world, 5);
     for it in &items { mor.insert(*it); }
 
+    // ---- the grid arm, with its cells made CUBIC ---------------------------------------------
+    //
+    // The world here is 1000 x 300 x 1000, and `levels` is ONE number for all three axes, so
+    // `levels 5` gives cells of 31.25 x 9.375 x 31.25 — slabs, against a query radius of 40. That
+    // is the pathology #118 fixed in the horde and #116 fixed inside `MortonGrid3::knn`, and this
+    // bench publishes the grid ratios quoted in THREE_D.md and the README. It was found by
+    // auditing every 3D bench for the signature "a fixed quantity chosen next to a parameter of
+    // one arm" (MEASURING § 8i) after the radix bench turned out to have it.
+    //
+    // Declaring the index world a CUBE costs nothing: the backing store is a sparse hash, so the
+    // layers above y = 300 are never stored and never traversed. Both resolutions are reported
+    // rather than one being swapped in, so the size of the handicap is visible.
+    let side = world.w.max(world.h).max(world.d);
+    let cube = Aabb::new(world.x, world.y, world.z, side, side, side);
+    let mut mor_c5 = MortonGrid3::new(cube, 5);
+    for it in &items { mor_c5.insert(*it); }
+    let mut mor_c6 = MortonGrid3::new(cube, 6);
+    for it in &items { mor_c6.insert(*it); }
+    let t_build_c5 = best(5, || { let mut g = MortonGrid3::new(cube, 5); for it in &items { g.insert(*it); } });
+    let t_build_c6 = best(5, || { let mut g = MortonGrid3::new(cube, 6); for it in &items { g.insert(*it); } });
+    println!("grid cells: slab L5 {:.2} x {:.2} x {:.2}  |  cube L5 {:.2}^3  |  cube L6 {:.2}^3",
+             world.w / 32.0, world.h / 32.0, world.d / 32.0, side / 32.0, side / 64.0);
+    println!("  cells a r={radius} query spans: slab ~{:.0} | cube L5 ~{:.0} | cube L6 ~{:.0}  \
+              (build ms: cube L5 {t_build_c5:.1}, cube L6 {t_build_c6:.1})",
+             (2.0 * radius / (world.w / 32.0) + 1.0) * (2.0 * radius / (world.h / 32.0) + 1.0) * (2.0 * radius / (world.d / 32.0) + 1.0),
+             (2.0 * radius / (side / 32.0) + 1.0).powi(3),
+             (2.0 * radius / (side / 64.0) + 1.0).powi(3));
+    println!("  occupancy slab L5 {:?}", mor.occupancy());
+    println!("  occupancy cube L5 {:?}", mor_c5.occupancy());
+    println!("  occupancy cube L6 {:?}", mor_c6.occupancy());
+    assert_eq!(mor.occupancy().items, mor_c6.occupancy().items,
+               "a cubic world must not drop items — every point is inside both boxes");
+
     // ---- cull ----
     let mut sink = 0usize;
     let t_cull_lin = best(6, || { for q in &queries { sink += lin.cull(&Sphere3::new(q.x, q.y, q.z, radius)).len(); } });
@@ -102,6 +149,35 @@ fn main() {
     pair("knn vs MortonGrid3", "knn_vs_morton3",
         &mut || { for q in &queries { std::hint::black_box(lin.knn(*q, 8).len()); } },
         &mut || { for q in &queries { std::hint::black_box(mor.knn(*q, 8).len()); } });
+
+    // The same two rivals again, with the grid's cells cubic. If these differ from the rows above,
+    // the published grid ratios were measured against a handicapped grid. **L5 is the row that
+    // matters** — same number of levels as the published slab, only the declared world box cubic,
+    // so nothing but the cell ASPECT changes. L6 is here to show that finer is not automatically
+    // better: it quarters the occupancy and quintuples the cells a query has to look up.
+    pair("cull vs Morton3 CUBE L5", "cull_vs_morton3_cube5",
+        &mut || { for q in &queries { std::hint::black_box(lin.cull(&Sphere3::new(q.x, q.y, q.z, radius)).len()); } },
+        &mut || { for q in &queries { std::hint::black_box(mor_c5.cull(&Sphere3::new(q.x, q.y, q.z, radius)).len()); } });
+    pair("knn vs Morton3 CUBE L5", "knn_vs_morton3_cube5",
+        &mut || { for q in &queries { std::hint::black_box(lin.knn(*q, 8).len()); } },
+        &mut || { for q in &queries { std::hint::black_box(mor_c5.knn(*q, 8).len()); } });
+    pair("cull vs Morton3 CUBE L6", "cull_vs_morton3_cube",
+        &mut || { for q in &queries { std::hint::black_box(lin.cull(&Sphere3::new(q.x, q.y, q.z, radius)).len()); } },
+        &mut || { for q in &queries { std::hint::black_box(mor_c6.cull(&Sphere3::new(q.x, q.y, q.z, radius)).len()); } });
+    pair("knn vs Morton3 CUBE L6", "knn_vs_morton3_cube",
+        &mut || { for q in &queries { std::hint::black_box(lin.knn(*q, 8).len()); } },
+        &mut || { for q in &queries { std::hint::black_box(mor_c6.knn(*q, 8).len()); } });
+    // And the grid against itself — the number that says how much the slab cost it, with nothing
+    // else varying: same items, same queries, same code, only the declared world box.
+    pair("Morton3 slab vs CUBE L5", "morton3_slab_vs_cube5",
+        &mut || { for q in &queries { std::hint::black_box(mor.cull(&Sphere3::new(q.x, q.y, q.z, radius)).len()); } },
+        &mut || { for q in &queries { std::hint::black_box(mor_c5.cull(&Sphere3::new(q.x, q.y, q.z, radius)).len()); } });
+    pair("Morton3 slab vs CUBE L6", "morton3_slab_vs_cube6",
+        &mut || { for q in &queries { std::hint::black_box(mor.cull(&Sphere3::new(q.x, q.y, q.z, radius)).len()); } },
+        &mut || { for q in &queries { std::hint::black_box(mor_c6.cull(&Sphere3::new(q.x, q.y, q.z, radius)).len()); } });
+    pair("Morton3 knn slab vs CUBE L6", "morton3_knn_slab_vs_cube6",
+        &mut || { for q in &queries { std::hint::black_box(mor.knn(*q, 8).len()); } },
+        &mut || { for q in &queries { std::hint::black_box(mor_c6.knn(*q, 8).len()); } });
 
     println!("structure       build(ms)   cull {nq}q(ms)   knn {nq}q(ms)   leaves/cells   depth");
     println!("LinearOctree3   {t_build_lin:8.2}   {t_cull_lin:11.2}   {t_knn_lin:10.2}   {:>12}   {}", lin.leaf_count(), lin.depth());

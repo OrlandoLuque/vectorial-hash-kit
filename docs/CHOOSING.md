@@ -77,7 +77,7 @@ Three cross-cutting choices that sit on top of the above:
 | **`MortonGrid`** | 2D | rebuild | dense + uniform 2D, refilled each frame | **cheapest** | **cheapest** when uniform |
 | **`MortonGrid3`** | 3D | rebuild | dense + uniform 3D, refilled each frame | **cheapest** | cheap; loses on skew |
 | **`KdTree3`** | 3D | static | **skewed/clustered, query-heavy** | median select (**≈3.4× on 16 threads**) | **cull ≈2.0–2.3× `Tree3` on clusters**, k-NN 1.67× |
-| **`LinearOctree3`** | 3D | static | skewed data you **rebuild often** | ~2.1× faster than `Octree3` | loses cull ~1.3× to `Octree3` |
+| **`LinearOctree3`** | 3D | static | skewed data you **rebuild often** | ~2.1× faster than `Octree3` | loses cull ~1.3× to `Octree3`; **ties a cubic `MortonGrid3`** on cull, keeps ~1.3–1.8× on k-NN |
 | **`LinearQuadTree`** | 2D | static | skewed 2D you rebuild often | fast | **won the fluid's neighbour query** |
 | **`KdTree2`** | 2D | static | **skewed/clustered 2D, query-heavy** | **fastest of the 2D builds** (2.8× on 16 threads) | **cull ~1.62× the pointer quadtree** |
 

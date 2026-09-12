@@ -472,15 +472,53 @@ flags, and a point estimate would be quoting noise):
 | comparison | speed-up for `LinearOctree3` | spread |
 | --- | ---: | ---: |
 | cull vs `Octree3` | **0.79-0.81×** (the pointer octree wins by ~1.25×) | 10-28% |
-| cull vs `MortonGrid3` | **1.33-1.35×** | 11-21% |
+| cull vs `MortonGrid3` | **1.33-1.35×** — **see the correction below, this one does not survive** | 11-21% |
 | knn vs `Octree3` | **0.81-0.83×** (the pointer octree wins by ~1.2×) | 5-9% |
 | knn vs `MortonGrid3` | **1.4-1.7×** | 15-30% |
+
+> ### ★ Correction, 2026-09-13: the grid in those two rows had SLAB cells
+>
+> This bench's world is **1000 × 300 × 1000** and `levels` is one number for all three axes, so
+> `levels 5` gives cells of **31.25 × 9.375 × 31.25**. A radius-40 query therefore spans about
+> **121** cells instead of the ~45 it would span if the cells were cubes — and a grid pays a hash
+> lookup per cell whether the cell holds anything or not.
+>
+> Declaring the *index* world a **cube** (side = the longest extent) costs nothing, exactly as the
+> horde's grid established when it was made cubic: the backing store is a sparse hash, so the
+> 22 layers above y = 300 are never stored and never traversed (10 201 occupied cells against the
+> slab's 28 589, same 200 000 items, asserted). Measured on the i7 laptop, three runs each, same
+> items, same queries, same code — **only the declared world box differs**:
+>
+> | comparison | vs the SLAB grid (published) | vs a CUBE grid, same `levels 5` |
+> | --- | ---: | ---: |
+> | `LinearOctree3` cull | 1.4-1.9× | **1.04-1.09×** — a dead heat |
+> | `LinearOctree3` knn | 1.7-2.8× | **1.33-1.77×** |
+> | the grid against itself, cull | — | cube is **1.45-1.96×** faster |
+>
+> So **`LinearOctree3` has no cull advantage over a properly-shaped uniform grid.** The published
+> 1.33-1.35× was measuring a handicap. The **k-NN row survives**, and for a reason worth noting:
+> `MortonGrid3::knn` was given **per-axis** shell expansion in #116, so its k-NN had already
+> stopped caring about cell aspect — `cull` never needed such a fix and therefore never got one,
+> which is why the slab still costs it.
+>
+> **And this is a concrete counterexample to reading `Occupancy` alone.** The slab grid's mean is
+> **7.0 items per non-empty cell** — squarely in the band the type recommends — and the cube's is
+> **19.6**, apparently worse. The cube is ~2× faster. The quantity that ordered the three
+> configurations correctly was **cells a query must look up** (cube L5 ~45 < slab ~121 < cube L6
+> ~229), which matched the measured ordering exactly and which occupancy cannot see. `Occupancy`
+> already says it is a diagnostic and not a predictor; this is what that looks like in practice.
+>
+> Finer is *not* automatically better, which is the other half: **cube `levels 6`** quarters the
+> occupancy to 4.4 and is **1.3-1.6× slower than the slab**, because the query then spans ~229
+> cells. The bench reports all three arms rather than swapping one in, so the size of the handicap
+> stays visible.
 
 Honest read: the tuned **pointer `Octree3` still wins the queries** — the arena already
 captures the adaptivity with better locality, the same result the wide-BVH probe reached.
 `LinearOctree3`'s real win is the **build: ~2.2× faster than `Octree3`** (pointer-free, one
-bucket pass per level — near the uniform grid's build cost), with a modest ~1.35× query edge
-over the uniform grid.
+bucket pass per level — near the uniform grid's build cost). Against the uniform grid it keeps a
+**k-NN** edge of ~1.3-1.8× and, once the grid's cells are cubic, **no cull edge at all** (see the
+correction above). The build is the case.
 
 **The clustered-k-NN cliff is gone, and this document used to sell it.** The line here said
 `LinearOctree3`'s clustered k-NN was *~5× faster* than `MortonGrid3`, and it was, until

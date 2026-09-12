@@ -236,6 +236,20 @@ pub struct Occupancy {
     /// Items in the grid.
     pub items: usize,
     /// Items per non-empty cell. Aim for roughly the `k` you ask k-NN for.
+    ///
+    /// **And do not stop here, because a good `mean` is not a fast grid.** Measured case
+    /// (`examples/linear_octree3_bench`, a 1000 x 300 x 1000 world): `levels 5` gives slab cells
+    /// of 31.25 x 9.375 x 31.25 and a `mean` of **7.0**, right in the band above. Declaring the
+    /// index world a **cube** at the *same* `levels` gives a `mean` of **19.6** — apparently
+    /// worse — and culls **1.45-1.96x faster**.
+    ///
+    /// What ordered the configurations correctly was the number of **cells a query has to look
+    /// up**, which for a radius `r` is `prod(2r/cell_i + 1)`: cube L5 ~45 < slab ~121 < cube L6
+    /// ~229, matching the measured speeds exactly. A grid pays a hash lookup per cell whether
+    /// the cell holds anything or not, and `mean` cannot see that — it is computed over
+    /// *non-empty* cells and says nothing about the shape of the ones a query crosses. Read
+    /// `mean` to catch a grid that is far too coarse or far too fine; read the cell ASPECT
+    /// against your query radius to catch one that is the wrong shape.
     pub mean: f64,
     /// The fullest cell. `max / mean` is how skewed the data is.
     pub max: usize,
