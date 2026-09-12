@@ -250,6 +250,18 @@ the answer is no.
    counting traversals and `$D3_ARMS` each cost under an hour; the four wrong explanations cost
    two days between them.
 
+**A fifth one, added 2026-09-13, because the same reflex fired again.** `radix_trie_bench` grew from
+two arms to six. Both pre-existing arms read roughly **2× slower** than their published figures, and
+the immediate explanation was the one this section is about: six large structures resident instead
+of two, so a footprint effect. It was stated in the session notes before being tested.
+
+It was not a footprint effect. It was **one sample per arm**. Taking the min over three reps of
+identical work brought `Octree3`'s uniform query back to **11.5 µs against the 12.2 µs published
+months earlier** — and the earlier single readings of 22–30 µs were simply the high tail. This
+section exists because a real cache-footprint effect was once mistaken for a property; the symmetric
+mistake is to reach for "footprint" whenever absolutes move, and it is *cheaper* to refute, because
+min-of-N costs one flag. **Try the estimator before you reach for the mechanism.**
+
 ## 8e. Noise is episodic, so "wait for an idle machine" is not the control you think
 
 The obvious defence against a noisy machine is to wait for it to go quiet, and both the gate and

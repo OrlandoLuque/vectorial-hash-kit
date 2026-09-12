@@ -1361,6 +1361,28 @@ Everything else in this file is **future** — left to triage later.
   when many are on screen at once.
 
 ## Index / algorithms
+- ~~**#171 The radix trie against the WHOLE 3D family, with radius as an axis**~~ — **done.**
+  `#168` raced it against `Octree3` alone and concluded 3.6–5.2×; "how does it compare to
+  the rest" was therefore an inference. Now all six answer the same `Sphere3`, rotated,
+  min-of-3, every answer asserted: **the trie is the slowest arm in all six
+  (distribution × radius) cells.** `KdTree3` takes the query in five of six, `MortonGrid3`
+  the build. The trie's one non-loss is the **clustered build**, where it beats `Tree3`.
+  → **The radius sweep turns the reason into the mechanism.** A node count can only cost
+  you on nodes a query visits, so ~1.4 nodes/item must get worse with query volume — and it
+  does, monotonically: **4.0× → 5.1× → 9.3×** (uniform) and **5.6× → 11.2× → 20.3×**
+  (clustered) against the best arm as the sphere grows from ⅓ of a grid cell to 3 of them.
+  → **It also had § 8i's defect:** one radius of 300 against a grid whose cells are 312 wu,
+  i.e. the fixed quantity had been set beside a parameter of one arm. `GRID_LEVELS` is
+  named now so the next reader compares the two.
+  → **Canonicity measured, not argued:** six build orders (incl. reversed and
+  Morton-sorted) → one compressed trie, by digest. But the trie has **no `update`/`remove`**,
+  so build-order independence is the only form of the property available — *and that is the
+  answer to "is the radix stable": yes, and so are seven of our nine, so it is not a
+  differentiator.* Anyone wanting it for a moving world writes that path first.
+  → **MEASURING § 8d gained a fifth lesson, against myself:** the two pre-existing arms read
+  2× slow when four were added and I reached for "footprint" in the notes before testing it.
+  Min-of-3 restored `Octree3` to **11.5 µs against the 12.2 published months earlier**. *Try
+  the estimator before you reach for the mechanism.*
 - ~~**#169 Structural stability under motion — keyed key vs pointer tree**~~ —
   **done, and the hypothesis was wrong in an interesting direction.**
   `examples/restructure_churn` (+ the new `struct-stats` feature, which counts

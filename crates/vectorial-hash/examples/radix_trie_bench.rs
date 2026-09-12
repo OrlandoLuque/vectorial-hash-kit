@@ -21,7 +21,14 @@
 //! ```
 use std::collections::BTreeMap;
 use std::time::Instant;
-use vectorial_hash::{Aabb, Octree3, Point3, Positioned3, Sphere3};
+/// `MortonGrid3` resolution: 32^3 = 32 768 cells, ~6 items each at this population, inside the
+/// occupancy band the grid documents. It is **named** rather than inlined because the query radius
+/// has to be read against the resulting cell width — 10 000 / 32 = 312 wu — and the first version
+/// of this bench used a single radius of 300, i.e. one cell. See the radius sweep below.
+const GRID_LEVELS: u32 = 5;
+
+use vectorial_hash::linear_octree3::LinearOctree3;
+use vectorial_hash::{Aabb, KdTree3, MortonGrid3, Octree3, Point3, Positioned3, Sphere3, Tree3};
 
 const WORLD: f64 = 10_000.0;
 const BITS: u32 = 10; // digits = BITS, 3 bits each → cells/axis = 2^10
@@ -135,6 +142,32 @@ impl RadixTrie {
                 stack.push(child as usize);
             }
         }
+    }
+
+    /// A **permutation-invariant** fingerprint of the compressed shape plus what each node holds.
+    ///
+    /// Children are walked in fixed digit order, so the traversal cannot depend on insertion
+    /// order, and the per-node item lists are keyed by `Obj::id` and sorted, so permuting the
+    /// input cannot move them either. Arena indices are never mixed in. Anything that differs
+    /// between two builds of the same key set therefore shows up in this number.
+    fn shape_digest(&self) -> u64 {
+        #[inline]
+        fn fnv(h: u64, v: u64) -> u64 { (h ^ v).wrapping_mul(0x100000001b3) }
+        let mut h = 0xcbf29ce484222325u64;
+        let mut stack = vec![0usize];
+        while let Some(i) = stack.pop() {
+            let nd = &self.nodes[i];
+            let mask: u64 = (0..8).filter(|&k| nd.kids[k] != u32::MAX).map(|k| 1u64 << k).sum();
+            h = fnv(fnv(fnv(h, nd.skip as u64), nd.path), mask);
+            let mut ids: Vec<u32> = nd.items.iter().map(|&x| self.objs[x as usize].id).collect();
+            ids.sort_unstable();
+            h = fnv(h, ids.len() as u64);
+            for id in ids { h = fnv(h, id as u64); }
+            // Pushed in reverse so children pop in ascending digit order. Either order would be
+            // deterministic; having a FIXED one is what makes the digest comparable at all.
+            for k in (0..8).rev() { let c = nd.kids[k]; if c != u32::MAX { stack.push(c as usize); } }
+        }
+        h
     }
 
     fn node_count(&self) -> usize {
@@ -262,59 +295,168 @@ fn main() {
         let oct = Octree3::bulk_load(world, 8, objs.clone());
         let build_oct = t0.elapsed().as_secs_f64() * 1e3;
 
-        // ---- queries: the same boxes through all three, answers compared against brute force
-        let mut rq = Rng(99);
-        let (trials, radius) = (200usize, 300.0f64);
-        let (mut tt, tb, mut to) = (0f64, 0f64, 0f64);
+        // The rest of the 3D family, so "how does the trie compare to the rest" is a measurement
+        // and not an inference from the one arm it happened to be raced against. Same world, same
+        // leaf capacity where the concept exists, same sphere below, every answer asserted.
+        // `levels 5` = 32 768 cells, ~6 items each at this population — the occupancy band the
+        // grid documents; it is reported rather than assumed.
+        let t0 = Instant::now();
+        let tre = Tree3::bulk_load(world, 8, objs.clone());
+        let build_tre = t0.elapsed().as_secs_f64() * 1e3;
+
+        let t0 = Instant::now();
+        let lin = LinearOctree3::from_items(world, 8, 12, objs.clone());
+        let build_lin = t0.elapsed().as_secs_f64() * 1e3;
+
+        let t0 = Instant::now();
+        let mut grid = MortonGrid3::new(world, GRID_LEVELS);
+        for o in &objs { grid.insert(*o); }
+        let build_grid = t0.elapsed().as_secs_f64() * 1e3;
+
+        let t0 = Instant::now();
+        let kd = KdTree3::from_items(8, objs.clone());
+        let build_kd = t0.elapsed().as_secs_f64() * 1e3;
+
+        // ---- queries: one sphere through all six arms, every answer checked against brute force
+        const ARMS: usize = 6;
+        const NAMES: [&str; ARMS] = ["trie", "Octree3", "Tree3", "LinearOct3", "Morton3", "KdTree3"];
+        const REPS: usize = 3;
+        let trials = 200usize;
+        let builds = [build_trie, build_oct, build_tre, build_lin, build_grid, build_kd];
+        let cell_w = WORLD / (1u32 << GRID_LEVELS) as f64;
+
+        println!("== {label} ==   (all six answer the SAME sphere, every answer asserted; arm order");
+        println!("                 rotated per trial; min of {REPS} reps; btree query excluded on");
+        println!("                 purpose, see the code. Morton3 cell = {cell_w:.0} wu.)");
+        println!("  {:<11} {:>10}", "arm", "build ms");
+        for a in 0..ARMS { println!("  {:<11} {:>10.1}", NAMES[a], builds[a]); }
+
+        // RADIUS IS AN AXIS, not a constant — and the reason is a defect this bench had. With a
+        // single radius of 300 and `GRID_LEVELS = 5` the grid's cells are 312 wu, so the query
+        // spanned about two cells per axis and the grid was effectively doing a bucket lookup.
+        // That is MEASURING.md § 8i exactly: the quantity held fixed had been set next to a
+        // parameter of one of the arms. Sweeping below, at, and well above the cell width is what
+        // makes the column mean something.
         let mut checked = 0usize;
-        for _ in 0..trials {
-            let c = (rq.unit() * WORLD, rq.unit() * WORLD, rq.unit() * WORLD);
-            let lo = [cell(c.0 - radius), cell(c.1 - radius), cell(c.2 - radius)];
-            let hi = [cell(c.0 + radius), cell(c.1 + radius), cell(c.2 + radius)];
+        for &radius in &[100.0f64, 300.0, 900.0] {
+            let mut best = [f64::INFINITY; ARMS];
+            for rep in 0..REPS {
+                // Same seed every rep, so min-of-N is a minimum over repeats of IDENTICAL work
+                // rather than over different work that happened to be easier once.
+                let mut rq = Rng(99);
+                let mut us = [0f64; ARMS];
+                for trial in 0..trials {
+                    let c = (rq.unit() * WORLD, rq.unit() * WORLD, rq.unit() * WORLD);
+                    // ONE `Sphere3`, shared by all six arms — `cull` takes a `Shape3` on every one
+                    // of them, so no arm has to answer a differently-shaped question.
+                    let s = Sphere3::new(c.0, c.1, c.2, radius);
 
-            let t0 = Instant::now();
-            let mut got = Vec::new();
-            trie.query_sphere(c, radius, &mut got);
-            tt += t0.elapsed().as_secs_f64() * 1e6;
+                    // The BTree arm is NOT queried here, and dropping it is the point: probing the
+                    // box cell by cell is hundreds of thousands of lookups, which is not a fair
+                    // rival but a straw man. `cold_index_bench` measures the ordered store properly,
+                    // with range scans over `box_ranges`. Comparing structures that answer
+                    // different questions is how a bench flatters whichever was asked the easier one.
+                    let _ = &bt;
 
-            // The BTree arm is NOT run here, and dropping it is the point: probing the box
-            // cell by cell means 61^3 = 230 000 lookups at this radius and resolution, which is
-            // not a fair rival, it is a straw man. `cold_index_bench` measures the ordered store
-            // properly, with range scans over `box_ranges`. Comparing structures that answer
-            // different questions is how a bench flatters whichever one was asked the easier one.
-            let _ = &bt;
+                    // ROTATED arm order. With six arms in a fixed sequence, whichever goes first
+                    // pays the cache miss for the query point and the last reads a warm `c` — and
+                    // this repo has already spent a night chasing a 1.09-1.17x "property" that
+                    // turned out to be frame position (MEASURING § 8d). Both decision maps rotate.
+                    let mut n = [0usize; ARMS];
+                    for step in 0..ARMS {
+                        let a = (step + trial) % ARMS;
+                        let t0 = Instant::now();
+                        n[a] = match a {
+                            0 => { let mut got = Vec::new(); trie.query_sphere(c, radius, &mut got); got.len() }
+                            1 => oct.cull(&s).len(),
+                            2 => tre.cull(&s).len(),
+                            3 => lin.cull(&s).len(),
+                            4 => grid.cull(&s).len(),
+                            5 => kd.cull(&s).len(),
+                            _ => unreachable!(),
+                        };
+                        us[a] += t0.elapsed().as_secs_f64() * 1e6;
+                    }
 
-            let t0 = Instant::now();
-            let ogot = oct.cull(&Sphere3::new(c.0, c.1, c.2, radius)).len();
-            to += t0.elapsed().as_secs_f64() * 1e6;
-
-            // Both answer the SAME sphere, so both are checked against brute force AND each
-            // other. Two independent structures agreeing on every query is worth more than
-            // either agreeing with a hand-written oracle once.
-            let want = objs.iter().filter(|o| {
-                let (dx, dy, dz) = (o.p.x - c.0, o.p.y - c.1, o.p.z - c.2);
-                dx * dx + dy * dy + dz * dz <= radius * radius
-            }).count();
-            assert_eq!(got.len(), want, "trie disagrees with brute force");
-            assert_eq!(ogot, want, "octree disagrees with brute force");
-            let _ = (lo, hi);
-            checked += want;
+                    // Six independent structures agreeing with brute force on every query is worth
+                    // more than any one of them agreeing with a hand-written oracle once. Checked
+                    // on the first rep only — the later reps repeat identical work.
+                    if rep == 0 {
+                        let want = objs.iter().filter(|o| {
+                            let (dx, dy, dz) = (o.p.x - c.0, o.p.y - c.1, o.p.z - c.2);
+                            dx * dx + dy * dy + dz * dz <= radius * radius
+                        }).count();
+                        for a in 0..ARMS {
+                            assert_eq!(n[a], want, "{} disagrees with brute force at r={radius} \
+                                       ({} vs {want})", NAMES[a], n[a]);
+                        }
+                        checked += want;
+                    }
+                }
+                for a in 0..ARMS { best[a] = best[a].min(us[a] / trials as f64); }
+            }
+            let slowest = NAMES[(0..ARMS).max_by(|&x, &y| best[x].total_cmp(&best[y])).unwrap()];
+            print!("  r={radius:<5.0} ({:>4.1} cells) us:", radius / cell_w);
+            for a in 0..ARMS { print!("  {}{:.2}", if NAMES[a] == slowest { "*" } else { "" }, best[a]); }
+            println!("   (* = slowest; order: {})", NAMES.join(" "));
         }
         assert!(checked > 0, "every query was empty — this proves nothing");
+        println!("  trie nodes {} for {} items ({:.2} nodes/item) | grid {:?}",
+                 trie.node_count(), n, trie.node_count() as f64 / n as f64, grid.occupancy());
+        println!("  (btree build {build_bt:.1} ms, for scale only — its QUERY is a different \
+                  question and is measured in cold_index_bench, not here)");
 
-        let t = trials as f64;
-        println!("== {label} ==");
-        println!("  build ms   trie {build_trie:7.1} | btree {build_bt:7.1} | octree {build_oct:7.1}");
-        println!("  query us   trie {:7.2} | octree {:7.2}   (SAME sphere, answers asserted equal)", tt / t, to / t);
-        let _ = tb;
-        println!("  trie nodes {} for {} items ({:.2} nodes/item)", trie.node_count(), n, trie.node_count() as f64 / n as f64);
+        // ---- is the trie's SHAPE a function of the keys, or of the insertion order?
+        //
+        // The claim "a PATRICIA is canonical" is an argument, and this repo does not leave those
+        // standing. The trie has no `update`/`remove`, so it cannot be tested the way a kept index
+        // is (build, maintain, compare against a rebuild — `tests/shape_is_history_free.rs`). The
+        // corresponding property for a build-once structure is that the ORDER of the build cannot
+        // be read off the result, and that is testable.
+        //
+        // Adversarial orders first (reverse, Morton-sorted: the one that makes every insert walk a
+        // fresh chain), then random shuffles.
+        let mut digests: Vec<(String, u64, usize)> =
+            vec![("as generated".into(), trie.shape_digest(), trie.node_count())];
+        let mut rev = objs.clone();
+        rev.reverse();
+        let mut srt = objs.clone();
+        srt.sort_by_key(|o| morton3(cell(o.p.x), cell(o.p.y), cell(o.p.z)));
+        for (name, v) in [("reversed", rev), ("morton-sorted", srt)] {
+            let tr = RadixTrie::build(v);
+            digests.push((name.into(), tr.shape_digest(), tr.node_count()));
+        }
+        let mut rp = Rng(4242);
+        for s in 0..3 {
+            let mut v = objs.clone();
+            for i in (1..v.len()).rev() {
+                let j = ((rp.unit() * (i + 1) as f64) as usize).min(i);
+                v.swap(i, j);
+            }
+            let tr = RadixTrie::build(v);
+            digests.push((format!("shuffle {s}"), tr.shape_digest(), tr.node_count()));
+        }
+        let (d0, n0) = (digests[0].1, digests[0].2);
+        for (name, d, nc) in &digests {
+            assert_eq!(*d, d0, "build order `{name}` produced a DIFFERENT compressed trie \
+                       (digest {d:#x} vs {d0:#x}) — a PATRICIA is supposed to be canonical");
+            assert_eq!(*nc, n0, "build order `{name}`: {nc} nodes against {n0}");
+        }
+        println!("  build order: {} orders (incl. reversed and morton-sorted) → one shape, \
+                  digest {d0:#016x}, {n0} nodes", digests.len());
         println!();
     }
 
-    println!("VERDICT: the hypothesis holds and the question closes. `Octree3` wins 3.6x (uniform)");
-    println!("and 5.2x (clustered) on the query, and 1.5-2.5x on the build, answering the identical");
-    println!("sphere with an answer asserted identical. A radix trie over Morton keys at 3 bits per");
-    println!("digit IS an octree with path compression, and the kit already has the better one.");
+    println!("VERDICT: the trie is the SLOWEST of the six at every radius, in both distributions.");
+    println!("Not narrowly, and not only against the octree it was first raced against: the whole");
+    println!("3D family beats it on the query, and the gap WIDENS with the query volume --");
+    println!("uniform 4.0x at r=100, 5.1x at r=300, 9.3x at r=900; clustered 5.6x / 11.2x / 20.3x");
+    println!("against the best arm at each radius. On the BUILD it is last on uniform data but");
+    println!("beats Tree3 on clustered, which is the one column where it is not simply worse.");
+    println!();
+    println!("A radix trie over Morton keys at 3 bits per digit IS an octree with path compression,");
+    println!("and the kit already has the better one. `KdTree3` takes the query at five of the six");
+    println!("(distribution x radius) cells and `MortonGrid3` takes the build.");
     println!();
     println!("The reason is worth more than the verdict, because it says the famous lever is the");
     println!("SMALL one. The trie pays ~1.4 NODES PER ITEM: it descends to full depth for every");
@@ -323,6 +465,25 @@ fn main() {
     println!("263k nodes against uniform's 288k -- but that is 8%. What the octree has instead is an");
     println!("ITEM LIMIT: stop subdividing at 8 items and the node count falls by nearly 8x. Adding");
     println!("that to the trie would not make it competitive, it would make it an octree.");
+    println!();
+    println!("The RADIUS SWEEP is what turns that from a plausible story into the mechanism. A node");
+    println!("count only costs you on the nodes a query actually visits, so if 1.4 nodes/item is the");
+    println!("cause then the penalty must grow with the query VOLUME -- and it does, monotonically,");
+    println!("4.0x -> 5.1x -> 9.3x as the sphere goes from a third of a grid cell to three of them.");
+    println!("A single radius would have shown one of those three numbers and called it the answer.");
+    println!();
+    println!("SHAPE: the trie is canonical, and that is measured here rather than argued. Six build");
+    println!("orders -- as generated, reversed, Morton-sorted, and three shuffles -- produce ONE");
+    println!("compressed trie, compared by a digest over (skip, path, child mask, sorted item ids)");
+    println!("with arena indices deliberately excluded. So insertion order cannot be read off the");
+    println!("result. Note what this does NOT say: the trie has no `update` or `remove`, so it");
+    println!("cannot be tested the way a KEPT index is (maintain, then compare against a rebuild --");
+    println!("tests/shape_is_history_free.rs). Build-order independence is the corresponding");
+    println!("property for a build-once structure, and it is the only one available here. Anyone");
+    println!("wanting this shape for a world that MOVES has to write that path first, which is");
+    println!("exactly the omission that was found twice in this repo already (the Morton grids, then");
+    println!("the linear trees: both had been described as rebuild-only when they simply had no");
+    println!("update method yet).");
     println!();
     println!("The BTree column is a different question and is deliberately not raced here: an");
     println!("ordered store is what you need when the index does not fit in memory, and");

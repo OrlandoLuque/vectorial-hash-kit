@@ -173,20 +173,46 @@ and 32.5–35.5) wider than the spread. A sorted key store is not only a disk sh
 (The radix trie is answered below; the `radix` elsewhere in this repo is radix *sort*, for building
 the GPU LBVH — unrelated.)
 
-## The radix / PATRICIA trie: measured, and the question closes
+## The radix / PATRICIA trie: measured against the whole 3D family
 
 `cargo run -p vectorial-hash --example radix_trie_bench --release` — 200 000 points, 10 bits/axis,
-an 8-ary trie with path compression racing the kit's `Octree3` on the **same sphere**, with both
-answers asserted equal to brute force and to each other.
+an 8-ary trie with path compression racing **all five** of the kit's 3D structures on the **same
+`Sphere3`**, every answer asserted against brute force, arm order rotated per trial, min of 3 reps.
 
-| data | trie build | octree build | trie query | octree query |
-| --- | ---: | ---: | ---: | ---: |
-| uniform | 294 ms | **117 ms** | 43.6 µs | **12.2 µs** |
-| clustered | 177 ms | **119 ms** | 25.6 µs | **4.9 µs** |
+Query µs, min over two runs (the runs agreed to within a few percent everywhere):
+
+| | r | trie | `Octree3` | `Tree3` | `LinearOct3` | `Morton3` | `KdTree3` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| uniform | 100 | 5.95 | 2.47 | 2.52 | 2.99 | **1.49** | 1.83 |
+| | 300 | 32.42 | 9.93 | 9.34 | 15.51 | 9.08 | **6.53** |
+| | 900 | 296.8 | 55.5 | 46.7 | 108.3 | 72.0 | **31.9** |
+| clustered | 100 | 2.00 | 0.78 | 0.78 | 1.29 | 0.74 | **0.41** |
+| | 300 | 18.60 | 3.07 | 2.65 | 6.96 | 2.57 | **1.64** |
+| | 900 | 167.0 | 16.8 | 14.7 | 52.9 | 14.4 | **8.21** |
+
+Build ms: uniform — trie 265, `Octree3` 108, `Tree3` 137, `LinearOct3` 56, **`Morton3` 56**,
+`KdTree3` 58. Clustered — trie 155, `Octree3` 131, `Tree3` 200, `LinearOct3` 58,
+**`Morton3` 21**, `KdTree3` 70.
+
+**The trie is the slowest arm in all six cells**, and not narrowly. `KdTree3` takes the query in
+five of the six and `MortonGrid3` takes the build. On the build the trie is last on uniform data
+but **beats `Tree3` on clustered** — the one column where it is not simply worse.
 
 The hypothesis the bench was written to kill was that a radix trie over Morton keys at 3 bits per
-digit simply *is* an octree with path compression. It is: `Octree3` wins 3.6–5.2× on the query and
-1.5–2.5× on the build. The kit already has this structure, spelled better.
+digit simply *is* an octree with path compression. It is, and the kit already has the structure
+spelled better.
+
+**The radius sweep is what turns the reason into a mechanism.** A node count can only cost you on
+the nodes a query visits, so if ~1.4 nodes per item is the cause then the penalty must grow with the
+query *volume*. It does, monotonically: against the best arm at each radius the trie is **4.0× →
+5.1× → 9.3×** (uniform) and **5.6× → 11.2× → 20.3×** (clustered) as the sphere grows from a third
+of a grid cell to three of them.
+
+> **A defect this table had, and it is `MEASURING.md` § 8i again.** The first version used a single
+> radius of **300** against a `MortonGrid3` at `levels 5`, whose cells are **312 wu** — so the query
+> spanned about one cell and the grid was effectively doing a bucket lookup. The quantity held fixed
+> had been chosen next to a parameter of one of the arms under test. Radius is an axis now, and
+> `GRID_LEVELS` is a named constant precisely so the next person reads one against the other.
 
 **The reason matters more than the verdict, because the famous lever turns out to be the small
 one.** The trie pays **~1.4 nodes per item** — it descends to full depth for every point, so a leaf
@@ -195,6 +221,29 @@ does help exactly where predicted, clustered data keeping 263 k nodes against un
 that is **8 %**. What the octree has instead is an **item limit**: stop subdividing at 8 items and
 the node count falls by nearly 8×. Adding that to the trie would not make it competitive; it would
 make it an octree.
+
+## The one property the trie *does* have — measured, not argued
+
+A PATRICIA is supposed to be **canonical**: its compressed shape is determined by where the keys
+diverge, so the insertion order cannot be read off the result. That is an argument, and this page
+does not leave those standing. The bench now builds the same 200 000 keys in **six orders** — as
+generated, **reversed**, **Morton-sorted** (the order that makes every insert walk a fresh chain),
+and three shuffles — and compares a digest over `(skip, path, child mask, sorted item ids)` per
+node, with arena indices deliberately excluded. All six produce **one shape**, asserted, both
+distributions.
+
+So the trie is stable. **What that is not, is a reason to prefer it**, because
+`tests/shape_is_history_free.rs` shows the same of seven of the kit's nine maintainable structures
+— including `Octree3`, `QuadTree`, both linear trees and both Morton grids, whose maintained shape
+is *integer-identical* to a rebuild from their current contents.
+
+And note carefully what build-order independence does **not** establish. The trie has no `update`
+and no `remove`, so it cannot be tested the way a kept index is — maintain, then compare against a
+rebuild. Build-order independence is the corresponding property for a **build-once** structure, and
+it is the only one available here. Anyone wanting this shape for a world that *moves* has to write
+that path first, which is precisely the omission this repo has found twice already: `MortonGrid3`
+and then both linear trees were each described as rebuild-only when the truth was that nobody had
+written their `update` yet.
 
 The ordered-store question is separate and stays open — that is what a `BTreeMap` (or a real
 on-disk B-tree) answers, and it is measured properly in `cold_index_bench` with range scans rather
