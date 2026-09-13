@@ -300,3 +300,52 @@ pub fn wall_ms_consuming<T: Clone, F: FnMut(Vec<T>)>(runs: usize, items: &[T], m
     }
     best
 }
+
+// ---------------------------------------------------------------- space-filling curve encoders
+//
+// These live here because two benches need them and a second copy would drift. `cold_index_bench`
+// asserts Hilbert's clustering against the published closed form (`H/s^2` -> 1), so a mistake in
+// either encoder fails a check rather than printing a plausible table.
+
+/// 3D Morton (Z-order) code from per-axis grid indices, up to 21 bits each.
+pub fn morton3(x: u32, y: u32, z: u32) -> u64 {
+    fn split(mut v: u64) -> u64 { // spread 21 bits with 2 gaps between
+        v &= 0x1f_ffff;
+        v = (v | v << 32) & 0x1f00000000ffff;
+        v = (v | v << 16) & 0x1f0000ff0000ff;
+        v = (v | v << 8) & 0x100f00f00f00f00f;
+        v = (v | v << 4) & 0x10c30c30c30c30c3;
+        v = (v | v << 2) & 0x1249249249249249;
+        v
+    }
+    split(x as u64) | (split(y as u64) << 1) | (split(z as u64) << 2)
+}
+
+/// 3D Hilbert distance from per-axis grid indices — Skilling's AxesToTranspose transform (exact,
+/// invertible) followed by a bit-interleave to a scalar. Unlike Morton this is a unit-step
+/// adjacency curve, which is the whole reason it clusters better.
+pub fn hilbert3(x: u32, y: u32, z: u32, bits: u32) -> u64 {
+    let mut c = [x, y, z];
+    let m = 1u32 << (bits - 1);
+    let mut q = m;
+    while q > 1 {
+        let p = q - 1;
+        for i in 0..3 {
+            if c[i] & q != 0 { c[0] ^= p; }
+            else { let t = (c[0] ^ c[i]) & p; c[0] ^= t; c[i] ^= t; }
+        }
+        q >>= 1;
+    }
+    for i in 1..3 { c[i] ^= c[i - 1]; }
+    let mut t = 0u32;
+    q = m;
+    while q > 1 { if c[2] & q != 0 { t ^= q - 1; } q >>= 1; }
+    for e in &mut c { *e ^= t; }
+    let mut d = 0u64;
+    let mut b = bits;
+    while b > 0 {
+        b -= 1;
+        for e in &c { d = (d << 1) | (((*e >> b) & 1) as u64); }
+    }
+    d
+}
