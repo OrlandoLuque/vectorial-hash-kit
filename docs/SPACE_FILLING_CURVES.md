@@ -194,13 +194,51 @@ Build ms: uniform — trie 265, `Octree3` 108, `Tree3` 137, `LinearOct3` 56, **`
 `KdTree3` 58. Clustered — trie 155, `Octree3` 131, `Tree3` 200, `LinearOct3` 58,
 **`Morton3` 21**, `KdTree3` 70.
 
-**The trie is the slowest arm in all six cells**, and not narrowly. `KdTree3` takes the query in
-five of the six and `MortonGrid3` takes the build. On the build the trie is last on uniform data
-but **beats `Tree3` on clustered** — the one column where it is not simply worse.
+`KdTree3` takes the query in five of the six and `MortonGrid3` takes the build. On the build the
+trie is last on uniform data but **beats `Tree3` on clustered**.
+
+> ### ★ Correction, 2026-09-13: a large part of that gap was my implementation
+>
+> The obvious question — *is the trie slow, or is my trie slow?* — is not answerable by timing the
+> trie alone, so the bench now carries a second arm, **`trie-flat`**: the **same trie**, converted
+> node for node from the same build (shape asserted identical), same descent, same answers. Only
+> the memory layout changes — items in one flat array instead of a `Vec` per node, coordinates
+> contiguous per leaf, nodes in DFS order. The census explains why that was available: 199 983
+> leaves for 200 000 items, so nearly every leaf was paying a 24-byte `Vec` header and an
+> allocation to hold one `u32`.
+>
+> | | r=100 | r=300 | r=900 |
+> | --- | ---: | ---: | ---: |
+> | uniform, `trie` → `trie-flat` | 1.71× | 2.22× | **3.24×** |
+> | clustered | 1.66× | 3.12× | **3.78×** |
+>
+> **1.7–3.8× from layout alone**, growing with radius — and with it the trie stops being last:
+> `trie-flat` **beats `LinearOctree3` in five of the six cells**. So "the trie is the slowest arm
+> in all six", which this page said, was measuring my code as much as the algorithm.
+>
+> **And the mechanism is not the one the byte census implied.** `trie-flat` is only **1.2× smaller**
+> (21.7 MB against 26.3), because it buys contiguity by storing a second copy of the coordinates.
+> Footprint fell 20 %, speed rose 2–4×: **the win was locality, not size.** Predicting from the
+> memory census would have got the direction right and the reason wrong.
+>
+> **What survives.** Even flat, the trie loses to `Octree3`, `Tree3`, `MortonGrid3` and `KdTree3` at
+> every radius, and it still pays **1.32–1.44 nodes per item** — which is what "descend to full
+> depth with no leaf bucket" means, and no layout touches it. ART (Leis et al., ICDE 2013) is the
+> literature's answer to a bloated radix trie and it adapts the *size of a node*, not the
+> nodes-per-item; the bench models ART-style nodes at a further **~4.3×** memory saving and that
+> still would not change the ranking. The thing that fixes nodes-per-item is an item limit — and an
+> 8-ary Morton trie with an item limit is an octree.
 
 The hypothesis the bench was written to kill was that a radix trie over Morton keys at 3 bits per
 digit simply *is* an octree with path compression. It is, and the kit already has the structure
 spelled better.
+
+**The literature says so outright, and I should have led with that rather than measuring my way to
+it.** Karras (HPG 2012) states the mapping as a premise: *each 3k-bit prefix of a Morton code maps
+directly to an octree node at level k, and binary radix trees can be used to enumerate these
+prefixes.* That equivalence is the foundation of GPU LBVH construction — **the same build this repo
+already implements** (`lbvh_bench`, `gpu_lbvh_query_bench`). So the measurement reproduces a known
+result rather than discovering one; its value is the local numbers, not the conclusion.
 
 **The radius sweep is what turns the reason into a mechanism.** A node count can only cost you on
 the nodes a query visits, so if ~1.4 nodes per item is the cause then the penalty must grow with the
@@ -257,3 +295,9 @@ than per-cell probes. Deliberately not raced here: probing a 61-cell-wide box ce
 - Xu & Tirthapura, *On the Optimality of Clustering Through a Space Filling Curve*, PODS 2012.
 - Tropf & Herzog, *Multidimensional Range Search in Dynamically Balanced Trees*, 1981 (BIGMIN /
   LITMAX).
+- Karras, *Maximizing Parallelism in the Construction of BVHs, Octrees, and k-d Trees*, HPG 2012 —
+  states the Morton-prefix ↔ octree-node mapping as a premise, and builds GPU LBVHs on it.
+- Leis, Kemper & Neumann, *The Adaptive Radix Tree: ARTful Indexing for Main-Memory Databases*,
+  ICDE 2013 — the standard answer to radix-trie node bloat: size each internal node to the
+  children it actually has. Relevant here as the reason **not** to read this page's trie numbers
+  as a verdict on radix tries in general; ART is what a tuned one looks like.

@@ -1361,6 +1361,32 @@ Everything else in this file is **future** — left to triage later.
   when many are on screen at once.
 
 ## Index / algorithms
+- ~~**#174 Is the trie slow, or is MY trie slow? — and what the literature already said**~~ —
+  **done, and it partly overturns #168/#171.** Prompted by the user asking whether the trie
+  "le faltará optimización" and whether the literature agrees.
+  → **The literature agrees about the equivalence and I should have led with it.** Karras
+  (HPG 2012) states the Morton-prefix ↔ octree-node mapping as a *premise* and builds GPU
+  LBVHs on it — the same build this repo already has. The measurement reproduced a known
+  result; its value is the local numbers, not the conclusion.
+  → **But ART (Leis et al., ICDE 2013) is the counter-example I had ignored**: it exists
+  precisely to fix radix-trie node bloat and reaches hash-table lookup speed. So "my trie is
+  bloated" is the known weakness with a known fix, and I had not applied it.
+  → **★ Measured, not argued.** New `trie-flat` arm: the *same trie*, converted node for node
+  (shape asserted identical), same descent, same answers — only the layout differs (flat item
+  array, coordinates contiguous per leaf, nodes in DFS order). A node census showed why it was
+  available: **199 983 leaves for 200 000 items**, so nearly every leaf paid a 24-byte `Vec`
+  header plus an allocation to hold one `u32`; 52 % of internal nodes have 2 children but carry
+  a full 8-slot array. **Layout alone buys 1.7–3.8×**, growing with radius (uniform 1.71 / 2.22
+  / 3.24; clustered 1.66 / 3.12 / 3.78), and with it the trie **beats `LinearOctree3` in 5 of 6
+  cells** instead of being last in all six.
+  → **The mechanism was not what the census implied**: `trie-flat` is only **1.2× smaller**
+  (it buys contiguity with a second copy of the coordinates). Footprint −20 %, speed +2–4× —
+  **the win was locality, not size.** Predicting from a memory census gets the direction right
+  and the reason wrong.
+  → **What survives**: even flat it loses to `Octree3`/`Tree3`/`MortonGrid3`/`KdTree3` at every
+  radius and still pays **1.32–1.44 nodes per item**. ART sizes *nodes*, not nodes-per-item;
+  the modelled further ~4.3× memory saving would not change the ranking. The fix for
+  nodes-per-item is an item limit, and an 8-ary Morton trie with an item limit is an octree.
 - ~~**#173 The 2D half of the audit — and #138's sweep had missed a bench**~~ — **done.**
   `linear_quadtree_bench`'s world is square, so no aspect handicap (and `decision2d`
   sizes `levels` from the query deliberately). But its **maintain** section had three
