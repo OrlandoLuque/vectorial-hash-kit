@@ -275,7 +275,18 @@ else here offers:
    copy, no geometry, O(digits) to find. Every other structure answers a region by descending with
    box tests and pushing survivors into a fresh `Vec`. That is right for an arbitrary sphere and
    wrong for *"give me cell 0o5273"*. Fetching a tile/chunk by address, streaming a region to a
-   peer, or iterating the world cell by cell are all this verb.
+   peer, or iterating the world cell by cell are all this verb. **Measured** (`radix_trie_bench`,
+   64 cell probes at 4 digits, two runs):
+
+   | | `RadixTrie3::region` | `Octree3::cull(box)` | `MortonGrid3::cull(box)` |
+   | --- | ---: | ---: | ---: |
+   | uniform | **0.085–0.157 µs** | 22.6–56.7 µs (**265–360×**) | 4.8–19.6 µs (56–124×) |
+   | clustered | **0.107–0.129 µs** | 110–197 µs (**1036–1531×**) | 31.0–62.6 µs (291–487×) |
+
+   Identical item counts on both sides (3 120 = 3 120 uniform, 169 558 = 169 558 clustered), so it
+   is exactly the same question — the trie *addresses* it where the others *search* for it. This
+   is not a close call and it does not need careful statistics; it is the difference between an
+   O(depth) descent returning a pointer and a traversal that visits and tests.
 2. **`cell_of(point, digits)` needs no index at all.** A peer, a client, or a file format can
    compute which cell an object belongs to from the point alone. Addresses become portable.
 3. **Any contiguous run of keys is a coherent shard.** `key_partition_bench` measures a query

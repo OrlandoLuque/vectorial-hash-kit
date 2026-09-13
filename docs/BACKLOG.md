@@ -1372,9 +1372,13 @@ Everything else in this file is **future** — left to triage later.
   data** (ties or loses on uniform; measured on a noisy laptop, read the range).
   → **Query still loses to everything** and the docs say so in the type's own header. That is not
   a defect to fix later: the fix for 1.4 nodes/item is an item limit, and that is `Octree3`.
-  → **★ The reason to pick it is a verb nobody else has**: `region(prefix, digits)` returns a whole
-  cell as a **borrowed contiguous slice** — no allocation, no copy, no geometry, O(digits) — because
-  items are stored in key order. With `cell_of(point, digits)`, which needs no index at all, an
+  → **★★ The reason to pick it, now MEASURED and not asserted.** Asked *"give me cell C"* rather
+  than *"give me this sphere"*, `region(prefix, digits)` answers with a **borrowed contiguous
+  slice** in **~0.1 µs** against **22–197 µs** for a box cull: **265–360× `Octree3` on uniform,
+  1036–1531× on clustered**, two runs, with **identical item counts** on both sides (3 120 = 3 120;
+  169 558 = 169 558) so it is exactly the same question. Every other structure *searches* for a
+  region; this one *addresses* it, because items are stored in key order and a cell is therefore a
+  contiguous run. No allocation, no copy, no geometry, O(digits) to find. With `cell_of(point, digits)`, which needs no index at all, an
   address becomes portable. Plus the shard property `key_partition_bench` measured (~2 % of shards
   touched vs ~47 % unordered) and canonicity over six build orders.
   → **7 brute-force-gated tests**, including the tiling property (cells at one resolution must sum
