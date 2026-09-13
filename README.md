@@ -108,23 +108,23 @@ found capabilities missing not because they were impossible but because nobody h
 asymmetry, and each time a doc had quietly recorded the omission as a *property* of the
 structure. Publishing the grid makes the next one visible without a grep.
 
-| | Tree | QuadTree | IntegerTree | Tree3 | Octree3 | MortonGrid | MortonGrid3 | LinearQuadTree | LinearOctree3 | KdTree2 | KdTree3 |
-| --- |:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
-| `insert` | ● | ● | ● | ● | ● | ● | ● | ● | ● | – | – |
-| `bulk_load` / `from_items` | ● | ● | ● | ● | ● | – | – | ● | ● | ● | ● |
-| parallel build | ● | ● | ● | ● | ● | ● | ● | ○ | ○ | ● | ● |
-| `update` / `remove` | ● | ● | ● | ● | ● | ● | ● | ● | ● | ✗ | ✗ |
-| `insert_ref` / `update_ref` / `get_ref` | ● | ● | ● | ● | ● | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `cull` / `cull_many` / `cull_many_par` | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● |
-| `knn` / `knn_many` / `knn_many_par` | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● |
-| `raycast` | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● |
-| `compact` | ● | ● | ● | ● | ● | – | – | – | – | – | – |
-| `occupancy` | – | – | – | – | – | ● | ● | ● | ● | – | – |
-| `iter` / `iter_z_order` | – | – | – | – | – | ● | ● | ● | ● | – | – |
-| `serialize` / `deserialize` | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● |
+| | Tree | QuadTree | IntegerTree | Tree3 | Octree3 | MortonGrid | MortonGrid3 | LinearQuadTree | LinearOctree3 | KdTree2 | KdTree3 | RadixTrie3 |
+| --- |:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
+| `insert` | ● | ● | ● | ● | ● | ● | ● | ● | ● | – | – | ✗ |
+| `bulk_load` / `from_items` | ● | ● | ● | ● | ● | – | – | ● | ● | ● | ● | ● |
+| parallel build | ● | ● | ● | ● | ● | ● | ● | ○ | ○ | ● | ● | ○ |
+| `update` / `remove` | ● | ● | ● | ● | ● | ● | ● | ● | ● | ✗ | ✗ | ✗ |
+| `insert_ref` / `update_ref` / `get_ref` | ● | ● | ● | ● | ● | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `cull` / `cull_many` / `cull_many_par` | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ◐ |
+| `knn` / `knn_many` / `knn_many_par` | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ◐ |
+| `raycast` | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ○ |
+| `compact` | ● | ● | ● | ● | ● | – | – | – | – | – | – | – |
+| `occupancy` | – | – | – | – | – | ● | ● | ● | ● | – | – | – |
+| `iter` / `iter_z_order` | – | – | – | – | – | ● | ● | ● | ● | – | – | ● |
+| `serialize` / `deserialize` | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ○ |
 
-● present · ○ **missing, and could exist** · ✗ deliberately absent, with a reason · – not
-meaningful for this structure
+● present · ◐ present, single-query only (no `_many` batch form yet) · ○ **missing, and
+could exist** · ✗ deliberately absent, with a reason · – not meaningful for this structure
 
 The two deliberate absences are the interesting ones:
 
@@ -135,6 +135,13 @@ The two deliberate absences are the interesting ones:
 - **The k-d trees cannot `update`.** A median split is derived from the whole point set, so
   moving a point in place leaves the tree silently unbalanced rather than merely slower. They
   rebuild, and `docs/CHOOSING.md` is organised around exactly that question.
+- **`RadixTrie3` has no `insert` or `update`**, and one row the table cannot show. It is
+  build-once by design, and it is **not the structure to reach for on query speed** — `Octree3`
+  and `Tree3` beat it, measurably, and its own docs say so. It exists for the one verb nobody
+  else has: **`region(prefix, digits)` returns a whole cell as a borrowed contiguous slice** —
+  no allocation, no copy, no geometry, because the items are stored in key order. Pair it with
+  `cell_of(point, digits)`, which any peer can compute without holding the index at all. If you
+  address data by *where it is* rather than searching for it, that is the difference.
 
 ## Algorithm internals
 

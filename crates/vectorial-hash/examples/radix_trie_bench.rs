@@ -444,6 +444,13 @@ fn main() {
         // The tuned-layout twin. Its build time is the original's PLUS the conversion, which is
         // the honest charge: a real implementation would emit this layout directly and pay less,
         // so treat its build column as an upper bound rather than a result.
+        // The LIBRARY structure: same family, ART-style adaptive nodes (child bitmask + packed
+        // children) on top of the flat layout. This is the arm that says whether the literature's
+        // fix delivers, as opposed to my hand-rolled layout patch above.
+        let t0 = Instant::now();
+        let rx = vectorial_hash::RadixTrie3::from_items(world, BITS, objs.clone());
+        let build_rx = t0.elapsed().as_secs_f64() * 1e3;
+
         let t0 = Instant::now();
         let flat = FlatTrie::from(&trie);
         let build_flat = build_trie + t0.elapsed().as_secs_f64() * 1e3;
@@ -453,11 +460,11 @@ fn main() {
         assert_eq!(flat.ids.len(), n, "every item must survive the conversion");
 
         // ---- queries: one sphere through all six arms, every answer checked against brute force
-        const ARMS: usize = 7;
-        const NAMES: [&str; ARMS] = ["trie", "trie-flat", "Octree3", "Tree3", "LinearOct3", "Morton3", "KdTree3"];
+        const ARMS: usize = 8;
+        const NAMES: [&str; ARMS] = ["trie", "trie-flat", "RadixTrie3", "Octree3", "Tree3", "LinearOct3", "Morton3", "KdTree3"];
         const REPS: usize = 3;
         let trials = 200usize;
-        let builds = [build_trie, build_flat, build_oct, build_tre, build_lin, build_grid, build_kd];
+        let builds = [build_trie, build_flat, build_rx, build_oct, build_tre, build_lin, build_grid, build_kd];
         let cell_w = WORLD / (1u32 << GRID_LEVELS) as f64;
 
         println!("== {label} ==   (all six answer the SAME sphere, every answer asserted; arm order");
@@ -504,11 +511,12 @@ fn main() {
                         n[a] = match a {
                             0 => { let mut got = Vec::new(); trie.query_sphere(c, radius, &mut got); got.len() }
                             1 => { let mut got = Vec::new(); flat.query_sphere(c, radius, &mut got); got.len() }
-                            2 => oct.cull(&s).len(),
-                            3 => tre.cull(&s).len(),
-                            4 => lin.cull(&s).len(),
-                            5 => grid.cull(&s).len(),
-                            6 => kd.cull(&s).len(),
+                            2 => rx.cull(&s).len(),
+                            3 => oct.cull(&s).len(),
+                            4 => tre.cull(&s).len(),
+                            5 => lin.cull(&s).len(),
+                            6 => grid.cull(&s).len(),
+                            7 => kd.cull(&s).len(),
                             _ => unreachable!(),
                         };
                         us[a] += t0.elapsed().as_secs_f64() * 1e6;

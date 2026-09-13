@@ -46,6 +46,7 @@ pub mod morton3;
 pub mod morton;
 pub mod adaptive;
 pub mod restructure;
+pub mod radix3;
 /// Provenance for hardware-specific measured files (baselines, calibrations).
 pub mod machine;
 pub mod adaptive2;
@@ -66,6 +67,7 @@ pub use adaptive2::AdaptiveIndex2;
 pub use kdtree2::KdTree2;
 pub use kdtree3::KdTree3;
 pub use linear_octree3::LinearOctree3;
+pub use radix3::RadixTrie3;
 pub use linear_quadtree::LinearQuadTree;
 pub use morton3::{MortonGrid3, Occupancy};
 pub use morton::MortonGrid;

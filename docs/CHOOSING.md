@@ -78,6 +78,7 @@ Three cross-cutting choices that sit on top of the above:
 | **`MortonGrid3`** | 3D | rebuild | dense + uniform 3D, refilled each frame | **cheapest** | cheap; loses on skew |
 | **`KdTree3`** | 3D | static | **skewed/clustered, query-heavy** | median select (**≈3.4× on 16 threads**) | **cull ≈2.0–2.3× `Tree3` on clusters**, k-NN 1.67× |
 | **`LinearOctree3`** | 3D | static | skewed data you **rebuild often** | ~2.1× faster than `Octree3` | loses cull ~1.3× to `Octree3`; **ties a cubic `MortonGrid3`** on cull, keeps ~1.3–1.8× on k-NN |
+| **`RadixTrie3`** | 3D | static | you address data **by key**, not by search | 1.8–4.4× the naive trie; **1.5–4.2× `Octree3` on clustered** | **loses every query** to `Octree3`/`Tree3`/`MortonGrid3`/`KdTree3` — pick it for `region()`, not for speed |
 | **`LinearQuadTree`** | 2D | static | skewed 2D you rebuild often | fast | **won the fluid's neighbour query** |
 | **`KdTree2`** | 2D | static | **skewed/clustered 2D, query-heavy** | **fastest of the 2D builds** (2.8× on 16 threads) | **cull ~1.62× the pointer quadtree** |
 
@@ -262,6 +263,36 @@ repeated passes** on an idle machine, via `cargo run -p bench-runner --release`:
   > for one row. Paired through `compare2` it reads 0.94–1.01× with a 17–47 % spread — no
   > measurable difference, which is what equal shapes must produce. See § 8j of
   > [`MEASURING.md`](MEASURING.md).
+
+### When is `RadixTrie3` actually the right pick?
+
+Short answer: **when your access pattern is a lookup, not a search.** Its query is the slowest of
+the 3D family and `radix_trie_bench` says so at every radius — if you are culling spheres, use
+`Octree3`. What it has instead is that *the key is the identity*, and that buys four things nothing
+else here offers:
+
+1. **`region(prefix, digits)` returns a cell as a borrowed contiguous slice** — no allocation, no
+   copy, no geometry, O(digits) to find. Every other structure answers a region by descending with
+   box tests and pushing survivors into a fresh `Vec`. That is right for an arbitrary sphere and
+   wrong for *"give me cell 0o5273"*. Fetching a tile/chunk by address, streaming a region to a
+   peer, or iterating the world cell by cell are all this verb.
+2. **`cell_of(point, digits)` needs no index at all.** A peer, a client, or a file format can
+   compute which cell an object belongs to from the point alone. Addresses become portable.
+3. **Any contiguous run of keys is a coherent shard.** `key_partition_bench` measures a query
+   reaching **~2 % of shards** under a curve key against **~47 %** under a balanced-but-unordered
+   one, and 100 % under clustering. Balanced partitioning is a *key* operation: a pointer tree's
+   subtree populations are whatever the data made them, so "give me K equal parts" has no answer
+   in the tree without first producing an ordering — which is the key.
+4. **The shape is canonical.** Six build orders, including reversed and already-sorted, produce
+   one structure (asserted). Useful when two machines must agree on a layout without exchanging it.
+
+And the build is genuinely competitive: sorting by Morton and building bottom-up beats `Octree3`'s
+insert path by **1.5–4.2× on clustered data** (it ties or loses on uniform, and these were measured
+on a noisy laptop — read the range, not the digits).
+
+So: **`RadixTrie3` if you address by key or shard by range; `Octree3` if you query by shape.** If
+you find yourself wanting both, you want `Octree3` plus a Morton sort of your own ids, and that is
+a fine answer too.
 
   **Why zero, and which structures actually get it.** `merge_limit == item_limit`, and the split
   planes are **positional** (fixed octants, not a data-dependent median). So "this node is

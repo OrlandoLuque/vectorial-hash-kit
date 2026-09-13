@@ -1361,6 +1361,26 @@ Everything else in this file is **future** — left to triage later.
   when many are on screen at once.
 
 ## Index / algorithms
+- ~~**#175 `RadixTrie3` — the 12th structure, so anyone wanting a radix has it done right**~~ —
+  **done.** The user's call: *"si alguien quiere usar nuestra librería y radix, que ya lo tenga
+  resuelto, aunque el octree3/tree3 sea mejor"*. So the fix #174 only modelled is now built.
+  → **ART's idea in its 8-ary form**, which is cleaner than ART's own: a **child bitmask + packed
+  children**. `mask: u8`, `kids: u32` pointing at the first child, child `k` at
+  `kids + popcount(mask & ((1<<k)-1))` — a node with two children stores two slots, not eight.
+  Node is **20 bytes**. Plus flat item storage and a Morton-sorted bottom-up build.
+  → **Build is its measured win**: 1.8–4.4× the naive trie, and **1.5–4.2× `Octree3` on clustered
+  data** (ties or loses on uniform; measured on a noisy laptop, read the range).
+  → **Query still loses to everything** and the docs say so in the type's own header. That is not
+  a defect to fix later: the fix for 1.4 nodes/item is an item limit, and that is `Octree3`.
+  → **★ The reason to pick it is a verb nobody else has**: `region(prefix, digits)` returns a whole
+  cell as a **borrowed contiguous slice** — no allocation, no copy, no geometry, O(digits) — because
+  items are stored in key order. With `cell_of(point, digits)`, which needs no index at all, an
+  address becomes portable. Plus the shard property `key_partition_bench` measured (~2 % of shards
+  touched vs ~47 % unordered) and canonicity over six build orders.
+  → **7 brute-force-gated tests**, including the tiling property (cells at one resolution must sum
+  to the population, so a subtree provably owns a contiguous run) and the world-maximum guard
+  (clamp, not mask). 198 lib tests green. CHOOSING.md has a "when is it actually the right pick"
+  section; README matrix gained the column and a `◐` legend for single-query-only verbs.
 - ~~**#174 Is the trie slow, or is MY trie slow? — and what the literature already said**~~ —
   **done, and it partly overturns #168/#171.** Prompted by the user asking whether the trie
   "le faltará optimización" and whether the literature agrees.
