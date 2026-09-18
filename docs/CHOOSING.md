@@ -291,9 +291,31 @@ else here offers:
    compute which cell an object belongs to from the point alone. Addresses become portable.
 3. **Any contiguous run of keys is a coherent shard.** `key_partition_bench` measures a query
    reaching **~2 % of shards** under a curve key against **~47 %** under a balanced-but-unordered
-   one, and 100 % under clustering. Balanced partitioning is a *key* operation: a pointer tree's
-   subtree populations are whatever the data made them, so "give me K equal parts" has no answer
-   in the tree without first producing an ordering — which is the key.
+   one, and 100 % under clustering.
+
+   > **Correction, 2026-09-19.** This point used to continue: *"a pointer tree's subtree
+   > populations are whatever the data made them, so 'give me K equal parts' has no answer in the
+   > tree"*. **That is false**, and the user said so. Partitioning by tree structure is the
+   > standard approach with a decade of literature behind it — SpatialHadoop ships Quadtree,
+   > KD-tree and STR partitioners beside its Z-curve and Hilbert ones, and R\*-Grove describes the
+   > family as *"reuse existing index search trees as-is … use its leaf nodes as partition
+   > boundaries"*.
+   >
+   > Measured (`key_partition_bench` now has the arm): a tree partition **grouped the obvious
+   > way**, largest leaf into the emptiest shard, has fine balance and its spatial quality
+   > collapses — R\*-Grove's Q2 overlap reads **288 and 13 381** against Morton's 4.5 and 6.8,
+   > because greedy packing groups leaves by *size* and a shard ends up a union of compact cubes
+   > scattered over the whole world. Grouped **in curve order** with leaves much finer than a
+   > shard, it lands on Morton's numbers in **every** column, balance included.
+   >
+   > So the honest statement is the opposite of the old one: **a tree partition done properly is
+   > not worse, it is the same thing** — a tree whose leaves are finer than a shard, walked in
+   > curve order, *is* a key sort at leaf granularity. What the key adds is that it can cut
+   > **anywhere**, where a tree cuts only at node boundaries; that quantisation is what forces a
+   > choice between balance and locality (coarse leaves in curve order read **30× max/mean** at
+   > K = 512). And what survives outside the table: which shard owns a point is two comparisons on
+   > a number its holder computes, where a tree partition is a node→shard directory somebody has
+   > to ship, agree on and keep in step.
 4. **The shape is canonical.** Six build orders, including reversed and already-sorted, produce
    one structure (asserted). Useful when two machines must agree on a layout without exchanging it.
 

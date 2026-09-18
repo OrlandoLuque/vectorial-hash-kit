@@ -15,7 +15,11 @@
 //!   without consulting the structure;
 //! - the key **orders** the data, so any contiguous run of keys is a spatially coherent shard —
 //!   `examples/key_partition_bench` measures a query reaching ~2 % of shards under a curve key
-//!   against ~47 % under a balanced-but-unordered one;
+//!   against ~47 % under a balanced-but-unordered one. (Not a claim that a tree *cannot* be
+//!   partitioned: it can, it is the standard approach, and done properly — leaves finer than a
+//!   shard, grouped in curve order — it matches these numbers exactly, because that *is* a key
+//!   sort at leaf granularity. What the key adds is that it can cut anywhere rather than only at a
+//!   node boundary, and that the ownership rule is arithmetic rather than a directory to ship.);
 //! - the shape is **canonical**: build order cannot be read off the result, asserted over six
 //!   orderings including reversed and Morton-sorted.
 //!

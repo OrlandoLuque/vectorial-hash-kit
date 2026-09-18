@@ -1361,6 +1361,32 @@ Everything else in this file is **future** — left to triage later.
   when many are on screen at once.
 
 ## Index / algorithms
+- ~~**#176 The partitioning arm I left out, and it refutes me twice**~~ — **done.** The user
+  objected: *"para particionar no sería una ventaja porque tú ya sabes qué rama es pesada y
+  partes siguiendo la estructura"*. Correct, and `key_partition_bench` had no such arm — it
+  compared four *orderings* and reported one metric.
+  → **Prior art first.** That objection names a whole family: SpatialHadoop ships **Quadtree,
+  KD-tree, STR, STR+** partitioners beside Z-curve and Hilbert (Eldawy, Alarabi & Mokbel, VLDB
+  2015), and R\*-Grove (Vu & Eldawy 2020) describes it as *"reuse existing index search trees
+  as-is … use its leaf nodes as partition boundaries"*. Their quality metrics — total volume
+  (Q1), overlap (Q2), margin, utilization, stddev of sizes (Q5) — are now all in the bench.
+  R\*-Grove's framing also corrects mine: SFC gives *"near-perfect load balance [but] an even
+  bigger spatial overlap"*, tree-based *"prioritize load balance over spatial quality"*.
+  → **★ Prediction wrong #1.** I expected the tree arm to win Q1/Q2 (compact cubes). Grouped the
+  obvious way — largest leaf into the emptiest shard, LPT — it is nearly the worst arm:
+  **Q2 = 288 and 13 381** against Morton's 4.5 and 6.8. Each shard *is* a union of compact cubes,
+  but scattered over the whole world, because greedy packing groups by **size**. Compactness does
+  not survive the grouping.
+  → **★ Prediction wrong #2.** Grouping leaves in **curve order** makes leaf size the dial:
+  coarse (≈4 leaves/shard) buys quality and wrecks balance (**30× max/mean** at K=512, one dense
+  leaf overflows a shard); fine (≈32/shard) lands on **Morton's numbers in every column**. Which
+  is the answer: **a tree with leaves finer than a shard, walked in curve order, IS a key sort at
+  leaf granularity.** The key is not a better partitioner — it is the same one. What it adds is
+  cutting **anywhere** vs only at node boundaries, plus ownership as arithmetic rather than a
+  node→shard directory to ship. MD-HBase does both at once.
+  → **A methodological catch**: `X-stripe` has the **best** Q1/Q2 of every arm and by far the
+  worst fan-out. Total area is a *join* metric (VLDB 2015 says so), so reading it alone picks the
+  worst partitioner here. Corrected the overclaim in `CHOOSING.md` and `radix3.rs`.
 - ~~**#175 `RadixTrie3` — the 12th structure, so anyone wanting a radix has it done right**~~ —
   **done.** The user's call: *"si alguien quiere usar nuestra librería y radix, que ya lo tenga
   resuelto, aunque el octree3/tree3 sea mejor"*. So the fix #174 only modelled is now built.
