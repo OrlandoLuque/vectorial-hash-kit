@@ -1361,6 +1361,21 @@ Everything else in this file is **future** — left to triage later.
   when many are on screen at once.
 
 ## Index / algorithms
+- ~~**#177 `MortonGrid3::cell` — and my 265–1531× headline was a lookup racing a search**~~ —
+  **done, and it is #176's lesson applied to myself.** Having just fixed a bench for omitting
+  the strongest alternative, I asked the same of the bench next door: `radix_trie_bench`
+  compared `RadixTrie3::region` against `Octree3::cull(box)` and `MortonGrid3::cull(box)` — and
+  **`MortonGrid3` had no cell lookup at all.** Not impossible; a hash of buckets *is* the answer.
+  Nobody had asked. Fifth time this repo has found that shape.
+  → `MortonGrid3::cell(code)` + `cell_code(point)` added (borrowed slice, no scan, no alloc).
+  Re-measured with prefix length as an axis, same cell both sides, counts asserted equal:
+  **d=1 967× · d=2 115× · d=3 17× · d=4 2.0× · d=5 0.20×** — i.e. **at the grid's own resolution
+  the grid wins ~5×**, one hash lookup against five levels of descent.
+  → So the honest property is not speed: **`region` is flat in `d`** (O(depth), resolution
+  independent) and the trie wins only where the cell is *coarser* than a single grid level, by
+  exactly `8^(levels−d)` — the buckets a fixed-resolution index must union. **One cell size →
+  grid; a hierarchy of cell sizes (LOD, tiles at several zooms) → trie.** Corrected in the bench
+  verdict, `CHOOSING.md`, `README.md` and `radix3.rs`.
 - ~~**#176 The partitioning arm I left out, and it refutes me twice**~~ — **done.** The user
   objected: *"para particionar no sería una ventaja porque tú ya sabes qué rama es pesada y
   partes siguiendo la estructura"*. Correct, and `key_partition_bench` had no such arm — it

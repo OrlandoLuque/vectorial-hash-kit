@@ -275,18 +275,34 @@ else here offers:
    copy, no geometry, O(digits) to find. Every other structure answers a region by descending with
    box tests and pushing survivors into a fresh `Vec`. That is right for an arbitrary sphere and
    wrong for *"give me cell 0o5273"*. Fetching a tile/chunk by address, streaming a region to a
-   peer, or iterating the world cell by cell are all this verb. **Measured** (`radix_trie_bench`,
-   64 cell probes at 4 digits, two runs):
+   peer, or iterating the world cell by cell are all this verb.
 
-   | | `RadixTrie3::region` | `Octree3::cull(box)` | `MortonGrid3::cull(box)` |
-   | --- | ---: | ---: | ---: |
-   | uniform | **0.085–0.157 µs** | 22.6–56.7 µs (**265–360×**) | 4.8–19.6 µs (56–124×) |
-   | clustered | **0.107–0.129 µs** | 110–197 µs (**1036–1531×**) | 31.0–62.6 µs (291–487×) |
-
-   Identical item counts on both sides (3 120 = 3 120 uniform, 169 558 = 169 558 clustered), so it
-   is exactly the same question — the trie *addresses* it where the others *search* for it. This
-   is not a close call and it does not need careful statistics; it is the difference between an
-   O(depth) descent returning a pointer and a traversal that visits and tests.
+   > **Correction, 2026-09-19 — and the honest win is much smaller than first published.** This
+   > point read *"0.085 µs against 22–197 µs for a box cull: **265–1531×**"*, and that comparison
+   > raced a **lookup against a search**. `MortonGrid3` had no cell lookup at all — not because a
+   > hash of buckets cannot do one, but because nobody had asked — so the strongest alternative was
+   > missing from its own comparison. The same omission the tree-partition arm had, found by
+   > applying the same question to the bench next door. `MortonGrid3::cell` exists now.
+   >
+   > Re-measured against it, asking for the identical cell with the item counts asserted equal, by
+   > prefix length `d` against a grid at `levels = 5`:
+   >
+   > | `d` | buckets the grid unions | `region` | `MortonGrid3::cell` | grid / region |
+   > | ---: | ---: | ---: | ---: | ---: |
+   > | 1 | 4 096 | 0.18 µs | 175 µs | **967×** |
+   > | 2 | 512 | 0.18 µs | 21.2 µs | 115× |
+   > | 3 | 64 | 0.15 µs | 2.56 µs | 17× |
+   > | 4 | 8 | 0.09 µs | 0.19 µs | 2.0× |
+   > | **5** | **1** | 0.18 µs | **0.037 µs** | **0.20× — the grid wins ~5×** |
+   >
+   > **At the grid's own resolution the grid wins**: one hash lookup beats descending five levels
+   > of trie. `region`'s real property is that it is **flat in `d`** — O(depth), resolution
+   > independent — so the trie's advantage is strictly the **multi-resolution** case and grows as
+   > `8^(levels−d)`, which is simply how many buckets a fixed-resolution index must union to answer
+   > a coarser question.
+   >
+   > **So: one cell size → `MortonGrid3::cell`. A hierarchy of cell sizes (LOD, tiles at several
+   > zooms, streaming at varying granularity) → `RadixTrie3::region`.**
 2. **`cell_of(point, digits)` needs no index at all.** A peer, a client, or a file format can
    compute which cell an object belongs to from the point alone. Addresses become portable.
 3. **Any contiguous run of keys is a coherent shard.** `key_partition_bench` measures a query

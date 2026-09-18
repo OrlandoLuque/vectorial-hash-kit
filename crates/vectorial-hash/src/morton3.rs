@@ -309,6 +309,36 @@ impl<T: Positioned3> MortonGrid3<T> {
         )
     }
 
+    /// **One cell's items, as a borrowed slice — a lookup, not a search.**
+    ///
+    /// `code` is the Morton code of a cell at *this grid's* `levels`, as returned by
+    /// [`Self::cell_code`]. Nothing is scanned and nothing is allocated: the grid is a hash of
+    /// buckets, so the cell's contents are already one contiguous `Vec`.
+    ///
+    /// This verb was missing until 2026-09-19, and it was missing in a way this repo has now seen
+    /// four times: not because a grid cannot do it, but because nobody had asked. It surfaced when
+    /// `radix_trie_bench` compared [`crate::RadixTrie3::region`] against `MortonGrid3::cull` with a
+    /// box shape and reported a 265-1531x win — a comparison against a *search* because the
+    /// *lookup* did not exist. See the capability matrix note in the README.
+    ///
+    /// The honest remaining difference is **resolution**: a grid answers only at its own `levels`,
+    /// so a coarser cell means unioning `8^k` buckets, while `RadixTrie3::region` takes any prefix
+    /// length. Fixed resolution, one call; variable resolution, use the trie.
+    #[inline]
+    pub fn cell(&self, code: u64) -> &[T] {
+        bucket_of(&self.cells, code).map_or(&[], |v| v.as_slice())
+    }
+
+    /// The cell code of a point at this grid's resolution — the argument [`Self::cell`] wants.
+    ///
+    /// Computable from the point and the grid's geometry alone, so it is safe to send to someone
+    /// who does not hold the grid.
+    #[inline]
+    pub fn cell_code(&self, p: Point3) -> u64 {
+        let (ix, iy, iz) = self.cell_of(p);
+        morton3(ix, iy, iz)
+    }
+
     /// Bucket an item by its Morton cell. Out-of-world points are rejected
     /// (returns `false`), matching `Tree3`/`Octree3` insert semantics.
     pub fn insert(&mut self, item: T) -> bool {

@@ -137,11 +137,17 @@ The two deliberate absences are the interesting ones:
   rebuild, and `docs/CHOOSING.md` is organised around exactly that question.
 - **`RadixTrie3` has no `insert` or `update`**, and one row the table cannot show. It is
   build-once by design, and it is **not the structure to reach for on query speed** — `Octree3`
-  and `Tree3` beat it, measurably, and its own docs say so. It exists for the one verb nobody
-  else has: **`region(prefix, digits)` returns a whole cell as a borrowed contiguous slice** —
-  no allocation, no copy, no geometry, because the items are stored in key order. Pair it with
-  `cell_of(point, digits)`, which any peer can compute without holding the index at all. If you
-  address data by *where it is* rather than searching for it, that is the difference.
+  and `Tree3` beat it, measurably, and its own docs say so. It exists for **`region(prefix,
+  digits)`**: a whole cell returned as a borrowed contiguous slice, no allocation, no copy, no
+  geometry, because the items are stored in key order. Pair it with `cell_of(point, digits)`,
+  which any peer can compute without holding the index.
+  **But not because it is the only structure that can do a cell lookup** — `MortonGrid3::cell`
+  does one too, and at the grid's own resolution it is **~5× faster**. `region`'s property is
+  being **flat in the prefix length**, so it wins only where you need cells *coarser* than a
+  single grid level, and then by `8^(levels−d)` (2× one level up, 967× four). One cell size → the
+  grid. A hierarchy of cell sizes → the trie. That correction came from noticing that the
+  comparison had raced a lookup against a search because the grid's lookup did not exist yet —
+  the fifth time this matrix's own warning has come true.
 
 ## Algorithm internals
 

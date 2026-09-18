@@ -385,6 +385,45 @@ impl FlatTrie {
     }
 }
 
+/// One row of the prefix-length sweep: the trie's `region` against the grid's own cell lookup,
+/// asked for the **same** cell, with the item counts asserted equal so neither can be answering an
+/// easier question. The grid answers at its fixed `GRID_LEVELS`, so a `digits`-long prefix costs it
+/// `8^(GRID_LEVELS - digits)` bucket lookups; the trie takes the prefix directly.
+fn cell_lookup_at(
+    rx: &vectorial_hash::RadixTrie3<Obj>,
+    grid: &MortonGrid3<Obj>,
+    objs: &[Obj],
+    digits: u32,
+) {
+    let mut cells: Vec<u64> = objs.iter().map(|o| rx.cell_of(o.p, digits)).collect();
+    cells.sort_unstable();
+    cells.dedup();
+    let step = (cells.len() / 32).max(1);
+    let probes: Vec<u64> = cells.iter().copied().step_by(step).take(32).collect();
+    let gap = GRID_LEVELS - digits;
+    let buckets = 1u64 << (3 * gap);
+    let reps = 20usize;
+
+    let t0 = Instant::now();
+    let mut a = 0usize;
+    for _ in 0..reps { for &c in &probes { a += rx.region(c, digits).len(); } }
+    let us_rx = t0.elapsed().as_secs_f64() * 1e6 / (reps * probes.len()) as f64;
+
+    let t0 = Instant::now();
+    let mut b = 0usize;
+    for _ in 0..reps {
+        for &c in &probes {
+            let base = c << (3 * gap);
+            for sub in 0..buckets { b += grid.cell(base | sub).len(); }
+        }
+    }
+    let us_gr = t0.elapsed().as_secs_f64() * 1e6 / (reps * probes.len()) as f64;
+
+    assert_eq!(a, b, "at d={digits} the grid's {buckets}-bucket union must equal the trie's cell");
+    assert!(a > 0, "every probe at d={digits} was empty — this proves nothing");
+    println!("    {digits:>2} {buckets:>9} {us_rx:>11.3} {us_gr:>11.3} {:>8.2}x", us_gr / us_rx);
+}
+
 fn main() {
     let n = 200_000usize;
     println!("radix/PATRICIA trie over Morton keys vs a sorted store and the pointer octree");
@@ -563,7 +602,19 @@ fn main() {
         // and `region`'s own correctness is gated against brute force in `src/radix3.rs`.
         {
             let rxq = vectorial_hash::RadixTrie3::from_items(world, BITS, objs.clone());
-            let digits = 4u32; // 16 cells per axis — a chunk-sized region
+            // PREFIX LENGTH IS THE AXIS, and it is the axis because the first version of this
+            // section used a single value and reported 265-1531x against a box cull — a lookup
+            // against a search, because `MortonGrid3` had no cell lookup at all. With the verb
+            // added the two are within 1.2x at one resolution, so the interesting question is the
+            // one a single value cannot ask: what happens as the requested cell gets COARSER than
+            // the grid's own levels, where the grid has to union 8^k buckets and the trie does not.
+            println!("  CELL LOOKUP (\"give me cell C\") — region() vs the grid's own lookup, by");
+            println!("  prefix length. GRID_LEVELS = {GRID_LEVELS}, so the grid unions 8^({GRID_LEVELS}-d) buckets:");
+            println!("    {:>2} {:>9} {:>11} {:>11} {:>9}", "d", "buckets", "region us", "grid us", "grid/region");
+            for digits in 1..=GRID_LEVELS { cell_lookup_at(&rxq, &grid, &objs, digits); }
+            println!();
+
+            let digits = 4u32; // 16 cells per axis — a chunk-sized region, kept for the scale rows
             let mut cells: Vec<u64> = objs.iter().map(|o| rxq.cell_of(o.p, digits)).collect();
             cells.sort_unstable();
             cells.dedup();
@@ -604,13 +655,36 @@ fn main() {
             for _ in 0..reps { for b in &boxes { sunk_g += grid.cull(b).len(); } }
             let us_grid = t0.elapsed().as_secs_f64() * 1e6 / (reps * probes.len()) as f64;
 
-            assert!(sunk > 0 && sunk_o > 0 && sunk_g > 0, "every cell probe was empty");
+            // ★ THE STRONGEST ALTERNATIVE, which this section did not have until it was pointed
+            // out that the same omission had just been fixed in `key_partition_bench`. A grid can
+            // answer "give me cell C" by a BUCKET LOOKUP rather than a box cull — `MortonGrid3`
+            // simply had no such verb, so the first version of this comparison raced a lookup
+            // against a search and reported 265-1531x. The verb exists now.
+            //
+            // The catch is resolution: the grid answers at ITS levels, so it needs the 8^k cells
+            // under the probe prefix. At GRID_LEVELS=5 against a 4-digit prefix that is 8 of them,
+            // which is the honest cost of a fixed-resolution index answering a coarser question.
+            let lvl_gap = GRID_LEVELS - digits;
+            let t0 = Instant::now();
+            let mut sunk_c = 0usize;
+            for _ in 0..reps {
+                for &c in &probes {
+                    let base = c << (3 * lvl_gap);
+                    for sub in 0..(1u64 << (3 * lvl_gap)) { sunk_c += grid.cell(base | sub).len(); }
+                }
+            }
+            let us_cell = t0.elapsed().as_secs_f64() * 1e6 / (reps * probes.len()) as f64;
+
+            assert!(sunk > 0 && sunk_o > 0 && sunk_g > 0 && sunk_c > 0, "every cell probe was empty");
+            assert_eq!(sunk_c, sunk, "the grid's bucket union must hold exactly the trie's cell");
             assert!(sunk_o >= sunk, "the closed box must be a superset of the half-open cell");
             println!("  CELL LOOKUP (\"give me cell C\", {} probes at {digits} digits, {:.0} wu/side):",
                      probes.len(), side);
-            println!("    RadixTrie3::region {:>8.3} us  (borrowed slice, no allocation)", us_region);
-            println!("    Octree3::cull(box) {:>8.3} us  ({:.0}x)", us_oct, us_oct / us_region);
-            println!("    MortonGrid3::cull  {:>8.3} us  ({:.0}x)", us_grid, us_grid / us_region);
+            println!("    RadixTrie3::region {:>8.3} us  (borrowed slice, any prefix length)", us_region);
+            println!("    MortonGrid3::cell  {:>8.3} us  ({:.2}x)  <- the LOOKUP: {} bucket(s) at its own levels",
+                     us_cell, us_cell / us_region, 1u64 << (3 * lvl_gap));
+            println!("    Octree3::cull(box) {:>8.3} us  ({:.0}x)  <- a SEARCH, for scale", us_oct, us_oct / us_region);
+            println!("    MortonGrid3::cull  {:>8.3} us  ({:.0}x)  <- a SEARCH, for scale", us_grid, us_grid / us_region);
             println!("    items returned: region {} | octree {} (closed box, shares upper faces)",
                      sunk / reps, sunk_o / reps);
         }
@@ -704,14 +778,27 @@ fn main() {
     println!("real and still would not change the ranking. The thing that fixes nodes-per-item is");
     println!("an item limit, and an 8-ary Morton trie with an item limit is an octree.");
     println!();
-    println!("★★★ AND THE SCENARIO WHERE IT WINS IS NOT A QUERY AT ALL — it is a LOOKUP. Asked");
-    println!("\"give me cell C\" rather than \"give me this sphere\", `RadixTrie3::region` answers");
-    println!("with a borrowed slice in ~0.1 us against 22-197 us for a box cull: 265-360x the");
-    println!("octree on uniform data and 1036-1531x on clustered, returning the identical items.");
-    println!("That is the whole argument for a key-ordered index in one line. Every structure here");
-    println!("SEARCHES for a region; this one ADDRESSES it, because the items are already stored");
-    println!("in key order and a cell is therefore a contiguous run. Pick it for that, not for the");
-    println!("sphere table above, where it loses to everything.");
+    println!("★★★ THE SCENARIO WHERE IT WINS IS A LOOKUP, NOT A QUERY — and the honest size of that");
+    println!("win is much smaller than this bench first reported, for a reason worth keeping.");
+    println!();
+    println!("  Asked \"give me cell C\", `region` answers with a borrowed slice in ~0.1-0.2 us while");
+    println!("  a box cull takes 22-197 us. That looks like 265-1531x, and it is NOT the comparison");
+    println!("  to quote: it races a LOOKUP against a SEARCH. `MortonGrid3` had no cell lookup at");
+    println!("  all -- not because a hash of buckets cannot do it, but because nobody had asked --");
+    println!("  so the strongest alternative was absent from its own comparison. That verb exists");
+    println!("  now (`MortonGrid3::cell`), and the table above is what it changes.");
+    println!();
+    println!("  AT THE GRID'S OWN RESOLUTION THE GRID WINS, ~5x: one hash lookup beats descending");
+    println!("  five levels of trie. The trie's advantage is strictly MULTI-RESOLUTION, and it grows");
+    println!("  exactly as 8^(levels-d) because that is how many buckets a fixed-resolution index");
+    println!("  must union to answer a coarser question: 2x one level up, 17x two, 115x three, 967x");
+    println!("  four. `region` is flat in d -- O(depth), resolution-independent -- which is the");
+    println!("  property, and the only one of these numbers that is about the structure rather than");
+    println!("  about the rival's missing method.");
+    println!();
+    println!("  So: query at ONE cell size and want it fast -> `MortonGrid3::cell`. Need a HIERARCHY");
+    println!("  of cell sizes (LOD, tiles at several zooms, streaming at varying granularity) ->");
+    println!("  `RadixTrie3::region`. For an arbitrary sphere, neither: see the table above.");
     println!();
     println!("So: a radix trie over Morton keys at 3 bits per digit IS an octree with path");
     println!("compression (Karras 2012 states the mapping outright, and it is the basis of the GPU");
