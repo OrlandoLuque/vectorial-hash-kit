@@ -385,6 +385,24 @@ separate immediately and enormously: the grid collapses to **44** non-empty cell
 while the octrees hold ~4 000 at 0.614. (`Octree3` and `LinearOctree3` agree in *both* columns, which
 is the cross-check you want — same algorithm, different storage, so disagreement would be a bug.)
 
+**★★ And tuning every structure toward a matched leaf count reverses the first table**, which is the
+degeneracy above caught in the act. At its default capacity `Octree3` reads Q1 = 0.269 against
+`Tree3`'s 0.573 and looks twice as tight — it had 4 058 leaves against 1 831. Matched, the order
+flips: `Tree3` 0.573 at 1 831 leaves, `Octree3` 0.822 at 750. A binary longest-axis split claims
+*less* dead space than octants once it stops being paid in resolution. **A metric that moves with the
+knob cannot be read at two different knobs.**
+
+**★★ `RadixTrie3` at `bits b` *is* `MortonGrid3` at `levels b`** — exactly: same leaf count, same Q1,
+same Q3, same Q5, in both distributions (512 / 0.856 / 182.3 / 0.160 uniform; 689 / 0.001 / 23.0 /
+0.855 clustered). A Morton trie descending to a fixed depth with no item limit partitions space into
+precisely the `8^b` cells of a grid at that resolution: same partition, different storage — a trie
+descent against a hash lookup. That is the fourth time this family has turned out to be one structure
+in different clothes, and the first time it is an *identity* rather than a resemblance.
+
+The matching is deliberately loose and the `leaves` column says so: capacity is a near-continuous
+knob, but a grid or a fixed-depth trie can only have `8^b` cells — 512 or 4 096, nothing between. An
+exactly matched comparison across both families does not exist.
+
 **★ The k-d trees' Q5 is 0.043 in every row, uniform and clustered alike.** A median split puts half
 the points either side by construction, so balance stops being a property of the data and becomes a
 property of the algorithm. Nothing else is within 2.5× on uniform data and the grids are 20–27×

@@ -1384,6 +1384,15 @@ Everything else in this file is **future** — left to triage later.
   makes balance a property of the algorithm rather than of the data. Nothing else within 2.5×
   uniform; grids 20–27× worse clustered. The column that justifies `KdTree2`/`KdTree3`, never
   measured here before because the metric came from a partitioning paper.
+  → **★★ Matched granularity REVERSES the first table**: `Octree3` read Q1 0.269 vs `Tree3`
+  0.573 and looked twice as tight — on 4 058 leaves against 1 831. Matched, `Tree3` 0.573 @1 831
+  beats `Octree3` 0.822 @750. A metric that moves with the knob cannot be read at two knobs.
+  → **★★ `RadixTrie3` at `bits b` IS `MortonGrid3` at `levels b`** — identical leaf count, Q1, Q3
+  and Q5 in both distributions. A fixed-depth Morton trie with no item limit partitions space into
+  exactly the `8^b` cells of that grid: same partition, trie descent vs hash lookup. Fourth time
+  this family turns out to be one structure in different clothes, first time as an IDENTITY.
+  (Matching is loose and the `leaves` column says so: capacity is near-continuous, a grid or
+  fixed-depth trie can only have `8^b` cells, so an exact match across families does not exist.)
   → **Q2 ≡ 0 for all twelve, asserted not printed**: overlap is an R-tree-family cost and every
   structure here partitions space disjointly. Q4 needs a capacity, so the three unbounded-bucket
   structures print `–` instead of a fabricated number.

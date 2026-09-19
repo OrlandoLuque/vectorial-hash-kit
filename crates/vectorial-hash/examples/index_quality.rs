@@ -132,6 +132,38 @@ fn env<T: std::str::FromStr>(k: &str, d: T) -> T {
     std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
 }
 
+/// Pick the knob from `ladder` whose leaf count lands closest to `target`, and return the winning
+/// knob with its `Leaves`.
+///
+/// This exists because the first table below cannot be read straight: Q1 and Q3 fall as leaves get
+/// smaller, so a structure with 10x the leaves looks 10x better at claiming no dead space and
+/// `RadixTrie3`'s one-point leaves score a perfect zero. Stating that as a caveat is weaker than
+/// removing it — so the second table tunes every structure to roughly the same granularity and only
+/// then compares. The knob differs per structure (leaf capacity, grid `levels`, key `bits`), which
+/// is exactly why it has to be searched rather than computed.
+fn tuned<K: Copy, F: Fn(K) -> Leaves>(ladder: &[K], target: usize, build: F) -> (K, Leaves) {
+    let mut best: Option<(K, Leaves, usize)> = None;
+    for &k in ladder {
+        let l = build(k);
+        let d = l.counts.len().abs_diff(target);
+        if best.as_ref().is_none_or(|(_, _, bd)| d < *bd) { best = Some((k, l, d)); }
+    }
+    let (k, l, _) = best.expect("ladder must not be empty");
+    (k, l)
+}
+
+/// Same row, plus the knob that got it there — because a comparison at matched granularity is only
+/// honest if you can see what each structure had to be set to.
+fn row_tuned(name: &str, knob: &str, l: &Leaves, cap: Option<usize>) {
+    let (leaves, q1, q2, q3, q5) = l.metrics();
+    assert!(q2 < 1e-9, "{name}: Q2 must be zero for a space partitioner, got {q2:.6}");
+    let q4 = match cap {
+        Some(c) => format!("{:>7.2}", l.mean_fill() / c as f64),
+        None => "      -".to_string(),
+    };
+    println!("  {name:<16} {knob:>11} {leaves:>7} {:>9.3} {:>9.1} {q4} {:>8.3}", q1, q3, q5);
+}
+
 fn main() {
     let n: usize = env("IQ_N", 20_000);
     let cap: usize = env("IQ_CAP", 16);
@@ -238,6 +270,100 @@ fn main() {
         let k2 = KdTree2::from_items(cap, p2.clone());
         k2.visit_leaf_items(|it| l.add(it, |p: &P2, k| [p.p.x, p.p.y][k]));
         row("KdTree2", &l, Some(cap));
+
+        // ---- the same twelve, tuned to a matched leaf count ------------------------------------
+        let target = 2048usize;
+        println!();
+        println!("  -- at a MATCHED ~{target} leaves, so Q1/Q3 can be read at all --");
+        println!("  {:<16} {:>11} {:>7} {:>9} {:>9} {:>7} {:>8}", "structure", "knob", "leaves", "Q1 vol", "Q3 margin", "Q4 fill", "Q5 sd");
+        const CAPS: [usize; 9] = [4, 8, 12, 16, 24, 32, 48, 64, 96];
+        const LEVELS: [u32; 7] = [2, 3, 4, 5, 6, 7, 8];
+        const BITSL: [u32; 8] = [2, 3, 4, 5, 6, 7, 8, 9];
+
+        let (c, l) = tuned(&CAPS, target, |c| {
+            let mut l = Leaves::new(3);
+            Tree3::bulk_load(w3, c, p3.clone()).visit_leaf_items(|it| l.add(it, |p: &P3, k| [p.p.x, p.p.y, p.p.z][k]));
+            l
+        });
+        row_tuned("Tree3", &format!("cap {c}"), &l, Some(c));
+
+        let (c, l) = tuned(&CAPS, target, |c| {
+            let mut l = Leaves::new(3);
+            Octree3::bulk_load(w3, c, p3.clone()).visit_leaf_items(|it| l.add(it, |p: &P3, k| [p.p.x, p.p.y, p.p.z][k]));
+            l
+        });
+        row_tuned("Octree3", &format!("cap {c}"), &l, Some(c));
+
+        let (c, l) = tuned(&CAPS, target, |c| {
+            let mut l = Leaves::new(3);
+            LinearOctree3::from_items(w3, c, 12, p3.clone()).visit_leaf_items(|it| l.add(it, |p: &P3, k| [p.p.x, p.p.y, p.p.z][k]));
+            l
+        });
+        row_tuned("LinearOctree3", &format!("cap {c}"), &l, Some(c));
+
+        let (lv, l) = tuned(&LEVELS, target, |lv| {
+            let mut l = Leaves::new(3);
+            let mut g = MortonGrid3::new(w3, lv);
+            for it in &p3 { g.insert(*it); }
+            g.visit_leaf_items(|it| l.add(it, |p: &P3, k| [p.p.x, p.p.y, p.p.z][k]));
+            l
+        });
+        row_tuned("MortonGrid3", &format!("levels {lv}"), &l, None);
+
+        let (c, l) = tuned(&CAPS, target, |c| {
+            let mut l = Leaves::new(3);
+            KdTree3::from_items(c, p3.clone()).visit_leaf_items(|it| l.add(it, |p: &P3, k| [p.p.x, p.p.y, p.p.z][k]));
+            l
+        });
+        row_tuned("KdTree3", &format!("cap {c}"), &l, Some(c));
+
+        let (b, l) = tuned(&BITSL, target, |b| {
+            let mut l = Leaves::new(3);
+            RadixTrie3::from_items(w3, b, p3.clone()).visit_leaf_items(|it| l.add(it, |p: &P3, k| [p.p.x, p.p.y, p.p.z][k]));
+            l
+        });
+        row_tuned("RadixTrie3", &format!("bits {b}"), &l, None);
+
+        let (c, l) = tuned(&CAPS, target, |c| {
+            let mut l = Leaves::new(2);
+            let mut t = Tree::new(w2, c);
+            for it in &p2 { t.insert(*it); }
+            t.visit_leaf_items(|it| l.add(it, |p: &P2, k| [p.p.x, p.p.y][k]));
+            l
+        });
+        row_tuned("Tree (2D)", &format!("cap {c}"), &l, Some(c));
+
+        let (c, l) = tuned(&CAPS, target, |c| {
+            let mut l = Leaves::new(2);
+            let mut t = QuadTree::new(w2, c);
+            for it in &p2 { t.insert(*it); }
+            t.visit_leaf_items(|it| l.add(it, |p: &P2, k| [p.p.x, p.p.y][k]));
+            l
+        });
+        row_tuned("QuadTree", &format!("cap {c}"), &l, Some(c));
+
+        let (c, l) = tuned(&CAPS, target, |c| {
+            let mut l = Leaves::new(2);
+            LinearQuadTree::from_items(w2, c, 12, p2.clone()).visit_leaf_items(|it| l.add(it, |p: &P2, k| [p.p.x, p.p.y][k]));
+            l
+        });
+        row_tuned("LinearQuadTree", &format!("cap {c}"), &l, Some(c));
+
+        let (lv, l) = tuned(&LEVELS, target, |lv| {
+            let mut l = Leaves::new(2);
+            let mut g = MortonGrid::new(w2, lv);
+            for it in &p2 { g.insert(*it); }
+            g.visit_leaf_items(|it| l.add(it, |p: &P2, k| [p.p.x, p.p.y][k]));
+            l
+        });
+        row_tuned("MortonGrid", &format!("levels {lv}"), &l, None);
+
+        let (c, l) = tuned(&CAPS, target, |c| {
+            let mut l = Leaves::new(2);
+            KdTree2::from_items(c, p2.clone()).visit_leaf_items(|it| l.add(it, |p: &P2, k| [p.p.x, p.p.y][k]));
+            l
+        });
+        row_tuned("KdTree2", &format!("cap {c}"), &l, Some(c));
         println!();
     }
 
@@ -261,6 +387,28 @@ fn main() {
     println!("collapses to 44 non-empty cells with Q5 = 1.175 while the octrees hold ~4 000 at 0.61.");
     println!("(`Octree3` and `LinearOctree3` agree in BOTH columns, which is the cross-check you");
     println!("would want: same algorithm, different storage, so any disagreement would be a bug.)");
+    println!();
+    println!("★★ AND THE MATCHED TABLE REVERSES THE FIRST ONE, which is the degeneracy above caught");
+    println!("in the act. At its default capacity `Octree3` read Q1 = 0.269 against `Tree3`'s 0.573");
+    println!("and looked twice as tight; it had 4 058 leaves against 1 831. Tuned toward a common");
+    println!("granularity the order flips — Tree3 0.573 at 1 831 leaves, Octree3 0.822 at 750 — so");
+    println!("the binary longest-axis split claims LESS dead space than octants once you stop paying");
+    println!("it in resolution. A metric that moves with the knob cannot be read at two knobs.");
+    println!();
+    println!("★★ `RadixTrie3` AT `bits b` IS `MortonGrid3` AT `levels b`, exactly: same leaf count,");
+    println!("same Q1, same Q3, same Q5, in both distributions (512 leaves / 0.856 / 182.3 / 0.160");
+    println!("uniform; 689 / 0.001 / 23.0 / 0.855 clustered). A Morton trie descending to a fixed");
+    println!("depth with no item limit partitions space into precisely the 8^b cells of a grid at");
+    println!("that resolution. Same partition, different storage — a trie descent against a hash");
+    println!("lookup. That is the fourth time this week the radix/grid/octree family has turned out");
+    println!("to be one structure wearing different clothes, and the first time it is an identity");
+    println!("rather than a resemblance.");
+    println!();
+    println!("  (The matching is LOOSE, deliberately visible in the `leaves` column: capacity is a");
+    println!("  near-continuous knob, but a grid or a fixed-depth trie can only have 8^b cells, so");
+    println!("  they can land on 512 or 4 096 and nothing between. An exactly matched comparison");
+    println!("  across both families is not available, and pretending otherwise would be the error");
+    println!("  this table exists to avoid.)");
     println!();
     println!("★ THE K-D TREES' Q5 IS 0.043 IN EVERY ROW, uniform and clustered alike. A median split");
     println!("puts half the points on each side by construction, so balance stops being a property");
