@@ -97,6 +97,12 @@ impl<T: Positioned3> LinearOctree3<T> {
     pub fn depth(&self) -> u32 { self.leaves.keys().map(|&k| level_of(k)).max().unwrap_or(0) }
 
     /// Visit every leaf as `(box, item_count)` — for debug / rendering overlays.
+    /// Each leaf's ITEMS, as a slice — the uniform verb across all twelve structures.
+    /// See [`crate::KdTree3::visit_leaf_items`] for why the box-and-count form was not enough.
+    pub fn visit_leaf_items<F: FnMut(&[T])>(&self, mut f: F) {
+        for b in self.leaves.values() { f(b.as_slice()); }
+    }
+
     pub fn visit_leaves<F: FnMut(&Aabb, usize)>(&self, mut f: F) {
         for (&key, items) in &self.leaves { f(&box_of(self.world, key), items.len()); }
     }

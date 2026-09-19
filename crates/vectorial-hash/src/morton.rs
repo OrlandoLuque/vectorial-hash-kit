@@ -259,6 +259,12 @@ impl<T: Positioned> MortonGrid<T> {
     pub fn levels(&self) -> u32 { self.levels }
 
     /// Visit each occupied cell's box and item count (for visualisation).
+    /// Each non-empty cell's ITEMS, as a slice — the uniform verb across all twelve structures.
+    /// See [`crate::KdTree3::visit_leaf_items`] for why the box-and-count form was not enough.
+    pub fn visit_leaf_items<F: FnMut(&[T])>(&self, mut f: F) {
+        for b in self.cells.values() { f(b.as_slice()); }
+    }
+
     pub fn visit_cells<F: FnMut(&Rect, usize)>(&self, mut f: F) {
         for (&code, bucket) in &self.cells {
             let (ix, iy) = demorton2(code);

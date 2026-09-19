@@ -329,6 +329,12 @@ impl<T: Positioned3> MortonGrid3<T> {
         bucket_of(&self.cells, code).map_or(&[], |v| v.as_slice())
     }
 
+    /// Each non-empty cell's ITEMS, as a slice — the uniform verb across all twelve structures.
+    /// See [`crate::KdTree3::visit_leaf_items`] for why the box-and-count form was not enough.
+    pub fn visit_leaf_items<F: FnMut(&[T])>(&self, mut f: F) {
+        for b in self.cells.values() { f(b.as_slice()); }
+    }
+
     /// The cell code of a point at this grid's resolution — the argument [`Self::cell`] wants.
     ///
     /// Computable from the point and the grid's geometry alone, so it is safe to send to someone

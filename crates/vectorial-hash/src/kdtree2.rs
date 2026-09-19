@@ -113,6 +113,16 @@ impl<T: Positioned> KdTree2<T> {
 
     #[inline] pub fn item_count(&self) -> usize { self.items.len() }
     #[inline] pub fn node_count(&self) -> usize { self.nodes.len() }
+
+    /// Each leaf's ITEMS, as a slice — the uniform verb across all twelve structures. See
+    /// [`crate::KdTree3::visit_leaf_items`] for why the box-and-count form was not enough.
+    pub fn visit_leaf_items<F: FnMut(&[T])>(&self, mut f: F) {
+        for nd in &self.nodes {
+            if let Split::Leaf { start, len } = nd.split {
+                f(&self.items[start as usize..(start + len) as usize]);
+            }
+        }
+    }
     /// Visit every leaf as `(rect, item_count)` — for debug / rendering overlays. The
     /// rects are **tight**, so unlike the midpoint trees' cells they don't tile the
     /// world: the gaps are exactly the empty space a median split refuses to index.

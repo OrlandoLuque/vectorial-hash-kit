@@ -354,6 +354,12 @@ impl<T: IPositioned> IntegerTree<T> {
         n
     }
 
+    /// Each leaf's ITEMS, as a slice — the uniform verb across all twelve structures.
+    /// See [`crate::KdTree3::visit_leaf_items`] for why the box-and-count form was not enough.
+    pub fn visit_leaf_items<F: FnMut(&[T])>(&self, mut f: F) {
+        self.visit_leaves(|_, n| f(n.items.as_slice()));
+    }
+
     pub fn visit_leaves<F: FnMut(INodeId, &INode<T>)>(&self, mut f: F) {
         self.visit_leaves_from(self.root, &mut f);
     }

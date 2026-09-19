@@ -124,6 +124,21 @@ impl<T: Positioned3> KdTree3<T> {
             if let Split::Leaf { len, .. } = nd.split { f(&nd.bbox, len as usize); }
         }
     }
+
+    /// Each leaf's ITEMS, as a slice. The uniform verb across all twelve structures.
+    ///
+    /// [`Self::visit_leaves`] hands you the node's box and a count, which is enough to ask how the
+    /// index is *shaped* and not enough to ask how well it *fits its data* — the bounding box of
+    /// what a leaf actually holds is usually much smaller than the leaf. Six of the twelve
+    /// structures had only the box-and-count form, which made `examples/index_quality` impossible
+    /// to write on equal terms; this is the fill. See that example for what it is for.
+    pub fn visit_leaf_items<F: FnMut(&[T])>(&self, mut f: F) {
+        for nd in &self.nodes {
+            if let Split::Leaf { start, len } = nd.split {
+                f(&self.items[start as usize..(start + len) as usize]);
+            }
+        }
+    }
     /// Deepest leaf level (0 = a single root leaf) — a k-d tree stays ~balanced.
     pub fn depth(&self) -> u32 { if self.nodes.is_empty() { 0 } else { self.depth_of(self.root) } }
     fn depth_of(&self, id: u32) -> u32 {

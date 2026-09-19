@@ -343,6 +343,61 @@ So: **`RadixTrie3` if you address by key or shard by range; `Octree3` if you que
 you find yourself wanting both, you want `Octree3` plus a Morton sort of your own ids, and that is
 a fine answer too.
 
+### Index quality across all twelve — R\*-Grove's metrics, and what they cannot say
+
+`key_partition_bench` borrowed three of R\*-Grove's five quality metrics to compare *partitioners*.
+They were defined for spatial **indexes**, so `examples/index_quality` asks them of the kit's own
+structures — measuring the **tight bounding box of what each leaf holds**, not the leaf's own box,
+because the first asks how much dead space the index claims and the second only asks whether it
+tiles the world. (Six structures exposed `(box, count)` and not their items, which is why this
+table did not exist; `visit_leaf_items` is now uniform across all twelve.)
+
+20 000 points, leaf capacity 16 where the structure has one, `levels 4` for the grids:
+
+| | leaves | Q1 dead vol | Q3 margin | Q4 fill | **Q5 balance** |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **uniform** | | | | | |
+| `Tree3` | 1 831 | 0.573 | **386.4** | **0.68** | 0.255 |
+| `Octree3` | 4 058 | 0.269 | 462.1 | 0.31 | 0.444 |
+| `LinearOctree3` | 4 058 | 0.269 | 462.1 | 0.31 | 0.444 |
+| `MortonGrid3` | 4 058 | 0.269 | 462.1 | – | 0.444 |
+| `KdTree3` | 2 048 | 0.598 | 418.9 | 0.61 | **0.043** |
+| `RadixTrie3` | 19 989 | *0.000* | *0.0* | – | 0.023 |
+| **clustered** | | | | | |
+| `Octree3` / `LinearOctree3` | 4 051 | 0.000 | 49.1 | 0.31 | 0.614 |
+| `MortonGrid3` | **44** | 0.001 | 4.1 | – | **1.175** |
+| `KdTree3` | 2 048 | 0.016 | 51.7 | 0.61 | **0.043** |
+
+Three findings, and the first is against the metrics themselves.
+
+**★ Q1 and Q3 reward degeneracy, so they are only readable at a comparable leaf count.**
+`RadixTrie3` scores a perfect 0.000 volume and 0.0 margin on uniform data — because it has 19 989
+leaves for 20 000 points, and a box around *one* point has no volume and no margin by definition.
+Minimising either metric alone drives you to one item per leaf: an index that prunes nothing and
+costs a descent per point. This is the **second** time this week an R\*-Grove metric read in
+isolation selected the worst candidate present; the first was an x-stripe partitioner with the best
+Q1/Q2 of any arm and by far the worst query fan-out.
+
+**★ On uniform data `Octree3`, `LinearOctree3` and `MortonGrid3` are the same partition** — identical
+leaf counts and identical Q1/Q3/Q5 to three decimals. An item limit applied to evenly spread points
+subdivides evenly, and that is a grid; the adaptivity has nothing to adapt to. Under clustering they
+separate immediately and enormously: the grid collapses to **44** non-empty cells at Q5 **1.175**
+while the octrees hold ~4 000 at 0.614. (`Octree3` and `LinearOctree3` agree in *both* columns, which
+is the cross-check you want — same algorithm, different storage, so disagreement would be a bug.)
+
+**★ The k-d trees' Q5 is 0.043 in every row, uniform and clustered alike.** A median split puts half
+the points either side by construction, so balance stops being a property of the data and becomes a
+property of the algorithm. Nothing else is within 2.5× on uniform data and the grids are 20–27×
+worse under clustering. That column is the argument for the k-d trees, and this repo had never
+measured it — the metric came from a partitioning paper rather than an index one.
+
+**And Q2 (overlap) is identically zero for all twelve, asserted rather than printed.** Overlap
+measures what you pay when partitions may intersect, which is an **R-tree-family** cost. Every
+structure here partitions *space* — disjoint octants, quadrants, cells, half-spaces — so a leaf's
+items lie where no other leaf's can. A metric that cannot separate twelve candidates is the wrong
+instrument, not a weak signal. Q4 likewise needs a capacity to be a fraction of, so the three
+unbounded-bucket structures print `–` rather than a fabricated number.
+
   **Why zero, and which structures actually get it.** `merge_limit == item_limit`, and the split
   planes are **positional** (fixed octants, not a data-dependent median). So "this node is
   subdivided" is equivalent to "this node holds more than the limit" — the same predicate a fresh

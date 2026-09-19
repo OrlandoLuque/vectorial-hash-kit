@@ -1361,6 +1361,32 @@ Everything else in this file is **future** — left to triage later.
   when many are on screen at once.
 
 ## Index / algorithms
+- ~~**#178 R\*-Grove's five quality metrics, applied to all twelve structures**~~ — **done.**
+  The user's ask: I had borrowed three of the five to compare *partitioners* and never applied
+  them to the kit's own indexes, and had never measured **Q3 (margin)** or **Q4 (utilization)**
+  at all. `examples/index_quality` does all five on the **tight bounding box of what each leaf
+  holds** (not the leaf's own box: the first asks how much dead space the index claims, the
+  second only whether it tiles the world).
+  → **Blocked on a capability gap first**: six of twelve exposed only `(box, count)` and not
+  their items, and `RadixTrie3` exposed nothing. **`visit_leaf_items` is now uniform across all
+  twelve** — the same asymmetry this repo has now found five times.
+  → **★ Q1 and Q3 reward DEGENERACY.** `RadixTrie3` scores a perfect 0.000 volume / 0.0 margin
+  on uniform data because it holds 19 989 leaves for 20 000 points, and a box around one point
+  has neither. Minimising them alone drives you to one item per leaf — an index that prunes
+  nothing. **Second time this week** a single R\*-Grove metric read alone picked the worst
+  candidate present (first: x-stripe, best Q1/Q2, worst fan-out). Readable only at comparable
+  leaf counts.
+  → **★ On uniform data `Octree3` = `LinearOctree3` = `MortonGrid3`**, identical leaf counts and
+  identical Q1/Q3/Q5 to three decimals. An item limit on evenly spread points subdivides evenly,
+  which *is* a grid. Under clustering they split apart: grid **44** cells at Q5 **1.175** against
+  the octrees' ~4 000 at 0.614.
+  → **★ The k-d trees' Q5 = 0.043 in every row**, uniform and clustered alike — a median split
+  makes balance a property of the algorithm rather than of the data. Nothing else within 2.5×
+  uniform; grids 20–27× worse clustered. The column that justifies `KdTree2`/`KdTree3`, never
+  measured here before because the metric came from a partitioning paper.
+  → **Q2 ≡ 0 for all twelve, asserted not printed**: overlap is an R-tree-family cost and every
+  structure here partitions space disjointly. Q4 needs a capacity, so the three unbounded-bucket
+  structures print `–` instead of a fabricated number.
 - ~~**#177 `MortonGrid3::cell` — and my 265–1531× headline was a lookup racing a search**~~ —
   **done, and it is #176's lesson applied to myself.** Having just fixed a bench for omitting
   the strongest alternative, I asked the same of the bench next door: `radix_trie_bench`

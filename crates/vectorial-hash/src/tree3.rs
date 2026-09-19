@@ -971,6 +971,12 @@ impl<T: Positioned3> Tree3<T> {
         out
     }
 
+    /// Each leaf's ITEMS, as a slice — the uniform verb across all twelve structures.
+    /// See [`crate::KdTree3::visit_leaf_items`] for why the box-and-count form was not enough.
+    pub fn visit_leaf_items<F: FnMut(&[T])>(&self, mut f: F) {
+        self.visit_leaves(|n| f(n.items.as_slice()));
+    }
+
     pub fn visit_leaves<F: FnMut(&Node3<T>)>(&self, mut f: F) {
         self.visit_from(self.root, &mut f);
     }

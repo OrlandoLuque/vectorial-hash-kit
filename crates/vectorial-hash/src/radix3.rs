@@ -227,6 +227,16 @@ impl<T: Positioned3> RadixTrie3<T> {
             + self.kids.len() * 4
             + self.items.len() * std::mem::size_of::<T>()
     }
+    /// Each leaf's ITEMS, as a slice — the uniform verb across all twelve structures.
+    /// See [`crate::KdTree3::visit_leaf_items`] for why the box-and-count form was not enough.
+    pub fn visit_leaf_items<F: FnMut(&[T])>(&self, mut f: F) {
+        for n in &self.nodes {
+            if n.mask == 0 && n.len > 0 {
+                f(&self.items[n.start as usize..(n.start + n.len) as usize]);
+            }
+        }
+    }
+
     /// Items in key order — Morton order, so this is also curve order, and any contiguous slice
     /// of it is a spatially coherent shard.
     #[inline]
