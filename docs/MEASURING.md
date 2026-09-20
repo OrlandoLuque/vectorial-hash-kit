@@ -664,3 +664,41 @@ One oddity, recorded rather than smoothed: in the strided arm three of the six s
 battles converging on the same coarse totals is plausible — the active-front cap quantises how
 much can happen — but it does mean the strided arm's six seeds are worth fewer than six
 independent samples. It does not change the verdict, because both arms show the same spread.
+
+## 12. A check that runs and is never read is not weaker than a missing one — it is worse
+
+This repo has a habit of finding that some fact a doc stated as a property was never checked, and
+the fix each time was a new gate: `scripts/check-docs-numbers.sh` (every quoted measurement names
+a way to re-run it), `scripts/check-web-fresh.sh` (every published artefact is newer than its
+sources), `tests/work_counts.rs` (traversal counts to exact equality). The lesson those share is
+*"a ratchet no build enables checks nothing"*.
+
+**This is the other failure, and it is the more embarrassing one.** `cargo doc` prints a warning
+for every documentation link that does not resolve. It had been printing **21 warnings, 15 of them
+unresolved links**, on every build, for months. Three of those were real. One was not a broken link
+at all but a **false capability
+claim**: `SetPosition3`'s rustdoc named `crate::MortonGrid::relocate` as an existing convenience
+over the predicate form, and the 2D grid had no `relocate` — nor did a 2D `SetPosition` trait
+exist, so no 2D item could have implemented one. The convenience had been written for one twin and
+the doc for both. Exactly the class of defect three audits had already gone looking for by hand,
+sitting in a warning stream nobody read.
+
+The count also shows why it stayed unread: **12 of the 15 are correct.** Feature-gated items
+(`knn_many_par`, `cull_many_par`) genuinely do not resolve in a bare `cargo doc`, so the stream's
+default state is noisy, and a noisy stream reads as "that is just how it looks". The separation is
+one flag — `cargo doc --features parallel` drops the unresolved count to the three real ones, and
+to zero after the fix. Counted, not estimated (I first wrote this table from memory and had two of
+the four numbers wrong):
+
+| build | unresolved | total warnings | what is left |
+| --- | ---: | ---: | --- |
+| `cargo doc` bare, before | 15 | 21 | 12 feature-gated + **3 real** |
+| `--features parallel`, before | **3** | 9 | the real ones, alone |
+| `cargo doc` bare, after | 12 | 18 | the feature-gated ones only |
+| `--features parallel`, after | **0** | 6 | 3 private-item links + 3 redundant targets |
+
+Two rules fall out. **A gate whose clean state is not empty will be ignored**, so either silence
+the expected noise or run it in the configuration where clean means zero. And when auditing for a
+class of defect, **check whether an existing tool already reports it** before writing a script to
+look — the capability audit, the docs-numbers gate and the freshness check were all built while
+this one was running unread.
