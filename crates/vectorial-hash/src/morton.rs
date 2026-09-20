@@ -17,6 +17,13 @@ use crate::template::CellState;
 use crate::tree::{knn_offer2, Positioned, RaycastOut};
 use crate::tree3::{knn_worst, KnnEntry};
 
+/// Set a point-like item's position — the 2D twin of [`crate::morton3::SetPosition3`], for
+/// [`MortonGrid::relocate`]. Kept separate from [`Positioned`] so that merely being indexable
+/// does not oblige a type to be mutable in place.
+pub trait SetPosition: Positioned {
+    fn set_position(&mut self, p: Point);
+}
+
 /// Interleave the low 32 bits of `n` with one zero bit between each (`abc` →
 /// `a.b.c`), so two OR'd (shifted 0/1) pack `(x, y)` into a u64 Z-order code.
 #[inline]
@@ -227,6 +234,16 @@ impl<T: Positioned> MortonGrid<T> {
         Crossed::Moved
     }
 
+    /// Convenience over [`MortonGrid::update`] for the common case of moving a point-like item
+    /// whose identity is decided by comparing positions — the 2D twin of
+    /// [`crate::MortonGrid3::relocate`].
+    pub fn relocate(&mut self, old: Point, new: Point) -> crate::morton3::Crossed
+    where
+        T: SetPosition,
+    {
+        self.update(old, |it| it.position() == old, |it| it.set_position(new))
+    }
+
     /// **Remove an item, given where it was** — the 2D twin of
     /// [`crate::MortonGrid3::remove`].
     pub fn remove<P: Fn(&T) -> bool>(&mut self, old: Point, predicate: P) -> Option<T> {
@@ -302,7 +319,7 @@ impl<T: Positioned> MortonGrid<T> {
         out
     }
 
-    /// **Coarse-tier cull** (the 2D twin of [`MortonGrid3::cull_layered`]): skip
+    /// **Coarse-tier cull** (the 2D twin of [`crate::MortonGrid3::cull_layered`]): skip
     /// empty regions of a large / sparse query in O(1) rather than probing every
     /// fine cell of the bbox. Derives a coarse occupancy set from the live cells
     /// (a coarse cell = `2^shift` fine cells per axis; its Morton code is the fine
@@ -868,4 +885,59 @@ mod update2_tests {
         assert_eq!(g.update(Point::new(100.0, 100.0), |it| it.id == 1, |it| it.p = Point::new(9999.0, 0.0)), Crossed::Left);
         assert_eq!(g.item_count(), 0, "an item that left the world must be gone");
     }
+
+    /// `relocate` is `update` with the predicate written for you, so the test is not "did it
+    /// move" — it is that the two forms leave grids that ANSWER the same, over every outcome
+    /// `Crossed` can report. The 3D twin asserted only `Moved`; this is the stronger version.
+    #[test]
+    fn relocate_matches_the_predicate_form() {
+        let world = Rect::new(0.0, 0.0, 256.0, 256.0);
+        let mut rng = Rng(0xC0FF_EE01);
+        let n = 300usize;
+        let start: Vec<M> = (0..n).map(|i| M { id: i as u32, p: Point::new(rng.r(0.0, 255.9), rng.r(0.0, 255.9)) }).collect();
+        let (mut by_relocate, mut by_update): (MortonGrid<M>, MortonGrid<M>) =
+            (MortonGrid::new(world, 4), MortonGrid::new(world, 4));
+        for it in &start { by_relocate.insert(*it); by_update.insert(*it); }
+
+        // Positions must be UNIQUE for relocate to be well defined: its predicate is
+        // `position() == old`, so two items sharing a cell and a position are interchangeable.
+        let mut seen = std::collections::HashSet::new();
+        let mut pts: Vec<M> = Vec::new();
+        for it in &start { if seen.insert((it.p.x.to_bits(), it.p.y.to_bits())) { pts.push(*it); } }
+        assert_eq!(pts.len(), n, "the generator produced a duplicate position");
+
+        let mut outcomes = [0u32; 4];
+        for round in 0..30 {
+            for pt in pts.iter_mut() {
+                let old = pt.p;
+                // A mix of same-cell nudges, cross-cell jumps, and the occasional exit.
+                let np = if round == 29 && pt.id % 37 == 0 {
+                    Point::new(9999.0, 0.0)
+                } else {
+                    let step = if pt.id % 2 == 0 { 1.0 } else { 90.0 };
+                    Point::new((old.x + rng.r(-step, step)).clamp(0.0, 255.9), (old.y + rng.r(-step, step)).clamp(0.0, 255.9))
+                };
+                let a = by_relocate.relocate(old, np);
+                let b = by_update.update(old, |it| it.position() == old, |it| it.p = np);
+                assert_eq!(a, b, "the two forms disagreed on what they did (id {})", pt.id);
+                outcomes[match a { Crossed::Stayed => 0, Crossed::Moved => 1, Crossed::Left => 2, Crossed::Missing => 3 }] += 1;
+                pt.p = np;
+            }
+            assert_eq!(by_relocate.item_count(), by_update.item_count(), "count diverged at round {round}");
+            assert_eq!(by_relocate.cell_count(), by_update.cell_count(), "cell set diverged at round {round}");
+            for (cx, cy, r) in [(40.0, 40.0, 30.0), (128.0, 128.0, 60.0)] {
+                let c = Circle::new(Point::new(cx, cy), r);
+                let mut x: Vec<u32> = by_relocate.cull(&c).iter().map(|m| m.id).collect();
+                let mut y: Vec<u32> = by_update.cull(&c).iter().map(|m| m.id).collect();
+                x.sort_unstable(); y.sort_unstable();
+                assert_eq!(x, y, "relocate != update at round {round}");
+            }
+        }
+        // Non-vacuity: a run that only ever reported `Stayed` would prove nothing.
+        assert!(outcomes[0] > 100 && outcomes[1] > 100 && outcomes[2] > 0,
+                "every branch must be exercised: stayed {}, moved {}, left {}, missing {}",
+                outcomes[0], outcomes[1], outcomes[2], outcomes[3]);
+    }
+
+    impl SetPosition for M { fn set_position(&mut self, p: Point) { self.p = p; } }
 }

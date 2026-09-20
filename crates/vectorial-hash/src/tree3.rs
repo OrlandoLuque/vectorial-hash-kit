@@ -68,6 +68,37 @@ impl Aabb {
     }
 }
 
+/// An item with a 3D position. **Every structure in this crate indexes POINTS, and that is a
+/// precondition rather than a detail.**
+///
+/// It is stated here because it is the one assumption that makes a wrong *answer* rather than a
+/// slow one. If your objects have extent — a ship, a building, a bounding box — and you index them
+/// by their centre, then a query for "everything within 500 m" will **miss** a 3 km-long object
+/// whose centre is 1 km away, even though its hull is 100 m from you. No amount of tuning fixes
+/// that; the index is answering a different question from the one you asked.
+///
+/// The known ways out, cheapest first:
+///
+/// 1. **Enlarge the query** by the largest object's radius, then test exactly. Correct, and the
+///    price is the enlargement: if the biggest thing in the world is 3 km across, every query grows
+///    by 1.5 km, so a 500 m query sweeps `(2000/500)^3` = **64x** the volume. Fine when the biggest
+///    object is small relative to your queries; ruinous when it is not.
+/// 2. **Size tiers** — one index per size class, enlarging by *that tier's* maximum instead of the
+///    global one. This is what most physics broadphases do, and it is the cheap fix for (1)'s
+///    pathology.
+/// 3. **A loose octree** (Ulrich): expand each node's box by ~2x so an object lives in exactly one
+///    node, chosen by its **size**. No duplication, and big objects stop sinking to the root. The
+///    standard answer inside the space-partitioning family.
+/// 4. **Duplicate into every overlapping cell** and dedupe on query. Correct and usually hopeless
+///    at scale: a 3 km object against 100 m cells is 30x30x30 = 27 000 entries.
+/// 5. **A BVH or R-tree** — group by data, let each box adapt to its contents. No duplication and
+///    no size-versus-level mismatch; the cost is maintenance under motion. See `docs/CHOOSING.md`
+///    on space-partitioning versus data-grouping for why this crate is the former.
+///
+/// Before reaching for (5), count the large objects. The size distribution in most worlds is
+/// violently skewed — thousands of capital ships against millions of small things — and a linear
+/// scan over a thousand big ones is microseconds. **A hybrid is usually the real answer**: the small
+/// and numerous in a structure from this crate, the large and few in a list or a small BVH beside it.
 pub trait Positioned3 {
     fn position(&self) -> Point3;
 }
@@ -836,7 +867,7 @@ impl<T: Positioned3> Tree3<T> {
         self.relocate(node, slot, np).is_some()
     }
 
-    /// Boundary-crossing variant of [`update_ref`] — reports whether the item
+    /// Boundary-crossing variant of [`update_ref`](Self::update_ref) — reports whether the item
     /// stayed in its leaf, crossed into a **different leaf** (with both leaf
     /// ids), or left the world. The hook for reacting to an item **changing
     /// cell** (re-streaming, LOD tier changes, dirty-region tracking, coarse

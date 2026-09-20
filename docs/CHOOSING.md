@@ -1,12 +1,41 @@
 # Choosing a structure
 
-`vectorial-hash` ships **eleven** spatial indexes. They all answer the same two queries —
+`vectorial-hash` ships **twelve** spatial indexes. They all answer the same two queries —
 `cull` (everything inside a shape) and `knn` (k nearest neighbours) — so picking one is
 about *your data and access pattern*, not features. This is the one-glance guide; the
 quantitative backing is the decision map in [`THREE_D.md`](THREE_D.md), the parallelism
 crossovers in [`PARALLEL.md`](PARALLEL.md), and the demo write-ups
 ([`FLUID.md`](FLUID.md), [`POINTCLOUD.md`](POINTCLOUD.md), [`STEALTH.md`](STEALTH.md))
 where each one is measured on a real workload rather than a synthetic one.
+
+## Before any of this: are your objects POINTS?
+
+All twelve index **points**, and it is worth checking first because getting it wrong produces a
+wrong *answer* rather than a slow one. Index a 3 km ship by its centre and a query for "everything
+within 500 m" will **miss** it when its centre is 1 km away, even though its hull is 100 m from
+you. No tuning fixes that — the index is answering a different question.
+
+If your objects have extent, the known routes, cheapest first:
+
+1. **Enlarge the query** by the largest object's radius, then test exactly. Correct; the price is
+   the enlargement. With a 3 km object every query grows by 1.5 km, so a 500 m query sweeps
+   `(2000/500)³` = **64×** the volume. Fine while the biggest thing is small next to your queries.
+2. **Size tiers** — one index per size class, enlarging by *that tier's* maximum rather than the
+   global one. The cheap fix for (1)'s pathology, and what most physics broadphases do.
+3. **A loose octree** (Ulrich): expand each node's box ~2× so each object lives in exactly one node
+   chosen by its **size**. No duplication, and big objects stop sinking to the root.
+4. **Duplicate into every overlapping cell**, dedupe on query. Correct, usually hopeless: a 3 km
+   object against 100 m cells is 30×30×30 = 27 000 entries.
+5. **A BVH or R-tree** — group by data so each box adapts to its contents (see the
+   space-partitioning-versus-data-grouping note further down). No duplication, no size/level
+   mismatch; the cost is maintenance under motion, which is why engines use BVHs for static
+   geometry and grids or sweep-and-prune for dynamic.
+
+**Count the large objects before reaching for (5).** Size distributions are violently skewed —
+thousands of capital ships against millions of small things — and a linear scan over a thousand big
+ones is microseconds. The practical answer is usually **hybrid**: the small and numerous in a
+structure from this crate, the large and few in a list or a small BVH beside it, enlarging each
+query only by its own tier's maximum.
 
 ## The first question is not "which tree"
 
@@ -417,6 +446,25 @@ in different clothes, and the first time it is an *identity* rather than a resem
 The matching is deliberately loose and the `leaves` column says so: capacity is a near-continuous
 knob, but a grid or a fixed-depth trie can only have `8^b` cells — 512 or 4 096, nothing between. An
 exactly matched comparison across both families does not exist.
+
+> **And these are NOT each structure's sweet spot — that is a third, different table.** Three
+> comparisons are possible and they answer different questions:
+>
+> 1. **Same knob value** (`cap 16` everywhere) — compares nothing. `cap 16` means different things
+>    to a binary tree and an eight-way one: it gave `Octree3` 4 058 leaves against `Tree3`'s 1 831.
+>    That is the error the matched table exists to fix.
+> 2. **Matched granularity** — the table above. Answers *"at equal resolution, whose boxes are
+>    tighter"*, which is the only way Q1 and Q3 can be read at all.
+> 3. **Each at its own optimum** — answers *"who wins when properly tuned"*, requires saying what
+>    you are optimising (query time? memory? build?), and **is not measured here**: `index_quality`
+>    never starts a clock.
+>
+> The cost of choosing (2) is worth stating plainly: matching the granularity **pushed some
+> structures to settings nobody would ship**. `Octree3` landed on `cap 48`, well above the usual
+> 8–16, and its utilisation fell to 0.56. You cannot have both — a knob-sensitive metric is only
+> comparable with the knob pinned, and pinning it takes structures away from their sensible
+> settings. For sweet spots, use the things that do hold a clock: the decision maps
+> (`critters3d_headless --sweep`, `examples/decision2d`) and `examples/regression_gate`.
 
 **★ The k-d trees' Q5 is 0.043 in every row, uniform and clustered alike.** A median split puts half
 the points either side by construction, so balance stops being a property of the data and becomes a

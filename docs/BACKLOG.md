@@ -1361,6 +1361,26 @@ Everything else in this file is **future** — left to triage later.
   when many are on screen at once.
 
 ## Index / algorithms
+- **#180 What is each structure's actual sweet spot? (the knob question, measured)** — the user
+  challenged `index_quality`'s matched table: *"comparaste estructuras con diferentes knobs…
+  tiene sentido? son sus 'sweet spots'?"*. Answered honestly in `CHOOSING.md`: **no**, they are
+  whatever the `tuned()` ladder landed nearest 2 048 leaves, and matching granularity is what
+  makes Q1/Q3 readable **at the cost of pushing structures to settings nobody would ship**
+  (`Octree3` at `cap 48`, utilisation 0.56). The third table does not exist: **sweep each
+  structure's knob against query COST** — build + cull + k-NN, `compare2`-paired, min-of-N — and
+  report where each one peaks, then check whether any geometric metric predicts it. If one does,
+  `Occupancy` gains a companion; if none does (likely, given #172's counterexample where the best
+  `mean` was the slowest arm), that is the finding and `prod(2r/cell_i + 1)` keeps the crown.
+  **Timing-sensitive — wants the main desktop.**
+- **#179 The extended-object tax, measured (prompted by the user's km-scale-ship question)** —
+  all twelve index **points**, now stated as a precondition in `Positioned3`'s rustdoc and at the
+  top of `CHOOSING.md` (it makes a wrong *answer*, not a slow one). What is argued there and not
+  measured is the **price of each route**: enlarge-the-query is `((2r + 2R)/2r)³` in swept volume
+  (arithmetic says 64× for a 3 km object against a 500 m query — verify against a real cull),
+  size tiers pay the same only within a tier, and duplication pays cells-spanned per object.
+  A short example over a skewed size distribution (a few hundred large, a million small) would
+  say where the hybrid split belongs, i.e. at what large-object count a linear scan over them
+  stops being free. Cheap, and it is the question anyone with mixed-scale objects asks first.
 - ~~**#178 R\*-Grove's five quality metrics, applied to all twelve structures**~~ — **done.**
   The user's ask: I had borrowed three of the five to compare *partitioners* and never applied
   them to the kit's own indexes, and had never measured **Q3 (margin)** or **Q4 (utilization)**
