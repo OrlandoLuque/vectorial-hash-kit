@@ -5,13 +5,22 @@
 //! own structures? The metrics, as Vu & Eldawy define them for a set of partitions — here, for a
 //! structure's set of leaves or cells:
 //!
-//! | | what it is | what a good index wants |
-//! | --- | --- | --- |
-//! | **Q1** total volume | Σ volume of each leaf's bounding box | small — dead space costs pruning |
-//! | **Q2** total overlap | Σ pairwise overlap between leaf boxes | zero — overlap means visiting twice |
-//! | **Q3** total margin | Σ of each box's side lengths | small — favours cubic over elongated |
-//! | **Q4** utilization | how full the blocks are | high — a half-empty leaf is overhead |
-//! | **Q5** load balance | standard deviation of leaf sizes | small — even work per leaf |
+//! | | what it is | wants | why it matters |
+//! | --- | --- | --- | --- |
+//! | **Q1** total volume | Σ volume of each leaf's bounding box | small | dead space: a leaf claiming a cube whose points sit in one corner is descended into by every query that grazes the cube |
+//! | **Q2** total overlap | Σ pairwise intersection of leaf boxes | zero | if two boxes overlap and a query lands in the shared part, both subtrees must be walked |
+//! | **Q3** total margin | Σ of each box's side lengths | small | tells shapes apart **at equal volume** — a cube and a long sliver can measure the same, but the sliver has far more surface, so more queries touch it for the same contents. This is the criterion the R\*-tree adds over the R-tree |
+//! | **Q4** utilization | how full a leaf is against its capacity | high | a half-empty leaf pays a header, a pointer and a descent for very few items |
+//! | **Q5** load balance | standard deviation of leaf sizes | small | one fat leaf is what ruins the worst case |
+//!
+//! Normalised here so they can be read: Q1 as a fraction of the world, Q3 in multiples of the
+//! world's side, Q4 as mean fill over capacity, Q5 as standard deviation over mean.
+//!
+//! **"Knob" means the granularity dial**, and each structure's is a different quantity: leaf
+//! `capacity` for the trees (how many items before a leaf splits), `levels` for the grids (cells
+//! per axis = 2^levels), `bits` for `RadixTrie3` (key resolution per axis). There is no common
+//! formula, which is why the matched table below *searches* for the setting that lands near a
+//! target leaf count instead of computing it, and prints the setting beside each row.
 //!
 //! **The box measured is the tight bounding box of the items a leaf HOLDS, not the leaf's own
 //! box.** Those are different questions: the node box asks how the index carves space (and for a

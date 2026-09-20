@@ -352,6 +352,21 @@ because the first asks how much dead space the index claims and the second only 
 tiles the world. (Six structures exposed `(box, count)` and not their items, which is why this
 table did not exist; `visit_leaf_items` is now uniform across all twelve.)
 
+The five, and what each is actually asking:
+
+| | sums | wants | why |
+| --- | --- | --- | --- |
+| **Q1** volume | each leaf box's volume | small | **dead space** — a leaf claiming a cube whose points sit in one corner gets descended into by every query that grazes the cube |
+| **Q2** overlap | pairwise intersection of leaf boxes | zero | a query landing in the shared part must walk both subtrees |
+| **Q3** margin | each box's side lengths | small | separates **shapes at equal volume**: a cube and a long sliver can measure the same, but the sliver has far more surface, so more queries touch it for the same contents (the criterion the R\*-tree adds over the R-tree) |
+| **Q4** utilization | fill against capacity | high | a half-empty leaf pays a header, a pointer and a descent for few items |
+| **Q5** balance | stddev of leaf sizes | small | one fat leaf ruins the worst case |
+
+Normalised below: Q1 as a fraction of the world, Q3 in multiples of the world's side, Q4 as mean
+fill over capacity, Q5 as stddev over mean. **"Knob" is the granularity dial**, and it is a
+different quantity per structure — leaf `capacity` for the trees, `levels` for the grids, `bits`
+for `RadixTrie3` — which is why the matched table has to *search* for it rather than compute it.
+
 20 000 points, leaf capacity 16 where the structure has one, `levels 4` for the grids:
 
 | | leaves | Q1 dead vol | Q3 margin | Q4 fill | **Q5 balance** |
@@ -409,12 +424,36 @@ property of the algorithm. Nothing else is within 2.5× on uniform data and the 
 worse under clustering. That column is the argument for the k-d trees, and this repo had never
 measured it — the metric came from a partitioning paper rather than an index one.
 
-**And Q2 (overlap) is identically zero for all twelve, asserted rather than printed.** Overlap
-measures what you pay when partitions may intersect, which is an **R-tree-family** cost. Every
-structure here partitions *space* — disjoint octants, quadrants, cells, half-spaces — so a leaf's
-items lie where no other leaf's can. A metric that cannot separate twelve candidates is the wrong
-instrument, not a weak signal. Q4 likewise needs a capacity to be a fraction of, so the three
-unbounded-bucket structures print `–` rather than a fabricated number.
+**And Q2 (overlap) is identically zero for all twelve, asserted rather than printed.** The reason is
+worth spelling out, because it is the one structural division in spatial indexing this document
+never states outright:
+
+- **Partitioning space** — everything in this kit. You decide the regions *before* looking at the
+  objects: an octree cuts the cube into eight octants, a grid into cells, a k-d tree with a plane
+  into left and right. The regions come from geometry, so they **cannot overlap by construction**,
+  and every point falls in exactly one.
+- **Grouping by data** — the R-tree family. You decide the *groups* first ("these eight objects are
+  near each other, they go together") and each group's box is whatever encloses its members. Because
+  the box is *derived* from the membership rather than carved out beforehand, two groups' boxes are
+  free to sit on top of each other.
+
+Overlap is the price of the second: if two boxes intersect and a query lands in the shared part, both
+subtrees must be walked, where disjoint regions let a point query follow exactly one path. Half the
+R-tree literature (R\*-tree and successors) is about minimising it. So a zero here is not "we are
+good at this", it is "the question does not arise" — and a metric that cannot separate twelve
+candidates is the wrong instrument, not a weak signal. It is asserted so that a structure which ever
+*does* group by data fails loudly, where a column of noughts would quietly gain an entry.
+
+(R-trees earn that cost honestly: they index **extended** objects — rectangles, polygons, a building
+— where partitioning space forces you to file one object in several cells. This kit indexes points.)
+
+**Q4 likewise needs a capacity to be a fraction of**, and the three unbounded-bucket structures print
+`–` rather than a fabricated number. That is not a gap in the library, it is the two designs
+inverting the same trade: a tree **fixes occupancy** (at most N per leaf) and lets resolution adapt,
+while a grid **fixes resolution** (`levels`) and lets occupancy adapt. Give a grid a capacity and it
+must subdivide when full — which makes it an adaptive tree. What a grid has instead is
+[`Occupancy`](../crates/vectorial-hash/src/morton3.rs), the same concern expressed as items per
+non-empty cell rather than as a fraction of a ceiling.
 
   **Why zero, and which structures actually get it.** `merge_limit == item_limit`, and the split
   planes are **positional** (fixed octants, not a data-dependent median). So "this node is
