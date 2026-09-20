@@ -116,6 +116,22 @@ impl<T: Positioned> MortonGrid<T> {
         Self { world, levels, cells_per_axis: n, cw: world.width / n as f64, ch: world.height / n as f64, cells: HashMap::new(), len: 0 }
     }
 
+    /// The 2D twin of [`crate::MortonGrid3::levels_for_density`] — pick `levels` so a cell holds
+    /// about `per_cell` items, from the density a query actually observed rather than from the
+    /// world box. Same contract, area instead of volume: `density = hits / (π r²)` and
+    /// `n = sqrt(world_area / cell_area)`. `None` when there is nothing to work from.
+    pub fn levels_for_density(world: Rect, query_extent: f64, hits: f64, per_cell: f64) -> Option<u32> {
+        let world_area = world.width * world.height;
+        if query_extent <= 0.0 || hits <= 0.0 || per_cell <= 0.0 || world_area <= 0.0 { return None; }
+        let r = query_extent * 0.5;
+        let q_area = std::f64::consts::PI * r * r;
+        if q_area <= 0.0 { return None; }
+        let cell_area = per_cell / (hits / q_area);
+        let n = (world_area / cell_area).sqrt();
+        if !n.is_finite() || n < 1.0 { return Some(1); }
+        Some((n.log2().round().max(1.0) as u32).clamp(1, 21))
+    }
+
     /// Pick the smallest `levels` whose cell is at least `target` wide on the
     /// larger axis — "I want cells ≈ the query radius".
     pub fn levels_for_cell_size(world: Rect, target: f64) -> u32 {

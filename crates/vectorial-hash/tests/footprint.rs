@@ -308,3 +308,81 @@ fn the_hash_structures_must_report_their_table_slack() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// #183: does density-based cell sizing actually put the target number of items in a cell?
+//
+// The formula converts an observed hit count into a cell size. That is a chain of three steps
+// (hits -> density -> cell volume -> levels), so it gets checked against the thing it claims
+// rather than against itself: build the grid at the level it picks and read `occupancy().mean`.
+//
+// Deliberately on CLUSTERED data, because on uniform data the old extent-based rule is already
+// close and the test would pass either way — the whole point of the change is skew.
+
+/// The clustered workload, with the density the queries actually see measured rather than assumed.
+fn clustered3(n: usize, seed: u64, blob_r: f64) -> Vec<P3> {
+    let mut r = Lcg(seed);
+    let blobs: Vec<Point3> = (0..8)
+        .map(|_| Point3::new(r.r(150.0, 850.0), r.r(150.0, 850.0), r.r(150.0, 850.0)))
+        .collect();
+    (0..n)
+        .map(|i| {
+            let b = blobs[(r.f() * blobs.len() as f64) as usize % blobs.len()];
+            P3 { id: i as u32, p: Point3::new(
+                (b.x + r.r(-blob_r, blob_r)).clamp(0.0, W - 0.1),
+                (b.y + r.r(-blob_r, blob_r)).clamp(0.0, W - 0.1),
+                (b.z + r.r(-blob_r, blob_r)).clamp(0.0, W - 0.1)) }
+        })
+        .collect()
+}
+
+#[test]
+fn density_sizing_lands_near_the_target_occupancy_on_clustered_data() {
+    use vectorial_hash::Sphere3;
+    let items = clustered3(N, 0x5EED_0183, 40.0);
+    let world = world3();
+    let radius = 60.0;
+    const TARGET: f64 = 8.0; // GRID_TARGET_PER_CELL, which is pub(crate)
+
+    // Measure what a query of this radius actually returns, exactly as the policy's EMA would.
+    let mut probe: MortonGrid3<P3> = MortonGrid3::new(world, 5);
+    for it in &items { probe.insert(*it); }
+    let mut rng = Lcg(0x5EED_0184);
+    let centres: Vec<Point3> = (0..64).map(|_| items[(rng.f() * items.len() as f64) as usize % items.len()].p).collect();
+    let hits: f64 = centres.iter()
+        .map(|c| probe.cull(&Sphere3::new(c.x, c.y, c.z, radius)).len() as f64)
+        .sum::<f64>() / centres.len() as f64;
+    assert!(hits > TARGET, "the workload must be dense enough for the question to mean anything (hits {hits})");
+
+    // The extent the policy would record: the largest side of the query's bounding box.
+    let extent = 2.0 * radius;
+    let levels = MortonGrid3::<P3>::levels_for_density(world, extent, hits, TARGET)
+        .expect("a positive extent, hit count and world volume must yield a level");
+
+    let mut g: MortonGrid3<P3> = MortonGrid3::new(world, levels);
+    for it in &items { g.insert(*it); }
+    let occ = g.occupancy();
+    println!("hits/query {hits:.1} -> levels {levels}, mean {:.2} items per non-empty cell over {} cells",
+             occ.mean, occ.cells);
+
+    // A factor of 2.5 either way. Loose on purpose: the formula assumes density is uniform WITHIN
+    // a query volume, and a blob edge violates that — so the claim being tested is "the right
+    // order of magnitude, from a measurement", not "exact". Verified to fail with the extent-based
+    // rule in its place. Measured on this workload: density sizing picks levels 6 for a mean of
+    // 11.81, the extent rule picks levels 3 for a mean of 740.74 — 93x the target. That control
+    // prints its own number below rather than being quoted here from memory, because the first
+    // draft of this comment guessed 62.7 and was wrong by an order of magnitude.
+    assert!(
+        occ.mean > TARGET / 2.5 && occ.mean < TARGET * 2.5,
+        "density sizing picked levels {levels}, giving {:.2} items per non-empty cell against a \
+         target of {TARGET}. The chain hits -> density -> cell volume -> levels is wrong somewhere.",
+        occ.mean
+    );
+
+    // And the control: the rule it replaces, on the same workload, for the record.
+    let extent_levels = MortonGrid3::<P3>::levels_for_cell_size(world, extent);
+    let mut ge: MortonGrid3<P3> = MortonGrid3::new(world, extent_levels);
+    for it in &items { ge.insert(*it); }
+    println!("  (extent-based rule would pick levels {extent_levels}, mean {:.2})", ge.occupancy().mean);
+    assert_ne!(levels, extent_levels, "on clustered data the two rules must differ, or this test is vacuous");
+}

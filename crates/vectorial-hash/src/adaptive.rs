@@ -691,6 +691,17 @@ pub struct AdaptiveIndex<T: Positioned3 + Clone> {
     /// where extent-sizing gives 4, because clustered blobs are denser than their query extent
     /// implies). Two policy rules composing so that one covers the other's blind spot is worth
     /// naming, since every other interaction found in this layer has gone the other way.
+    ///
+    /// **#183 acted on that**: extent-sizing is now the *second* choice. When enough culls have run
+    /// to trust observation ([`AdaptiveIndex::sizing_hits`]), the grid is sized from the density
+    /// those culls revealed via [`crate::MortonGrid3::levels_for_density`] — which can see
+    /// clustering, where the world box cannot. Validated end-to-end on the one workload in this
+    /// repo that actually reaches the Grid backend, the SPH fluid demo
+    /// (`FLUID_HEADLESS=400 FLUID_INDEX=adaptive`), three runs each side and no overlap: query
+    /// **5 075–5 264 µs before, 4 406–4 491 µs after (1.16×)**, with the backend choice unchanged
+    /// (still `grid`) and the hand-sized fixed-grid arm — which this change cannot touch — reading
+    /// 3 594–3 645 µs in *both* windows, so the machine did not move. The remaining gap to a
+    /// hand-sized grid narrows from 1.42× to 1.23×.
     q_extent: f64,
     /// EMA of how many items culls actually RETURN, and how many samples it has seen.
     ///
@@ -1277,6 +1288,18 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
     /// the thing being escaped from.
     const HIT_WARMUP: u64 = 8;
 
+    /// The hit mean to size a grid's cells from, or 0.0 when there is not enough evidence.
+    ///
+    /// Deliberately NOT `expected_hits`: that one falls back to a geometric estimate computed from
+    /// the declared world volume, and sizing cells from that estimate would reintroduce exactly the
+    /// blindness to clustering this is meant to remove. Below `HIT_WARMUP` samples it returns 0.0
+    /// and `levels_for_density` declines, so the caller falls back deliberately rather than acting
+    /// on a guess dressed as a measurement.
+    fn sizing_hits(&self) -> f64 {
+        let (mean, samples) = self.observed_hits();
+        if samples >= Self::HIT_WARMUP { mean } else { 0.0 }
+    }
+
     /// The mean number of items recent culls actually returned, and how many were sampled.
     /// `(0.0, 0)` before the first cull.
     pub fn observed_hits(&self) -> (f64, u64) {
@@ -1306,7 +1329,7 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
         self.stats.pairs[backend_ix(self.backend())][backend_ix(to)] += 1;
         self.switches += 1;
         let order = self.warm_order();
-        self.held = Self::build_ordered(to, &self.items, self.world, self.leaf, self.q_extent, &order);
+        self.held = Self::build_ordered(to, &self.items, self.world, self.leaf, self.q_extent, self.sizing_hits(), &order);
         self.grid_for = self.live; // whatever the grid's cells were just sized for
         self.dirty = false;
     }
@@ -1320,7 +1343,7 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
     /// structure answers, and `examples/migration_warm_start` asserts exactly that against a
     /// non-vacuous probe cull. It is also allowed to be incomplete or stale — any slot it does
     /// not mention is still inserted afterwards, so a wrong hint costs speed, never contents.
-    fn build_ordered(to: Backend, items: &[Option<T>], world: Aabb, leaf: usize, q_extent: f64, order: &[u32]) -> Held<T> {
+    fn build_ordered(to: Backend, items: &[Option<T>], world: Aabb, leaf: usize, q_extent: f64, hits: f64, order: &[u32]) -> Held<T> {
         // Visit `order` first, then anything it missed. `seen` is only allocated when a hint
         // was actually given, so the cold path is unchanged.
         let mut seen = vec![false; if order.is_empty() { 0 } else { items.len() }];
@@ -1331,10 +1354,10 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
             v
         };
         let visit: Box<dyn Iterator<Item = usize>> = if slots.is_empty() { Box::new(0..items.len()) } else { Box::new(slots.into_iter()) };
-        Self::build_visiting(to, items, world, leaf, q_extent, visit)
+        Self::build_visiting(to, items, world, leaf, q_extent, hits, visit)
     }
 
-    fn build_visiting(to: Backend, items: &[Option<T>], world: Aabb, leaf: usize, q_extent: f64, visit: Box<dyn Iterator<Item = usize> + '_>) -> Held<T> {
+    fn build_visiting(to: Backend, items: &[Option<T>], world: Aabb, leaf: usize, q_extent: f64, hits: f64, visit: Box<dyn Iterator<Item = usize> + '_>) -> Held<T> {
         match to {
             Backend::Brute => { let _ = visit; Held::Brute }
             Backend::KeepTree => {
@@ -1363,12 +1386,20 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
                 let live = items.iter().flatten().count().max(1);
                 // A cell about the size of a typical query, when one has been seen; the
                 // occupancy rule only as a fallback for a grid built before any query.
-                let levels = if q_extent > 0.0 {
-                    MortonGrid3::<Tagged<T>>::levels_for_cell_size(world, q_extent)
-                } else {
-                    let per_axis = (live as f64 / GRID_TARGET_PER_CELL).cbrt().max(1.0);
-                    (per_axis.log2().round().max(1.0) as u32).min(10)
-                };
+                //
+                // #183: three sources, best first. DENSITY, from what culls actually returned, is
+                // the only one that can see clustering — extent-sizing is geometry and lands 1-2
+                // levels off in every workload measured (`examples/sweet_spot`), costing 1.83x on
+                // k-NN where the data is clumped. It needs `hits`, so it is unavailable until
+                // HIT_WARMUP culls have run; then extent; then occupancy for a grid built before
+                // any query at all.
+                let levels = MortonGrid3::<Tagged<T>>::levels_for_density(world, q_extent, hits, GRID_TARGET_PER_CELL)
+                    .unwrap_or_else(|| if q_extent > 0.0 {
+                        MortonGrid3::<Tagged<T>>::levels_for_cell_size(world, q_extent)
+                    } else {
+                        let per_axis = (live as f64 / GRID_TARGET_PER_CELL).cbrt().max(1.0);
+                        (per_axis.log2().round().max(1.0) as u32).min(10)
+                    });
                 let mut g = MortonGrid3::new(world, levels);
                 for slot in visit {
                     if let Some(v) = &items[slot] { g.insert(Tagged { slot: slot as u32, item: v.clone() }); }
@@ -1387,7 +1418,7 @@ impl<T: Positioned3 + Clone> AdaptiveIndex<T> {
         let b = self.backend();
         if b == Backend::Brute { self.dirty = false; return; }
         let order = self.warm_order();
-        self.held = Self::build_ordered(b, &self.items, self.world, self.leaf, self.q_extent, &order);
+        self.held = Self::build_ordered(b, &self.items, self.world, self.leaf, self.q_extent, self.sizing_hits(), &order);
         self.grid_for = self.live;
         self.dirty = false;
     }
@@ -1983,13 +2014,13 @@ mod tests {
         let bogus: Vec<u32> = (0..400).map(|i| (i + 9000) as u32).collect();   // all out of range
 
         for backend in [Backend::KeepTree, Backend::Grid, Backend::Static, Backend::Brute] {
-            let cold = AdaptiveIndex::build_ordered(backend, &items, w, leaf, 0.0, &[]);
+            let cold = AdaptiveIndex::build_ordered(backend, &items, w, leaf, 0.0, 0.0, &[]);
             let mut want: Vec<(u64, u64, u64)> = held_cull(&cold, &probe, &items);
             want.sort_unstable();
             assert!(!want.is_empty(), "the probe must hit something or this proves nothing");
 
             for (name, order) in [("full", &full), ("partial", &partial), ("repeated", &repeated), ("bogus", &bogus)] {
-                let warm = AdaptiveIndex::build_ordered(backend, &items, w, leaf, 0.0, order);
+                let warm = AdaptiveIndex::build_ordered(backend, &items, w, leaf, 0.0, 0.0, order);
                 let mut got = held_cull(&warm, &probe, &items);
                 got.sort_unstable();
                 assert_eq!(got, want, "{backend:?} answered differently with the {name} order hint");
@@ -2217,7 +2248,7 @@ mod tests {
         let (mut canon_cull, mut canon_knn, mut raw_orders) = (None, None, Vec::new());
 
         for backend in [Backend::Brute, Backend::KeepTree, Backend::Grid, Backend::Static] {
-            ix.held = AdaptiveIndex::build_ordered(backend, &items, w, leaf, 0.0, &[]);
+            ix.held = AdaptiveIndex::build_ordered(backend, &items, w, leaf, 0.0, 0.0, &[]);
             ix.dirty = false;
 
             let cull: Vec<u32> = ix.cull(&probe).iter().map(|q| q.id).collect();

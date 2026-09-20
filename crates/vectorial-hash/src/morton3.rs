@@ -302,6 +302,39 @@ impl<T: Positioned3> MortonGrid3<T> {
     /// goes wrong. Used **directly**, outside that policy, there is nothing protecting you — check
     /// [`MortonGrid3::occupancy`] against the guidance on `Occupancy::mean`, and if your queries
     /// are k-NN rather than `cull`, go a level finer than this returns.
+    /// Pick `levels` so that a cell holds about `per_cell` items — **from the density a query
+    /// actually observed**, not from the world box.
+    ///
+    /// The companion to [`MortonGrid3::levels_for_cell_size`], and it exists because that one is
+    /// geometry only. Given the extent of a typical query (`query_extent`, the largest side of its
+    /// bounding box) and how many items such a query **returned** (`hits`), the local density is
+    /// `hits / query_volume` — which is a measurement, so it knows about clustering that the world
+    /// box cannot. Then `cell_volume = per_cell / density`, and `levels` follows from the world's
+    /// own volume, which keeps it correct for a slab as well as a cube.
+    ///
+    /// Measured against the per-level optimum on the four workloads of `examples/sweet_spot`, this
+    /// picks the k-NN-optimal level in **3 of 4** where extent-sizing picks it in 2, and it is the
+    /// one that fixes the reachable case: clustered data with a large query wants `levels 5–6`
+    /// where extent-sizing gives 4, a **1.83×** k-NN penalty. The remaining miss is a workload
+    /// [`crate::adaptive::Thresholds::grid_min_hits`] refuses a grid for anyway.
+    ///
+    /// Returns `None` when it has nothing to work from — a non-positive extent, hit count or world
+    /// volume. An unknown input must not produce a guess, so the caller falls back rather than
+    /// being handed a number derived from nothing.
+    pub fn levels_for_density(world: Aabb, query_extent: f64, hits: f64, per_cell: f64) -> Option<u32> {
+        let world_vol = world.w * world.h * world.d;
+        if query_extent <= 0.0 || hits <= 0.0 || per_cell <= 0.0 || world_vol <= 0.0 { return None; }
+        let r = query_extent * 0.5;
+        let q_vol = (4.0 / 3.0) * std::f64::consts::PI * r * r * r;
+        if q_vol <= 0.0 { return None; }
+        let density = hits / q_vol;                 // items per unit volume, where the queries are
+        let cell_vol = per_cell / density;
+        // cells_per_axis^3 * cell_vol = world_vol, so n = (world_vol / cell_vol)^(1/3).
+        let n = (world_vol / cell_vol).cbrt();
+        if !n.is_finite() || n < 1.0 { return Some(1); }
+        Some((n.log2().round().max(1.0) as u32).clamp(1, 21))
+    }
+
     pub fn levels_for_cell_size(world: Aabb, target: f64) -> u32 {
         let span = world.w.max(world.h).max(world.d);
         let mut levels = 1u32;

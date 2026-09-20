@@ -1361,17 +1361,32 @@ Everything else in this file is **future** — left to triage later.
   when many are on screen at once.
 
 ## Index / algorithms
-- **#183 Data-aware cell sizing for the grid backend (the one reachable penalty #180 found)** —
-  `levels_for_cell_size` is geometry only (world span, query extent) and therefore blind to
-  clustering. Measured against the per-level optimum it lands 1–2 levels off in all four
-  (distribution × radius) cells, never on it: 1.05–1.09× on `cull` throughout, and on k-NN
-  1.00 / 1.00 / **1.83×** / **12.46×**. The 12.46× and one other are **unreachable** through
-  `AdaptiveIndex` because `grid_min_hits` refuses those workloads first (1.01 and 6.77 hits per
-  query against a default of 9), so the prize is the **1.83× k-NN penalty on clustered data**,
-  where the optimum is `levels 5` and extent-sizing gives 4. The shape of a fix: feed
-  `occupancy().mean` back in, or bias k-NN-dominated callers one level finer — but note #172's
-  counterexample, where the best `mean` was the SLOWEST arm, so occupancy alone cannot decide it.
-  Do not touch `cull`: those penalties are inside the 5 % tie band.
+- ~~**#183 Data-aware cell sizing for the grid backend**~~ — **done, and validated on the one
+  workload that reaches the Grid backend.** `levels_for_cell_size` is geometry only and lands 1–2
+  levels off the per-level optimum in all four cells #180 measured. Added
+  `MortonGrid3::levels_for_density(world, query_extent, hits, per_cell)` and its 2D twin: local
+  density is `hits / query_volume`, which is a *measurement*, so it sees clustering the world box
+  cannot; `cell_volume = per_cell / density`, and `levels` comes from the world's own volume so it
+  stays right for a slab. Wired into both adaptive twins as the FIRST choice, with extent-sizing
+  second and occupancy third, fed by `sizing_hits()` — deliberately not `expected_hits`, whose
+  geometric fallback is the blindness being escaped.
+  → **Predicts the k-NN-optimal level in 3 of 4 cells** where extent-sizing gets 2, and it is the
+  one that fixes the reachable case (clustered + large query, which wanted 5–6 against extent's 4).
+  The remaining miss is a workload `grid_min_hits` refuses a grid for anyway.
+  → **★ Validated end-to-end, with a control.** `adaptive_vs_pinned` is **inert** here — it chooses
+  `[Brute, KeepTree]` and never reaches a grid — so the acceptance test is `fluid_wgpu`
+  (`FLUID_HEADLESS=400 FLUID_INDEX=adaptive`), the same demo that was the counterexample which
+  disabled `grid_min_hits` in #154. Three runs each side, no overlap: query **5 075–5 264 µs before,
+  4 406–4 491 µs after = 1.16×**. Backend choice unchanged (still `grid`). And the hand-sized
+  fixed-grid arm, which this change *cannot* touch, read **3 594–3 645 µs in both windows** — so the
+  machine did not move, which is the control this repo learned to run the hard way. The gap to a
+  hand-sized grid narrows 1.42× → 1.23×.
+  → The test (`tests/footprint.rs`) checks the whole chain against ground truth rather than against
+  itself: build the grid at the level the formula picks and read `occupancy().mean`. Clustered data
+  on purpose, since on uniform data the old rule is already close and the test would pass either
+  way. **Density sizing lands at mean 11.81 against a target of 8; extent-sizing lands at 740.74,
+  93× the target.** The first draft of that comment guessed 62.7 and was wrong by an order of
+  magnitude, so the control now prints its own number.
 - **#182 BIG SWING: the extent-aware family (loose octree / BVH / R-tree) — answered, not built** —
   the user asked whether to add loose octrees and "otros de esos árboles". The answer, recorded so
   it is not re-derived: **for points a loose octree degenerates into `Octree3`** (looseness only

@@ -475,6 +475,14 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
         self.hits_ema_q10.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1024.0
     }
 
+    /// The 2D twin of [`AdaptiveIndex::sizing_hits`](crate::AdaptiveIndex) — the hit mean to size
+    /// cells from, or 0.0 when there is not enough evidence. Deliberately not `expected_hits`,
+    /// whose geometric fallback is the blindness being escaped.
+    fn sizing_hits(&self) -> f64 {
+        let (mean, samples) = self.observed_hits();
+        if samples >= Self::HIT_WARMUP { mean } else { 0.0 }
+    }
+
     /// The mean number of items recent culls actually returned, and how many were sampled.
     pub fn observed_hits(&self) -> (f64, u64) {
         (self.hits_mean(), self.hit_samples.load(std::sync::atomic::Ordering::Relaxed))
@@ -487,7 +495,7 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
         self.stats.pairs[backend_ix(self.backend())][backend_ix(to)] += 1;
         self.switches += 1;
         let order = self.warm_order();
-        self.held = Self::build_ordered(to, &self.items, self.world, self.leaf, self.q_extent, &order);
+        self.held = Self::build_ordered(to, &self.items, self.world, self.leaf, self.q_extent, self.sizing_hits(), &order);
         self.grid_for = self.live; // whatever the grid's cells were just sized for
         self.dirty = false;
     }
@@ -509,7 +517,7 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
     /// Rebuild a backend from the item list. This is the cost hysteresis exists to avoid
     /// paying twice. `order` is a performance hint only: an empty, partial or stale one costs
     /// speed, never contents, because every slot it does not mention is still visited after it.
-    fn build_ordered(to: Backend, items: &[Option<T>], world: Rect, leaf: usize, q_extent: f64, order: &[u32]) -> Held2<T> {
+    fn build_ordered(to: Backend, items: &[Option<T>], world: Rect, leaf: usize, q_extent: f64, hits: f64, order: &[u32]) -> Held2<T> {
         let mut seen = vec![false; if order.is_empty() { 0 } else { items.len() }];
         let slots: Vec<usize> = if order.is_empty() { Vec::new() } else {
             let mut v = Vec::with_capacity(items.len());
@@ -539,12 +547,16 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
                 // Cells sized by occupancy, not by a fixed fraction of the world — see the 3D
                 // twin, where `world_max / 64` meant 0.08 items per cell at 20k population.
                 let live = items.iter().flatten().count().max(1);
-                let levels = if q_extent > 0.0 {
-                    MortonGrid::<Tagged<T>>::levels_for_cell_size(world, q_extent)
-                } else {
-                    let per_axis = (live as f64 / crate::adaptive::GRID_TARGET_PER_CELL).sqrt().max(1.0);
-                    (per_axis.log2().round().max(1.0) as u32).min(12)
-                };
+                // #183, the 2D twin: density from observed hits first (it is the only source
+                // that can see clustering), then extent, then occupancy. See
+                // `MortonGrid3::levels_for_density` for the measurement that ordered these.
+                let levels = MortonGrid::<Tagged<T>>::levels_for_density(world, q_extent, hits, crate::adaptive::GRID_TARGET_PER_CELL)
+                    .unwrap_or_else(|| if q_extent > 0.0 {
+                        MortonGrid::<Tagged<T>>::levels_for_cell_size(world, q_extent)
+                    } else {
+                        let per_axis = (live as f64 / crate::adaptive::GRID_TARGET_PER_CELL).sqrt().max(1.0);
+                        (per_axis.log2().round().max(1.0) as u32).min(12)
+                    });
                 let mut g = MortonGrid::new(world, levels);
                 for slot in visit {
                     if let Some(v) = &items[slot] { g.insert(Tagged { slot: slot as u32, item: v.clone() }); }
@@ -563,7 +575,7 @@ impl<T: Positioned + Clone> AdaptiveIndex2<T> {
         let b = self.backend();
         if b == Backend::Brute { self.dirty = false; return; }
         let order = self.warm_order();
-        self.held = Self::build_ordered(b, &self.items, self.world, self.leaf, self.q_extent, &order);
+        self.held = Self::build_ordered(b, &self.items, self.world, self.leaf, self.q_extent, self.sizing_hits(), &order);
         self.grid_for = self.live;
         self.dirty = false;
     }
@@ -610,7 +622,7 @@ mod tests {
         let items = ix.items.clone();
         let (mut canon_cull, mut canon_knn, mut raw) = (None, None, Vec::new());
         for backend in [Backend::Brute, Backend::KeepTree, Backend::Grid, Backend::Static] {
-            ix.held = AdaptiveIndex2::build_ordered(backend, &items, w, leaf, 0.0, &[]);
+            ix.held = AdaptiveIndex2::build_ordered(backend, &items, w, leaf, 0.0, 0.0, &[]);
             ix.dirty = false;
             let cull: Vec<u32> = ix.cull(&probe).iter().map(|q| q.id).collect();
             assert!(cull.len() > 20, "{backend:?}: the probe must hit plenty or this proves nothing");
