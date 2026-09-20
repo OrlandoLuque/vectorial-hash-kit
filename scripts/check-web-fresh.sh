@@ -35,8 +35,19 @@ declare -A DEPS=(
 )
 
 # Every demo also links the library, so a library change can stale all of them.
-LIB_NEWEST=$(find crates/vectorial-hash/src -name '*.rs' -newer /dev/null -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 || true)
+#
+# This arm had `-newer /dev/null` in it, intended as a harmless always-true predicate. On Git Bash
+# for Windows it matches NOTHING — 0 of 23 files — so `LIB_NEWEST` was always empty, `LIB_T` never
+# set, and the library arm of this check could not fire at all. It went unnoticed for the obvious
+# reason: a check that cannot fail looks exactly like a check that is passing. Found by editing the
+# library and watching every demo still report `ok`.
+LIB_NEWEST=$(find crates/vectorial-hash/src -name '*.rs' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 || true)
 LIB_T=${LIB_NEWEST%% *}
+# And a guard, because the thing that went wrong was silence: if the library has sources but we
+# failed to read a timestamp for any of them, say so instead of quietly checking nothing.
+if [ -z "$LIB_T" ] && [ -n "$(find crates/vectorial-hash/src -name '*.rs' -print -quit)" ]; then
+  echo "WARNING: could not read any library source timestamp — the library arm of this check is inert." >&2
+fi
 
 list_only=0
 [ "${1:-}" = "--list" ] && list_only=1

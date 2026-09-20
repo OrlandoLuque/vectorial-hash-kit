@@ -1361,6 +1361,13 @@ Everything else in this file is **future** — left to triage later.
   when many are on screen at once.
 
 ## Index / algorithms
+- **#184 Republish the nine remaining web demos (relink-only, after #183)** — `#183` changed
+  `vectorial-hash`, so `check-web-fresh.sh` correctly calls every published wasm stale. **fluid and
+  adaptive_lab were rebuilt** because the change alters what they *do* (both exercise the adaptive
+  policy's Grid backend). The other nine only relink: `bytes()`, `MortonGrid::relocate` and
+  `levels_for_density` are additions, and nothing in those demos calls them. Rebuild them at the
+  next convenient point so the freshness check reads clean rather than being habitually red — a
+  gate that is always red is on its way to being ignored, which is § 12's whole point.
 - ~~**#183 Data-aware cell sizing for the grid backend**~~ — **done, and validated on the one
   workload that reaches the Grid backend.** `levels_for_cell_size` is geometry only and lands 1–2
   levels off the per-level optimum in all four cells #180 measured. Added
