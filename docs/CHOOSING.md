@@ -37,6 +37,40 @@ ones is microseconds. The practical answer is usually **hybrid**: the small and 
 structure from this crate, the large and few in a list or a small BVH beside it, enlarging each
 query only by its own tier's maximum.
 
+#### Measured (`examples/extent_tax`), including two results that corrected the advice above
+
+A 10 km world, 50 000 objects (99 % of radius 1–5, 0.9 % of 20–100, 0.1 % of 500–1 477), queried at
+radius 500. All four arms answer the same question — *whose hull intersects this sphere* — and the
+three correct ones are asserted to return identical hit counts, so no arm can look fast by
+answering less.
+
+| arm | µs/query | candidates/query | correct? |
+| --- | ---: | ---: | :-: |
+| `centre` (query at `r`, take what comes back) | — | — | **no, recall 0.9566** |
+| `enlarged` (query at `r + R_max`, then test exactly) | 28.30 | 1 282.5 | yes |
+| `tiered` (one index per size class, `r + R_max(tier)`) | **3.38** | **27.9** | yes |
+| `hybrid` (small indexed, large scanned) | **3.35** | 527.3 | yes |
+
+**★ The misses are not mostly the big objects.** Of 234 missed intersections, **94 are small
+objects** against 118 huge. Per object the huge ones are ~1 200× likelier to be missed (118 from 48,
+against 94 from 49 499) — but a numerous population has numerous boundary cases, and a radius-5
+object whose centre sits at 502 from a radius-500 query is missed just the same. So **this cannot be
+fixed by handling the ships specially**: every tier needs its enlargement, the small one included.
+And 95.7 % recall is the kind of figure that reads as fine and is not — on an interest query it
+means things arriving late.
+
+**★ `tiered` and `hybrid` tie, so the win is not the hybrid — it is not enlarging by the global
+maximum.** Both beat `enlarged` by **8.5×**, and whether the large objects sit in an index or a list
+is worth nothing at these counts. If anything prefer `tiered`: it examines 27.9 candidates per query
+against the hybrid's 527.3, and an index over 501 objects costs nothing to build.
+
+**And the scan is very forgiving.** Sweeping the large population, the hybrid is still **0.78×** the
+enlarged arm at **16 032** large objects and only loses between 16 k and 32 k. "Count the large
+objects first" has a lot of headroom.
+
+The recall figures are counts and hold anywhere; the microseconds are one laptop, and it is the
+*ordering* of the three correct arms that is the durable part.
+
 ## The first question is not "which tree"
 
 **Do the points move?** That splits the whole family in two, and it matters more than any
