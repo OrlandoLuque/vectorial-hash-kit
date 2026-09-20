@@ -685,6 +685,43 @@ impl<T: Positioned3> Tree3<T> {
     pub fn node_count(&self) -> usize { self.nodes.len() }
     pub fn live_node_count(&self) -> usize { self.nodes.len() - self.free.len() }
 
+    /// **Bytes this index holds** — the answer to "which structure is smallest", and the
+    /// canonical statement of the accounting rules every other `bytes()` in the crate follows,
+    /// because a memory column whose arms count differently is worse than no column.
+    ///
+    /// Three rules:
+    ///
+    /// 1. **Resident, not reachable.** The tempting implementation is
+    ///    `live_node_count() * size + item_count() * size`, because those are the public counts —
+    ///    and it is wrong, because a freed arena slot is still memory. `tests/footprint.rs` pins
+    ///    this: a tree filled with 20 000 items and emptied to 2 000 holds **5.9x** what one
+    ///    built small holds, and the reachable-only version reports the two as identical.
+    ///    [`Tree3::compact`] is what actually returns those slots, so its effect belongs in this
+    ///    number rather than being pre-assumed by the estimator.
+    /// 2. **`capacity()`, not `len()`** — and this one is not a detail: measured at 20 000 items,
+    ///    capacity-based over len-based is **1.28x** for this tree and **2.45x** for
+    ///    [`crate::MortonGrid3`] (a `HashMap` holds a power-of-two table at a 0.875 load factor,
+    ///    plus per-bucket `Vec` slack). Big enough to **reorder the column**: counting `len` the
+    ///    grid reads 974 KB against this tree's 1 157 KB and looks like the smaller structure;
+    ///    counting `capacity` it reads 2 385 KB against 1 485 KB and is clearly the larger one.
+    ///    So the rule matters less for its own sake than for being the *same* rule everywhere.
+    /// 3. **Headers once, heap once.** `size_of::<Node3<T>>()` already includes the `Vec`
+    ///    *headers* for `items` and `hs`; the per-node loop adds only their *heap*.
+    ///
+    /// Exact for arena structures like this one. The hash-map structures
+    /// ([`crate::MortonGrid3`], [`crate::LinearOctree3`]) can only estimate their table
+    /// overhead, and say so at their own `bytes()`.
+    pub fn bytes(&self) -> usize {
+        let mut n = self.nodes.capacity() * std::mem::size_of::<Node3<T>>()
+            + self.free.capacity() * std::mem::size_of::<Node3Id>()
+            + self.locs.capacity() * std::mem::size_of::<ItemLoc>()
+            + self.free_handles.capacity() * 4;
+        for node in &self.nodes {
+            n += node.items.capacity() * std::mem::size_of::<T>() + node.hs.capacity() * 4;
+        }
+        n
+    }
+
     /// Reorder the node arena into DFS pre-order and drop freed slots — a pure
     /// **cache-locality** pass (van-Emde-Boas-flavoured: a node lands adjacent to
     /// its first child, so a root→leaf descent walks mostly-contiguous memory).

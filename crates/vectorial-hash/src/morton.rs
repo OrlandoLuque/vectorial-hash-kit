@@ -260,6 +260,16 @@ impl<T: Positioned> MortonGrid<T> {
 
     pub fn cell_count(&self) -> usize { self.cells.len() }
 
+    /// Bytes this index holds — the 2D twin of [`crate::MortonGrid3::bytes`]: sparse, so it
+    /// grows with *occupied* cells and not with `levels`. Accounting rules at
+    /// [`Tree3::bytes`](crate::Tree3::bytes).
+    pub fn bytes(&self) -> usize {
+        let entry = std::mem::size_of::<(u64, Vec<T>)>() + 1;
+        let mut n = self.cells.capacity() * entry;
+        for v in self.cells.values() { n += v.capacity() * std::mem::size_of::<T>(); }
+        n
+    }
+
     /// Every item in the grid, in unspecified (hash) order. The 2D twin of
     /// [`crate::MortonGrid3::iter`].
     pub fn iter(&self) -> impl Iterator<Item = &T> { self.cells.values().flat_map(|b| b.iter()) }

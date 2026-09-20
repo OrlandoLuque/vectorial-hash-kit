@@ -121,6 +121,8 @@ structure. Publishing the grid makes the next one visible without a grep.
 | `compact` | ● | ● | ● | ● | ● | – | – | – | – | – | – | – |
 | `occupancy` | – | – | – | – | – | ● | ● | ● | ● | – | – | – |
 | `iter` / `iter_z_order` | – | – | – | – | – | ● | ● | ● | ● | – | – | ● |
+| `visit_leaf_items` | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● |
+| `bytes` | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● |
 | `serialize` / `deserialize` | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ○ |
 
 ● present · ◐ present, single-query only (no `_many` batch form yet) · ○ **missing, and

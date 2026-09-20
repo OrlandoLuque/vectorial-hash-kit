@@ -91,6 +91,15 @@ impl<T: Positioned> LinearQuadTree<T> {
 
     #[inline] pub fn item_count(&self) -> usize { self.len }
     #[inline] pub fn leaf_count(&self) -> usize { self.leaves.len() }
+    /// Bytes this index holds — the 2D twin of [`crate::LinearOctree3::bytes`], including the
+    /// same hash-table estimate and the same `internal` overhead (the price of being adaptive
+    /// without pointers). Accounting rules at [`Tree3::bytes`](crate::Tree3::bytes).
+    pub fn bytes(&self) -> usize {
+        let entry = std::mem::size_of::<(u64, Vec<T>)>() + 1;
+        let mut n = self.leaves.capacity() * entry + self.internal.capacity() * (8 + 1);
+        for v in self.leaves.values() { n += v.capacity() * std::mem::size_of::<T>(); }
+        n
+    }
     #[inline] pub fn world(&self) -> Rect { self.world }
     /// The deepest occupied level (0 = a single root leaf) — how far the densest
     /// cluster forced the tree to refine.

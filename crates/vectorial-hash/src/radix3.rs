@@ -222,10 +222,15 @@ impl<T: Positioned3> RadixTrie3<T> {
     pub fn node_count(&self) -> usize { self.nodes.len() }
     /// Bytes held by the arena — nodes, packed child slots and items. The number the ART-style
     /// layout exists to reduce; `examples/radix_trie_bench` prints it beside the naive trie's.
+    ///
+    /// Accounting rules at [`Tree3::bytes`](crate::Tree3::bytes). This originally read `len()`,
+    /// which is the same figure here (the build sizes its arenas exactly) but not the same
+    /// *rule* — and a memory column is read across arms, so the arm counting differently is the
+    /// one that makes the column wrong.
     pub fn bytes(&self) -> usize {
-        self.nodes.len() * std::mem::size_of::<RNode>()
-            + self.kids.len() * 4
-            + self.items.len() * std::mem::size_of::<T>()
+        self.nodes.capacity() * std::mem::size_of::<RNode>()
+            + self.kids.capacity() * 4
+            + self.items.capacity() * std::mem::size_of::<T>()
     }
     /// Each leaf's ITEMS, as a slice — the uniform verb across all twelve structures.
     /// See [`crate::KdTree3::visit_leaf_items`] for why the box-and-count form was not enough.

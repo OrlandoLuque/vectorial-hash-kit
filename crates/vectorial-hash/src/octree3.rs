@@ -110,6 +110,20 @@ impl<T: Positioned3> Octree3<T> {
     pub fn node_count(&self) -> usize { self.nodes.len() }
     pub fn live_node_count(&self) -> usize { self.nodes.len() - self.free.len() }
 
+    /// Bytes this index holds — see [`Tree3::bytes`](crate::Tree3::bytes) for the accounting
+    /// rules. An `ONode` carries eight child ids against the binary node's two, so this is the
+    /// structure where the per-node cost is worth watching against the shallower descent it buys.
+    pub fn bytes(&self) -> usize {
+        let mut n = self.nodes.capacity() * std::mem::size_of::<ONode<T>>()
+            + self.free.capacity() * std::mem::size_of::<ONodeId>()
+            + self.locs.capacity() * std::mem::size_of::<OItemLoc>()
+            + self.free_handles.capacity() * 4;
+        for node in &self.nodes {
+            n += node.items.capacity() * std::mem::size_of::<T>() + node.hs.capacity() * 4;
+        }
+        n
+    }
+
     /// Reorder the node arena into DFS pre-order and drop freed slots — the
     /// [`Tree3::compact`](crate::Tree3::compact) cache-locality pass for the
     /// 8-way octree (a node lands next to its first child, so a root→leaf descent

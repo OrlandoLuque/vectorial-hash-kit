@@ -115,6 +115,13 @@ impl<T: Positioned3> KdTree3<T> {
 
     #[inline] pub fn item_count(&self) -> usize { self.items.len() }
     #[inline] pub fn node_count(&self) -> usize { self.nodes.len() }
+    /// Bytes this index holds — see [`Tree3::bytes`](crate::Tree3::bytes) for the accounting
+    /// rules. The tightest of the 3D family by construction: items live in **one** flat `Vec`
+    /// that leaves address as a range, so there is no per-leaf `Vec` header or heap at all.
+    pub fn bytes(&self) -> usize {
+        self.nodes.capacity() * std::mem::size_of::<KdNode>()
+            + self.items.capacity() * std::mem::size_of::<T>()
+    }
     /// Visit every leaf as `(box, item_count)` — for debug / rendering overlays. The
     /// boxes are **tight** (the median build fits each node to its own points), so
     /// unlike the midpoint trees' space-partitioning cells they don't tile the world:

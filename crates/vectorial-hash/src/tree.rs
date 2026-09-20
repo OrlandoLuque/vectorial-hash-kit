@@ -732,6 +732,22 @@ impl<T: Positioned> Tree<T> {
     /// Currently-reachable nodes (arena capacity minus free-list slots).
     pub fn live_node_count(&self) -> usize { self.nodes.len() - self.free.len() }
 
+    /// Bytes this index holds — accounting rules at [`Tree3::bytes`](crate::Tree3::bytes).
+    /// The `neighbors` feature's rope lists are counted when compiled in, because they are real
+    /// memory and a footprint that silently ignores an enabled feature is the wrong number.
+    pub fn bytes(&self) -> usize {
+        let mut n = self.nodes.capacity() * std::mem::size_of::<Node<T>>()
+            + self.free.capacity() * std::mem::size_of::<NodeId>()
+            + self.locs.capacity() * std::mem::size_of::<ItemLoc>()
+            + self.free_handles.capacity() * 4;
+        for node in &self.nodes {
+            n += node.items.capacity() * std::mem::size_of::<T>() + node.hs.capacity() * 4;
+            #[cfg(feature = "neighbors")]
+            for rope in &node.ropes { n += rope.capacity() * std::mem::size_of::<NodeId>(); }
+        }
+        n
+    }
+
     /// Reorder the node arena into DFS pre-order and drop freed slots — the
     /// [`Tree3::compact`](crate::Tree3::compact) cache-locality pass for the 2D
     /// binary tree. Pure layout: shape, items, bboxes, `ItemRef` handles and

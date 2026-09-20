@@ -532,6 +532,22 @@ impl<T: Positioned3> MortonGrid3<T> {
     pub fn item_count(&self) -> usize { self.len }
     pub fn cell_count(&self) -> usize { self.cells.len() }
     pub fn levels(&self) -> u32 { self.levels }
+    /// Bytes this index holds — accounting rules at [`Tree3::bytes`](crate::Tree3::bytes), and
+    /// the same hash-table estimate as [`crate::LinearOctree3::bytes`] (exact leaf heaps, the
+    /// table charged as `capacity * (size_of::<(K, V)>() + 1)`).
+    ///
+    /// Note what this does **not** grow with: `levels`. The grid is sparse, so an empty cell
+    /// costs nothing at all — which is why declaring a cubic index world over a slab-shaped
+    /// one is free (see [`Occupancy::mean`]). What it grows with is the number of *occupied*
+    /// cells, i.e. one `Vec` header per cell the data actually reaches, and that is the cost
+    /// of refining: at `levels` fine enough for one item per cell, the headers outweigh the
+    /// items.
+    pub fn bytes(&self) -> usize {
+        let entry = std::mem::size_of::<(u64, Vec<T>)>() + 1;
+        let mut n = self.cells.capacity() * entry;
+        for v in self.cells.values() { n += v.capacity() * std::mem::size_of::<T>(); }
+        n
+    }
 
     /// Visit each **occupied** cell's box and item count (for visualisation /
     /// debugging — the grid analogue of a tree's `visit_leaves`). Order is the

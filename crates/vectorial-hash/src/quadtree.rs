@@ -542,6 +542,18 @@ impl<T: Positioned> QuadTree<T> {
         self.nodes.len() - self.free.len()
     }
 
+    /// Bytes this index holds — accounting rules at [`Tree3::bytes`](crate::Tree3::bytes).
+    pub fn bytes(&self) -> usize {
+        let mut n = self.nodes.capacity() * std::mem::size_of::<QNode<T>>()
+            + self.free.capacity() * std::mem::size_of::<QNodeId>()
+            + self.locs.capacity() * std::mem::size_of::<QItemLoc>()
+            + self.free_handles.capacity() * 4;
+        for node in &self.nodes {
+            n += node.items.capacity() * std::mem::size_of::<T>() + node.hs.capacity() * 4;
+        }
+        n
+    }
+
     /// Visit every live leaf reachable from the root, depth-first.
     /// Each leaf's ITEMS, as a slice — the uniform verb across all twelve structures.
     /// See [`crate::KdTree3::visit_leaf_items`] for why the box-and-count form was not enough.

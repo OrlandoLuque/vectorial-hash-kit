@@ -308,6 +308,20 @@ impl<T: IPositioned> IntegerTree<T> {
     pub fn node_count(&self) -> usize { self.nodes.len() }
     pub fn live_node_count(&self) -> usize { self.nodes.len() - self.free.len() }
 
+    /// Bytes this index holds — accounting rules at [`Tree3::bytes`](crate::Tree3::bytes).
+    /// The integer twin's node is the smallest of the pointer trees: an `IRect` is four `i32`
+    /// against a `Rect`'s four `f64`, so the box costs half as much per node.
+    pub fn bytes(&self) -> usize {
+        let mut n = self.nodes.capacity() * std::mem::size_of::<INode<T>>()
+            + self.free.capacity() * std::mem::size_of::<INodeId>()
+            + self.locs.capacity() * std::mem::size_of::<IItemLoc>()
+            + self.free_handles.capacity() * 4;
+        for node in &self.nodes {
+            n += node.items.capacity() * std::mem::size_of::<T>() + node.hs.capacity() * 4;
+        }
+        n
+    }
+
     /// Reorder the node arena into DFS pre-order and drop freed slots — the
     /// [`Tree3::compact`](crate::Tree3::compact) cache-locality pass for the
     /// integer 2D tree. Pure layout: shape, items, bboxes, `ItemRef` handles and

@@ -91,6 +91,24 @@ impl<T: Positioned3> LinearOctree3<T> {
 
     #[inline] pub fn item_count(&self) -> usize { self.len }
     #[inline] pub fn leaf_count(&self) -> usize { self.leaves.len() }
+    /// Bytes this index holds — accounting rules at [`Tree3::bytes`](crate::Tree3::bytes).
+    ///
+    /// **An estimate, unlike the arena structures', and the reason is the hash table.** A
+    /// `HashMap` does not publish its allocation, so the table is charged as
+    /// `capacity * (size_of::<(K, V)>() + 1)` — the entry array plus hashbrown's one control
+    /// byte per slot. The per-leaf `Vec` heaps underneath are exact. So the pointer trees'
+    /// figures are exact and this one is good to a few percent, which is stated rather than
+    /// blurred because the two get printed in the same column.
+    ///
+    /// The `internal` set is the price of being *adaptive* without pointers: every ancestor of
+    /// every leaf is remembered so a descent knows where to go. It is pure overhead a fixed
+    /// grid does not pay, and it is worth seeing separately from the leaves.
+    pub fn bytes(&self) -> usize {
+        let entry = std::mem::size_of::<(u64, Vec<T>)>() + 1;
+        let mut n = self.leaves.capacity() * entry + self.internal.capacity() * (8 + 1);
+        for v in self.leaves.values() { n += v.capacity() * std::mem::size_of::<T>(); }
+        n
+    }
     #[inline] pub fn world(&self) -> Aabb { self.world }
     /// The deepest occupied level (0 = a single root leaf). A proxy for how far
     /// the densest cluster forced the tree to refine.

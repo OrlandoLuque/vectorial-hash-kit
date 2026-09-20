@@ -113,6 +113,13 @@ impl<T: Positioned> KdTree2<T> {
 
     #[inline] pub fn item_count(&self) -> usize { self.items.len() }
     #[inline] pub fn node_count(&self) -> usize { self.nodes.len() }
+    /// Bytes this index holds — accounting rules at [`Tree3::bytes`](crate::Tree3::bytes).
+    /// Like [`crate::KdTree3::bytes`], items sit in one flat `Vec` addressed by range, so there
+    /// is no per-leaf header.
+    pub fn bytes(&self) -> usize {
+        self.nodes.capacity() * std::mem::size_of::<KdNode>()
+            + self.items.capacity() * std::mem::size_of::<T>()
+    }
 
     /// Each leaf's ITEMS, as a slice — the uniform verb across all twelve structures. See
     /// [`crate::KdTree3::visit_leaf_items`] for why the box-and-count form was not enough.
