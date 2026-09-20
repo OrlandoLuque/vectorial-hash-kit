@@ -456,15 +456,85 @@ exactly matched comparison across both families does not exist.
 > 2. **Matched granularity** — the table above. Answers *"at equal resolution, whose boxes are
 >    tighter"*, which is the only way Q1 and Q3 can be read at all.
 > 3. **Each at its own optimum** — answers *"who wins when properly tuned"*, requires saying what
->    you are optimising (query time? memory? build?), and **is not measured here**: `index_quality`
->    never starts a clock.
+>    you are optimising (query time? memory? build?), and is not measured by `index_quality`, which
+>    never starts a clock. It is measured by **`examples/sweet_spot`**, and the section below is
+>    its answer.
 >
 > The cost of choosing (2) is worth stating plainly: matching the granularity **pushed some
 > structures to settings nobody would ship**. `Octree3` landed on `cap 48`, well above the usual
 > 8–16, and its utilisation fell to 0.56. You cannot have both — a knob-sensitive metric is only
 > comparable with the knob pinned, and pinning it takes structures away from their sensible
-> settings. For sweet spots, use the things that do hold a clock: the decision maps
-> (`critters3d_headless --sweep`, `examples/decision2d`) and `examples/regression_gate`.
+> settings. For sweet spots, use the thing that does hold a clock: `examples/sweet_spot`, below.
+
+### The sweet spot, measured — and there is no such thing as *the* sweet spot
+
+`examples/sweet_spot` sweeps each structure's own knob (`item_limit` / `capacity` / `levels` /
+`bits`) against six objectives — build time, cull time, k-NN time, bytes, and `build + q·cull` at
+a light (`N/10`) and a heavy (`N`) query load — across **48 cells** (12 structures × uniform and
+clustered × a small and a large query radius, N = 50 000). Every knob within **5 %** of the best is
+counted as tied for best, so what is reported is a band and not an argmin.
+
+**In 44 of those 48 cells, no single setting is within 5 % on all six objectives.** The four
+exceptions are `RadixTrie3` on uniform data and `LinearOctree3` on clustered data, both radii.
+
+That is not bad luck, it is forced, and the exact counts say why. Sweeping the knob from fine to
+coarse, **boxes classified per query falls monotonically** (fewer, bigger leaves ⇒ a shallower
+descent) while **points tested per query rises monotonically** (a bigger leaf is scanned linearly).
+Two costs moving in opposite directions produce an interior optimum for queries. Build and memory
+have no such tension — both simply get cheaper as the structure gets coarser — so they sit at the
+end of the ladder. Hence the gradient:
+
+| objective | how often the ladder's COARSEST setting is within 5 % of best |
+| --- | ---: |
+| `bytes` | **46 / 48** |
+| `build` | **40 / 48** |
+| `cull` | 21 / 48 |
+| `knn` | **4 / 48** |
+
+So the practical rule is to name the objective before the knob:
+
+- **Minimising memory or build (a structure you rebuild every frame, or a big static one you must
+  fit):** go coarse. The coarsest setting on the ladder is essentially always within 5 % of the best
+  either objective can do.
+- **Minimising cull:** a middle setting — `item_limit` 32–96 for the trees, and for the grids it
+  depends on the data (see below).
+- **Minimising k-NN: go noticeably finer than you would for cull.** In **35 of 36** tree cells the
+  k-NN band's centre sits below the cull band's — typically 16–32 against 32–64. A k-NN descent
+  tightens its own radius bound as it goes, so more and smaller leaves buy pruning that a
+  fixed-shape cull cannot use.
+
+**★ And the grid's ladder points the other way depending on the data.** On uniform points
+`MortonGrid3` wants its coarsest (`levels 3`) on every objective. On clustered points it wants
+`levels 5–7`: at `levels 3` a whole blob lands in one cell and a query tests **2 620 points**
+against **66** at `levels 7`. Its memory barely moves there (**1.17×** across the whole ladder,
+because clustered data occupies few cells at any resolution), so on clustered data the grid has no
+build-versus-query conflict at all and you should simply refine it. On uniform data it does have
+one, and refining costs you.
+
+#### How much the knob can cost you, by structure
+
+Worst-axis spread across the ladder, median over the cells — i.e. how badly a careless setting can
+hurt:
+
+| structure | worst axis | build | cull | k-NN | bytes |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `KdTree3` / `KdTree2` | **2.2×** | 1.7–1.8× | 1.4–1.6× | 1.4–1.6× | 2.2× |
+| `RadixTrie3` | 2.9× | 2.0× | 2.7× | 2.7× | 2.0× |
+| `Tree` / `LinearQuadTree` / `Tree3` / `QuadTree` | 3.6–3.8× | 2.9–3.6× | 1.6–2.2× | 1.4–1.8× | 1.9–3.8× |
+| `LinearOctree3` / `IntegerTree` / `Octree3` | 4.1–4.6× | 3.2–3.6× | 1.6–3.0× | 1.8–2.0× | 2.1–4.4× |
+| `MortonGrid` | 5.7× | 2.3× | 3.7× | 5.6× | 2.2× |
+| `MortonGrid3` | **10.7×** | 2.6× | **7.0×** | 7.4× | 2.5× |
+
+**The k-d trees are the hardest to misconfigure and the Morton grids by far the easiest**, a factor
+of about five apart. A median split derives the partition from the points, so `capacity` only sets
+how early the recursion stops; a grid's `levels` sets the cell size outright, and getting that wrong
+is the pathology `grid_min_hits` exists to veto. The single worst reading in the whole sweep is a
+uniform `MortonGrid3` cull at radius 60: **44.7×** between its best and worst `levels`.
+
+Caveat on the microsecond columns, as ever: they are one laptop on one night, and the leverage
+ratios in particular are the kind of quantity MEASURING.md § 8e says moves between runs. The
+**counts** (boxes and points per query), the monotonicity directions, and the 44/48 verdict are
+arithmetic over a fixed point set and say the same thing anywhere.
 
 **★ The k-d trees' Q5 is 0.043 in every row, uniform and clustered alike.** A median split puts half
 the points either side by construction, so balance stops being a property of the data and becomes a

@@ -702,3 +702,34 @@ the expected noise or run it in the configuration where clean means zero. And wh
 class of defect, **check whether an existing tool already reports it** before writing a script to
 look — the capability audit, the docs-numbers gate and the freshness check were all built while
 this one was running unread.
+
+## 13. An argmin on a noisy metric is not an optimum, and a composite must be weighted like the workload
+
+Three defects from one bench (`examples/sweet_spot`, #180), all of which produced output that read
+as a result.
+
+**An argmin is a sample, a band is a claim.** The first version reported, per objective, the knob
+with the smallest reading, and announced "5 distinct knobs across six objectives" — off `cull`
+values of 0.43 / 0.44 / 0.44 µs. A 2 % spread, on the box § 8e measured at up to 40 % between
+identical runs. It was reporting noise as a sweet spot, and it would have reported a *different*
+sweet spot on the next run. The fix is to define **tied for best** — every setting within 5 % — and
+publish the band. It is both more honest and more useful: *"anything from 48 to 128 is within 5 %"*
+tells a caller to decide on another axis, where *"48 is optimal"* sends them chasing a digit. The
+interesting question then stops being "which knob wins" and becomes "**do the objectives' bands
+overlap at all**", which is a question a re-run agrees with.
+
+**A composite with the wrong weights only re-reports one term's argmin.** The same bench scored
+`build + q·cull` at `q` = 20 and 400 queries. At N = 50 000 a build costs ~10 000 µs and a cull
+~0.6 µs, so even the "heavy" column was **99.9 % build** and both composites simply reproduced the
+build's own best setting. The column looked like a frame budget and measured nothing the other
+columns had not. Query load has to scale with the workload — `N/10` and `N` culls, since a frame in
+which every item examines its own neighbourhood is N culls — and only then does the composite have
+a term to trade off. **Before trusting a weighted sum, print the share each term contributes.**
+
+**And the aggregation script over the output is code too.** Reducing 48 cells to countable claims,
+my parser anchored on `'-> ' in line` to find the verdict — and the *next* line,
+`counts: boxes/q falls (32 -> 18)`, contains `-> ` as well, so it overwrote the verdict every time.
+The reported figure was **0 of 48 cells agree**; the truth is **4 of 48**. The tell was that 0/48 is
+a cleaner story than 4/48, and § 8f's rule generalises: **a number that arrives tidier than the
+phenomenon deserves the same suspicion as one that arrives too good.** The check that caught it was
+free — `44 + 4 = 48`, so grep both verdict strings and make them add up to the cell count.
