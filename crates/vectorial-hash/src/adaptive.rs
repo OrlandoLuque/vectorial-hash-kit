@@ -676,6 +676,21 @@ pub struct AdaptiveIndex<T: Positioned3 + Clone> {
     /// it was being asked. It does now: `cull` reports the bounding box of every shape, and the
     /// grid is built for the typical one. Zero until a query has been seen, in which case the
     /// occupancy rule stands in.
+    ///
+    /// **What that rule costs, measured, and why it is survivable here** (#180,
+    /// `examples/sweet_spot`): sizing cells by query extent is geometry only, so it is blind to
+    /// clustering, and against the per-level optimum it lands 1–2 levels off in all four
+    /// (distribution × radius) cells tested — never on it. The penalties are 1.05–1.09× on `cull`
+    /// everywhere, and on k-NN 1.00× / 1.00× / **1.83×** / **12.46×**.
+    ///
+    /// The 12.46× cannot be reached from here, and not by luck: it is the sparse-uniform
+    /// small-query case, whose queries return **1.01 items** against a
+    /// [`Thresholds::grid_min_hits`] default of 9 — so the rule deciding *whether* to hold a grid
+    /// refuses this workload before cell sizing is consulted. Same for the 6.77-hit cell. Of the
+    /// two reachable cells one is clean and the other pays **1.83× on k-NN** (it wants `levels 5`
+    /// where extent-sizing gives 4, because clustered blobs are denser than their query extent
+    /// implies). Two policy rules composing so that one covers the other's blind spot is worth
+    /// naming, since every other interaction found in this layer has gone the other way.
     q_extent: f64,
     /// EMA of how many items culls actually RETURN, and how many samples it has seen.
     ///

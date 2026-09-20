@@ -185,6 +185,14 @@ struct Cell3 {
 /// tells a caller they may pick on another axis, where "48 is optimal" tells them to chase a digit.
 const TIE: f64 = 1.05;
 
+/// The query count, stashed so `summarise` can turn total hits into hits-per-query without
+/// threading it through every call site.
+static NQ_FOR_REPORT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+trait Get { fn get(&self) -> usize; }
+impl Get for std::sync::atomic::AtomicUsize {
+    fn get(&self) -> usize { self.load(std::sync::atomic::Ordering::Relaxed) }
+}
+
 fn band(cells: &[Cell3], f: impl Fn(&Cell3) -> f64) -> (f64, Vec<usize>) {
     let best = cells.iter().map(&f).fold(f64::INFINITY, f64::min);
     (best, cells.iter().filter(|c| f(c) <= best * TIE).map(|c| c.knob).collect())
@@ -202,6 +210,16 @@ fn summarise(label: &str, cells: &[Cell3], nq_light: usize, nq_heavy: usize) {
     println!("  {label}");
     println!("    {:>6}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>9}  {:>9}",
              "knob", "build us", "cull us", "knn us", "KB", "+N/10q ms", "+Nq ms", "boxes/q", "pts/q");
+    // hits/q is printed because it decides whether a workload is REACHABLE through AdaptiveIndex
+    // at all: `grid_min_hits` refuses a grid whose queries return fewer than ~9 items, so a cell
+    // where the grid looks catastrophic may be one the policy would never enter. It is the same
+    // number for every knob (a knob must not change the answer), so it is stated once.
+    let hpq = cells[0].hits as f64 / NQ_FOR_REPORT.get() as f64;
+    println!("    hits/q {hpq:.2} — {}", if hpq < 9.0 {
+        "BELOW the grid_min_hits default of 9, so AdaptiveIndex would refuse a grid on this          workload: whatever the grid rows say here, the policy never enters them"
+    } else {
+        "above the grid_min_hits default of 9, so a grid is reachable here and its rows are          policy-relevant"
+    });
     for c in cells {
         let light = c.build_us + nq_light as f64 * c.cull_us;
         let heavy = c.build_us + nq_heavy as f64 * c.cull_us;
@@ -270,6 +288,7 @@ fn main() {
     let reps: usize = std::env::var("SS_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
     let dim = std::env::var("SS_DIM").unwrap_or_else(|_| "3".into());
     let nq = 200usize;
+    NQ_FOR_REPORT.store(nq, std::sync::atomic::Ordering::Relaxed);
 
     println!("#180 — each structure's sweet spot, per objective");
     println!("N = {n}, {nq} queries per measurement, min of {reps} reps, ladder order rotated per rep");

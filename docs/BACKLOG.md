@@ -1361,17 +1361,75 @@ Everything else in this file is **future** — left to triage later.
   when many are on screen at once.
 
 ## Index / algorithms
-- **#180 What is each structure's actual sweet spot? (the knob question, measured)** — the user
-  challenged `index_quality`'s matched table: *"comparaste estructuras con diferentes knobs…
-  tiene sentido? son sus 'sweet spots'?"*. Answered honestly in `CHOOSING.md`: **no**, they are
-  whatever the `tuned()` ladder landed nearest 2 048 leaves, and matching granularity is what
-  makes Q1/Q3 readable **at the cost of pushing structures to settings nobody would ship**
-  (`Octree3` at `cap 48`, utilisation 0.56). The third table does not exist: **sweep each
-  structure's knob against query COST** — build + cull + k-NN, `compare2`-paired, min-of-N — and
-  report where each one peaks, then check whether any geometric metric predicts it. If one does,
-  `Occupancy` gains a companion; if none does (likely, given #172's counterexample where the best
-  `mean` was the slowest arm), that is the finding and `prod(2r/cell_i + 1)` keeps the crown.
-  **Timing-sensitive — wants the main desktop.**
+- **#183 Data-aware cell sizing for the grid backend (the one reachable penalty #180 found)** —
+  `levels_for_cell_size` is geometry only (world span, query extent) and therefore blind to
+  clustering. Measured against the per-level optimum it lands 1–2 levels off in all four
+  (distribution × radius) cells, never on it: 1.05–1.09× on `cull` throughout, and on k-NN
+  1.00 / 1.00 / **1.83×** / **12.46×**. The 12.46× and one other are **unreachable** through
+  `AdaptiveIndex` because `grid_min_hits` refuses those workloads first (1.01 and 6.77 hits per
+  query against a default of 9), so the prize is the **1.83× k-NN penalty on clustered data**,
+  where the optimum is `levels 5` and extent-sizing gives 4. The shape of a fix: feed
+  `occupancy().mean` back in, or bias k-NN-dominated callers one level finer — but note #172's
+  counterexample, where the best `mean` was the SLOWEST arm, so occupancy alone cannot decide it.
+  Do not touch `cull`: those penalties are inside the 5 % tie band.
+- **#182 BIG SWING: the extent-aware family (loose octree / BVH / R-tree) — answered, not built** —
+  the user asked whether to add loose octrees and "otros de esos árboles". The answer, recorded so
+  it is not re-derived: **for points a loose octree degenerates into `Octree3`** (looseness only
+  buys something when an object has a size), so the real cost is the **item contract** — bounding
+  boxes across twelve structures plus intersects-versus-contains query semantics — and not the
+  tree. And the comparison **is not measurable on points at all**: an R-tree racing twelve space
+  partitioners over points would answer the same question with more machinery, lose, and prove
+  nothing. Order if it is ever taken: (1) an extent trait + **one** BVH over AABBs, the family
+  genuinely absent here; (2) #179's hybrid measurement, because if the hybrid wins then the
+  contribution is the hybrid and not a new tree; (3) a loose octree **only** if size-tiering inside
+  one tree then beats separate tiers. Depends on whether mixed-scale objects are actually on the
+  road — see the precondition now at the top of `CHOOSING.md`.
+- ~~**#181 `bytes()` on all twelve — "which is smallest" had no answer**~~ — **done.** Only
+  `RadixTrie3` could report a footprint, so eleven structures could not enter #180's memory column.
+  One set of accounting rules, stated on `Tree3::bytes` and referenced from the rest, because a
+  memory column is read across arms. At 20k uniform items `KdTree3` holds **1.41×** its items' own
+  size and `MortonGrid3` **4.48×** at `levels 5`.
+  → **Two of my three claims about the test were wrong.** The centrepiece was "remove 90% and the
+  footprint stays near peak, because `Vec` and `HashMap` never shrink"; it FAILED, and the test was
+  wrong — the grid drops a whole bucket when a cell empties, so it genuinely does hand memory back
+  (0.416 of peak) while an arena keeps its freed slots. Then I wrote that it verified
+  `capacity`-vs-`len`; perturbing `Tree3` to `len()` left all three tests **passing**, because an
+  arena keeps freed slots inside the `Vec` so `len` sits at the high-water mark. What it actually
+  catches is resident-vs-**reachable**, i.e. the version written from the public counts
+  (`live_node_count + item_count`), which reads exactly 1.00×.
+  → So `capacity`-vs-`len` was measured instead of asserted, and it matters for a different reason:
+  **1.28× on `Tree3` but 2.45× on `MortonGrid3`**, enough to **reorder the column** (under `len` the
+  grid reads 974 KB against the tree's 1 157 KB and looks smaller; under `capacity`, 2 385 against
+  1 485 and is clearly larger). A third test pins it for the hash structures from public counts
+  alone; the reconstruction reads exactly 1.00× when perturbed, which also validates the accounting.
+- ~~**#180 What is each structure's actual sweet spot? (the knob question, measured)**~~ —
+  **done, and the answer is that there is no such thing as *the* sweet spot.**
+  `examples/sweet_spot` sweeps each knob against six objectives over **48 cells** (12 structures ×
+  uniform/clustered × small/large radius, N = 50 000), with every setting within **5 %** counted as
+  tied so the output is a band and not an argmin.
+  → **In 44 of 48 cells no single setting is within 5 % on all six.** Exceptions: `RadixTrie3`
+  uniform and `LinearOctree3` clustered, both radii.
+  → **It is forced, and the exact counts say why**: fine→coarse, boxes classified per query FALLS
+  monotonically while points tested RISES, so queries get an interior optimum; build and memory have
+  no such tension and sit at the ladder's end. The gradient for how often the coarsest setting is
+  within 5 % of best: `bytes` **46/48**, `build` **40/48**, `cull` 21/48, `knn` **4/48**.
+  → **k-NN wants a noticeably finer leaf than `cull`** — band centre below `cull`'s in **35 of 36**
+  tree cells, typically 16–32 against 32–64, because a k-NN descent tightens its own radius bound.
+  → **The grid's ladder reverses with the data**: uniform `MortonGrid3` wants `levels 3` on every
+  objective, clustered wants 5–7 (at `levels 3` a blob lands in one cell and a query tests **2 620**
+  points against 66), and its memory moves only **1.17×** across the whole ladder there — so on
+  clustered data it has no build-versus-query conflict at all.
+  → **The k-d trees are the hardest to misconfigure and the Morton grids by far the easiest**,
+  ~5× apart on worst-axis spread (2.2× vs 10.7×; single worst reading **44.7×**, a uniform grid cull
+  at radius 60). A median split derives the partition from the points, so `capacity` only decides
+  when to stop; `levels` sets cell size outright.
+  → Three method defects, all in MEASURING.md § 13, all of which printed as results: argmins off a
+  2 % spread; composites weighted so the "heavy" column was 99.9 % build; and an aggregation script
+  anchored on `'-> '` that the *next* line (`boxes/q falls (32 -> 18)`) also matched, reporting
+  **0 of 48** where the truth is **4 of 48** — the tell being that 0/48 is the tidier story, and
+  `44 + 4 = 48` a check I had not run.
+  → Follow-ups: #183 (the one reachable penalty). Superseded nothing; `index_quality`'s matched
+  table stands, with its purpose now stated as a different question rather than implied.
 - **#179 The extended-object tax, measured (prompted by the user's km-scale-ship question)** —
   all twelve index **points**, now stated as a precondition in `Positioned3`'s rustdoc and at the
   top of `CHOOSING.md` (it makes a wrong *answer*, not a slow one). What is argued there and not

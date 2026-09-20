@@ -536,6 +536,29 @@ ratios in particular are the kind of quantity MEASURING.md § 8e says moves betw
 **counts** (boxes and points per query), the monotonicity directions, and the 44/48 verdict are
 arithmetic over a fixed point set and say the same thing anywhere.
 
+#### What this says about the knob `AdaptiveIndex` picks for you
+
+Worth checking, since the sweep is the first thing able to price it. `AdaptiveIndex` takes one
+`leaf` from its caller and gives it to *both* the `Tree3` backend (as `item_limit`) and the
+`KdTree3` backend (as `capacity`); the grid sizes itself with
+`MortonGrid3::levels_for_cell_size(world, q_extent)`.
+
+**Sharing one number between the tree and the k-d tree is cheap**, and the leverage table is why:
+`KdTree3` is the least knob-sensitive structure in the kit (2.2× worst-axis) while `Tree3` is 3.7×,
+so a caller who picks for the tree loses almost nothing on the k-d side. Pick for the tree.
+
+**The grid's self-sizing lands 1–2 levels off the per-level optimum in all four cells tested** —
+never on it — because it is geometry only and cannot see clustering. The penalties are 1.05–1.09×
+on `cull` throughout, and on k-NN `1.00× / 1.00× / 1.83× / 12.46×`.
+
+**And the 12.46× is unreachable, which is the interesting part.** It is the sparse-uniform
+small-query case, where queries return **1.01 items** against a `grid_min_hits` default of 9 — so
+the threshold that decides *whether* to hold a grid rejects that workload before cell sizing is ever
+consulted. The 6.77-hit cell is rejected too. Of the two reachable cells one is clean and the other
+pays **1.83× on k-NN**. No default is worth changing on that evidence (the reachable `cull`
+penalties sit inside the 5 % tie band), but the k-NN gap is real and data-aware cell sizing is
+queued as #183 with that figure as its prize.
+
 **★ The k-d trees' Q5 is 0.043 in every row, uniform and clustered alike.** A median split puts half
 the points either side by construction, so balance stops being a property of the data and becomes a
 property of the algorithm. Nothing else is within 2.5× on uniform data and the grids are 20–27×

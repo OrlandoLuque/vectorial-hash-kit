@@ -275,6 +275,33 @@ impl<T: Positioned3> MortonGrid3<T> {
 
     /// Pick the smallest `levels` whose cell is at least `target` units wide on
     /// the largest axis — a convenience for "I want cells ≈ the query radius".
+    ///
+    /// **It is geometry only, and therefore blind to how the points are distributed.** Measured
+    /// against the per-objective optimum (`examples/sweet_spot`, 50 000 points in a 1000-cube,
+    /// every level on the ladder timed):
+    ///
+    /// | workload | this picks | cull wants | cull penalty | k-NN penalty |
+    /// | --- | ---: | ---: | ---: | ---: |
+    /// | uniform, radius 4 | 7 | 5 | 1.77× | **12.46×** |
+    /// | uniform, radius 60 | 4 | 3 | 1.05× | 1.00× |
+    /// | clustered, radius 4 | 7 | 6 | 1.09× | 1.00× |
+    /// | clustered, radius 60 | 4 | **5** | 1.09× | **1.83×** |
+    ///
+    /// Two things to read off it. On *clustered* data it **under**-refines — the blobs are denser
+    /// than the query extent suggests, so the cell wants to be smaller than `target` — and that
+    /// costs 1.83× on k-NN in the bottom row. And on sparse uniform data with a small query it
+    /// **over**-refines badly: `levels 7` over a 1000-cube is 2 M cells for 50 000 items, and a
+    /// k-NN ring expansion then walks a great deal of empty space. That second case is the
+    /// pathology [`Occupancy::mean`] exists to diagnose.
+    ///
+    /// **The saving grace, and it is not luck:** the two rows with the large penalties are exactly
+    /// the two whose queries return too little for
+    /// [`crate::adaptive::Thresholds::grid_min_hits`] to allow a grid at all — 1.01 and 6.77 hits
+    /// per query against a default of 9. So `AdaptiveIndex` cannot reach them: the rule that
+    /// decides *whether* to use a grid happens to exclude the workloads where sizing it this way
+    /// goes wrong. Used **directly**, outside that policy, there is nothing protecting you — check
+    /// [`MortonGrid3::occupancy`] against the guidance on `Occupancy::mean`, and if your queries
+    /// are k-NN rather than `cull`, go a level finer than this returns.
     pub fn levels_for_cell_size(world: Aabb, target: f64) -> u32 {
         let span = world.w.max(world.h).max(world.d);
         let mut levels = 1u32;
